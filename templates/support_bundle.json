@@ -1,0 +1,126 @@
+{
+  "provenance": {
+    "origin": "bootstrap",
+    "written_from": [
+      "public log-format conventions of multi-tenant SaaS backup and restore services",
+      "public knowledge-base articles that quote log excerpts",
+      "public documentation for the cloud APIs such a service calls"
+    ],
+    "contains_customer_data": false,
+    "contains_vendor_internals": false,
+    "note": "This file is the sanitize-at-source artefact. It holds log line SKELETONS only: every value position is a typed placeholder, never a real value, and every component name is generic rather than any vendor's. Templates extracted from real bundles should be reviewed wherever those bundles legitimately live and then appended here in the same form. Nothing in this file needs to be treated as customer or vendor data."
+  },
+  "placeholders": {
+    "TS": "log timestamp, dd.MM.yyyy HH:mm:ss.fff",
+    "TSZ": "ISO 8601 UTC timestamp",
+    "PID": "hex thread id",
+    "LEVEL": "log level token",
+    "MS": "duration in milliseconds",
+    "N": "small integer",
+    "ITEMS": "item count",
+    "MB": "size in megabytes",
+    "PCT": "percentage",
+    "HTTP": "HTTP status code",
+    "JOBNAME": "non-sensitive policy label"
+  },
+  "files": [
+    {
+      "path": "logs/backup-proxy/job.{JOBNAME}.log",
+      "weight": 6,
+      "lines": [
+        "[{TS}] <{PID}> Info     [Session] Backup session <<SESSION_GUID>> started for tenant <<TENANT_ID>> on proxy <<POD_ID>>",
+        "[{TS}] <{PID}> Info     [Session] Processing mailbox <<UPN_EMAIL>> (id <<OBJECT_GUID>>), {ITEMS} items queued",
+        "[{TS}] <{PID}> Info     [Api] Connected to the mail endpoint as <<UPN_EMAIL>>, latency {MS} ms",
+        "[{TS}] <{PID}> Warning  [Throttling] Mail API returned {HTTP} for <<UPN_EMAIL>>, retry {N} in {MS} ms",
+        "[{TS}] <{PID}> Warning  [Throttling] Site API returned {HTTP} for <<SITE_URL>>, Remaining: 0",
+        "[{TS}] <{PID}> Info     [Transport] Uploading {MB} MB to <<PRESIGNED_URL>>",
+        "[{TS}] <{PID}> Info     [Auth] Acquired token for <<TENANT_ID>>: <<JWT>>",
+        "[{TS}] <{PID}> Error    [Session] Session <<SESSION_GUID>> failed on <<POD_ID>>: item <<OBJECT_GUID>> unreadable",
+        "[{TS}] <{PID}> Info     [Repo] Repository endpoint <<HOSTNAME_FQDN>> (<<IPV4>>) reachable, {MS} ms",
+        "[{TS}] <{PID}> Info     [Session] Session <<SESSION_GUID>> completed, {ITEMS} items, {MB} MB, {MS} ms",
+        "[{TS}] <{PID}> Info     [Service] Handled by service instance <<SERVICE_INSTANCE_ID>>",
+        "[{TS}] <{PID}> Warning  [Cache] Local cache path <<WINDOWS_USER_PATH>> is {PCT}% full",
+        "[{TS}] <{PID}> Info     [Api] GET /users/<<UPN_EMAIL>>/mailFolders returned {HTTP} in {MS} ms",
+        "[{TS}] <{PID}> Info     [Session] Progress {PCT}% for <<SESSION_GUID>> ({ITEMS} of {ITEMS} items)"
+      ]
+    },
+    {
+      "path": "logs/backup-service/service.log",
+      "weight": 4,
+      "lines": [
+        "[{TS}] <{PID}> Info     [Scheduler] Policy '{JOBNAME}' bound to service <<SERVICE_INSTANCE_ID>>, next run in {MS} ms",
+        "[{TS}] <{PID}> Info     [Config] Connecting to object storage: <<CONNECTION_STRING>>",
+        "[{TS}] <{PID}> Info     [Tenant] Tenant <<TENANT_ID>> quota {PCT}% used",
+        "[{TS}] <{PID}> Error    [Rest] Call to <<HOSTNAME_FQDN>> failed with {HTTP} after {MS} ms",
+        "[{TS}] <{PID}> Info     [Rest] Authorization: Bearer <<JWT>>",
+        "[{TS}] <{PID}> Info     [Agent] Agent <<POD_ID>> heartbeat received from <<IPV4>>",
+        "[{TS}] <{PID}> Info     [Agent] Agent <<POD_ID>> registered on <<IPV6>>",
+        "[{TS}] <{PID}> Warning  [Support] Support case <<SUPPORT_CASE_NUMBER>> referenced in maintenance note",
+        "[{TS}] <{PID}> Info     [Integration] Calling downstream API with key <<API_KEY>>"
+      ]
+    },
+    {
+      "path": "logs/restore/restore-session.log",
+      "weight": 4,
+      "lines": [
+        "[{TS}] <{PID}> Info     [Restore] Execution session <<SESSION_GUID>> started by <<UPN_EMAIL>>",
+        "[{TS}] <{PID}> Info     [Restore] Target site <<SITE_URL>>, source collection <<OBJECT_GUID>>",
+        "[{TS}] <{PID}> Info     [Restore] Worker <<POD_ID>> claimed the session after {MS} ms in queue",
+        "[{TS}] <{PID}> Warning  [Restore] Trying to resume after throttling, target <<SITE_URL>>",
+        "[{TS}] <{PID}> Info     [Restore] Restored {ITEMS} items into <<SITE_URL>>/Shared%20Documents",
+        "[{TS}] <{PID}> Error    [Restore] Session <<SESSION_GUID>> cancelled, worker <<POD_ID>> unreachable at <<IPV4>>",
+        "[{TS}] <{PID}> Info     [Restore] Export written to <<WINDOWS_USER_PATH>>\\restore-{N}.zip"
+      ]
+    },
+    {
+      "path": "pods/{JOBNAME}/worker-stdout.jsonl",
+      "weight": 3,
+      "lines": [
+        "{\"ts\":\"{TSZ}\",\"level\":\"{LEVEL}\",\"pod\":\"<<POD_ID>>\",\"session\":\"<<SESSION_GUID>>\",\"tenant\":\"<<TENANT_ID>>\",\"msg\":\"claim accepted\"}",
+        "{\"ts\":\"{TSZ}\",\"level\":\"{LEVEL}\",\"pod\":\"<<POD_ID>>\",\"upn\":\"<<UPN_EMAIL>>\",\"items\":{ITEMS},\"msg\":\"batch flushed\"}",
+        "{\"ts\":\"{TSZ}\",\"level\":\"warn\",\"pod\":\"<<POD_ID>>\",\"site\":\"<<SITE_URL>>\",\"status\":{HTTP},\"msg\":\"throttled\"}",
+        "{\"ts\":\"{TSZ}\",\"level\":\"error\",\"pod\":\"<<POD_ID>>\",\"peer\":\"<<IPV4>>\",\"msg\":\"connection reset\"}",
+        "{\"ts\":\"{TSZ}\",\"level\":\"{LEVEL}\",\"sas\":\"<<PRESIGNED_URL>>\",\"msg\":\"chunk uploaded\",\"mb\":{MB}}",
+        "{\"ts\":\"{TSZ}\",\"level\":\"{LEVEL}\",\"token\":\"<<JWT>>\",\"msg\":\"token refreshed\"}"
+      ]
+    },
+    {
+      "path": "notes/support-notes.txt",
+      "weight": 2,
+      "lines": [
+        "Call with <<PERSON_NAME>> at <<ORG_NAME>> on case <<SUPPORT_CASE_NUMBER>>: the restore into <<SITE_URL>> is still queued.",
+        "<<PERSON_NAME>> confirmed the affected mailbox is <<UPN_EMAIL>>, session <<SESSION_GUID>>.",
+        "Escalation note: <<ORG_NAME>> is asking for an ETA. Worker <<POD_ID>> has been idle for {MS} ms.",
+        "<<PERSON_NAME>> from <<ORG_NAME>> will send a fresh bundle from <<HOSTNAME_FQDN>>.",
+        "Handover: <<PERSON_NAME>> takes over case <<SUPPORT_CASE_NUMBER>> tomorrow, tenant <<TENANT_ID>>."
+      ]
+    },
+    {
+      "path": "config/appsettings.Production.json",
+      "weight": 1,
+      "lines": [
+        "  \"Storage\": { \"ConnectionString\": \"<<CONNECTION_STRING>>\" },",
+        "  \"Identity\": { \"TenantId\": \"<<TENANT_ID>>\", \"ClientSecret\": \"<<API_KEY>>\" },",
+        "  \"Repository\": { \"Endpoint\": \"<<HOSTNAME_FQDN>>\", \"Address\": \"<<IPV4>>\" },",
+        "  \"Proxy\": { \"Pod\": \"<<POD_ID>>\", \"Service\": \"<<SERVICE_INSTANCE_ID>>\" },",
+        "  \"Diagnostics\": { \"LogPath\": \"<<WINDOWS_USER_PATH>>\" }"
+      ]
+    }
+  ],
+  "clean_lines": [
+    "[{TS}] <{PID}> Info     [Session] Reading configuration, {N} sections loaded",
+    "[{TS}] <{PID}> Info     [Transport] Compression level {N}, block size {MB} MB",
+    "[{TS}] <{PID}> Warning  [Retry] Backoff window {MS} ms exceeded, retry {N} of {N}",
+    "[{TS}] <{PID}> Info     [Scheduler] Policy '{JOBNAME}' evaluated in {MS} ms",
+    "[{TS}] <{PID}> Info     [Stats] {ITEMS} items processed, {PCT}% cache hit rate",
+    "[{TS}] <{PID}> Error    [Transport] Stream closed after {MB} MB, code {HTTP}",
+    "[{TS}] <{PID}> Info     [Service] Build 8.1.0.{N}, runtime initialised in {MS} ms",
+    "[{TS}] <{PID}> Info     [Queue] Depth {N}, oldest entry {MS} ms",
+    "{\"ts\":\"{TSZ}\",\"level\":\"{LEVEL}\",\"msg\":\"heartbeat\",\"queue\":{N},\"ms\":{MS}}",
+    "{\"ts\":\"{TSZ}\",\"level\":\"{LEVEL}\",\"msg\":\"gc pause\",\"ms\":{MS},\"gen\":{N}}",
+    "The retry window was widened after the last release, see the internal runbook section {N}.",
+    "No further action needed on the transport layer, throughput is back to {MB} MB/s.",
+    "  \"Limits\": { \"MaxParallelJobs\": {N}, \"TimeoutMs\": {MS} },",
+    "[{TS}] <{PID}> Info     [Cache] Evicted {N} entries, {MB} MB reclaimed"
+  ]
+}

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hider"
+version = "0.1.0"
+description = "Tiered redaction gateway for support log bundles on their way to an LLM provider"
+requires-python = ">=3.11"
+dependencies = [
+    "presidio-analyzer>=2.2",
+    "presidio-anonymizer>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+hider = "hider.cli:main"
+
+[tool.setuptools]
+packages = ["hider"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

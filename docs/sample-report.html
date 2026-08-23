@@ -1,0 +1,187 @@
+<title>Hider: what the model provider actually sees</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf8; --panel: #ffffff; --ink: #1c1a17; --muted: #6b6560;
+  --line: #e3ded7; --accent: #7a4b2a; --raw: #b3261e; --safe: #1f6b3a;
+  --raw-bg: rgba(179,38,30,.10); --safe-bg: rgba(31,107,58,.10);
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+:root:not([data-theme="light"]) { }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #16151a; --panel: #1e1d23; --ink: #ece9e4; --muted: #9a938c;
+    --line: #322f38; --accent: #d8a06b; --raw: #ff8a80; --safe: #7ddb9b;
+    --raw-bg: rgba(255,138,128,.12); --safe-bg: rgba(125,219,155,.12);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #16151a; --panel: #1e1d23; --ink: #ece9e4; --muted: #9a938c;
+  --line: #322f38; --accent: #d8a06b; --raw: #ff8a80; --safe: #7ddb9b;
+  --raw-bg: rgba(255,138,128,.12); --safe-bg: rgba(125,219,155,.12);
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 40px 24px 80px; }
+h1 { font-size: 28px; letter-spacing: -.02em; margin: 0 0 6px; }
+h2 { font-size: 18px; margin: 44px 0 12px; letter-spacing: -.01em; }
+h3 { font-size: 14px; margin: 22px 0 8px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+p { margin: 0 0 12px; max-width: 74ch; }
+.sub { color: var(--muted); margin-bottom: 28px; }
+.kpis { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.kpi .n { font-size: 26px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.kpi .l { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.kpi .f { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
+.split { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+.pane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.pane > header { padding: 10px 14px; border-bottom: 1px solid var(--line);
+  font-size: 12.5px; font-weight: 650; letter-spacing: .02em; }
+.pane.raw > header { color: var(--raw); background: var(--raw-bg); }
+.pane.safe > header { color: var(--safe); background: var(--safe-bg); }
+pre { margin: 0; padding: 12px 14px; overflow-x: auto; font-family: var(--mono);
+  font-size: 11.5px; line-height: 1.65; white-space: pre; }
+mark { background: var(--raw-bg); color: var(--raw); border-radius: 3px; padding: 0 2px; }
+mark.ok { background: var(--safe-bg); color: var(--safe); }
+table { width: 100%; border-collapse: collapse; font-size: 13px;
+  font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; }
+tbody tr:last-child td { border-bottom: none; }
+td.good { color: var(--safe); } td.bad { color: var(--raw); }
+.tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted); }
+.tag.gap { color: var(--accent); border-color: var(--accent); }
+.note { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 8px; padding: 14px 16px; }
+.note p:last-child { margin-bottom: 0; }
+ul { max-width: 74ch; padding-left: 20px; } li { margin-bottom: 7px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 56px;
+  border-top: 1px solid var(--line); padding-top: 16px; }
+</style>
+<div class="wrap">
+<h1>Hider: what the model provider actually sees</h1>
+<p class="sub">Hider, phase 1. Deterministic tier only, measured on a synthetic
+bundle of 5,024 lines and 695,117 characters with
+6676 planted values whose type and position are known exactly.</p>
+
+<div class="kpis"><div class='kpi'><div class='n'>99.9%</div><div class='l'>recall on shaped identifiers</div><div class='f'>6103 of 6676 seeded values, tier 1 only</div></div><div class='kpi'><div class='n'>0.0%</div><div class='l'>false-redaction rate</div><div class='f'>on 1000 lines known to hold nothing sensitive</div></div><div class='kpi'><div class='n'>0</div><div class='l'>unexplained survivors</div><div class='f'>seeded values still findable verbatim in the output</div></div><div class='kpi'><div class='n'>39.0%</div><div class='l'>managed-NER spend avoided</div><div class='f'>tier 1 clears this share of characters before any paid tier</div></div><div class='kpi'><div class='n'>108 us</div><div class='l'>tier 1 per line</div><div class='f'>single-threaded, no network, no NLP model</div></div></div>
+
+<h2>The same excerpt, two destinations</h2>
+<p>Left is what a support engineer pasting a log excerpt into a chat window
+sends today. Right is what leaves the building once the same text goes through
+Hider. Identifiers keep a stable pseudonym, so the correlation an engineer needs
+survives; credentials are destroyed outright, because holding one is itself the
+risk.</p>
+<div class="split">
+  <div class="pane raw"><header>Raw, straight to the provider</header><pre>[14.08.2026 13:29:44.772] &lt;ad&gt; Warning  [Cache] Local cache path <mark>C:\Users\priya.ferreira\Documents\Exports</mark> is 74% full
+[01.08.2026 04:09:13.661] &lt;c2&gt; Info     [Session] Session <mark>1d1cb348-7af0-f9c4-43fc-35f8339f1415</mark> completed, 322224 items, 14104 MB, 112679 ms
+[10.08.2026 19:06:31.787] &lt;8f&gt; Info     [Session] Backup session <mark>509cee51-05d6-911b-072f-c77188430592</mark> started for tenant <mark>77a0af3e-4703-71e9-8f54-dbb4fffe8f8b</mark> on proxy <mark>wkr-apj-prx180</mark>
+[22.08.2026 19:23:17.372] &lt;49&gt; Error    [Session] Session <mark>0463ca73-77d3-7cde-de18-636319eb4dff</mark> failed on <mark>wkr-amer-node170</mark>: item <mark>d4b787c8-0a0b-2e0f-fce5-92f3392080da</mark> unreadable
+[21.08.2026 16:32:42.036] &lt;c3&gt; Info     [Repo] Repository endpoint <mark>dc31.tailspingrp.internal</mark> (<mark>172.170.160.151</mark>) reachable, 309151 ms
+[26.08.2026 17:37:48.501] &lt;d2&gt; Info     [Session] Backup session <mark>8b0bbe48-9c4e-2d0c-3e4a-7bc367387549</mark> started for tenant <mark>25da5bb7-a342-a43f-fd5f-1157cb6fac25</mark> on proxy <mark>wkr-amer-prx109</mark>
+[06.08.2026 19:02:08.710] &lt;76&gt; Info     [Repo] Repository endpoint <mark>dc02.northwindgrp.internal</mark> (<mark>192.75.112.198</mark>) reachable, 226734 ms
+[20.08.2026 14:12:56.265] &lt;9f&gt; Info     [Api] GET /users/<mark>pavel.vargas@fabrikamgrp.com</mark>/mailFolders returned 429 in 297681 ms
+[21.08.2026 01:37:22.866] &lt;73&gt; Info     [Service] Handled by service instance <mark>svc-stage-northeu-022</mark>
+[22.08.2026 04:53:25.556] &lt;c1&gt; Info     [Auth] Acquired token for <mark>1d472814-1868-40b3-b06c-177f9926e96a</mark>: <mark>eyJdv_JtoJNxmIIbdjv_xSXu-SIZKGWjt.eyJBOkQzUglxm6BOo-AuS33ZCTw9Em_QP5FdyoftWJf3uGAcckTUVJOglt4MzWy_rkt.ORwkXK76Vrc9cxI8kAV6KBofpz0gkSOvst0SvjruV2m</mark>
+[20.08.2026 15:52:30.419] &lt;d6&gt; Info     [Auth] Acquired token for <mark>efe67a7e-bf0b-e98d-656e-c25699333685</mark>: <mark>eyJ6b0PQSMmvBc_Oo1LQJQWtrjcAZ4DzS.eyJJs1SXcg9ZeIW03KjyJX209FTlPAUm_j2uNu0n0kZLMG_HUcq68QDei7hYwPPd63a.U8SmUhIHMol8dXDBvScE6rxlVt68E5wRFhGnqz8co8t</mark>
+[26.08.2026 22:37:19.587] &lt;96&gt; Info     [Api] GET /users/<mark>hanna.iyer@litwarecorp.com</mark>/mailFolders returned 404 in 752524 ms
+[23.08.2026 14:24:02.403] &lt;c4&gt; Info     [Session] Processing mailbox <mark>anna.delacroix@adventurecorp.com</mark> (id <mark>74d998b6-96c3-7d7a-a6ef-1e53a7d3117d</mark>), 84894 items queued
+[19.08.2026 15:44:06.343] &lt;a5&gt; Info     [Service] Handled by service instance <mark>svc-prod-eastau-001</mark></pre></div>
+  <div class="pane safe"><header>Through Hider</header><pre>[14.08.2026 13:29:44.772] &lt;ad&gt; Warning  [Cache] Local cache path <mark class='ok'>C:\Users\user-01\Documents\Exports</mark> is 74% full
+[01.08.2026 04:09:13.661] &lt;c2&gt; Info     [Session] Session <mark class='ok'>&lt;Session-01&gt;</mark> completed, 322224 items, 14104 MB, 112679 ms
+[10.08.2026 19:06:31.787] &lt;8f&gt; Info     [Session] Backup session <mark class='ok'>&lt;Session-02&gt;</mark> started for tenant <mark class='ok'>&lt;Session-03&gt;</mark> on proxy <mark class='ok'>pod-01</mark>
+[22.08.2026 19:23:17.372] &lt;49&gt; Error    [Session] Session <mark class='ok'>&lt;Session-04&gt;</mark> failed on <mark class='ok'>pod-02</mark>: item <mark class='ok'>&lt;Session-05&gt;</mark> unreadable
+[21.08.2026 16:32:42.036] &lt;c3&gt; Info     [Repo] Repository endpoint <mark class='ok'>node-01.tenant.example</mark> (<mark class='ok'>203.0.113.2</mark>) reachable, 309151 ms
+[26.08.2026 17:37:48.501] &lt;d2&gt; Info     [Session] Backup session <mark class='ok'>&lt;Session-06&gt;</mark> started for tenant <mark class='ok'>&lt;Session-07&gt;</mark> on proxy <mark class='ok'>pod-03</mark>
+[06.08.2026 19:02:08.710] &lt;76&gt; Info     [Repo] Repository endpoint <mark class='ok'>node-02.tenant.example</mark> (<mark class='ok'>203.0.113.3</mark>) reachable, 226734 ms
+[20.08.2026 14:12:56.265] &lt;9f&gt; Info     [Api] GET /users/<mark class='ok'>user-01@tenant-01.example</mark>/mailFolders returned 429 in 297681 ms
+[21.08.2026 01:37:22.866] &lt;73&gt; Info     [Service] Handled by service instance <mark class='ok'>&lt;Service-01&gt;</mark>
+[22.08.2026 04:53:25.556] &lt;c1&gt; Info     [Auth] Acquired token for <mark class='ok'>&lt;Session-08&gt;</mark>: <mark class='ok'>&lt;REDACTED:JWT&gt;</mark>
+[20.08.2026 15:52:30.419] &lt;d6&gt; Info     [Auth] Acquired token for <mark class='ok'>&lt;Session-09&gt;</mark>: <mark class='ok'>&lt;REDACTED:JWT&gt;</mark>
+[26.08.2026 22:37:19.587] &lt;96&gt; Info     [Api] GET /users/<mark class='ok'>user-02@tenant-02.example</mark>/mailFolders returned 404 in 752524 ms
+[23.08.2026 14:24:02.403] &lt;c4&gt; Info     [Session] Processing mailbox <mark class='ok'>user-03@tenant-03.example</mark> (id <mark class='ok'>&lt;Session-10&gt;</mark>), 84894 items queued
+[19.08.2026 15:44:06.343] &lt;a5&gt; Info     [Service] Handled by service instance <mark class='ok'>&lt;Service-02&gt;</mark></pre></div>
+</div>
+
+<h2>Recall, per entity type</h2>
+<p>Every value in the corpus was planted deliberately, so nothing here is
+hand-labelled. <strong>Typed recall</strong> is stricter than recall: it also
+requires the detector to have named the entity correctly, which it honestly
+cannot always do, since a session id and a tenant id are the same 36 characters
+on the wire. The last column is stock Presidio on the identical corpus, which is
+what the custom domain recognizers are measured against.</p>
+<div class='scroll'><table><thead><tr><th>Entity type</th><th>Seeded</th><th>Fully redacted</th><th>Partial</th><th>Recall</th><th>Typed recall</th><th>Stock Presidio</th></tr></thead><tbody><tr><td>POD_ID<br><span class='tag'>tier 1</span></td><td>1062</td><td>1062</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>SESSION_GUID<br><span class='tag'>tier 1</span></td><td>724</td><td>722</td><td>0</td><td class=''>99.7%</td><td>99.7%</td><td>0.0%</td></tr><tr><td>UPN_EMAIL<br><span class='tag'>tier 1</span></td><td>645</td><td>643</td><td>0</td><td class=''>99.7%</td><td>99.7%</td><td>88.4%</td></tr><tr><td>SITE_URL<br><span class='tag'>tier 1</span></td><td>635</td><td>635</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>TENANT_ID<br><span class='tag'>tier 1</span></td><td>489</td><td>489</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>IPV4<br><span class='tag'>tier 1</span></td><td>424</td><td>423</td><td>0</td><td class=''>99.8%</td><td>99.8%</td><td>99.8%</td></tr><tr><td>PERSON_NAME<br><span class='tag gap'>tier 2, not built</span></td><td>316</td><td>0</td><td>0</td><td class=''>0.0%</td><td>0.0%</td><td>0.0%</td></tr><tr><td>JWT<br><span class='tag'>tier 1</span></td><td>296</td><td>294</td><td>0</td><td class=''>99.3%</td><td>99.3%</td><td>0.0%</td></tr><tr><td>OBJECT_GUID<br><span class='tag'>tier 1</span></td><td>290</td><td>290</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>HOSTNAME_FQDN<br><span class='tag'>tier 1</span></td><td>285</td><td>285</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>SUPPORT_CASE_NUMBER<br><span class='tag'>tier 1</span></td><td>264</td><td>264</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>ORG_NAME<br><span class='tag gap'>tier 2, not built</span></td><td>248</td><td>0</td><td>0</td><td class=''>0.0%</td><td>0.0%</td><td>0.0%</td></tr><tr><td>WINDOWS_USER_PATH<br><span class='tag'>tier 1</span></td><td>246</td><td>245</td><td>0</td><td class=''>99.6%</td><td>99.6%</td><td>0.0%</td></tr><tr><td>PRESIGNED_URL<br><span class='tag'>tier 1</span></td><td>205</td><td>205</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>SERVICE_INSTANCE_ID<br><span class='tag'>tier 1</span></td><td>202</td><td>202</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>API_KEY<br><span class='tag'>tier 1</span></td><td>140</td><td>139</td><td>1</td><td class=''>99.3%</td><td>99.3%</td><td>0.0%</td></tr><tr><td>CONNECTION_STRING<br><span class='tag'>tier 1</span></td><td>120</td><td>120</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>0.0%</td></tr><tr><td>IPV6<br><span class='tag'>tier 1</span></td><td>85</td><td>85</td><td>0</td><td class='good'>100.0%</td><td>100.0%</td><td>100.0%</td></tr></tbody></table></div>
+<p><span class="tag gap">tier 2, not built</span> marks the free-text types that
+have no shape to match. Tier 1 scoring zero on them is the design working as
+intended, not a defect, which is why the headline figure is recall on shaped
+types (99.9%) and the all-types figure
+(91.4%) is reported next to it rather than instead of it.</p>
+
+<h2>Over-redaction</h2>
+<p>Recall alone is easy to game: redact everything and score 100 percent. The
+corpus therefore includes 1000 lines that contain no sensitive
+value at all, drawn from the same templates. A redaction there is unambiguously
+wrong.</p>
+<div class="note"><p><strong>0 of
+1000</strong> clean lines were touched, a false-redaction rate of
+0.0%. Getting there needed two named suppression
+rules, both found by this measurement rather than by inspection: stock IP
+matching flags build numbers such as <code>8.1.0.7</code>, and public Microsoft
+endpoints are not customer data. Both live in one small, tested function,
+because suppression is the only part of the engine that removes protection.</p></div>
+
+<h2>Hostile placements</h2>
+<p>The generator produces the placements its author thought of, which is exactly
+the blind spot that makes self-scored recall untrustworthy. These
+16 cases were written to attack it: identifiers split across
+lines, percent-encoded, re-cased, buried in escaped JSON and stack traces. Each
+one declares in advance whether tier 1 should catch it, so a documented
+limitation can never be mistaken for a pass, or for a defect.</p>
+<div class='scroll'><table><thead><tr><th>Hostile placement</th><th>Shaped caught</th><th>Free text caught</th><th>Verdict</th></tr></thead><tbody><tr><td>split-guid-newline<br><span class='tag'>Session GUID broken across a wrapped line, as long log lines arrive after a te</span><br><span class='tag gap'>known gap: a fragment is not a GUID. Needs a line-joining pre-pass before detection, tracked as a phase 1 follow-up.</span></td><td>0 / 2</td><td>0 / 0</td><td class=''>known gap</td></tr><tr><td>url-encoded-upn<br><span class='tag'>UPN percent-encoded inside a query string</span><br><span class='tag gap'>known gap: the @ is gone, so no address pattern matches. Fix is a decode-then-rescan pre-pass, cheap and deterministic.</span></td><td>0 / 1</td><td>0 / 0</td><td class=''>known gap</td></tr><tr><td>guid-n-format<br><span class='tag'>GUID logged in .NET N format, no dashes</span></td><td>2 / 2</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>json-escaped-quotes<br><span class='tag'>Value inside a JSON string that is itself embedded in a JSON string, so quotes</span></td><td>2 / 2</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>stack-trace<br><span class='tag'>Identifiers inside a .NET stack trace, where the surrounding punctuation is de</span></td><td>2 / 2</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>unusual-delimiters<br><span class='tag'>Values wrapped in delimiters a template would not produce</span></td><td>3 / 3</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>uppercase-pod<br><span class='tag'>Pod id in upper case, as some components emit it</span><br><span class='tag gap'>known gap: the pod pattern is case sensitive on purpose, since a case-insensitive wkr- prefix collides with ordinary prose. Fix is a normalised second</span></td><td>1 / 1</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>display-name-address<br><span class='tag'>RFC 5322 display name plus address, and the display name is itself a person</span><br><span class='tag gap'>the address and case number are tier 1; the display name is tier 2 NER and scored separately</span></td><td>2 / 2</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>plus-addressing<br><span class='tag'>Plus addressing and a long TLD</span></td><td>1 / 1</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>html-escaped-sas<br><span class='tag'>SAS URL with HTML-escaped ampersands, as pasted from a browser view</span></td><td>1 / 1</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>split-jwt-continuation<br><span class='tag'>JWT split by a continuation marker</span><br><span class='tag gap'>known gap: the head is a valid JWT and is destroyed, the trailing signature fragment is not. The head being destroyed is what matters for the credenti</span></td><td>0 / 2</td><td>0 / 0</td><td class=''>known gap</td></tr><tr><td>base64-wrapped<br><span class='tag'>Whole payload base64 encoded, so no plaintext value exists to match</span><br><span class='tag gap'>accepted, out of scope for tier 1. A blanket decode-everything pass is a false-positive generator; the right control is refusing to send opaque blobs </span></td><td>0 / 1</td><td>0 / 0</td><td class=''>known gap</td></tr><tr><td>ipv4-leading-zeros<br><span class='tag'>IPv4 with leading zeros, which some loggers emit</span><br><span class='tag gap'>known gap: stock IP pattern rejects zero-padded octets. One-line pattern addition, deliberately left visible in the numbers rather than quietly fixed </span></td><td>0 / 1</td><td>0 / 0</td><td class=''>known gap</td></tr><tr><td>forward-slash-path<br><span class='tag'>Windows profile path written with forward slashes</span><br><span class='tag gap'>known gap: the profile pattern assumes backslashes. Same one-line fix as above, left visible.</span></td><td>0 / 1</td><td>0 / 0</td><td class=''>known gap</td></tr><tr><td>multiline-connection-string<br><span class='tag'>Connection string wrapped across two config lines</span><br><span class='tag gap'>both fragments carry a matchable keyword, so both halves are destroyed</span></td><td>2 / 2</td><td>0 / 0</td><td class='good'>caught</td></tr><tr><td>guid-in-prose<br><span class='tag'>Identifier mentioned in an operator note rather than a log line</span><br><span class='tag gap'>the identifiers are tier 1; the name and company are the tier 2 case and scored separately</span></td><td>2 / 2</td><td>0 / 2</td><td class='good'>caught</td></tr></tbody></table></div>
+<p>Surprises, meaning a case expected to pass that did not:
+<strong>0</strong>.</p>
+
+<h2>Why tiering, in money</h2>
+<p>Tier 1 runs first as a cost gate. It has no per-call price and no network
+hop, so every character it clears is a character no paid tier is billed for. At
+an assumed managed-NER list rate of $0.001 per 1000 characters:</p>
+<div class='scroll'><table><thead><tr><th>Tier</th><th>Characters offered</th><th>Characters redacted</th><th>Cost at assumed rate</th><th>Wall time</th></tr></thead><tbody><tr><td>tier 1, Presidio patterns</td><td>695,117</td><td>271,258</td><td>$0.0000</td><td>0.54 s</td></tr><tr><td>tier 2, managed NER over the residue</td><td>423,859</td><td>not built</td><td>$0.4239</td><td>network bound</td></tr><tr><td>no tiering, everything to managed NER</td><td>695,117</td><td>n/a</td><td>$0.6951</td><td>network bound</td></tr></tbody></table></div>
+<p>On this corpus tier 1 clears 39.0% of the characters
+before anything paid is consulted. The saving scales with how shaped the data is,
+and support bundles are almost all shaped, which is the whole argument for
+putting regex in front rather than reaching for a model first.</p>
+
+<h2>What this does not show</h2>
+<ul>
+<li><strong>The corpus is synthetic.</strong> Real bundles hold placements
+nobody thought to generate. The mitigation is procedural: entity formats were
+written from public documentation and sanitized structural templates before any
+recognizer existed, and the hostile corpus above exists to attack the overlap
+that remains. It is a mitigation, not a fix.</li>
+<li><strong>One person wrote both sides.</strong> Generator and recognizers came
+from one mental model, so independence here is procedural rather than
+organisational. Recall on shaped types should be read as an upper bound.</li>
+<li><strong>Free-text names and organisations are not detected at all</strong>
+in phase 1. That is 564
+planted values passing straight through, and it is the entire reason a managed
+NER tier is phase 2 rather than optional.</li>
+<li><strong>Prompt-injection resistance is untested.</strong> The
+5 injection canaries are already in the corpus, but
+tier 1 has no instructions to subvert, so it cannot be injected and reporting a
+pass would be dishonest. That number arrives with tier 3.</li>
+<li><strong>The cost figures use an assumed list rate,</strong> not an invoice.
+Characters offered per tier are measured; the dollar conversion is arithmetic on
+a published price.</li>
+</ul>
+
+<footer>Generated by <code>hider.report</code>. Corpus seed and configuration are
+recorded in the accompanying JSON. No customer data was used at any point: the
+templates hold typed placeholders only, and every value in this report was
+generated locally.</footer>
+</div>
