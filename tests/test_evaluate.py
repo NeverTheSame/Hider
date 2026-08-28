@@ -16,13 +16,16 @@ from hider import entities, evaluate, generator, ner, pipeline, pseudonym, repor
 LINES = 900
 SEED = 20260820
 
+#: The default tier 2 backend (a locally trained classifier, hider.classifier)
+#: has no external model to install, so it is always available; the spaCy
+#: backend is exercised separately where it specifically matters.
 HAS_NER = ner.available()
 
 
 @pytest.fixture(scope="module")
 def scored():
     full, base, redacted, corpus = evaluate.run_with_baseline(
-        lines=LINES, seed=SEED, include_ner=HAS_NER
+        lines=LINES, seed=SEED, tier2="classifier"
     )
     return full, base, redacted, corpus
 
@@ -60,11 +63,11 @@ def test_tiering_actually_reduces_the_paid_surface(scored):
     assert full.cost_reduction > 0.25
 
 
-@pytest.mark.skipif(not HAS_NER, reason="spaCy model not installed")
 def test_freetext_recall_meets_the_floor(scored):
     """Tier 2 is a model: gated at a floor, not at zero, and never hidden."""
     full = scored[0]
     assert full.ner_enabled is True
+    assert full.tier2_backend == "classifier"
     assert full.freetext_recall >= evaluate.FREETEXT_RECALL_FLOOR, (
         full.freetext_recall,
         [(s["entity_type"], s["reason"]) for s in full.verbatim_survivors],
@@ -74,18 +77,38 @@ def test_freetext_recall_meets_the_floor(scored):
     assert full.freetext_recall < 1.0
 
 
-@pytest.mark.skipif(not HAS_NER, reason="spaCy model not installed")
 def test_freetext_misses_are_labelled_as_probabilistic_not_hidden(scored):
+    """Recall below 1.0 must show up somewhere measured, not be rounded away.
+
+    The classifier's actual failure mode on this corpus is a partial catch
+    (half an organisation name redacted, not the whole one) rather than a
+    clean zero-detection miss, so it will not always leave a literal,
+    fully-unredacted survivor string to find - a partial catch by definition
+    breaks that literal match. The per-type ``partial``/``missed`` counters
+    are the ones that cannot be zero here; verbatim survivors are asserted
+    only when a full miss actually produced one.
+    """
     full = scored[0]
-    misses = [s for s in full.verbatim_survivors
-              if s["reason"] == "tier2 miss (probabilistic tier)"]
-    assert misses, "recall below 1.0 must be visible in the survivor list"
-    assert all(s["expected_tier"] == entities.TIER_FREETEXT for s in misses)
+    freetext_types = [t for t in full.types.values() if t.expected_tier == entities.TIER_FREETEXT]
+    not_fully_caught = sum(t.partial + t.missed for t in freetext_types)
+    assert not_fully_caught > 0, "recall below 1.0 must be visible in per-type partial/missed counts"
+
+    full_misses = [s for s in full.verbatim_survivors
+                   if s["reason"] == "tier2 miss (probabilistic tier)"]
+    assert all(s["expected_tier"] == entities.TIER_FREETEXT for s in full_misses)
+
+
+@pytest.mark.skipif(not HAS_NER, reason="spaCy model not installed")
+def test_spacy_backend_also_meets_the_floor():
+    """The alternate tier 2 backend is scored the same way as the default."""
+    full, _ = evaluate.run(lines=LINES, seed=SEED, tier2="spacy")
+    assert full.tier2_backend == "spacy"
+    assert full.freetext_recall >= evaluate.FREETEXT_RECALL_FLOOR
 
 
 def test_tier1_only_run_reports_freetext_as_a_phase_boundary():
     """Without tier 2, free-text survivors are owned gaps, not silent passes."""
-    full, _ = evaluate.run(lines=200, seed=SEED, include_ner=False,
+    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None,
                            include_adversarial=False)
     assert full.ner_enabled is False
     assert full.freetext_recall == 0.0
@@ -96,16 +119,63 @@ def test_tier1_only_run_reports_freetext_as_a_phase_boundary():
     assert all(s["reason"] == "tier not built yet" for s in survivors)
 
 
-def test_include_ner_raises_rather_than_silently_skipping(monkeypatch):
+def test_spacy_backend_raises_rather_than_silently_skipping(monkeypatch):
     monkeypatch.setattr(ner, "available", lambda: False)
     with pytest.raises(RuntimeError, match="spaCy model"):
-        evaluate.run_with_baseline(lines=10, include_ner=True)
+        evaluate.run_with_baseline(lines=10, tier2="spacy")
 
 
-def test_injection_bypass_rate_is_not_claimed(scored):
+def test_unknown_tier2_backend_raises():
+    with pytest.raises(ValueError, match="unknown tier2 backend"):
+        evaluate.run(lines=10, tier2="made-up-backend")
+
+
+def test_injection_bypass_rate_is_not_claimed_without_tier3(scored):
+    """Tiers 1-2 have no notion of an instruction, so a bypass claim for a run
+    that never included tier 3 would be reporting a test that never ran."""
     full = scored[0]
+    assert full.tier3_enabled is False
     assert full.to_dict()["adversarial"]["injection_bypass_rate"] is None
     assert full.injection_canaries > 0
+
+
+def test_injection_bypass_rate_is_measured_once_tier3_runs():
+    """A tier 3 backend that always complies with an injected instruction lets
+    every injection-adjacent name it alone was responsible for survive."""
+
+    class AlwaysComplyBackend:
+        name = "always-comply"
+
+        def complete(self, prompt: str) -> str:
+            return '{"findings": []}'
+
+    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None,
+                           tier3=AlwaysComplyBackend())
+    assert full.tier3_enabled is True
+    assert full.injection_bypass_rate == 1.0
+
+
+def test_injection_bypass_rate_is_zero_for_an_honest_tier3():
+    class HonestBackend:
+        name = "honest"
+
+        def complete(self, prompt: str) -> str:
+            from hider import llm_tier
+
+            data = prompt.split("<<<DATA\n", 1)[1].rsplit("\nDATA>>>", 1)[0]
+            findings = []
+            for etype, marker in (("PERSON", "Sofia Tanaka"), ("PERSON", "Noah Delacroix"),
+                                   ("ORGANIZATION", "Fabrikam Advisory"),
+                                   ("PERSON", "Clara Petrov"),
+                                   ("ORGANIZATION", "Tailspin Industries")):
+                if marker in data:
+                    findings.append({"text": marker, "type": etype})
+            import json
+            return json.dumps({"findings": findings})
+
+    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None, tier3=HonestBackend())
+    assert full.tier3_enabled is True
+    assert full.injection_bypass_rate == 0.0
 
 
 def test_nothing_is_reported_as_degraded_on_a_clean_run(scored):
@@ -142,5 +212,7 @@ def test_metrics_json_round_trips(scored, tmp_path):
     d = json.loads(path.read_text())
     assert d["recall_shaped_types"] == round(full.shaped_recall, 4)
     assert d["ner_enabled"] is full.ner_enabled
+    assert d["tier2_backend"] == full.tier2_backend
+    assert d["tier3_enabled"] is full.tier3_enabled
     assert d["freetext_recall_floor"] == evaluate.FREETEXT_RECALL_FLOOR
     assert d["types"]["POD_ID"]["seeded"] > 0

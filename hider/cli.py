@@ -13,15 +13,33 @@ import json
 import sys
 from pathlib import Path
 
-from . import evaluate, generator, ner, pipeline, pseudonym, report
+from . import evaluate, generator, llm_backend, ner, pipeline, pseudonym, report
 
 OUT = Path(__file__).resolve().parent.parent / "out"
 
 
+def _build_tier3_backend(args: argparse.Namespace):
+    """Construct the tier 3 backend from --tier3/--cassette/--record, or None."""
+    if args.tier3 == "none":
+        return None
+    if not args.cassette:
+        print("error: --tier3 requires --cassette PATH (add --record to create one "
+              "from a live call)", file=sys.stderr)
+        raise SystemExit(2)
+    if args.record:
+        if args.tier3 == "openai":
+            real = llm_backend.OpenAIBackend()
+        else:
+            raise SystemExit(f"error: unknown --tier3 backend {args.tier3!r}")
+        return llm_backend.CassetteBackend(path=args.cassette, mode="record", inner=real)
+    return llm_backend.CassetteBackend(path=args.cassette, mode="replay")
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
+    tier2 = None if args.tier2 == "none" else args.tier2
+    tier3_backend = _build_tier3_backend(args)
     full, base, _, corpus = evaluate.run_with_baseline(
-        lines=args.lines, seed=args.seed,
-        include_ner=(not args.no_ner) if ner.available() else False,
+        lines=args.lines, seed=args.seed, tier2=tier2, tier3=tier3_backend,
     )
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -30,7 +48,9 @@ def _cmd_eval(args: argparse.Namespace) -> int:
 
     excerpt_tiers: list[pipeline.Tier] = [pipeline.RegexTier()]
     if full.ner_enabled:
-        excerpt_tiers.append(ner.LocalNerTier())
+        excerpt_tiers.append(evaluate.build_tier2(full.tier2_backend))
+    if tier3_backend is not None:
+        excerpt_tiers.append(pipeline.LlmPassTier(tier3_backend))
     pipe = pipeline.Pipeline(
         excerpt_tiers, vault=pseudonym.EntityVault(key=b"hider-demo-fixed-key")
     )
@@ -43,13 +63,18 @@ def _cmd_eval(args: argparse.Namespace) -> int:
           f"baseline stock Presidio {base.shaped_recall:.4f}")
     if full.ner_enabled:
         print(f"recall (freetext) {full.freetext_recall:.4f}   "
-              f"floor {evaluate.FREETEXT_RECALL_FLOOR:.2f} (tier 2, local NER)")
+              f"floor {evaluate.FREETEXT_RECALL_FLOOR:.2f} "
+              f"(tier 2, {evaluate.TIER2_LABELS.get(full.tier2_backend, full.tier2_backend)})")
     print(f"recall (all)      {full.recall:.4f}")
     print(f"false redaction   {full.false_redaction_rate:.4f} "
           f"({full.clean_lines_with_redaction}/{full.clean_lines} clean lines)")
     print(f"survivors         {len(full.unexpected_survivors)} unexplained, "
           f"{len(full.verbatim_survivors) - len(full.unexpected_survivors)} known gap")
     print(f"adversarial       {len(full.surprises)} surprises of {len(full.cases)} cases")
+    if full.tier3_enabled:
+        rate = full.injection_bypass_rate
+        print(f"injection bypass  {rate:.1%} of injection-adjacent names survived "
+              f"(tier 3 active, tier2={full.tier2_backend or 'off'})")
     print(f"tier 1 residue    {full.residue_chars:,} chars "
           f"({1 - full.cost_reduction:.1%} of input would reach a paid tier)")
     print(f"cost at ${evaluate.NER_USD_PER_1K_CHARS}/1k chars   "
@@ -118,13 +143,13 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     from . import proxy as proxy_mod
 
     tiers: list[pipeline.Tier] = [pipeline.RegexTier()]
-    if not args.tier1_only:
-        if ner.available():
-            tiers.append(ner.LocalNerTier())
-        else:
+    if args.tier2 != "none":
+        if args.tier2 == "spacy" and not ner.available():
             print("WARNING: spaCy model not installed, tier 2 will not run; "
                   "free-text names will pass through. See requirements-ner.txt.",
                   file=sys.stderr)
+        else:
+            tiers.append(evaluate.build_tier2(args.tier2))
     if args.vault and Path(args.vault).exists():
         vault = pseudonym.EntityVault.load(args.vault)
     else:
@@ -145,8 +170,15 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("eval", help="run the eval harness and write the report")
     e.add_argument("--lines", type=int, default=4000)
     e.add_argument("--seed", type=int, default=20260820)
-    e.add_argument("--no-ner", action="store_true",
-                   help="score tier 1 only, without the local NER tier")
+    e.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
+                   help="tier 2 backend: the trained classifier (default), local "
+                        "spaCy NER, or none")
+    e.add_argument("--tier3", choices=["none", "openai"], default="none",
+                   help="tier 3 backend: an LLM pass, or none (default)")
+    e.add_argument("--cassette", help="cassette JSONL path for --tier3 (record or replay)")
+    e.add_argument("--record", action="store_true",
+                   help="make a live --tier3 call and append it to --cassette, "
+                        "instead of replaying")
     e.add_argument("--excerpt", default="RestoreSession",
                    help="substring of the unit path to show in the before/after pane")
     e.add_argument("--excerpt-lines", type=int, default=14)
@@ -170,8 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--listen", default="127.0.0.1:8787", help="host:port to bind")
     p.add_argument("--vault", help="persist the pseudonym vault here")
     p.add_argument("--log", help="append the JSONL decision log here")
-    p.add_argument("--tier1-only", action="store_true",
-                   help="skip the local NER tier in the sync path")
+    p.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
+                   help="tier 2 backend in the sync path: the trained classifier "
+                        "(default, fastest), local spaCy NER, or none")
     p.set_defaults(fn=_cmd_proxy)
 
     args = ap.parse_args(argv)

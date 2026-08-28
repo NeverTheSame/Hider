@@ -109,11 +109,31 @@ def test_fail_open_is_opt_in_only():
         p.redact(LINE)
 
 
+class UnbuiltTier:
+    """A tier slot with no implementation behind it yet."""
+
+    name = "tier-unbuilt"
+    cost_per_1k_chars = 0.0
+
+    def detect(self, text, residue):
+        raise NotImplementedError("phase not shipped")
+
+
 def test_unbuilt_tier_is_absent_not_failed():
-    p = fresh([pipeline.RegexTier(), pipeline.ManagedNerTier()])
+    p = fresh([pipeline.RegexTier(), UnbuiltTier()])
     r = p.redact(LINE)
     assert r.degraded is False
+    assert p.stats.tier("tier-unbuilt").errors == 0
+
+
+def test_managed_ner_tier_is_built_and_runs():
+    """ManagedNerTier used to be the phase-2 stub; it is the shipped trained
+    classifier now, so it must actually detect, not silently no-op."""
+    p = fresh([pipeline.RegexTier(), pipeline.ManagedNerTier()])
+    r = p.redact("Spoke to Anna Novak about the outage.")
+    assert r.degraded is False
     assert p.stats.tier("tier2").errors == 0
+    assert any(s.entity_type == "PERSON" for s in r.spans)
 
 
 def test_malformed_spans_cannot_corrupt_the_rewrite():

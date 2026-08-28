@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol, Sequence
 
-from . import entities, pseudonym, recognizers
+from . import classifier, entities, pseudonym, recognizers
 
 
 @dataclass(frozen=True)
@@ -92,47 +92,66 @@ class RegexTier:
 
 
 # ---------------------------------------------------------------------------
-# Tiers 2 and 3: contracts only, phases 2 and 3
+# Tier 2: a trained classifier over the free-text residue
 # ---------------------------------------------------------------------------
 
 
 class ManagedNerTier:
-    """A managed PII-detection service over the free-text residue. Phase 2+.
+    """A locally trained classifier over the free-text residue. Phase 2.
 
-    The LOCAL implementation of this tier slot ships and is measured: see
-    ``hider/ner.py`` (``LocalNerTier``), Presidio's spaCy engine run
-    in-process over the residue. This class remains the contract for the
-    managed-service variant, for operators whose volume out-scales a local
-    model. The engine treats the two identically, as one tier slot. Either
-    variant must hold:
+    Runs entirely in-process: no network, no per-call bill, no third-party
+    endpoint to trust with the residue. ``hider/classifier.py`` is the model -
+    a per-token BIO classifier trained on a synthetic sentence corpus whose
+    name and organisation vocabulary is disjoint from the one the eval corpus
+    is seeded from, so recall measured against ``hider eval`` reflects
+    generalisation rather than a lookup table.
 
-    * Sees only the residue segments, batched into documents under the service
-      limit, so shaped tokens already cleared by tier 1 are never paid for.
-    * Results are memoised by content hash. The sync path needs this because the
-      chat API resends the whole conversation on every turn; without memoisation
-      the same history would be re-analysed on each request.
-    * Runs inside the operator's own cloud account. That is the point of using a
-      managed service here rather than the model provider's own: the boundary
-      being defended is the third-party model endpoint, not the cloud in general.
-    * Any transport error, throttle, or malformed response fails closed.
+    * Sees only the residue segments tier 1 left behind, so shaped tokens
+      already cleared are never re-analysed.
+    * The model is process-cached (``classifier.get_trained``): training is
+      deterministic for a fixed seed and takes well under a second, so it runs
+      once per interpreter rather than once per ``Pipeline``.
+    * Anything the classifier raises on propagates to the engine's fail-closed
+      handling in the same way any other tier's exception does.
     """
 
     name = "tier2"
-    cost_per_1k_chars = 0.001  # placeholder until measured against real pricing
+    cost_per_1k_chars = 0.0  # local model: no per-call bill, CPU time is in elapsed_s
+
+    def __init__(self, seed: int = 20260821) -> None:
+        self._clf = classifier.get_trained(seed=seed)
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
-        raise NotImplementedError("managed variant; the local tier2 ships in hider.ner")
+        spans: list[Span] = []
+        for start, end in residue:
+            segment = text[start:end]
+            if not segment.strip():
+                continue
+            for s0, e0, etype, score in classifier.predict_spans(self._clf, segment):
+                spans.append(Span(start + s0, start + e0, etype, float(score),
+                                   self.name, detector="trained-classifier"))
+        return spans
 
 
-class ResidualClassifierTier:
-    """A small self-hosted model as residual classifier. Phase 3.
+# ---------------------------------------------------------------------------
+# Tier 3: an LLM pass over what tier 2 could not resolve
+# ---------------------------------------------------------------------------
 
-    Deployed inside the operator's own account, never the model vendor's shared
-    endpoint. Contract:
+
+class LlmPassTier:
+    """An LLM pass over the residue, for free-text edge cases tier 2 misses. Phase 3.
+
+    ``hider/llm_tier.py`` holds the implementation; this docstring is the
+    contract it is built against, unchanged from when it was written for the
+    tier 3 stub:
 
     * Input is data only, wrapped in inert delimiters, never instructions.
     * Output is strict JSON span labelling. Anything non-conforming fails
       closed to redact, it does not fail open to allow.
+    * Every reported span is verified as a literal, byte-identical substring
+      of the residue before it is trusted. An offset the model invents, or a
+      quote that does not appear verbatim, is discarded rather than acted on -
+      the model is not trusted to do its own arithmetic, only to point.
     * No tools, no retrieval, no memory. It is a classifier, not an agent.
     * Verdicts can only ADD spans. The engine enforces that structurally, so a
       successful prompt injection cannot unmask anything, it can at worst waste
@@ -140,13 +159,21 @@ class ResidualClassifierTier:
     * A prompt-shield or input-classification layer in front is defence in
       depth, not the control. The control is the add-only rule above.
     * Never runs in the sync proxy path.
+
+    Constructing this tier requires a ``Backend`` (see ``llm_backend.py``); the
+    engine has no default one, because a paid, network-calling tier must never
+    be reached by accident.
     """
 
     name = "tier3"
-    cost_per_1k_chars = 0.02  # placeholder until measured
+    cost_per_1k_chars = 0.02  # placeholder until measured against real usage
+
+    def __init__(self, backend) -> None:
+        self.backend = backend
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
-        raise NotImplementedError("phase 3")
+        from . import llm_tier
+        return llm_tier.detect(self.backend, text, residue, tier_name=self.name)
 
 
 # ---------------------------------------------------------------------------

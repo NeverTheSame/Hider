@@ -1,0 +1,3 @@
+# Tier 3 (an LLM pass) requirements.
+# Tiers 1-2 run without this; --tier3 openai does not.
+openai>=1.0

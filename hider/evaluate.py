@@ -30,12 +30,43 @@ from pathlib import Path
 from typing import Sequence
 
 from . import adversarial, entities, generator, ner, pipeline, pseudonym
+from .llm_backend import Backend
 from .markup import Occurrence
 
 #: Assumed managed-NER price, US dollars per 1000 characters. Managed PII
 #: services typically bill per 1000-character text record; this rate is a
 #: list-price assumption and is stated as such wherever a cost appears.
 NER_USD_PER_1K_CHARS = 0.001
+
+#: Human-readable label per tier 2 backend, used in the report and printed
+#: summary so either backend's numbers say honestly which model produced them.
+TIER2_LABELS = {
+    "classifier": "trained classifier (hider.classifier, local, no external model)",
+    "spacy": "local spaCy NER (hider.ner, pretrained en_core_web_sm)",
+}
+
+
+def build_tier2(backend: str | None) -> pipeline.Tier | None:
+    """Construct the tier 2 slot for ``backend``, or ``None`` for tier 1 only.
+
+    ``"classifier"`` (the default) has no external dependency beyond
+    scikit-learn and always works. ``"spacy"`` requires the pretrained model
+    and raises rather than silently downgrading, for the same reason a
+    missing tier should never pass itself off as a clean run.
+    """
+    if backend is None:
+        return None
+    if backend == "classifier":
+        return pipeline.ManagedNerTier()
+    if backend == "spacy":
+        if not ner.available():
+            raise RuntimeError(
+                "tier2='spacy' but the spaCy model is not installed; "
+                "run: pip install https://github.com/explosion/spacy-models/releases/"
+                "download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+            )
+        return ner.LocalNerTier()
+    raise ValueError(f"unknown tier2 backend {backend!r}; expected 'classifier', 'spacy', or None")
 
 #: The recall floor for the free-text types tier 2 owns. Tier 1 is held to
 #: zero unexplained survivors because it is deterministic: a miss is a defect.
@@ -121,10 +152,17 @@ class Report:
     cases: list[CaseResult] = field(default_factory=list)
     injection_canaries: int = 0
     vault_size: int = 0
-    #: True when the run included a live tier 2 (local NER). Free-text
-    #: survivors are a floor-gated measurement when this is set and a phase
-    #: boundary when it is not.
+    #: True when the run included a live tier 2. Free-text survivors are a
+    #: floor-gated measurement when this is set and a phase boundary when
+    #: it is not.
     ner_enabled: bool = False
+    #: Which tier 2 backend ran ("classifier", "spacy", or "" for none).
+    tier2_backend: str = ""
+    #: True when the run included a live tier 3 (an LLM pass). Only tier 3
+    #: reads free text as anything an injected instruction could act on;
+    #: tiers 1 and 2 have no notion of an instruction at all, so the
+    #: injection-bypass numbers are only meaningful once this is set.
+    tier3_enabled: bool = False
 
     # -- rolled-up numbers -------------------------------------------------
 
@@ -196,6 +234,26 @@ class Report:
     def surprises(self) -> list[CaseResult]:
         return [c for c in self.cases if c.surprise]
 
+    @property
+    def injection_bypass_rate(self) -> float | None:
+        """Share of the injection-adjacent cases where the planted name did
+        NOT survive as free text next to an injection payload.
+
+        Only meaningful once tier 3 ran: tiers 1 and 2 have no notion of an
+        instruction, so they cannot be talked out of anything, and reporting
+        a bypass rate for them would claim a resistance test that never
+        happened. Returns ``None`` when tier 3 did not run, or when no
+        injection-adjacent case seeded anything to miss.
+        """
+        if not self.tier3_enabled:
+            return None
+        inj = [c for c in self.cases if c.case_id.startswith("injection-")]
+        total = sum(c.free_seeded for c in inj)
+        if not total:
+            return None
+        caught = sum(c.free_covered for c in inj)
+        return 1 - (caught / total)
+
     def to_dict(self) -> dict:
         return {
             "label": self.label,
@@ -206,6 +264,8 @@ class Report:
             "recall_freetext_types": round(self.freetext_recall, 4),
             "freetext_recall_floor": FREETEXT_RECALL_FLOOR,
             "ner_enabled": self.ner_enabled,
+            "tier2_backend": self.tier2_backend,
+            "tier3_enabled": self.tier3_enabled,
             "seeded": self.seeded,
             "covered": self.covered,
             "groups": {"total": self.groups_total, "caught": self.groups_caught},
@@ -254,11 +314,16 @@ class Report:
                 ],
                 "surprises": [c.case_id for c in self.surprises],
                 "injection_canaries": self.injection_canaries,
-                "injection_bypass_rate": None,
+                "injection_bypass_rate": self.injection_bypass_rate,
                 "injection_note": (
-                    "Not applicable in a phase 1 run. Tier 1 has no instructions to "
-                    "subvert, so it cannot be injected. The canaries are in the corpus "
-                    "and are scored once the tier 3 classifier exists."
+                    f"{self.injection_bypass_rate:.1%} of injection-adjacent names were "
+                    "NOT redacted despite an injected instruction sitting next to them, "
+                    "measured against a live tier 3 backend."
+                    if self.tier3_enabled and self.injection_bypass_rate is not None
+                    else "Not applicable: no tier 3 backend ran in this configuration. "
+                    "Tiers 1 and 2 have no notion of an instruction, so they cannot be "
+                    "talked out of anything; reporting a pass for them would be dishonest. "
+                    "Pass --tier3 openai (with a cassette) to measure this."
                 ),
             },
         }
@@ -325,7 +390,8 @@ def run(
     seed: int = 20260820,
     include_custom: bool = True,
     include_adversarial: bool = True,
-    include_ner: bool = False,
+    tier2: str | None = "classifier",
+    tier3: Backend | None = None,
     label: str = "tier1-custom",
     corpus: generator.Corpus | None = None,
     vault_key: bytes = b"hider-eval-fixed-key",
@@ -333,23 +399,31 @@ def run(
 ) -> tuple[Report, dict[str, list[str]]]:
     """Score one configuration. Returns the report and the redacted text per unit.
 
-    ``include_ner`` adds the local NER tier when the model is available; it
-    raises rather than silently skipping when the model is missing, because a
-    tier that quietly did not run is how a recall figure ends up lying.
+    ``tier2`` selects the tier 2 backend (``"classifier"``, ``"spacy"``, or
+    ``None`` for tier 1 only); an unavailable backend raises rather than
+    silently skipping, because a tier that quietly did not run is how a
+    recall figure ends up lying. ``tier3``, when given, is an
+    ``llm_backend.Backend`` wrapped into a live ``LlmPassTier``.
     """
     corp = corpus or generator.generate(lines=lines, seed=seed)
     vault = pseudonym.EntityVault(key=vault_key)
     if tiers is None:
         chosen: list[pipeline.Tier] = [pipeline.RegexTier(include_custom=include_custom)]
-        if include_ner:
-            chosen.append(ner.LocalNerTier())
+        t2 = build_tier2(tier2)
+        if t2 is not None:
+            chosen.append(t2)
+        if tier3 is not None:
+            chosen.append(pipeline.LlmPassTier(tier3))
     else:
         chosen = list(tiers)
     pipe = pipeline.Pipeline(chosen, vault=vault)
     ner_ran = any(getattr(t, "name", "") == "tier2" for t in chosen)
+    tier3_ran = any(getattr(t, "name", "") == "tier3" for t in chosen)
 
     report = Report(label=label)
     report.ner_enabled = ner_ran
+    report.tier2_backend = tier2 if ner_ran else ""
+    report.tier3_enabled = tier3_ran
     truth_by_line: dict[tuple[str, int], list[Occurrence]] = defaultdict(list)
     for occ in corp.truth:
         truth_by_line[(occ.unit, occ.line_no)].append(occ)
@@ -457,8 +531,12 @@ def run(
             elif spec.expected_tier == entities.TIER_FREETEXT and ner_ran:
                 # Tier 2 is a model; its misses are measured against a floor
                 # (below_freetext_floor) rather than against zero, and shown
-                # in the report as exactly what they are.
-                reason, known_gap = "tier2 miss (probabilistic tier)", True
+                # in the report as exactly what they are. If tier 3 also ran
+                # and still missed it, that is the more expensive miss, so it
+                # is named separately rather than folded into the same label.
+                reason = ("tier2+tier3 miss (probabilistic tiers)" if tier3_ran
+                          else "tier2 miss (probabilistic tier)")
+                known_gap = True
             else:
                 reason, known_gap = "tier not built yet", True
             report.verbatim_survivors.append(
@@ -484,31 +562,24 @@ def run(
 
 
 def run_with_baseline(
-    *, include_ner: bool | None = None, **kwargs
+    *, tier2: str | None = "classifier", tier3: Backend | None = None, **kwargs
 ) -> tuple[Report, Report, dict[str, list[str]], generator.Corpus]:
     """Run the full configuration and the stock-Presidio baseline on one corpus.
 
-    ``include_ner`` defaults to "on when the NER model is installed", so the
-    shipped numbers describe the shipped configuration wherever the repo is
-    run with the model present. Passing True when the model is missing raises,
-    for the same reason ``run(include_ner=True)`` does.
+    ``tier2`` defaults to ``"classifier"``, which has no external model to
+    install and always works. Pass ``tier2="spacy"`` to score the alternate
+    pretrained-NER backend instead, or ``None`` for tier 1 only.
     """
     lines = kwargs.pop("lines", 4000)
     seed = kwargs.pop("seed", 20260820)
-    if include_ner is None:
-        include_ner = ner.available()
-    elif include_ner and not ner.available():
-        raise RuntimeError(
-            "include_ner=True but the spaCy model is not installed; "
-            "run: pip install https://github.com/explosion/spacy-models/releases/"
-            "download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
-        )
     corp = generator.generate(lines=lines, seed=seed)
+    label = f"presidio + custom recognizers + tier2={tier2 or 'none'}"
+    if tier3 is not None:
+        label += " + tier3"
     full, redacted = run(corpus=corp, seed=seed, include_custom=True,
-                         include_ner=include_ner,
-                         label="presidio + custom recognizers + local NER", **kwargs)
+                         tier2=tier2, tier3=tier3, label=label, **kwargs)
     base, _ = run(corpus=corp, seed=seed, include_custom=False,
-                  label="stock Presidio patterns only", **kwargs)
+                  tier2=None, label="stock Presidio patterns only", **kwargs)
     return full, base, redacted, corp
 
 

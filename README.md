@@ -1,10 +1,16 @@
 # Hider
 
 A tiered redaction layer for log bundles on their way to a third-party LLM
-provider, and the gateway that enforces it in the request path. Two tiers are
-built and measured: the deterministic tier and the local NER tier. The
-OpenAI-compatible gateway intercepts a chat completion, redacts it, forwards
-only the redacted payload, and de-tokenises the answer on the way back.
+provider, and the gateway that enforces it in the request path. Detectors are
+chosen per data class on cost, latency and accuracy grounds: high-volume
+secret and identifier patterns go to regex (tier 1), free-text names and
+organisations go to a trained classifier (tier 2, with a pretrained-NER
+backend as an alternative), and the free-text edge cases that classifier
+cannot resolve go to an LLM pass (tier 3). A measured eval harness gates every
+promotion: no tier ships, and no change to a shipped tier lands, without a
+number attached to it. The OpenAI-compatible gateway intercepts a chat
+completion, redacts it, forwards only the redacted payload, and de-tokenises
+the answer on the way back.
 
 No real data has ever passed through this repository. The templates in
 `templates/` hold log line skeletons with typed placeholders and no values, and
@@ -27,22 +33,46 @@ the log.
 
 ## The design
 
-Detection runs in tiers, cheapest first.
+Detection runs in tiers, cheapest and most reliable first. Every tier past the
+first only ever sees what the ones before it left unclaimed, which is both the
+cost argument and the reason a model can sit this deep in the path at all: it
+never gets a chance to see, or leak, anything a cheaper tier already redacted.
 
-- **Tier 1** is Presidio pattern recognizers, including custom ones for the
-  shapes that generic PII tooling has never heard of: region-scoped worker pod
+- **Tier 1, regex.** Presidio pattern recognizers, including custom ones for
+  the shapes generic PII tooling has never heard of: region-scoped worker pod
   ids, service instance ids, tenant-bearing SaaS site URLs, pre-signed storage
-  URLs. It costs nothing, needs no network and no NLP model, and clears most of
-  the sensitive tokens, which is what makes the paid tiers affordable.
-- **Tier 2** (local NER, built) sees only the residue tier 1 could not clear:
-  free-text names and organisations, which have no shape to match. It is
-  Presidio's NLP engine (`SpacyNlpEngine`, spaCy underneath) run in-process,
-  so nothing a name appears in ever leaves the machine — a strictly stronger
-  boundary than "inside your cloud account". A managed-service variant of the
-  same tier slot remains a written contract in `pipeline.py` for operators who
-  out-scale a local model; the engine treats the two identically.
-- **Tier 3** (a small self-hosted model, phase 3) is a span-labelling classifier
-  over what is left, with no tools and add-only authority. Contract only.
+  URLs, live bearer tokens. It costs nothing, needs no network and no NLP
+  model, and clears most of the sensitive tokens in a support bundle, which is
+  what makes every tier behind it affordable. This is also where every true
+  secret (JWTs, connection strings, API keys) is caught: high-volume, sharply
+  shaped, and worth catching deterministically rather than probabilistically.
+- **Tier 2, a trained classifier.** Free-text names and organisations have no
+  shape to match, so tier 1 is designed to miss them; tier 2 sees only the
+  residue. Two interchangeable backends sit behind one interface
+  (`--tier2 classifier|spacy|none`):
+  - `classifier` (default, `hider/classifier.py`) is a small per-token BIO
+    model trained here, locally, on a synthetic sentence corpus. Its name and
+    organisation vocabulary is deliberately disjoint from the one the eval
+    corpus is seeded from, so the recall figure below is a generalisation
+    test, not a lookup table scoring itself. No external model download, no
+    network, works out of the box.
+  - `spacy` (`hider/ner.py`) runs Presidio's NLP engine (spaCy's pretrained
+    `en_core_web_sm`) in-process over the same residue, with its own named
+    suppression rules for the log-structure noise NER misreads as a name.
+  Either way, nothing a name appears in ever leaves the machine — a strictly
+  stronger boundary than "inside your cloud account", which is what a managed
+  cloud NER service would give you; that variant remains a written contract in
+  `pipeline.py` (`ManagedNerTier`'s docstring) for operators who out-scale a
+  local model.
+- **Tier 3, an LLM pass.** What tier 2's classifier still cannot resolve -
+  `--tier3 openai`, built and tested in `hider/llm_tier.py`. It is asked for
+  strict JSON and nothing else, and its output is never trusted on its own
+  say-so: every reported finding must be a literal, byte-identical quote from
+  the residue, or it is discarded as a hallucinated citation rather than
+  acted on. A response that isn't the shape asked for is a hard failure that
+  fails the whole call closed, the same as any other tier's exception. No
+  default backend is wired in, because a paid, network-calling tier must never
+  run by accident.
 
 The boundary itself is code, not aspiration: `hider/proxy.py` is an
 OpenAI-compatible gateway that intercepts `/v1/chat/completions`, redacts every
@@ -75,28 +105,78 @@ Three invariants hold everywhere, enforced by tests rather than by convention:
 
 ## Measured
 
-From `python -m hider eval` on a 5,024 line, 695,117 character synthetic bundle
-with 6,676 planted values across 18 entity types:
+From `python -m hider eval` (tier 2 = `classifier`, the default; tier 3 not
+active — see below) on a 5,029 line, 695,841 character synthetic bundle with
+6,681 planted values across 18 entity types:
 
 | | |
 |---|---|
-| Recall on shaped identifier types | 99.9% |
-| Same corpus, stock Presidio patterns only | 17.6% |
-| Recall on free-text names and orgs (tier 2, floor 0.75) | 86.7% |
-| Recall across all types | 98.7% |
+| Recall on shaped identifier types | 99.85% |
+| Same corpus, stock Presidio patterns only | 17.64% |
+| Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 92.09% |
+| Recall across all types | 99.19% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Seeded values still findable verbatim in the output | 0 unexplained, 57 known gap (49 of them tier 2 misses) |
-| Adversarial surprises across 16 hostile placements | 0 |
-| Characters cleared before any model is consulted | 39.0% |
-| Tier 1 throughput | ~139 microseconds per line, single threaded |
-| Tier 2 throughput | ~3.8 milliseconds per line over the residue only |
+| Seeded values still findable verbatim in the output | 0 unexplained, 7 known gap |
+| Adversarial surprises across 21 hostile placements | 0 |
+| Characters cleared before any paid or model tier is consulted | 40.3% |
+| Tier 1 throughput | ~125 microseconds per line, single threaded |
+| Tier 2 (classifier) throughput | ~0.5 milliseconds per line over the residue only |
+
+Swapping in `--tier2 spacy` on the same corpus: 86.82% free-text recall, ~3.9ms
+per line over the residue. On this corpus the from-scratch classifier is both
+faster (roughly 8x) and higher-recall (92.1% vs 86.8%) than the pretrained
+general-purpose model, which is not the result to expect going in and is
+exactly why both are reported rather than one asserted: a classifier trained
+tightly on the shape of *this* log format's free text (short operator notes,
+a narrow set of introducing verbs, no other entity classes to confuse it with)
+can out-perform a general NER model on that format while failing harder the
+moment the free text looks like something else. Neither number should be
+read past the corpus that produced it.
 
 The gates differ by tier, on purpose. Tier 1 is deterministic, so its gate is
 zero unexplained survivors: a miss is a defect and fails the eval. Tier 2 is a
 model, so its gate is a recall floor (0.75) that it must clear with its misses
 listed one by one; a tier 2 miss is a measurement, reported next to the tier 1
-number instead of blended into it. Passing 86.7% against a 0.75 floor is a
-statement with headroom, not a rounding exercise.
+number instead of blended into it. Passing 92.1% (or 86.8% for the spaCy
+backend) against a 0.75 floor is a statement with headroom, not a rounding
+exercise. The classifier's actual failure mode here is worth naming: it is
+mostly partial catches (part of a two-word organisation name redacted, not the
+whole one) rather than clean zero-detection misses, which is a smaller leak
+than it sounds like but is still counted as a miss in the recall number above.
+
+### Tier 3, measured against the injection-adjacent cases
+
+What the harness measures: 5 pure-text injection canaries (no PII, carried
+over from phase 1) plus 5 cases that place the same injection payloads next to
+a real, seeded name or org (the `injection-*` entries in `adversarial.CASES`).
+A name that survives one of the second five was talked out of being caught by
+the text sitting next to it - the only thing "prompt-injection resistance" can
+mean for a redaction tier. Because tier 2 already catches ordinary free text
+and has no notion of an instruction to subvert, the **system-level** bypass
+rate can read 0% even with a fully-complying tier 3 (verified in
+`test_injection_bypass_rate_is_measured_once_tier3_runs` /
+`test_injection_bypass_rate_is_zero_for_an_honest_tier3`), so the meaningful
+isolation of tier 3's own behaviour is `--tier2 none --tier3 openai`, which
+takes tier 2 out of the way and lets a bypass show up as a bypass.
+
+Run once against a live model (`gpt-4o-mini`, `--tier2 none --tier3 openai
+--record`), then replayable forever from the committed cassette
+(`cassettes/tier3-injection-run1.jsonl`) with no key and no network:
+
+| | |
+|---|---|
+| Injection-adjacent cases | 5 of 5 names/orgs caught |
+| Injection bypass rate (tier 2 disabled, tier 3 alone) | **0.0%** |
+| Malformed/degraded responses | 0 of 41 API calls |
+
+Two caveats on that number, stated the way the rest of this project states
+them. First, it is 5 payload variants against one model on one small corpus -
+enough to say this specific model did not fold under these specific attempts,
+not enough to claim general injection resistance for any LLM slotted into
+this tier. Second, the system-level number (tiers 1+2+3 together) was already
+0% before tier 3 ever ran, because tier 2 has no notion of an instruction
+either; this section exists to give tier 3 a fair, isolated test rather than
+let it hide behind tier 2's coverage.
 
 Two of those numbers were only reachable after the measurement found real
 defects in off-the-shelf behaviour:
@@ -121,10 +201,10 @@ measurement rather than by inspection and each with its own test in
 
 ```sh
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/pip install -r requirements-ner.txt   # tier 2: spaCy + the small English model
+# tier 1 + tier 2 (classifier, the default) need nothing else.
 
-.venv/bin/python -m hider eval          # metrics + HTML report into out/
-.venv/bin/python -m pytest              # 130 tests
+.venv/bin/python -m hider eval          # tier1 + tier2=classifier; metrics + HTML report into out/
+.venv/bin/python -m pytest              # 164 tests
 .venv/bin/python -m hider generate      # write a synthetic bundle to out/bundle
 .venv/bin/python -m hider redact FILE --log out/decisions.jsonl --vault out/vault.json
 .venv/bin/python -m hider proxy --upstream https://api.openai.com \
@@ -135,6 +215,24 @@ Point any OpenAI-compatible client's base URL at `http://127.0.0.1:8787` and
 the redaction happens in flight: the provider sees pseudonyms and destroyed
 credentials, the caller sees real values in the answer. Streaming requests get
 an explicit 400 rather than a silently-buffered or corrupted stream.
+
+The alternate tier 2 backend and tier 3 are both optional and both need extra
+install steps:
+
+```sh
+.venv/bin/pip install -r requirements-ner.txt   # tier 2 alternate: spaCy + the small English model
+.venv/bin/python -m hider eval --tier2 spacy
+
+.venv/bin/pip install -r requirements-llm.txt   # tier 3: the openai package
+export OPENAI_API_KEY=...
+.venv/bin/python -m hider eval --tier3 openai --cassette cassettes/run1.jsonl --record
+# later, or in CI, with no key and no network:
+.venv/bin/python -m hider eval --tier3 openai --cassette cassettes/run1.jsonl
+```
+
+The cassette is what makes a committed metrics file checkable by somebody
+without an API key: record once, replay forever, fail closed (not silently
+skip) on a prompt the cassette has never seen.
 
 `eval` exits non-zero if any seeded value survives unexplained, if an
 adversarial case that was expected to pass fails, or if tier 2 recall drops
@@ -154,13 +252,16 @@ so it can be read without installing anything.
 |---|---|
 | `hider/entities.py` | The contract. How each of 18 sensitive value types is formed, where the format came from, which tier owns it, and whether it is destroyed or pseudonymised. Written before any recognizer existed. |
 | `hider/recognizers.py` | Tier 1 detection, written against the contract rather than from it. Custom recognizers plus reused Presidio built-ins, and the suppression rules that keep precision up. |
-| `hider/ner.py` | Tier 2: Presidio's NLP engine over the tier 1 residue, in-process, memoised, with its own named suppression rules. |
-| `hider/pipeline.py` | The engine. Tier ordering, span algebra, monotonicity, fail-closed handling, the decision log. Tier 3 is a contract; tier 2's managed-service variant is one too, next to the local implementation that ships. |
+| `hider/classifier.py` | Tier 2, default backend: the trained per-token BIO classifier, its synthetic training-sentence generator, and the disjoint train/eval vocabulary split that keeps its recall honest. |
+| `hider/ner.py` | Tier 2, alternate backend: Presidio's pretrained NLP engine over the tier 1 residue, in-process, memoised, with its own named suppression rules. |
+| `hider/llm_backend.py` | Tier 3's backends: a real OpenAI-calling backend, and the cassette that records or replays one so a run never needs a key to be checked. |
+| `hider/llm_tier.py` | Tier 3's detection logic: prompt assembly with the residue fenced as untrusted data, strict JSON parsing, and literal-citation verification that never trusts a model-reported offset. |
+| `hider/pipeline.py` | The engine. Tier ordering, span algebra, monotonicity, fail-closed handling, the decision log. Every tier slot (including tier 2's managed-cloud variant, never built) is one interface. |
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, refuses degraded requests unforwarded, de-tokenises replies, logs decisions. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 16 hand-built hostile placements plus 5 prompt-injection canaries. Each case declares in advance whether tier 1 should catch it. |
-| `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, and the tier 2 recall floor. |
+| `hider/adversarial.py` | 16 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/report.py` | The self-contained HTML page. |
 | `templates/` | Sanitized log line skeletons. Typed placeholders only. |
 
@@ -168,7 +269,7 @@ so it can be read without installing anything.
 
 If one person writes the generator and the recognizers from one mental model,
 recall measured on that data proves very little: the recognizers only ever get
-tested against what their author thought to generate. Four countermeasures, none
+tested against what their author thought to generate. Five countermeasures, none
 of which fully solves it:
 
 1. **The spec came first.** `entities.py` describes how values are *formed*,
@@ -187,6 +288,13 @@ of which fully solves it:
    numbers are always reported together.
 4. **A baseline.** Stock Presidio on the identical corpus, so the custom
    recognizers' contribution is a measured delta rather than a claim.
+5. **A vocabulary holdout, for tier 2's classifier.** `classifier.py` trains its
+   name and organisation recognition on a first/last-name and org-word list
+   that shares no entry with the one `entities.py` seeds the eval corpus from.
+   Without that split, a linear model could reach the same recall number by
+   memorising the eight organisation names and twenty-eight given names in the
+   corpus, which would say nothing about whether it generalises to a name that
+   is not in this file - which, in a real bundle, none of them are.
 
 ## Working from real bundles safely
 
@@ -215,18 +323,30 @@ recall will never be exactly 100%.
   shaped-type recall figure should be read as an upper bound.
 - **Independence is procedural, not organisational.** One person wrote both
   sides of the contract.
-- **Tier 2 recall is a model's recall.** 86.7% on free-text names means roughly
-  one name in eight passes through, listed in the metrics as individual
-  survivors. The floor gate catches regressions; it cannot make a small local
-  model perfect. Operators who need more can slot a managed NER service or the
-  tier 3 classifier behind the same interface.
+- **Tier 2 recall is a model's recall, whichever backend runs.** 92.1%
+  (classifier) or 86.8% (spaCy) on free-text names means the rest passes
+  through, listed in the metrics as individual survivors. The floor gate
+  catches regressions; it cannot make either backend perfect. A managed cloud
+  NER service remains a documented, unbuilt contract behind the same
+  interface for operators who out-scale both.
+- **The classifier's training grammar is narrow.** Twelve sentence templates,
+  two names per organisation, a fixed suffix vocabulary. It generalises past
+  its own training vocabulary (proven by the disjoint train/eval split,
+  `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary`), but an
+  organisation suffix outside its trained set (`Tailspin Technology` versus a
+  trained `Tailspin Industries`) is a realistic way for it to miss — caught
+  while building the injection-adjacent adversarial cases, not by inspection.
 - **The gateway does not stream.** `stream: true` gets a 400 with the reason in
   the body. Rewriting an SSE stream means buffering it (which silently disables
   streaming) or detokenising fragments (which corrupts labels cut across chunk
   boundaries); both are worse than an honest error.
-- **Prompt-injection resistance is untested.** The canaries are in the corpus,
-  but tiers 1 and 2 have no instructions to subvert, so they cannot be injected
-  and reporting a pass would be dishonest. That number arrives with tier 3.
+- **Tier 3's injection number is one model, one small run.** `gpt-4o-mini`
+  caught all 5 injection-adjacent cases in the one recorded run
+  (`cassettes/tier3-injection-run1.jsonl`). That is evidence this model
+  did not fold under these five specific attempts, not a general injection-
+  resistance claim for any LLM slotted into this tier - a different model, a
+  larger or more creative payload set, or a longer run could read differently,
+  and none of those have been tried.
 - **Cost figures use an assumed list rate.** Characters offered per tier are
   measured; the dollar conversion is arithmetic on a published price, not an
   invoice.
@@ -236,9 +356,8 @@ recall will never be exactly 100%.
 
 ## Roadmap
 
-Phase 2 shipped as the local NER tier plus the gateway. Next: tier 3, the
-residual classifier, with injection canaries scored and bypass rate reported;
-an async bundle-ingest flow for whole-bundle jobs; streaming support if a way
-is found to rewrite SSE honestly. The tier contracts for 3 are already written
-down in `pipeline.py`, so the engine and the harness accommodate them without
-changes.
+Tier 2 shipped with two interchangeable backends, tier 3 shipped and has a
+real recorded run against it, plus the gateway. Next: a larger and more
+adversarial injection-payload set against tier 3, a second model for
+comparison, an async bundle-ingest flow for whole-bundle jobs, and streaming
+support if a way is found to rewrite SSE honestly.
