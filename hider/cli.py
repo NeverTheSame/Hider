@@ -3,6 +3,7 @@
     python -m hider eval      run the harness, write JSON metrics and the HTML report
     python -m hider generate  write a synthetic bundle to disk
     python -m hider redact    redact a file or stdin
+    python -m hider proxy     run the redacting OpenAI-compatible gateway
 """
 
 from __future__ import annotations
@@ -12,19 +13,27 @@ import json
 import sys
 from pathlib import Path
 
-from . import evaluate, generator, pipeline, pseudonym, report
+from . import evaluate, generator, ner, pipeline, pseudonym, report
 
 OUT = Path(__file__).resolve().parent.parent / "out"
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
-    full, base, _, corpus = evaluate.run_with_baseline(lines=args.lines, seed=args.seed)
+    full, base, _, corpus = evaluate.run_with_baseline(
+        lines=args.lines, seed=args.seed,
+        include_ner=(not args.no_ner) if ner.available() else False,
+    )
     OUT.mkdir(parents=True, exist_ok=True)
 
     evaluate.save(full, OUT / "metrics.json")
     evaluate.save(base, OUT / "metrics-baseline.json")
 
-    pipe = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"hider-demo-fixed-key"))
+    excerpt_tiers: list[pipeline.Tier] = [pipeline.RegexTier()]
+    if full.ner_enabled:
+        excerpt_tiers.append(ner.LocalNerTier())
+    pipe = pipeline.Pipeline(
+        excerpt_tiers, vault=pseudonym.EntityVault(key=b"hider-demo-fixed-key")
+    )
     rows = report.excerpt_from(corpus, pipe, unit_hint=args.excerpt, n=args.excerpt_lines)
     html_path = report.write(OUT / "hider-report.html", report.build(full, base, rows))
 
@@ -32,6 +41,9 @@ def _cmd_eval(args: argparse.Namespace) -> int:
           f"{full.seeded} seeded values")
     print(f"recall (shaped)   {full.shaped_recall:.4f}   "
           f"baseline stock Presidio {base.shaped_recall:.4f}")
+    if full.ner_enabled:
+        print(f"recall (freetext) {full.freetext_recall:.4f}   "
+              f"floor {evaluate.FREETEXT_RECALL_FLOOR:.2f} (tier 2, local NER)")
     print(f"recall (all)      {full.recall:.4f}")
     print(f"false redaction   {full.false_redaction_rate:.4f} "
           f"({full.clean_lines_with_redaction}/{full.clean_lines} clean lines)")
@@ -45,10 +57,16 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     print(f"\nwrote {html_path}")
     print(f"wrote {OUT / 'metrics.json'}")
 
+    failed = False
     if full.unexpected_survivors or full.surprises:
-        print("\nFAIL: unexplained survivors or unexpected adversarial misses", file=sys.stderr)
-        return 1
-    return 0
+        print("\nFAIL: unexplained survivors or unexpected adversarial misses",
+              file=sys.stderr)
+        failed = True
+    if full.below_freetext_floor:
+        print(f"\nFAIL: freetext recall {full.freetext_recall:.4f} is below the "
+              f"floor {evaluate.FREETEXT_RECALL_FLOOR:.2f}", file=sys.stderr)
+        failed = True
+    return 1 if failed else 0
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
@@ -96,6 +114,30 @@ def _cmd_redact(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_proxy(args: argparse.Namespace) -> int:
+    from . import proxy as proxy_mod
+
+    tiers: list[pipeline.Tier] = [pipeline.RegexTier()]
+    if not args.tier1_only:
+        if ner.available():
+            tiers.append(ner.LocalNerTier())
+        else:
+            print("WARNING: spaCy model not installed, tier 2 will not run; "
+                  "free-text names will pass through. See requirements-ner.txt.",
+                  file=sys.stderr)
+    if args.vault and Path(args.vault).exists():
+        vault = pseudonym.EntityVault.load(args.vault)
+    else:
+        vault = pseudonym.EntityVault()
+    pipe = pipeline.Pipeline(tiers, vault=vault)
+    gateway = proxy_mod.RedactionGateway(
+        args.upstream, pipe, vault_path=args.vault, log_path=args.log
+    )
+    host, _, port = args.listen.partition(":")
+    proxy_mod.serve(host, int(port or "8787"), gateway)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="hider", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -103,6 +145,8 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("eval", help="run the eval harness and write the report")
     e.add_argument("--lines", type=int, default=4000)
     e.add_argument("--seed", type=int, default=20260820)
+    e.add_argument("--no-ner", action="store_true",
+                   help="score tier 1 only, without the local NER tier")
     e.add_argument("--excerpt", default="RestoreSession",
                    help="substring of the unit path to show in the before/after pane")
     e.add_argument("--excerpt-lines", type=int, default=14)
@@ -119,6 +163,16 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--log", help="write the JSONL decision log here")
     r.add_argument("--vault", help="save the pseudonym vault here")
     r.set_defaults(fn=_cmd_redact)
+
+    p = sub.add_parser("proxy", help="run the redacting OpenAI-compatible gateway")
+    p.add_argument("--upstream", required=True,
+                   help="provider base URL, e.g. https://api.openai.com")
+    p.add_argument("--listen", default="127.0.0.1:8787", help="host:port to bind")
+    p.add_argument("--vault", help="persist the pseudonym vault here")
+    p.add_argument("--log", help="append the JSONL decision log here")
+    p.add_argument("--tier1-only", action="store_true",
+                   help="skip the local NER tier in the sync path")
+    p.set_defaults(fn=_cmd_proxy)
 
     args = ap.parse_args(argv)
     return args.fn(args)

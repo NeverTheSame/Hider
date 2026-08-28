@@ -1,0 +1,5 @@
+# Tier 2 (local NER) requirements.
+# Tier 1 runs without these; free-text person and organisation detection does not.
+# The model wheel is pinned to the spaCy 3.8 line resolved by requirements.txt.
+spacy>=3.8
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

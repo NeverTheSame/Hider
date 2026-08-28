@@ -27,14 +27,24 @@ import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+from typing import Sequence
 
-from . import adversarial, entities, generator, pipeline, pseudonym
+from . import adversarial, entities, generator, ner, pipeline, pseudonym
 from .markup import Occurrence
 
 #: Assumed managed-NER price, US dollars per 1000 characters. Managed PII
 #: services typically bill per 1000-character text record; this rate is a
 #: list-price assumption and is stated as such wherever a cost appears.
 NER_USD_PER_1K_CHARS = 0.001
+
+#: The recall floor for the free-text types tier 2 owns. Tier 1 is held to
+#: zero unexplained survivors because it is deterministic: a miss is a defect.
+#: Tier 2 is a model, so a miss is a measurement. The gate is therefore a
+#: floor, reported next to the number rather than blended into it. On the
+#: shipped corpus the floor passes with real headroom (see README); if a
+#: change drops recall below it, the eval fails exactly as it would for a
+#: tier 1 leak.
+FREETEXT_RECALL_FLOOR = 0.75
 
 
 @dataclass
@@ -111,6 +121,10 @@ class Report:
     cases: list[CaseResult] = field(default_factory=list)
     injection_canaries: int = 0
     vault_size: int = 0
+    #: True when the run included a live tier 2 (local NER). Free-text
+    #: survivors are a floor-gated measurement when this is set and a phase
+    #: boundary when it is not.
+    ner_enabled: bool = False
 
     # -- rolled-up numbers -------------------------------------------------
 
@@ -137,6 +151,17 @@ class Report:
         rel = [t for t in self.types.values() if t.expected_tier == entities.TIER_SHAPED]
         s = sum(t.seeded for t in rel)
         return sum(t.covered for t in rel) / s if s else 0.0
+
+    @property
+    def freetext_recall(self) -> float:
+        """Recall on the free-text types tier 2 owns, when tier 2 ran."""
+        rel = [t for t in self.types.values() if t.expected_tier == entities.TIER_FREETEXT]
+        s = sum(t.seeded for t in rel)
+        return sum(t.covered for t in rel) / s if s else 0.0
+
+    @property
+    def below_freetext_floor(self) -> bool:
+        return self.ner_enabled and self.freetext_recall < FREETEXT_RECALL_FLOOR
 
     @property
     def false_redaction_rate(self) -> float:
@@ -178,6 +203,9 @@ class Report:
             "chars": self.chars,
             "recall_all": round(self.recall, 4),
             "recall_shaped_types": round(self.shaped_recall, 4),
+            "recall_freetext_types": round(self.freetext_recall, 4),
+            "freetext_recall_floor": FREETEXT_RECALL_FLOOR,
+            "ner_enabled": self.ner_enabled,
             "seeded": self.seeded,
             "covered": self.covered,
             "groups": {"total": self.groups_total, "caught": self.groups_caught},
@@ -297,16 +325,31 @@ def run(
     seed: int = 20260820,
     include_custom: bool = True,
     include_adversarial: bool = True,
+    include_ner: bool = False,
     label: str = "tier1-custom",
     corpus: generator.Corpus | None = None,
     vault_key: bytes = b"hider-eval-fixed-key",
+    tiers: Sequence[pipeline.Tier] | None = None,
 ) -> tuple[Report, dict[str, list[str]]]:
-    """Score one configuration. Returns the report and the redacted text per unit."""
+    """Score one configuration. Returns the report and the redacted text per unit.
+
+    ``include_ner`` adds the local NER tier when the model is available; it
+    raises rather than silently skipping when the model is missing, because a
+    tier that quietly did not run is how a recall figure ends up lying.
+    """
     corp = corpus or generator.generate(lines=lines, seed=seed)
     vault = pseudonym.EntityVault(key=vault_key)
-    pipe = pipeline.Pipeline([pipeline.RegexTier(include_custom=include_custom)], vault=vault)
+    if tiers is None:
+        chosen: list[pipeline.Tier] = [pipeline.RegexTier(include_custom=include_custom)]
+        if include_ner:
+            chosen.append(ner.LocalNerTier())
+    else:
+        chosen = list(tiers)
+    pipe = pipeline.Pipeline(chosen, vault=vault)
+    ner_ran = any(getattr(t, "name", "") == "tier2" for t in chosen)
 
     report = Report(label=label)
+    report.ner_enabled = ner_ran
     truth_by_line: dict[tuple[str, int], list[Occurrence]] = defaultdict(list)
     for occ in corp.truth:
         truth_by_line[(occ.unit, occ.line_no)].append(occ)
@@ -404,18 +447,27 @@ def run(
         seen.add(occ.value)
         if occ.value in all_out:
             spec = entities.BY_NAME.get(occ.entity_type)
-            tier_not_built = spec is not None and spec.expected_tier != entities.TIER_SHAPED
             documented_case = (
                 occ.unit == adversarial.UNIT and occ.line_no in adv_gap_lines
             )
+            if spec is None or spec.expected_tier == entities.TIER_SHAPED:
+                # No tier is allowed to miss this: either a tier 1 leak or an
+                # unexplained failure. Fails the eval.
+                reason, known_gap = "unexplained", False
+            elif spec.expected_tier == entities.TIER_FREETEXT and ner_ran:
+                # Tier 2 is a model; its misses are measured against a floor
+                # (below_freetext_floor) rather than against zero, and shown
+                # in the report as exactly what they are.
+                reason, known_gap = "tier2 miss (probabilistic tier)", True
+            else:
+                reason, known_gap = "tier not built yet", True
             report.verbatim_survivors.append(
                 {"entity_type": occ.entity_type, "unit": occ.unit, "line": occ.line_no,
                  "length": len(occ.value),
                  "expected_tier": spec.expected_tier if spec else "",
-                 "reason": "tier not built yet" if tier_not_built
-                           else "documented adversarial gap" if documented_case
-                           else "unexplained",
-                 "known_gap": tier_not_built or documented_case}
+                 "reason": reason if not documented_case
+                           else "documented adversarial gap",
+                 "known_gap": known_gap or documented_case}
             )
 
     report.lines = pipe.stats.lines
@@ -431,13 +483,30 @@ def run(
     return report, redacted
 
 
-def run_with_baseline(**kwargs) -> tuple[Report, Report, dict[str, list[str]], generator.Corpus]:
-    """Run the full configuration and the stock-Presidio baseline on one corpus."""
+def run_with_baseline(
+    *, include_ner: bool | None = None, **kwargs
+) -> tuple[Report, Report, dict[str, list[str]], generator.Corpus]:
+    """Run the full configuration and the stock-Presidio baseline on one corpus.
+
+    ``include_ner`` defaults to "on when the NER model is installed", so the
+    shipped numbers describe the shipped configuration wherever the repo is
+    run with the model present. Passing True when the model is missing raises,
+    for the same reason ``run(include_ner=True)`` does.
+    """
     lines = kwargs.pop("lines", 4000)
     seed = kwargs.pop("seed", 20260820)
+    if include_ner is None:
+        include_ner = ner.available()
+    elif include_ner and not ner.available():
+        raise RuntimeError(
+            "include_ner=True but the spaCy model is not installed; "
+            "run: pip install https://github.com/explosion/spacy-models/releases/"
+            "download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+        )
     corp = generator.generate(lines=lines, seed=seed)
     full, redacted = run(corpus=corp, seed=seed, include_custom=True,
-                         label="presidio + custom domain recognizers", **kwargs)
+                         include_ner=include_ner,
+                         label="presidio + custom recognizers + local NER", **kwargs)
     base, _ = run(corpus=corp, seed=seed, include_custom=False,
                   label="stock Presidio patterns only", **kwargs)
     return full, base, redacted, corp

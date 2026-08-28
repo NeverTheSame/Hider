@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 from . import adversarial, entities
-from .evaluate import NER_USD_PER_1K_CHARS, Report
+from .evaluate import FREETEXT_RECALL_FLOOR, NER_USD_PER_1K_CHARS, Report
 
 CSS = """
 :root {
@@ -127,12 +127,18 @@ def build(
     # ---- KPI row ----
     kpis = "".join([
         _kpi(_pct(report.shaped_recall), "recall on shaped identifiers",
-             f"{report.covered} of {report.seeded} seeded values, tier 1 only"),
+             f"{report.covered} of {report.seeded} seeded values, tier 1"),
+        _kpi(
+            _pct(report.freetext_recall) if report.ner_enabled else "not run",
+            "recall on free-text names",
+            "tier 2, local NER; gated at a floor, not at zero"
+            if report.ner_enabled else "no NER model installed in this environment",
+        ),
         _kpi(_pct(report.false_redaction_rate), "false-redaction rate",
              f"on {report.clean_lines} lines known to hold nothing sensitive"),
         _kpi(str(len(report.unexpected_survivors)), "unexplained survivors",
              "seeded values still findable verbatim in the output"),
-        _kpi(_pct(report.cost_reduction), "managed-NER spend avoided",
+        _kpi(_pct(report.cost_reduction), "paid-tier spend avoided",
              "tier 1 clears this share of characters before any paid tier"),
         _kpi(f"{report.tier_elapsed_s.get('tier1', 0) / max(report.lines, 1) * 1e6:,.0f} us",
              "tier 1 per line", "single-threaded, no network, no NLP model"),
@@ -144,8 +150,14 @@ def build(
         b = baseline.types.get(name)
         base_recall = b.recall if b else 0.0
         gap = t.expected_tier != entities.TIER_SHAPED
+        probabilistic = t.expected_tier == entities.TIER_FREETEXT
         cls = "good" if t.recall >= 0.999 else ("bad" if not gap and t.recall < 0.95 else "")
-        tier_note = "tier 1" if not gap else "tier 2, not built"
+        if t.expected_tier == entities.TIER_FREETEXT:
+            tier_note = "tier 2, probabilistic"
+        elif t.expected_tier == entities.TIER_CONTEXTUAL:
+            tier_note = "tier 3, not built"
+        else:
+            tier_note = "tier 1"
         rows.append(
             f"<tr><td>{name}<br><span class='tag{' gap' if gap else ''}'>{tier_note}</span></td>"
             f"<td>{t.seeded}</td><td>{t.covered}</td><td>{t.partial}</td>"
@@ -187,13 +199,26 @@ def build(
 
     # ---- tier routing ----
     t1 = report.tier_chars_offered.get("tier1", 0)
+    if report.ner_enabled:
+        tier2_row = (
+            f"<tr><td>tier 2, local spaCy NER over the residue</td>"
+            f"<td>{report.tier_chars_offered.get('tier2', 0):,}</td>"
+            f"<td>{report.tier_chars_redacted.get('tier2', 0):,}</td><td>$0.0000</td>"
+            f"<td>{report.tier_elapsed_s.get('tier2', 0):.2f} s</td></tr>"
+        )
+    else:
+        tier2_row = (
+            f"<tr><td>tier 2, NER over the residue</td><td>{report.residue_chars:,}</td>"
+            f"<td>not run (no model installed)</td><td>$0.0000</td><td>&mdash;</td></tr>"
+        )
     trows = [
         f"<tr><td>tier 1, Presidio patterns</td><td>{t1:,}</td>"
         f"<td>{report.tier_chars_redacted.get('tier1', 0):,}</td><td>$0.0000</td>"
         f"<td>{report.tier_elapsed_s.get('tier1', 0):.2f} s</td></tr>",
-        f"<tr><td>tier 2, managed NER over the residue</td><td>{report.residue_chars:,}</td>"
-        f"<td>not built</td><td>${report.tiered_ner_cost_usd:.4f}</td><td>network bound</td></tr>",
-        f"<tr><td>no tiering, everything to managed NER</td><td>{report.chars:,}</td>"
+        tier2_row,
+        f"<tr><td>hypothetical: tier 2 as a paid managed NER</td><td>{report.residue_chars:,}</td>"
+        f"<td>n/a</td><td>${report.tiered_ner_cost_usd:.4f}</td><td>network bound</td></tr>",
+        f"<tr><td>hypothetical: no tiering, everything to managed NER</td><td>{report.chars:,}</td>"
         f"<td>n/a</td><td>${report.naive_ner_cost_usd:.4f}</td><td>network bound</td></tr>",
     ]
     tier_table = (
@@ -206,9 +231,10 @@ def build(
 <style>{CSS}</style>
 <div class="wrap">
 <h1>{html.escape(title)}</h1>
-<p class="sub">Hider, phase 1. Deterministic tier only, measured on a synthetic
-bundle of {report.lines:,} lines and {report.chars:,} characters with
-{report.seeded} planted values whose type and position are known exactly.</p>
+<p class="sub">Hider. Two live tiers &mdash; deterministic patterns, then local
+NER over what they leave &mdash; measured on a synthetic bundle of
+{report.lines:,} lines and {report.chars:,} characters with {report.seeded}
+planted values whose type and position are known exactly.</p>
 
 <div class="kpis">{kpis}</div>
 
@@ -231,11 +257,11 @@ cannot always do, since a session id and a tenant id are the same 36 characters
 on the wire. The last column is stock Presidio on the identical corpus, which is
 what the custom domain recognizers are measured against.</p>
 {recall_table}
-<p><span class="tag gap">tier 2, not built</span> marks the free-text types that
-have no shape to match. Tier 1 scoring zero on them is the design working as
-intended, not a defect, which is why the headline figure is recall on shaped
-types ({_pct(report.shaped_recall)}) and the all-types figure
-({_pct(report.recall)}) is reported next to it rather than instead of it.</p>
+<p><span class="tag gap">tier 2, probabilistic</span> marks the free-text
+types: tier 1 cannot catch them (they have no shape) and tier 2 is a model, so
+its recall is a measurement against a floor
+({_pct(FREETEXT_RECALL_FLOOR)}), not a zero-survivor invariant like tier 1's.
+The two gates are reported side by side, never blended.</p>
 
 <h2>Over-redaction</h2>
 <p>Recall alone is easy to game: redact everything and score 100 percent. The
@@ -263,13 +289,16 @@ limitation can never be mistaken for a pass, or for a defect.</p>
 
 <h2>Why tiering, in money</h2>
 <p>Tier 1 runs first as a cost gate. It has no per-call price and no network
-hop, so every character it clears is a character no paid tier is billed for. At
-an assumed managed-NER list rate of ${NER_USD_PER_1K_CHARS} per 1000 characters:</p>
+hop, so every character it clears is a character no paid tier is billed for.
+The shipped tier 2 is local and in-process, so it costs nothing per character
+either; the two hypothetical rows below keep the original argument visible,
+at an assumed managed-NER list rate of ${NER_USD_PER_1K_CHARS} per 1000
+characters:</p>
 {tier_table}
 <p>On this corpus tier 1 clears {_pct(report.cost_reduction)} of the characters
-before anything paid is consulted. The saving scales with how shaped the data is,
-and support bundles are almost all shaped, which is the whole argument for
-putting regex in front rather than reaching for a model first.</p>
+before the NER model is consulted at all. The saving scales with how shaped
+the data is, and support bundles are almost all shaped, which is the whole
+argument for putting regex in front rather than reaching for a model first.</p>
 
 <h2>What this does not show</h2>
 <ul>
@@ -281,17 +310,18 @@ that remains. It is a mitigation, not a fix.</li>
 <li><strong>One person wrote both sides.</strong> Generator and recognizers came
 from one mental model, so independence here is procedural rather than
 organisational. Recall on shaped types should be read as an upper bound.</li>
-<li><strong>Free-text names and organisations are not detected at all</strong>
-in phase 1. That is {sum(t.seeded for t in report.types.values() if t.expected_tier != entities.TIER_SHAPED)}
-planted values passing straight through, and it is the entire reason a managed
-NER tier is phase 2 rather than optional.</li>
+<li><strong>Tier 2 recall is a model's recall.</strong> Free-text names are
+caught at {_pct(report.freetext_recall) if report.ner_enabled else "n/a"},
+against a floor of {_pct(FREETEXT_RECALL_FLOOR)}. A miss is not a defect the
+way a tier 1 miss is; it is the honest ceiling of a small local model, and the
+reasons are listed per survivor in the JSON metrics.</li>
 <li><strong>Prompt-injection resistance is untested.</strong> The
 {report.injection_canaries} injection canaries are already in the corpus, but
-tier 1 has no instructions to subvert, so it cannot be injected and reporting a
-pass would be dishonest. That number arrives with tier 3.</li>
-<li><strong>The cost figures use an assumed list rate,</strong> not an invoice.
-Characters offered per tier are measured; the dollar conversion is arithmetic on
-a published price.</li>
+tiers 1 and 2 have no instructions to subvert, so they cannot be injected and
+reporting a pass would be dishonest. That number arrives with tier 3.</li>
+<li><strong>The hypothetical cost figures use an assumed list rate,</strong>
+not an invoice. Characters offered per tier are measured; the dollar
+conversion is arithmetic on a published price.</li>
 </ul>
 
 <footer>Generated by <code>hider.report</code>. Corpus seed and configuration are

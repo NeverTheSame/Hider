@@ -7,8 +7,9 @@ the latency budget is minutes. Every tier runs. This is the flow that produces
 the cost and routing numbers, because it is the one that sees millions of lines.
 
 *Sync prompt proxy.* A chat completion is intercepted in flight, and the budget
-is tens of milliseconds on top of the provider call. Only the deterministic
-tiers run. Tier 3 never runs in the sync path.
+is tens of milliseconds on top of the provider call. The deterministic tier
+always runs; the local NER tier runs unless latency forbids it. Tier 3 never
+runs in the sync path. See ``proxy.py`` for the gateway itself.
 
 Three rules hold in both:
 
@@ -96,11 +97,14 @@ class RegexTier:
 
 
 class ManagedNerTier:
-    """A managed PII-detection service over the free-text residue. Phase 2.
+    """A managed PII-detection service over the free-text residue. Phase 2+.
 
-    Any cloud NER service with a PII endpoint fits behind this interface. The
-    contract is written down now so the engine and the eval harness can be built
-    against it:
+    The LOCAL implementation of this tier slot ships and is measured: see
+    ``hider/ner.py`` (``LocalNerTier``), Presidio's spaCy engine run
+    in-process over the residue. This class remains the contract for the
+    managed-service variant, for operators whose volume out-scales a local
+    model. The engine treats the two identically, as one tier slot. Either
+    variant must hold:
 
     * Sees only the residue segments, batched into documents under the service
       limit, so shaped tokens already cleared by tier 1 are never paid for.
@@ -117,7 +121,7 @@ class ManagedNerTier:
     cost_per_1k_chars = 0.001  # placeholder until measured against real pricing
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
-        raise NotImplementedError("phase 2")
+        raise NotImplementedError("managed variant; the local tier2 ships in hider.ner")
 
 
 class ResidualClassifierTier:

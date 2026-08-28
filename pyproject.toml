@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hider"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tiered redaction gateway for support log bundles on their way to an LLM provider"
 requires-python = ">=3.11"
 dependencies = [
@@ -14,6 +14,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Tier 2: local NER over the free-text residue. See requirements-ner.txt.
+ner = [
+    "spacy>=3.8",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
 
 [project.scripts]
 hider = "hider.cli:main"
