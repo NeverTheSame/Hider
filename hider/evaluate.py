@@ -416,7 +416,20 @@ def run(
             chosen.append(pipeline.LlmPassTier(tier3))
     else:
         chosen = list(tiers)
-    pipe = pipeline.Pipeline(chosen, vault=vault)
+    # Tier 3 is scoped to the hostile corpus, and only there.
+    #
+    # It is the tier that costs money per call and the only one whose recording
+    # has to exist before a replay can work. Running it over the generated
+    # corpus as well meant 5,000 lines with no cassette entry, every one of
+    # them failing closed: correct behaviour, invisible consequence, because
+    # the degraded count was recorded and never printed. The measurement tier 3
+    # exists for here is the injection corpus, so that is where it runs. The
+    # generated corpus keeps the deterministic tiers, which also makes its
+    # recall and cost numbers comparable across runs with and without tier 3.
+    main_tiers = [t for t in chosen if getattr(t, "name", "") != "tier3"]
+    pipe = pipeline.Pipeline(main_tiers, vault=vault)
+    adv_pipe = (pipeline.Pipeline(chosen, vault=vault)
+                if len(main_tiers) != len(chosen) else pipe)
     ner_ran = any(getattr(t, "name", "") == "tier2" for t in chosen)
     tier3_ran = any(getattr(t, "name", "") == "tier3" for t in chosen)
 
@@ -472,7 +485,7 @@ def run(
 
         out_lines = []
         for i, line in enumerate(adv_lines):
-            r = pipe.redact(line, unit=adversarial.UNIT, line_no=i)
+            r = adv_pipe.redact(line, unit=adversarial.UNIT, line_no=i)
             out_lines.append(r.text)
             occs = adv_truth_by_line.get(i, [])
             _score_line(report, line, occs, r.spans, group_state)
@@ -548,15 +561,20 @@ def run(
                  "known_gap": known_gap or documented_case}
             )
 
-    report.lines = pipe.stats.lines
-    report.chars = pipe.stats.chars_in
-    report.residue_chars = pipe.stats.residue_chars
-    report.degraded_units = pipe.stats.degraded_units
+    stats_sources = [pipe.stats] if adv_pipe is pipe else [pipe.stats, adv_pipe.stats]
+    report.lines = sum(st.lines for st in stats_sources)
+    report.chars = sum(st.chars_in for st in stats_sources)
+    report.residue_chars = sum(st.residue_chars for st in stats_sources)
+    report.degraded_units = sum(st.degraded_units for st in stats_sources)
     report.vault_size = vault.size
-    for name, st in pipe.stats.tiers.items():
-        report.tier_chars_offered[name] = st.chars_offered
-        report.tier_chars_redacted[name] = st.chars_redacted
-        report.tier_elapsed_s[name] = st.elapsed_s
+    for source in stats_sources:
+        for name, st in source.tiers.items():
+            report.tier_chars_offered[name] = (
+                report.tier_chars_offered.get(name, 0) + st.chars_offered)
+            report.tier_chars_redacted[name] = (
+                report.tier_chars_redacted.get(name, 0) + st.chars_redacted)
+            report.tier_elapsed_s[name] = (
+                report.tier_elapsed_s.get(name, 0.0) + st.elapsed_s)
 
     return report, redacted
 

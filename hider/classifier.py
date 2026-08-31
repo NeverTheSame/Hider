@@ -17,6 +17,16 @@ vocabulary forces the model to key on shape and context - capitalisation,
 sentence position, the words around a mention - which is the only thing that
 transfers to a real bundle, where nobody's name is in this file.
 
+One overlap is deliberate and should be named rather than glossed over: the
+``_ORG_SUFFIX_WORDS`` feature list contains the same generic corporate suffixes
+the eval corpus builds organisation names from (holdings, group, partners,
+industries, advisory, ag). The names and the organisation head-words are
+disjoint; the suffix list is not. It is a hand-written feature encoding generic
+domain knowledge, not memorised answers, and "Ltd" would be in it whatever the
+eval corpus looked like. But it does lift organisation recall relative to a
+corpus whose suffixes the list has never seen, so the honest phrasing is
+"disjoint except for the generic corporate-suffix feature list".
+
 Known limitation, stated the way the rest of this project states them: a
 linear per-token classifier with a two-name-per-organisation-suffix training
 grammar is a small model. It will not match a production NER system's recall,

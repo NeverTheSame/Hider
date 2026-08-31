@@ -207,3 +207,65 @@ def test_committed_injection_cassette_still_reads_as_zero_bypass():
     full, _ = evaluate.run(lines=0, seed=20260820, tier2=None, tier3=cb,
                            include_adversarial=True, label="cassette-regression")
     assert full.injection_bypass_rate == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Regression: a verified literal was applied at its first occurrence only, so
+# the second mention of a repeated name stayed in the clear.
+# ---------------------------------------------------------------------------
+
+class _OneFinding:
+    name = "one-finding"
+
+    def __init__(self, literal: str, etype: str = "PERSON") -> None:
+        self.literal, self.etype = literal, etype
+        self.calls = 0
+
+    def complete(self, prompt: str) -> str:
+        self.calls += 1
+        return json.dumps({"findings": [{"text": self.literal, "type": self.etype}]})
+
+
+def _mask(text, spans):
+    out = list(text)
+    for s in spans:
+        for i in range(s.start, s.end):
+            out[i] = "*"
+    return "".join(out)
+
+
+def test_every_occurrence_of_a_verified_literal_is_redacted():
+    text = "Spoke to Mateo Berg today. Mateo Berg will call back at 5."
+    spans = llm_tier.detect(_OneFinding("Mateo Berg"), text, [(0, len(text))])
+    assert len(spans) == 2
+    assert "Mateo Berg" not in _mask(text, spans)
+
+
+def test_repeated_occurrences_across_several_residue_segments():
+    text = "Mateo Berg opened it. <redacted> Mateo Berg closed it."
+    residue = [(0, 21), (32, len(text))]
+    spans = llm_tier.detect(_OneFinding("Mateo Berg"), text, residue)
+    assert len(spans) == 2
+    for s in spans:
+        assert text[s.start:s.end] == "Mateo Berg"
+
+
+def test_a_hallucinated_literal_is_still_discarded_silently():
+    text = "Spoke to Mateo Berg today."
+    assert llm_tier.detect(_OneFinding("Someone Else"), text, [(0, len(text))]) == []
+
+
+def test_overlapping_findings_do_not_double_claim():
+    class TwoOverlapping:
+        name = "two"
+
+        def complete(self, prompt):
+            return json.dumps({"findings": [
+                {"text": "Mateo Berg", "type": "PERSON"},
+                {"text": "Berg", "type": "PERSON"},
+            ]})
+
+    text = "Spoke to Mateo Berg today."
+    spans = llm_tier.detect(TwoOverlapping(), text, [(0, len(text))])
+    assert len(spans) == 1
+    assert text[spans[0].start:spans[0].end] == "Mateo Berg"

@@ -193,6 +193,10 @@ def _api_key(rng: random.Random) -> str:
 # The specification
 # ---------------------------------------------------------------------------
 
+#: A bare GUID carries the generic label. ``recognizers.refine`` upgrades it to
+#: a specific type when the surrounding text names one, so each type accepts
+#: the generic label plus its own, and nothing else. A tenant id relabelled
+#: SESSION_GUID is a typing error and is counted as one.
 _GUID_LABELS = frozenset({"GUID"})
 
 SPECS: tuple[EntitySpec, ...] = (
@@ -200,13 +204,13 @@ SPECS: tuple[EntitySpec, ...] = (
         name="SESSION_GUID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="backup and restore session identifiers as written in service logs",
         description="Backup or restore session id. Correlates lines across a bundle, so it must stay stable after redaction.",
-        generate=_guid, detected_as=_GUID_LABELS, label_prefix="Session",
+        generate=_guid, detected_as=_GUID_LABELS | {"SESSION_GUID"}, label_prefix="Session",
     ),
     EntitySpec(
         name="TENANT_ID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="cloud identity provider tenant identifier, public format",
         description="Tenant id of the customer directory. Same shape as any other GUID on the wire.",
-        generate=_guid, detected_as=_GUID_LABELS, label_prefix="Tenant",
+        generate=_guid, detected_as=_GUID_LABELS | {"TENANT_ID"}, label_prefix="Tenant",
     ),
     EntitySpec(
         name="OBJECT_GUID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,

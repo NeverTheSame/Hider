@@ -106,20 +106,21 @@ Three invariants hold everywhere, enforced by tests rather than by convention:
 ## Measured
 
 From `python -m hider eval` (tier 2 = `classifier`, the default; tier 3 not
-active — see below) on a 5,029 line, 695,841 character synthetic bundle with
+active — see below) on a 5,029 line, 695,840 character synthetic bundle with
 6,681 planted values across 18 entity types:
 
 | | |
 |---|---|
-| Recall on shaped identifier types | 99.85% |
+| Recall on shaped identifier types | 99.89% |
 | Same corpus, stock Presidio patterns only | 17.64% |
 | Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 92.09% |
 | Recall across all types | 99.19% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Seeded values still findable verbatim in the output | 0 unexplained, 7 known gap |
+| Seeded values still findable verbatim in the output | 0 unexplained, 6 known gap |
 | Adversarial surprises across 21 hostile placements | 0 |
 | Characters cleared before any paid or model tier is consulted | 40.3% |
-| Tier 1 throughput | ~125 microseconds per line, single threaded |
+| Units degraded during the run | 0 |
+| Tier 1 throughput | ~136 microseconds per line, single threaded |
 | Tier 2 (classifier) throughput | ~0.5 milliseconds per line over the residue only |
 
 Swapping in `--tier2 spacy` on the same corpus: 86.82% free-text recall, ~3.9ms
@@ -132,6 +133,17 @@ a narrow set of introducing verbs, no other entity classes to confuse it with)
 can out-perform a general NER model on that format while failing harder the
 moment the free text looks like something else. Neither number should be
 read past the corpus that produced it.
+
+One vocabulary overlap is worth naming rather than glossing over. The training
+given names, surnames and organisation head-words are disjoint from the ones
+the eval corpus is seeded from, which is what stops a lookup table scoring
+100%. The corporate-suffix feature list is not disjoint: it contains the same
+generic suffixes the corpus builds organisation names from. That is a
+hand-written feature encoding generic domain knowledge rather than memorised
+answers, and "Ltd" would be in it whatever the corpus looked like, but it does
+lift organisation recall relative to a corpus whose suffixes it has never seen.
+The accurate phrasing is "disjoint except for the generic corporate-suffix
+feature list".
 
 The gates differ by tier, on purpose. Tier 1 is deterministic, so its gate is
 zero unexplained survivors: a miss is a defect and fails the eval. Tier 2 is a
@@ -167,7 +179,19 @@ Run once against a live model (`gpt-4o-mini`, `--tier2 none --tier3 openai
 |---|---|
 | Injection-adjacent cases | 5 of 5 names/orgs caught |
 | Injection bypass rate (tier 2 disabled, tier 3 alone) | **0.0%** |
-| Malformed/degraded responses | 0 of 41 API calls |
+| Malformed/degraded responses | 0 of 42 recorded calls |
+| Units degraded during the replay run | 0 |
+
+Tier 3 runs on the hostile corpus and only there. It is the tier that costs
+money per call and the only one that cannot run at all without a recording, so
+running it across the generated corpus meant 5,000 lines with no cassette entry,
+every one of them failing closed. That was correct behaviour with an invisible
+consequence: the engine counted the degraded units and the eval never printed
+the count, so a run that degraded on 5,000 of 5,029 units reported a clean pass
+with a headline injection number beside it. The eval now prints the degraded
+count and fails on it, and tier 3 is scoped to the corpus it is measured
+against. The generated corpus keeps the deterministic tiers, which also means
+its recall and cost numbers are comparable across runs with and without tier 3.
 
 Two caveats on that number, stated the way the rest of this project states
 them. First, it is 5 payload variants against one model on one small corpus -
@@ -197,6 +221,57 @@ CamelCase keys, spans glued across log structure), each found by the same
 measurement rather than by inspection and each with its own test in
 `test_ner.py`.
 
+### What the last round of measurement found
+
+Four defects, all found by running the tool against realistic input rather than
+by reading it:
+
+- **A split bearer credential was not redacted at all, and reached the model
+  provider.** The three-part JWT pattern never matched a token whose signature
+  had been wrapped onto the next line, so the head stayed in the clear, landed
+  in the residue and, with tier 3 enabled, was sent upstream. The adversarial
+  case covering this carried an owner note asserting the head "is destroyed",
+  which was simply not true, and that note is what stopped anyone looking. Now
+  covered by three patterns and a line-anchored continuation recognizer, with a
+  test asserting the property that matters: no fragment survives into the
+  residue.
+- **A degraded run could report a clean pass.** See the tier 3 section above.
+- **`redact` ran tier 1 only** while `proxy` ran tier 2, so the documented
+  "redact the bundle before pasting it anywhere" workflow was the one path that
+  let a person's name through. Both now build their tiers through one function.
+- **Every GUID was pseudonymised as a session id,** so a tenant id read back as
+  `<Session-02>` and invited a model to reason about two sessions where there
+  was one session and one tenant. GUIDs are now typed from the words around
+  them, with a bare `<Guid-07>` when nothing names the kind, and all GUID
+  subtypes share one identity space so a value's label never changes with
+  context.
+
+## Site profiles
+
+Tier 1 ships with generic identifier shapes. The formats a particular operator
+actually uses are themselves information about that estate: region codes,
+service tiers, how many worker classes exist. Publishing them next to the tool
+would leak the topology the tool exists to hide.
+
+So the real schemes live in a profile file loaded at runtime and never
+committed. Copy `templates/profile.example.json`, fill in your own patterns,
+and point `HIDER_PROFILE` at it:
+
+```sh
+export HIDER_PROFILE=~/.config/hider/site.json
+```
+
+Two rules keep this from becoming a way to weaken the tool. A profile can only
+**add** patterns, so it cannot override or soften a built-in recognizer and can
+never reduce coverage below what the committed tests measure. And a broken
+profile is a **startup error**, never a silent skip: a missing file, malformed
+JSON, an unknown entity label or an uncompilable regex all raise. The failure
+mode of a config-driven security control has to be "refuses to start", not
+"starts with less protection than you think".
+
+The eval deliberately ignores any local profile, so the committed numbers
+reproduce on a machine that has one set.
+
 ## Run it
 
 ```sh
@@ -204,7 +279,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # tier 1 + tier 2 (classifier, the default) need nothing else.
 
 .venv/bin/python -m hider eval          # tier1 + tier2=classifier; metrics + HTML report into out/
-.venv/bin/python -m pytest              # 164 tests
+.venv/bin/python -m pytest              # 247 tests
 .venv/bin/python -m hider generate      # write a synthetic bundle to out/bundle
 .venv/bin/python -m hider redact FILE --log out/decisions.jsonl --vault out/vault.json
 .venv/bin/python -m hider proxy --upstream https://api.openai.com \

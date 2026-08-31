@@ -117,3 +117,64 @@ def test_pseudonym_does_not_contain_the_original():
         for part in value.replace("@", ".").replace("-", ".").split("."):
             if len(part) > 4:
                 assert part.lower() not in p.lower()
+
+
+# ---------------------------------------------------------------------------
+# GUID identity. Regression: context-based subtyping briefly minted two labels
+# for one value, because the same tenant id was typed TENANT_ID on the line
+# that named it and GUID on the line that did not. Two labels for one value is
+# precisely the correlation loss pseudonyms exist to prevent.
+# ---------------------------------------------------------------------------
+
+GUID_A = "6cafd2ac-dd19-d991-291a-8d565940996d"
+
+
+def test_one_value_keeps_one_label_across_guid_subtypes():
+    a = v()
+    first = a.pseudonym("TENANT_ID", GUID_A)
+    assert a.pseudonym("GUID", GUID_A) == first
+    assert a.pseudonym("SESSION_GUID", GUID_A) == first
+    assert a.pseudonym("OBJECT_GUID", GUID_A) == first
+
+
+def test_the_first_sighting_names_the_label():
+    a, b = v(), v()
+    assert a.pseudonym("TENANT_ID", GUID_A).startswith("<Tenant-")
+    assert b.pseudonym("GUID", GUID_A).startswith("<Guid-")
+
+
+def test_a_bare_guid_label_asserts_nothing():
+    """An untyped GUID must not be dressed up as a session."""
+    assert "Session" not in v().pseudonym("GUID", GUID_A)
+
+
+def test_distinct_guids_still_get_distinct_labels():
+    a = v()
+    other = "ffeeddcc-0011-4222-8333-445566778899"
+    assert a.pseudonym("TENANT_ID", GUID_A) != a.pseudonym("TENANT_ID", other)
+
+
+# ---------------------------------------------------------------------------
+# De-tokenisation through a model that reformats.
+# ---------------------------------------------------------------------------
+
+def test_detokenize_survives_a_model_dropping_the_brackets():
+    a = v()
+    label = a.pseudonym("SESSION_GUID", GUID_A)
+    assert label.startswith("<") and label.endswith(">")
+    bare = label[1:-1]
+    assert a.detokenize(f"The stall is on {bare}, retry it.") == \
+        f"The stall is on {GUID_A}, retry it."
+    assert a.detokenize(f"The stall is on {label}, retry it.") == \
+        f"The stall is on {GUID_A}, retry it."
+
+
+def test_detokenize_prefers_the_longest_label():
+    a = v()
+    a.pseudonym("SESSION_GUID", GUID_A)
+    for _ in range(11):
+        a.pseudonym("SESSION_GUID", GUID_A.replace("6c", f"{_:02d}"))
+    long_label = "<Session-11>"
+    assert long_label in a.by_label
+    out = a.detokenize("Session-11 and Session-1 differ")
+    assert "Session-11" not in out

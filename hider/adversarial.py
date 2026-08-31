@@ -109,10 +109,10 @@ CASES: tuple[Case, ...] = (
     Case(
         "split-jwt-continuation",
         "JWT split by a continuation marker",
-        "[21.08.2026 09:02:21.900] <2f> Info [Auth] Authorization: Bearer <<JWT|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2ZGMtcHJvZC0wMDEiLCJpYXQiOjE3NTUwMDAwMDB9|g-jwt1>> \\\n"
+        "[21.08.2026 09:02:21.900] <2f> Info [Auth] Authorization: Bearer <<JWT|eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdmMtYWJjLTAwMSIsImlhdCI6MTc1NTAwMDAwMH0|g-jwt1>> \\\n"
         "    <<JWT|.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U|g-jwt1>>",
-        expect_tier1=False,
-        owner="known gap: the head is a valid JWT and is destroyed, the trailing signature fragment is not. The head being destroyed is what matters for the credential, so this is accepted risk, documented.",
+        expect_tier1=True,
+        owner="was a documented gap and should not have been: the note claimed the head was destroyed when the three-part pattern never matched it, so a bearer token reached the residue and, with tier 3 enabled, the model provider. Now covered by the two-segment head pattern, the bearer-value pattern and the continuation-fragment recognizer.",
     ),
     Case(
         "base64-wrapped",

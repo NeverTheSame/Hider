@@ -118,7 +118,7 @@ class EntityVault:
             raise ValueError(
                 f"{canonical} is a secret; it must be destroyed, not vaulted"
             )
-        d = _digest(self.key, canonical, value)
+        d = _digest(self.key, _identity_type(canonical), value)
         hit = self.entries.get(d)
         if hit:
             return hit["label"]
@@ -128,10 +128,23 @@ class EntityVault:
         return label
 
     def detokenize(self, text: str) -> str:
-        """Turn pseudonyms in a model response back into real values."""
-        # Longest label first, so a short label cannot clip a longer one.
+        """Turn pseudonyms in a model response back into real values.
+
+        Labels are matched in their bracketed form first, then bare. Models
+        routinely drop the angle brackets when they quote a token back at you,
+        so ``<Session-01>`` comes home as ``Session-01``; matching only the
+        exact form left those un-restored, which looks like the vault failing
+        when it is the model reformatting. Longest first, so a short label
+        cannot clip a longer one.
+        """
         for label in sorted(self.by_label, key=len, reverse=True):
             text = text.replace(label, self.by_label[label])
+        bare = {
+            label[1:-1]: value for label, value in self.by_label.items()
+            if label.startswith("<") and label.endswith(">")
+        }
+        for label in sorted(bare, key=len, reverse=True):
+            text = text.replace(label, bare[label])
         return text
 
     # -- persistence -------------------------------------------------------
@@ -166,6 +179,22 @@ class EntityVault:
         return sum(1 for e in self.entries.values() if not e["type"].startswith("_"))
 
 
+#: Every GUID subtype shares one identity space in the vault.
+#:
+#: ``recognizers.refine`` types a GUID from the words around it, so the same
+#: value can arrive as TENANT_ID on one line and as a bare GUID on the next,
+#: where the sentence did not happen to say what it was. Keying the vault on
+#: the subtype would then mint two labels for one value and destroy exactly the
+#: cross-line correlation the pseudonyms exist to preserve. The digest is taken
+#: over the family; the label keeps the prefix of the first sighting, so a
+#: value's pseudonym never changes once it has been issued.
+_GUID_FAMILY = frozenset({"GUID", "SESSION_GUID", "TENANT_ID", "OBJECT_GUID"})
+
+
+def _identity_type(canonical: str) -> str:
+    return "GUID_FAMILY" if canonical in _GUID_FAMILY else canonical
+
+
 def _canonical_type(entity_type: str, value: str = "") -> str:
     """Map a detector label back to a spec entity type where they differ.
 
@@ -182,7 +211,6 @@ def _canonical_type(entity_type: str, value: str = "") -> str:
         return "IPV6" if ":" in value else "IPV4"
     return {
         "EMAIL_ADDRESS": "UPN_EMAIL",
-        "GUID": "SESSION_GUID",
         "WORKER_POD_ID": "POD_ID",
         "SERVICE_INSTANCE_ID": "SERVICE_INSTANCE_ID",
         "IP_ADDRESS": "IPV4",

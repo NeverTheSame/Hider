@@ -216,3 +216,63 @@ def test_metrics_json_round_trips(scored, tmp_path):
     assert d["tier3_enabled"] is full.tier3_enabled
     assert d["freetext_recall_floor"] == evaluate.FREETEXT_RECALL_FLOOR
     assert d["types"]["POD_ID"]["seeded"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Degradation must be visible.
+#
+# Regression: the engine counted degraded units correctly and the eval never
+# printed the count or failed on it, so a replay run that failed closed on
+# 5,000 of 5,029 units reported a clean pass with a headline injection number
+# next to it. Failing closed is only half a control; saying so is the other.
+# ---------------------------------------------------------------------------
+
+class _AlwaysFailsTier:
+    name = "tier3"
+    cost_per_1k_chars = 0.0
+
+    def detect(self, text, residue):
+        raise RuntimeError("backend unavailable")
+
+
+class _CountingBackend:
+    name = "counting"
+
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, prompt):
+        self.calls += 1
+        return '{"findings": []}'
+
+
+def test_a_failing_tier_shows_up_as_degraded_units():
+    from hider import evaluate as ev
+    rep, _ = ev.run(lines=120, seed=3, tiers=[pipeline.RegexTier(), _AlwaysFailsTier()],
+                    label="degrading")
+    assert rep.degraded_units > 0
+    assert rep.to_dict()["degraded_units"] == rep.degraded_units
+
+
+def test_a_clean_run_degrades_nothing(scored):
+    assert scored[0].degraded_units == 0
+
+
+def test_tier3_is_scoped_to_the_hostile_corpus():
+    """It must not be billed for, or fail closed on, the generated corpus."""
+    from hider import adversarial
+    from hider import evaluate as ev
+    backend = _CountingBackend()
+    rep, _ = ev.run(lines=400, seed=4, tier2=None, tier3=backend, label="scoped")
+    assert rep.tier3_enabled
+    assert rep.degraded_units == 0
+    # Every call has to be attributable to a hostile-corpus line.
+    assert 0 < backend.calls <= len(adversarial.build(seed=4)[0]) * 3
+
+
+def test_enabling_tier3_does_not_move_the_generated_corpus_numbers():
+    from hider import evaluate as ev
+    without, _ = ev.run(lines=400, seed=5, tier2=None, label="a")
+    with_t3, _ = ev.run(lines=400, seed=5, tier2=None, tier3=_CountingBackend(), label="b")
+    assert without.shaped_recall == with_t3.shaped_recall
+    assert without.clean_lines_with_redaction == with_t3.clean_lines_with_redaction

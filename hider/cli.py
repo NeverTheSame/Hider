@@ -13,7 +13,16 @@ import json
 import sys
 from pathlib import Path
 
-from . import evaluate, generator, llm_backend, ner, pipeline, pseudonym, report
+from . import (
+    evaluate,
+    generator,
+    llm_backend,
+    ner,
+    pipeline,
+    profiles,
+    pseudonym,
+    report,
+)
 
 OUT = Path(__file__).resolve().parent.parent / "out"
 
@@ -71,6 +80,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     print(f"survivors         {len(full.unexpected_survivors)} unexplained, "
           f"{len(full.verbatim_survivors) - len(full.unexpected_survivors)} known gap")
     print(f"adversarial       {len(full.surprises)} surprises of {len(full.cases)} cases")
+    print(f"degraded units    {full.degraded_units} "
+          f"(a tier failed; redaction on those units is incomplete)")
     if full.tier3_enabled:
         rate = full.injection_bypass_rate
         print(f"injection bypass  {rate:.1%} of injection-adjacent names survived "
@@ -86,6 +97,14 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     if full.unexpected_survivors or full.surprises:
         print("\nFAIL: unexplained survivors or unexpected adversarial misses",
               file=sys.stderr)
+        failed = True
+    if full.degraded_units:
+        # A degraded unit means some tier did not complete, so that unit's
+        # redaction is not the redaction the numbers describe. It was possible
+        # for a whole run to degrade quietly: the count was recorded and never
+        # printed, so a missing cassette entry looked like a clean pass.
+        print(f"\nFAIL: {full.degraded_units} unit(s) degraded during the run; "
+              f"the reported coverage does not describe them", file=sys.stderr)
         failed = True
     if full.below_freetext_floor:
         print(f"\nFAIL: freetext recall {full.freetext_recall:.4f} is below the "
@@ -118,38 +137,69 @@ def _cmd_generate(args: argparse.Namespace) -> int:
 
 
 def _cmd_redact(args: argparse.Namespace) -> int:
+    _announce_profile()
     vault = pseudonym.EntityVault()
-    pipe = pipeline.Pipeline(vault=vault)
+    pipe = pipeline.Pipeline(_build_tiers(args.tier2), vault=vault)
     text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
     events: list[dict] = []
     out = []
+    degraded = 0
     for i, line in enumerate(text.splitlines()):
         r = pipe.redact(line, unit=args.path or "<stdin>", line_no=i)
         out.append(r.text)
         events.extend(r.events)
+        degraded += int(r.degraded)
     sys.stdout.write("\n".join(out) + "\n")
     if args.log:
         Path(args.log).write_text(
             "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
         )
-        print(f"\nwrote {len(events)} decision events to {args.log}", file=sys.stderr)
+        print(f"wrote {len(events)} decision events to {args.log}", file=sys.stderr)
     if args.vault:
         vault.save(args.vault)
         print(f"wrote vault with {vault.size} entries to {args.vault}", file=sys.stderr)
+    if degraded:
+        print(f"REFUSE: {degraded} line(s) degraded during redaction; do not forward "
+              f"this output", file=sys.stderr)
+        return 1
     return 0
+
+
+def _build_tiers(which_tier2: str) -> list[pipeline.Tier]:
+    """Tier 1, plus tier 2 unless it was explicitly turned off.
+
+    Shared by every command that redacts real input, so the file path and the
+    gateway path cannot drift apart. They did once: ``redact`` ran tier 1 only
+    while ``proxy`` ran tier 2, which meant the documented "redact the bundle
+    before pasting it anywhere" workflow was the one workflow that let a
+    customer's name through.
+    """
+    tiers: list[pipeline.Tier] = [pipeline.RegexTier()]
+    if which_tier2 != "none":
+        if which_tier2 == "spacy" and not ner.available():
+            print("WARNING: spaCy model not installed, tier 2 will not run; "
+                  "free-text names will pass through. See requirements-ner.txt.",
+                  file=sys.stderr)
+        else:
+            tiers.append(evaluate.build_tier2(which_tier2))
+    else:
+        print("WARNING: tier 2 disabled; free-text names and organisations "
+              "will pass through unredacted.", file=sys.stderr)
+    return tiers
+
+
+def _announce_profile() -> None:
+    prof = profiles.active()
+    if prof is not None:
+        print(f"site profile: {prof.name} ({prof.pattern_count} extra patterns "
+              f"from {prof.source})", file=sys.stderr)
 
 
 def _cmd_proxy(args: argparse.Namespace) -> int:
     from . import proxy as proxy_mod
 
-    tiers: list[pipeline.Tier] = [pipeline.RegexTier()]
-    if args.tier2 != "none":
-        if args.tier2 == "spacy" and not ner.available():
-            print("WARNING: spaCy model not installed, tier 2 will not run; "
-                  "free-text names will pass through. See requirements-ner.txt.",
-                  file=sys.stderr)
-        else:
-            tiers.append(evaluate.build_tier2(args.tier2))
+    _announce_profile()
+    tiers = _build_tiers(args.tier2)
     if args.vault and Path(args.vault).exists():
         vault = pseudonym.EntityVault.load(args.vault)
     else:
@@ -194,6 +244,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("path", nargs="?")
     r.add_argument("--log", help="write the JSONL decision log here")
     r.add_argument("--vault", help="save the pseudonym vault here")
+    r.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
+                   help="tier 2 backend for free-text names: the trained "
+                        "classifier (default), local spaCy NER, or none")
     r.set_defaults(fn=_cmd_redact)
 
     p = sub.add_parser("proxy", help="run the redacting OpenAI-compatible gateway")

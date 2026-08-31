@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from . import entities
+from . import entities, profiles
 from presidio_analyzer import (
     LocalRecognizer,
     Pattern,
@@ -185,6 +185,23 @@ def connection_string() -> PatternRecognizer:
 
 
 def jwt() -> PatternRecognizer:
+    """Bearer credentials, including the fragments a three-part pattern misses.
+
+    A JWT that has been wrapped, truncated or split across lines is still a
+    credential, and the naive ``a.b.c`` pattern does not match any of those
+    forms. Three patterns instead of one:
+
+    * the full compact serialisation, header.payload.signature;
+    * a two-segment head, header.payload with the signature elsewhere, which is
+      what a wrapped log line leaves behind and which still carries the claims;
+    * whatever follows ``Bearer``, whatever shape it is, because the position
+      is the evidence: a token in an Authorization header is a credential even
+      when it is not a JWT at all.
+
+    A continuation fragment on its own line is handled by
+    ``ContinuationFragmentRecognizer``, which needs line anchoring the pattern
+    engine here cannot express.
+    """
     return PatternRecognizer(
         supported_entity="JWT",
         name="JwtRecognizer",
@@ -194,9 +211,55 @@ def jwt() -> PatternRecognizer:
                 regex=r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
                 score=0.95,
             ),
+            # Header.payload with no signature: a split or truncated token.
+            Pattern(
+                name="jwt-head",
+                regex=r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+                score=0.9,
+            ),
+            # Anything presented as a bearer credential. Fixed-width lookbehind
+            # keeps the span on the credential and off the word "Bearer".
+            Pattern(
+                name="bearer-value",
+                regex=r"(?<=[Bb]earer )[A-Za-z0-9._~+/=-]{10,}",
+                score=0.9,
+            ),
         ],
         context=["bearer", "authorization", "token"],
     )
+
+
+class ContinuationFragmentRecognizer(LocalRecognizer):
+    """A base64url fragment alone on a line, the tail of a split credential.
+
+    Log lines get wrapped by editors, ticket systems and mail clients. The tail
+    of a split token has no internal structure to match: it is just a long
+    base64url run, usually opened by the dot that used to join it to its
+    payload. Anchoring to the line is what makes it safe to match at all, and
+    line anchoring is what Presidio's pattern engine cannot express here.
+    """
+
+    FRAGMENT = re.compile(r"(?m)^[ \t]*(\.[A-Za-z0-9_-]{20,})[ \t]*$")
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["JWT"],
+            name="ContinuationFragmentRecognizer",
+            context=["bearer", "authorization", "token", "continued"],
+        )
+        self.supported_entity = "JWT"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        return [
+            RecognizerResult(entity_type=self.supported_entity, start=m.start(1),
+                             end=m.end(1), score=0.85, analysis_explanation=None)
+            for m in self.FRAGMENT.finditer(text)
+        ]
 
 
 def api_key() -> PatternRecognizer:
@@ -311,19 +374,58 @@ def custom() -> list[LocalRecognizer]:
         windows_user_path(),
         hostname_fqdn(),
         SupportCaseRecognizer(),
+        ContinuationFragmentRecognizer(),
     ]
 
 
-def all_recognizers(*, include_builtins: bool = True) -> list[LocalRecognizer]:
+def profile_recognizers(profile: profiles.SiteProfile | None) -> list[LocalRecognizer]:
+    """Recognizers built from a site profile's patterns.
+
+    These are additive only: they join the registry alongside the built-ins and
+    are subject to the same overlap resolution, so a profile can widen coverage
+    and can never narrow it.
+    """
+    if profile is None:
+        return []
+    out: list[LocalRecognizer] = []
+    for label, items in sorted(profile.patterns.items()):
+        out.append(
+            PatternRecognizer(
+                supported_entity=label,
+                name=f"Profile[{profile.name}]:{label}",
+                patterns=[
+                    Pattern(name=f"profile-{label.lower()}-{i}", regex=regex, score=score)
+                    for i, (regex, score) in enumerate(items)
+                ],
+            )
+        )
+    return out
+
+
+def all_recognizers(
+    *,
+    include_builtins: bool = True,
+    profile: profiles.SiteProfile | None = None,
+    use_active_profile: bool = True,
+) -> list[LocalRecognizer]:
     """The tier 1 registry.
 
     ``include_builtins=False`` gives the custom-only registry, which the eval
     harness uses to measure what the domain-specific recognizers add over stock
     Presidio patterns.
+
+    A site profile is picked up from ``HIDER_PROFILE`` automatically. That is
+    deliberate: a control you have to remember to enable is a control that gets
+    forgotten on the busy day. Pass ``use_active_profile=False`` to measure the
+    repository's own baseline behaviour without it, which is what the eval does
+    so its committed numbers stay reproducible on any machine.
     """
     regs: list[LocalRecognizer] = list(custom())
     if include_builtins:
         regs = builtins() + regs
+    if profile is None and use_active_profile:
+        profile = profiles.active()
+    regs = regs + profile_recognizers(profile)
     return regs
 
 
@@ -334,7 +436,7 @@ def analyze(text: str, recognizers: list[LocalRecognizer]) -> list[RecognizerRes
         # A broken recognizer must not silently drop coverage, so nothing is
         # caught here. The pipeline decides what a tier failure means.
         out.extend(rec.analyze(text, entities=rec.supported_entities, nlp_artifacts=None))
-    return suppress(text, out)
+    return refine(text, suppress(text, out))
 
 # ---------------------------------------------------------------------------
 # Suppression: the precision half of the job
@@ -358,6 +460,47 @@ _PUBLIC_HOSTS = re.compile(
     r"login\.microsoftonline\.com|login\.windows\.net|management\.azure\.com|"
     r"api\.slack\.com|www\.googleapis\.com|sts\.amazonaws\.com|api\.github\.com)\b"
 )
+
+
+#: What a GUID is, when the surrounding text says so. Every GUID is the same
+#: 36 characters, so a detector cannot type one from the token alone. It can
+#: read the word in front of it, and that is worth doing: a pseudonym that
+#: calls a tenant id "Session-02" invites a model to reason about two sessions
+#: where there is one session and one tenant.
+_GUID_KINDS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\b(?:tenant|directory|organisation|organization|customer)\b"
+                r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"), "TENANT_ID"),
+    (re.compile(r"(?i)\b(?:session|job|run|execution|task|activity)\b"
+                r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"), "SESSION_GUID"),
+    (re.compile(r"(?i)\b(?:mailbox|item|object|site|collection|folder|user|drive)\b"
+                r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"), "OBJECT_GUID"),
+)
+
+
+def refine(text: str, results: list[RecognizerResult]) -> list[RecognizerResult]:
+    """Relabel a bare GUID when its context names what kind of id it is.
+
+    Only the label changes, never the span, so this cannot alter coverage in
+    either direction. An unrecognised context leaves the generic ``GUID``
+    label, which is the honest answer rather than a guess: the pseudonym for it
+    reads ``<Guid-07>`` and asserts nothing.
+    """
+    out: list[RecognizerResult] = []
+    for r in results:
+        if r.entity_type != "GUID":
+            out.append(r)
+            continue
+        before = text[max(0, r.start - 48):r.start]
+        label = "GUID"
+        for rx, kind in _GUID_KINDS:
+            if rx.search(before):
+                label = kind
+                break
+        out.append(
+            RecognizerResult(entity_type=label, start=r.start, end=r.end,
+                             score=r.score, analysis_explanation=r.analysis_explanation)
+        )
+    return out
 
 
 def suppress(text: str, results: list[RecognizerResult]) -> list[RecognizerResult]:

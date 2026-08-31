@@ -74,9 +74,13 @@ class RegexTier:
     name = "tier1"
     cost_per_1k_chars = 0.0
 
-    def __init__(self, *, include_builtins: bool = True, include_custom: bool = True) -> None:
+    def __init__(self, *, include_builtins: bool = True, include_custom: bool = True,
+                 use_active_profile: bool = True) -> None:
         if include_custom:
-            self.recognizers = recognizers.all_recognizers(include_builtins=include_builtins)
+            self.recognizers = recognizers.all_recognizers(
+                include_builtins=include_builtins,
+                use_active_profile=use_active_profile,
+            )
         else:
             # Baseline configuration: stock Presidio patterns only, so the
             # uplift from the domain-specific recognizers is a measured delta.

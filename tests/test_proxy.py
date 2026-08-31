@@ -21,7 +21,7 @@ from hider import pipeline, pseudonym, proxy
 SECRET_LINE = (
     "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd for anna.novak@contoso.com "
     "on wkr-amer-prx117 token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJzdWIiOiJ2ZGMtcHJvZC0wMDEiLCJpYXQiOjE3NTUwMDAwMDB9."
+    "eyJzdWIiOiJzdmMtYWJjLTAwMSIsImlhdCI6MTc1NTAwMDAwMH0."
     "QQQQQQQQQQQQQQQQQQQQQQQ "
     "upload https://stor9f2c1a8b3d.blob.core.windows.net/repo/chunk881.bin"
     "?sv=2024-11-04&sig=Q1dEZm5rTHhWc0h0YkpQd0dyTm1YeVpjQXNEZmdIamtM%3D"

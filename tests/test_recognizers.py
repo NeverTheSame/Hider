@@ -29,11 +29,11 @@ def covered(line: str, value: str) -> bool:
 
 
 CASES = [
-    ("GUID", "[Session] Backup session a41f77c2-9be1-4c33-8f0e-1122aabbccdd started",
+    ("SESSION_GUID", "[Session] Backup session a41f77c2-9be1-4c33-8f0e-1122aabbccdd started",
      "a41f77c2-9be1-4c33-8f0e-1122aabbccdd"),
-    ("GUID", 'session={a41f77c2-9be1-4c33-8f0e-1122aabbccdd} braced',
+    ("SESSION_GUID", 'session={a41f77c2-9be1-4c33-8f0e-1122aabbccdd} braced',
      "a41f77c2-9be1-4c33-8f0e-1122aabbccdd"),
-    ("GUID", "session=a41f77c29be14c338f0e1122aabbccdd n-format",
+    ("SESSION_GUID", "session=a41f77c29be14c338f0e1122aabbccdd n-format",
      "a41f77c29be14c338f0e1122aabbccdd"),
     ("WORKER_POD_ID", "[Agent] Agent wkr-amer-prx117 heartbeat received", "wkr-amer-prx117"),
     ("WORKER_POD_ID", '{"pod":"wkr-emea-rg124","msg":"claim"}', "wkr-emea-rg124"),
@@ -121,3 +121,72 @@ def test_custom_registry_adds_to_stock_presidio():
     full = types_in(line)
     assert full - stock
     assert stock <= full
+
+
+# ---------------------------------------------------------------------------
+# Bearer credentials in every shape a wrapped log line produces.
+#
+# Regression: the three-part JWT pattern never matched a token whose signature
+# had been split onto the next line, so the head stayed in the clear, reached
+# the residue, and with tier 3 enabled was sent to the model provider. The
+# adversarial case that covered this had an owner note asserting the head "is
+# destroyed", which it was not. Every shape below now destroys.
+# ---------------------------------------------------------------------------
+
+JWT_HEAD = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdmMtYWJjLTAwMSJ9"
+JWT_SIG = ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+
+
+@pytest.mark.parametrize("line,value", [
+    (f"[Auth] Authorization: Bearer {JWT_HEAD}{JWT_SIG}", JWT_HEAD + JWT_SIG),
+    (f"[Auth] Authorization: Bearer {JWT_HEAD}", JWT_HEAD),
+    (f"[Auth] token={JWT_HEAD} refreshed", JWT_HEAD),
+    ("[Auth] Authorization: Bearer aGVsbG8td29ybGQtb3BhcXVlLXRva2Vu",
+     "aGVsbG8td29ybGQtb3BhcXVlLXRva2Vu"),
+    (f"    {JWT_SIG}", JWT_SIG),
+])
+def test_every_bearer_credential_shape_is_found(line, value):
+    assert covered(line, value)
+    assert "JWT" in types_in(line)
+
+
+def test_a_split_credential_leaves_nothing_in_the_residue():
+    """The property that actually matters: no fragment survives to a later tier."""
+    from hider import pipeline, pseudonym
+    wrapped = f"[Auth] Authorization: Bearer {JWT_HEAD} \\\n    {JWT_SIG}"
+    p = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k"))
+    for i, line in enumerate(wrapped.split("\n")):
+        spans, _ = p.detect(line)
+        residue = "".join(line[s:e] for s, e in pipeline.residue_segments(len(line), spans))
+        assert "eyJ" not in residue
+        assert "dozjgNry" not in residue
+
+
+def test_the_word_bearer_alone_is_not_a_credential():
+    assert "JWT" not in types_in("[Auth] Bearer token refresh scheduled in 30 ms")
+
+
+# ---------------------------------------------------------------------------
+# GUID subtyping. Label only, never the span.
+# ---------------------------------------------------------------------------
+
+GUID_A = "6cafd2ac-dd19-d991-291a-8d565940996d"
+
+
+@pytest.mark.parametrize("line,expected", [
+    (f"[Restore] Execution session {GUID_A} started", "SESSION_GUID"),
+    (f"[Tenant] tenant {GUID_A} quota 91% used", "TENANT_ID"),
+    (f"[Tenant] tenant id {GUID_A} quota", "TENANT_ID"),
+    (f"[Restore] source collection {GUID_A} exported", "OBJECT_GUID"),
+    (f"[Dump] Reading {GUID_A} from disk", "GUID"),
+])
+def test_a_guid_is_typed_from_the_words_around_it(line, expected):
+    labels = {r.entity_type for r in R.analyze(line, REGS) if line[r.start:r.end] == GUID_A}
+    assert labels == {expected}
+
+
+def test_subtyping_never_changes_the_span():
+    for line in (f"session {GUID_A} x", f"tenant {GUID_A} x", f"Reading {GUID_A} x"):
+        hits = [r for r in R.analyze(line, REGS) if "GUID" in r.entity_type or "TENANT" in r.entity_type]
+        assert [(h.start, h.end) for h in hits] == [(line.index(GUID_A),
+                                                     line.index(GUID_A) + len(GUID_A))]

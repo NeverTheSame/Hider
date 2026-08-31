@@ -1,0 +1,23 @@
+{
+  "name": "example-site",
+  "_comment": [
+    "Copy this file somewhere outside the repository, replace the patterns with",
+    "the naming schemes your own estate uses, and point HIDER_PROFILE at it.",
+    "Do not commit a filled-in profile: identifier formats describe your",
+    "topology, which is part of what the redaction layer exists to hide.",
+    "A profile can only ADD patterns. It cannot weaken a built-in recognizer,",
+    "and anything malformed here is a startup error rather than a silent skip.",
+    "Entries are a regex string, or an object with 'regex' and 'score'."
+  ],
+  "patterns": {
+    "WORKER_POD_ID": [
+      "\\bacme-[a-z]{3,6}-(?:prx|rg|wrk|node)\\d{1,4}\\b"
+    ],
+    "SERVICE_INSTANCE_ID": [
+      { "regex": "\\bacme-svc-[a-z]{3,6}-[a-z]{2,8}-\\d{1,4}\\b", "score": 0.95 }
+    ],
+    "HOSTNAME_FQDN": [
+      "\\b[a-z0-9-]{1,40}\\.acme-internal\\.example\\b"
+    ]
+  }
+}
