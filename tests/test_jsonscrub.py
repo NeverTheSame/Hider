@@ -140,3 +140,19 @@ def test_log_vocabulary_is_not_a_name_and_prefix_terms():
     msg = res.output["message"]
     assert "Too Many Requests" in msg and "Site Pages" in msg
     assert "acmeimd" not in msg.lower()
+
+
+def test_word_list_is_bundled_not_read_from_the_os(monkeypatch):
+    # Linux CI images have no /usr/share/dict/words; the filter must not depend on it.
+    import builtins
+
+    real_open = builtins.open
+
+    def guarded(path, *a, **k):
+        assert "/usr/share/dict" not in str(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", guarded)
+    monkeypatch.setattr(jsonscrub, "_COMMON", None)
+    assert jsonscrub._WORDS_FILE.is_relative_to(jsonscrub.Path(jsonscrub.__file__).parent)
+    assert all(jsonscrub._is_common(w) for w in ("server", "records", "sites"))

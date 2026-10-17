@@ -27,9 +27,11 @@ and is returned separately so it can stay on this machine.
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from . import evaluate, localcfg, pipeline, pseudonym
@@ -335,15 +337,17 @@ _PLAIN_KEY = re.compile(r"^(?!.*\d{4})[A-Za-z_][A-Za-z0-9_ ()/-]{0,63}$")
 _COMMON: set[str] | None = None
 
 
+#: Bundled, so the noise filter behaves the same on every OS. Reading the
+#: system word list instead silently gave an empty set on Linux.
+_WORDS_FILE = Path(__file__).resolve().parent / "data" / "common_words.txt.gz"
+
+
 def _common_words() -> set[str]:
-    """Lowercase entries of the system word list (macOS /usr/share/dict/words)."""
+    """Lowercase dictionary words (Webster's Second, public domain), loaded once."""
     global _COMMON
     if _COMMON is None:
-        try:
-            with open("/usr/share/dict/words", encoding="utf-8") as fh:
-                _COMMON = {w.strip() for w in fh if w.strip() and w.strip().islower()}
-        except OSError:
-            _COMMON = set()
+        with gzip.open(_WORDS_FILE, "rt", encoding="utf-8") as fh:
+            _COMMON = {w.strip() for w in fh if w.strip() and not w.startswith("#")}
     return _COMMON
 
 

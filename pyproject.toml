@@ -45,6 +45,9 @@ hider = "hider.cli:main"
 [tool.setuptools]
 packages = ["hider"]
 
+[tool.setuptools.package-data]
+hider = ["data/*.txt.gz"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
