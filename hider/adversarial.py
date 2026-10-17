@@ -27,6 +27,13 @@ UNIT = "Adversarial/hostile-placements.log"
 
 @dataclass(frozen=True)
 class Case:
+    """One hostile placement.
+
+    ``template`` carries inline ``<<TYPE|value>>`` markup, ``expect_tier1`` says
+    in advance whether tier 1 should catch it, and ``owner`` explains a declared
+    gap so a known limitation cannot pass for a success.
+    """
+
     case_id: str
     description: str
     template: str

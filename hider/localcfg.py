@@ -26,6 +26,11 @@ _KEYS = {"portal_url": str, "vendor_suffixes": list, "vendor_hosts": list}
 
 @lru_cache(maxsize=1)
 def settings() -> dict:
+    """The local settings dict, or {} when there is no file.
+
+    Cached after the first call. Raises RuntimeError when ``HIDER_LOCAL`` names
+    a missing file or the file is malformed.
+    """
     path = Path(os.environ.get(ENV) or DEFAULT).expanduser()
     if not path.is_file():
         if os.environ.get(ENV):

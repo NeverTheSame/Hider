@@ -41,9 +41,12 @@ import hashlib
 import re
 import threading
 from collections.abc import Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from .pipeline import Span
+
+if TYPE_CHECKING:
+    from presidio_analyzer.nlp_engine import NlpArtifacts
 
 #: Raw NER labels this tier maps to spec entity types. The keys are spaCy's
 #: labels; Presidio's NLP engine already normalises ORG to ORGANIZATION when
@@ -66,7 +69,9 @@ _CACHE_MAX = 4096
 class NlpEngine(Protocol):
     """The slice of Presidio's NLP engine this tier needs."""
 
-    def process_text(self, text: str, language: str): ...
+    def process_text(self, text: str, language: str) -> NlpArtifacts:
+        """Run the NLP pipeline over ``text`` and return its artifacts."""
+        ...
 
 
 def default_engine() -> NlpEngine:
@@ -190,6 +195,7 @@ class LocalNerTier:
         return spans
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        """Run local NER over each residue segment and return spans in document offsets."""
         out: list[Span] = []
         for start, end in residue:
             segment = text[start:end]

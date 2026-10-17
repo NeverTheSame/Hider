@@ -368,6 +368,7 @@ def _cmd_unmask(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line and run the chosen subcommand; returns the exit code."""
     ap = argparse.ArgumentParser(prog="hider", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

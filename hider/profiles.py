@@ -50,6 +50,8 @@ class ProfileError(RuntimeError):
 
 @dataclass(frozen=True)
 class SiteProfile:
+    """A validated site profile: its name, extra patterns per detector label, and source path."""
+
     name: str
     #: detector label -> tuple of (regex source, score)
     patterns: dict[str, tuple[tuple[str, float], ...]]
@@ -57,10 +59,16 @@ class SiteProfile:
 
     @property
     def pattern_count(self) -> int:
+        """Total number of patterns across all labels."""
         return sum(len(v) for v in self.patterns.values())
 
 
 def parse(raw: dict, *, source: str = "") -> SiteProfile:
+    """Validate a profile dict and build a SiteProfile.
+
+    Raises ProfileError on an unknown label, an empty or uncompilable regex, or
+    a score outside (0, 1]. Never returns a partial profile.
+    """
     if not isinstance(raw, dict):
         raise ProfileError(f"{source or 'profile'}: top level must be an object")
     name = raw.get("name") or "unnamed"
@@ -109,6 +117,7 @@ def parse(raw: dict, *, source: str = "") -> SiteProfile:
 
 
 def load(path: str | Path) -> SiteProfile:
+    """Read and parse a profile file; raises ProfileError if it is missing or not valid JSON."""
     p = Path(path).expanduser()
     if not p.is_file():
         raise ProfileError(f"{ENV_PROFILE} points at {p}, which is not a readable file")

@@ -620,12 +620,20 @@ def _fqdn_spans(line: str) -> list[pipeline.Span]:
 
 @dataclass
 class Result:
+    """The obfuscated document, the label -> original mapping, and run statistics."""
+
     output: Any
     mapping: dict[str, str]
     stats: dict[str, Any] = field(default_factory=dict)
 
 
 class JsonScrubber:
+    """One obfuscation run over one JSON document.
+
+    Holds the vault and the known-value index, so a value gets the same label
+    everywhere it appears in the document. Use a fresh instance per document.
+    """
+
     def __init__(self, tier2: str = "classifier", terms: list[str] | None = None) -> None:
         self.terms = [t.strip() for t in (terms or []) if t and t.strip()]
         self._prefixes: list[str] = []
@@ -927,6 +935,12 @@ class JsonScrubber:
     # -- entry point -------------------------------------------------------
 
     def run(self, doc: Any) -> Result:
+        """Obfuscate ``doc`` and return the result.
+
+        Registers the user's terms, harvests values under sensitive keys, rewrites
+        the document, sweeps it once more for anything that slipped past, and runs
+        the leak check. The input document is not modified.
+        """
         for t in self.terms:
             # User-named terms ("ACME") are hidden whatever their length;
             # "acme*" hides any word that starts with it.
@@ -970,6 +984,7 @@ class JsonScrubber:
 
 
 def scrub(doc: Any, tier2: str = "classifier", terms: list[str] | None = None) -> Result:
+    """Obfuscate a parsed JSON document with a fresh scrubber; see ``JsonScrubber.run``."""
     return JsonScrubber(tier2=tier2, terms=terms).run(doc)
 
 

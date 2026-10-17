@@ -25,6 +25,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import csvmerge, jsonscrub, localcfg, research
@@ -260,6 +261,11 @@ def _safe_stem(name: str) -> str:
 def obfuscate_text(
     raw: str, name: str = "input.json", tier2: str = "classifier", terms: list[str] | None = None
 ) -> dict:
+    """Obfuscate a JSON or JSON Lines string and save both halves under ``out/json/``.
+
+    Returns the output text, the mapping, the stats, the run name and the saved
+    paths. The mapping file holds real values and stays on this machine.
+    """
     doc, jsonl = jsonscrub.parse(raw)
     with _LOCK:
         res = jsonscrub.scrub(doc, tier2=tier2, terms=terms)
@@ -294,9 +300,12 @@ def obfuscate_text(
 
 
 class Handler(BaseHTTPRequestHandler):
+    """The web UI's request handler: serves the page and the local JSON API."""
+
     tier2 = "classifier"
 
-    def log_message(self, fmt, *args):  # no bodies or values in the console
+    def log_message(self, fmt: str, *args: Any) -> None:  # no bodies or values in the console
+        """Log the request line only, never a body or a value."""
         sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
@@ -312,7 +321,8 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json")
 
-    def do_GET(self):
+    def do_GET(self) -> None:
+        """Serve the page, the list of runs, or a Claude Code job's status."""
         url = urlparse(self.path)
         if url.path in ("/", "/index.html"):
             page = PAGE.replace("__REPO__", str(OUT.parent.parent)).replace(
@@ -329,7 +339,11 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
-    def do_POST(self):
+    def do_POST(self) -> None:
+        """Handle an API call: obfuscate, merge CSV parts, mask, ask or unmask.
+
+        Refuses cross-origin posts (403) and bodies outside the size limit (413).
+        """
         url = urlparse(self.path)
         if url.path not in ("/api/obfuscate", "/api/mask", "/api/ask", "/api/unmask", "/api/csv"):
             return self._json(404, {"error": "not found"})
@@ -409,6 +423,11 @@ class Handler(BaseHTTPRequestHandler):
 def serve(
     host: str = "127.0.0.1", port: int = 8790, tier2: str = "classifier", allow_remote: bool = False
 ) -> None:
+    """Run the web UI until interrupted.
+
+    Refuses a non-loopback address unless ``allow_remote`` is set, and trains
+    the tier 2 model before the first request.
+    """
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:

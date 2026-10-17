@@ -47,6 +47,7 @@ class Occurrence:
 
     @property
     def key(self) -> tuple:
+        """A tuple identifying this occurrence: unit, line, offsets and entity type."""
         return (self.unit, self.line_no, self.start, self.end, self.entity_type)
 
 

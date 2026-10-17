@@ -162,6 +162,12 @@ class RedactionGateway:
     # -- upstream ----------------------------------------------------------
 
     def forward(self, path: str, payload: bytes, headers: dict) -> tuple[int, bytes, str]:
+        """POST the already-redacted payload upstream and return (status, body, content type).
+
+        Hop-by-hop headers are dropped and ``X-Hider-Redacted`` is added. An
+        upstream HTTP error is passed back as is; a transport failure raises
+        Refused(502), because nobody can be sure what the provider saw.
+        """
         req = urllib.request.Request(self.upstream_base + path, data=payload, method="POST")
         for k, v in headers.items():
             if k.lower() not in HOP_BY_HOP:
@@ -187,6 +193,7 @@ class RedactionGateway:
     # -- response rewriting ------------------------------------------------
 
     def detokenize_response(self, body: dict) -> None:
+        """Replace pseudonyms with real values, in place, in each choice's message content or text."""
         choices = body.get("choices")
         if not isinstance(choices, list):
             return
@@ -214,6 +221,12 @@ class RedactionGateway:
     # -- one request -------------------------------------------------------
 
     def handle(self, path: str, payload: bytes, headers: dict) -> tuple[int, bytes, str]:
+        """Redact one request, forward it, and de-tokenise a successful JSON reply.
+
+        Raises Refused(400) on a payload that is not a JSON object. A non-JSON
+        upstream body is passed through untouched. Every call is recorded in the
+        decision log.
+        """
         try:
             body = json.loads(payload.decode("utf-8"))
             if not isinstance(body, dict):
@@ -283,6 +296,7 @@ def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTT
 
 
 def serve(host: str, port: int, gateway: RedactionGateway) -> None:
+    """Run the proxy on ``host:port`` until interrupted."""
     httpd = make_server(host, port, gateway)
     print(
         f"hider gateway on http://{host}:{port} -> {gateway.upstream_base} "

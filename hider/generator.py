@@ -82,11 +82,14 @@ class Unit:
 
     @property
     def text(self) -> str:
+        """The unit's lines joined with newlines."""
         return "\n".join(self.lines)
 
 
 @dataclass
 class Corpus:
+    """A generated bundle: its units, the ground truth for every planted value, and the clean units."""
+
     units: list[Unit] = field(default_factory=list)
     truth: list[Occurrence] = field(default_factory=list)
     #: Units known to contain no sensitive values. False redactions here are
@@ -96,13 +99,16 @@ class Corpus:
 
     @property
     def total_lines(self) -> int:
+        """Number of lines across all units."""
         return sum(len(u.lines) for u in self.units)
 
     @property
     def total_chars(self) -> int:
+        """Number of characters across all units."""
         return sum(len(u.text) for u in self.units)
 
     def unit(self, path: str) -> Unit:
+        """The unit with the given path; raises KeyError if there is none."""
         for u in self.units:
             if u.path == path:
                 return u
@@ -110,6 +116,7 @@ class Corpus:
 
 
 def load_templates(path: str | Path = DEFAULT_TEMPLATES) -> dict:
+    """Load the placeholder templates JSON (by default ``templates/support_bundle.json``)."""
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 

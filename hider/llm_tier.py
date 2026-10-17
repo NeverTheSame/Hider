@@ -57,6 +57,7 @@ class LlmTierError(Exception):
 
 
 def build_prompt(segment: str) -> str:
+    """The tier 3 prompt for one residue segment, with the segment fenced as untrusted data."""
     return f"{_SYSTEM_PREAMBLE}\n\n{_INSTRUCTIONS}\n\n<<<DATA\n{segment}\nDATA>>>\n"
 
 
@@ -105,6 +106,12 @@ def _find_all(haystack: str, needle: str) -> list[int]:
 def detect(
     backend: Backend, text: str, residue: Sequence[tuple[int, int]], *, tier_name: str = "tier3"
 ) -> list:
+    """Ask the backend about each residue segment and return verified spans.
+
+    Every finding must be a literal quote from its segment: a quote that is not
+    there is discarded, and every occurrence of a verified quote is redacted.
+    A malformed response raises, which fails the unit closed.
+    """
     from .pipeline import Span  # local import: pipeline imports this module lazily too
 
     spans: list[Span] = []

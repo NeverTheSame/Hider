@@ -149,6 +149,7 @@ class EntityVault:
     # -- persistence -------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
+        """Write the vault's entries and counters to ``path`` as JSON. The file holds real values."""
         Path(path).write_text(
             json.dumps(
                 {
@@ -165,6 +166,7 @@ class EntityVault:
 
     @classmethod
     def load(cls, path: str | Path, key: bytes | None = None) -> EntityVault:
+        """Load a vault saved by ``save``, using ``key`` or the configured vault key."""
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         v = cls(key=key or _load_key(), entries=raw["entries"], _counters=raw["counters"])
         v.by_label = {
@@ -174,6 +176,7 @@ class EntityVault:
 
     @property
     def size(self) -> int:
+        """Number of stored identifier entries, not counting internal bookkeeping entries."""
         return sum(1 for e in self.entries.values() if not e["type"].startswith("_"))
 
 
@@ -228,4 +231,5 @@ def _load_key() -> bytes:
 
 
 def destroyed_marker(entity_type: str, value: str = "") -> str:
+    """The irreversible ``<REDACTED:TYPE>`` marker that replaces a secret."""
     return f"<REDACTED:{_canonical_type(entity_type, value)}>"

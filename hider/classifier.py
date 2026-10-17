@@ -191,12 +191,15 @@ O_TAG = "O"
 
 @dataclass(frozen=True)
 class Token:
+    """A word token and its character offsets in the source text."""
+
     text: str
     start: int
     end: int
 
 
 def tokenize(text: str) -> list[Token]:
+    """Split text into word tokens, keeping each token's character offsets."""
     return [Token(m.group(0), m.start(), m.end()) for m in _TOKEN_RE.finditer(text)]
 
 
@@ -243,6 +246,7 @@ def _token_features(tokens: Sequence[Token], i: int) -> dict:
 
 
 def featurize(tokens: Sequence[Token]) -> list[dict]:
+    """Feature dicts for every token, in order, using its neighbours as context."""
     return [_token_features(tokens, i) for i in range(len(tokens))]
 
 
@@ -281,6 +285,11 @@ def _render_sentence(rng: random.Random) -> tuple[str, list[tuple[int, int, str]
 
 
 def training_examples(seed: int, n_sentences: int) -> tuple[list[dict], list[str]]:
+    """Generate (features, BIO labels) from synthetic sentences.
+
+    Deterministic for a given seed. Every sentence is rendered from the training
+    vocabulary, which is disjoint from the one the eval corpus is seeded from.
+    """
     rng = random.Random(seed)
     features: list[dict] = []
     labels: list[str] = []
@@ -299,6 +308,8 @@ def training_examples(seed: int, n_sentences: int) -> tuple[list[dict], list[str
 
 @dataclass
 class TrainedNerClassifier:
+    """A fitted vectorizer and logistic regression model, plus how it was trained."""
+
     vectorizer: DictVectorizer
     model: LogisticRegression
     seed: int
@@ -306,6 +317,10 @@ class TrainedNerClassifier:
 
 
 def train(seed: int = 20260821, n_sentences: int = 500) -> TrainedNerClassifier:
+    """Fit the tier 2 token classifier on synthetic training sentences.
+
+    Runs locally in memory; nothing is downloaded and nothing is written to disk.
+    """
     features, labels = training_examples(seed, n_sentences)
     vec = DictVectorizer(sparse=True)
     x = vec.fit_transform(features)

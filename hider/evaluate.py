@@ -28,6 +28,7 @@ from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import adversarial, entities, generator, ner, pipeline, pseudonym
 from .llm_backend import Backend
@@ -81,6 +82,8 @@ FREETEXT_RECALL_FLOOR = 0.75
 
 @dataclass
 class TypeScore:
+    """Recall bookkeeping for one entity type: seeded, covered, partial and typed counts."""
+
     entity_type: str
     seeded: int = 0
     covered: int = 0
@@ -91,14 +94,17 @@ class TypeScore:
 
     @property
     def missed(self) -> int:
+        """Seeded values of this type that were not covered."""
         return self.seeded - self.covered
 
     @property
     def recall(self) -> float:
+        """Share of seeded values covered, or 0.0 when none were seeded."""
         return self.covered / self.seeded if self.seeded else 0.0
 
     @property
     def typed_recall(self) -> float:
+        """Share of seeded values covered and given the right type, or 0.0 when none were seeded."""
         return self.typed / self.seeded if self.seeded else 0.0
 
 
@@ -123,6 +129,7 @@ class CaseResult:
 
     @property
     def caught_all(self) -> bool:
+        """True when the case seeded shaped values and every one of them was covered."""
         return self.shaped_seeded > 0 and self.shaped_covered == self.shaped_seeded
 
     @property
@@ -133,6 +140,8 @@ class CaseResult:
 
 @dataclass
 class Report:
+    """Everything one eval run measured: recall per type, precision, cost, cases and tier stats."""
+
     label: str
     lines: int = 0
     chars: int = 0
@@ -169,14 +178,17 @@ class Report:
 
     @property
     def seeded(self) -> int:
+        """Total seeded values across all types."""
         return sum(t.seeded for t in self.types.values())
 
     @property
     def covered(self) -> int:
+        """Total seeded values covered across all types."""
         return sum(t.covered for t in self.types.values())
 
     @property
     def recall(self) -> float:
+        """Recall across all types, or 0.0 when nothing was seeded."""
         return self.covered / self.seeded if self.seeded else 0.0
 
     @property
@@ -200,10 +212,12 @@ class Report:
 
     @property
     def below_freetext_floor(self) -> bool:
+        """True when tier 2 ran and free-text recall fell below the floor."""
         return self.ner_enabled and self.freetext_recall < FREETEXT_RECALL_FLOOR
 
     @property
     def false_redaction_rate(self) -> float:
+        """Share of known-clean lines that had anything redacted."""
         return (self.clean_lines_with_redaction / self.clean_lines) if self.clean_lines else 0.0
 
     @property
@@ -218,6 +232,7 @@ class Report:
 
     @property
     def cost_reduction(self) -> float:
+        """Fractional saving from sending only tier 1's residue, not everything, to a managed NER tier."""
         n = self.naive_ner_cost_usd
         return (n - self.tiered_ner_cost_usd) / n if n else 0.0
 
@@ -233,6 +248,7 @@ class Report:
 
     @property
     def surprises(self) -> list[CaseResult]:
+        """Adversarial cases whose outcome contradicted what they declared in advance."""
         return [c for c in self.cases if c.surprise]
 
     @property
@@ -256,6 +272,7 @@ class Report:
         return 1 - (caught / total)
 
     def to_dict(self) -> dict:
+        """The report as a JSON-ready dict, the shape written to metrics.json."""
         return {
             "label": self.label,
             "lines": self.lines,
@@ -591,7 +608,7 @@ def run(
 
 
 def run_with_baseline(
-    *, tier2: str | None = "classifier", tier3: Backend | None = None, **kwargs
+    *, tier2: str | None = "classifier", tier3: Backend | None = None, **kwargs: Any
 ) -> tuple[Report, Report, dict[str, list[str]], generator.Corpus]:
     """Run the full configuration and the stock-Presidio baseline on one corpus.
 
@@ -620,4 +637,5 @@ def run_with_baseline(
 
 
 def save(report: Report, path: str | Path) -> None:
+    """Write the report's dict form to ``path`` as indented JSON."""
     Path(path).write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")

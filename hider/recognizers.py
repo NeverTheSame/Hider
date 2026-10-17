@@ -15,6 +15,7 @@ consulted.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from presidio_analyzer import (
     LocalRecognizer,
@@ -28,6 +29,9 @@ from presidio_analyzer.predefined_recognizers import (
 )
 
 from . import entities, profiles
+
+if TYPE_CHECKING:
+    from presidio_analyzer.nlp_engine import NlpArtifacts
 
 TIER1 = "tier1"
 
@@ -171,6 +175,7 @@ def presigned_url() -> PatternRecognizer:
 
 
 def connection_string() -> PatternRecognizer:
+    """Recognizer for storage and database connection strings and their account keys."""
     return PatternRecognizer(
         supported_entity="CONNECTION_STRING",
         name="ConnectionStringRecognizer",
@@ -256,9 +261,17 @@ class ContinuationFragmentRecognizer(LocalRecognizer):
         self.supported_entity = "JWT"
 
     def load(self) -> None:
+        """Nothing to load; required by the recognizer interface."""
         return None
 
-    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+    def analyze(
+        self,
+        text: str,
+        entities: list[str],
+        nlp_artifacts: NlpArtifacts | None = None,
+        regex_flags: int | None = None,
+    ) -> list[RecognizerResult]:
+        """Return a result for each line that holds only a dot-prefixed fragment, the tail of a wrapped token."""
         if entities and self.supported_entity not in entities:
             return []
         return [
@@ -274,6 +287,7 @@ class ContinuationFragmentRecognizer(LocalRecognizer):
 
 
 def api_key() -> PatternRecognizer:
+    """Recognizer for prefixed API keys such as ``sk-...``."""
     return PatternRecognizer(
         supported_entity="API_KEY",
         name="ApiKeyRecognizer",
@@ -348,9 +362,17 @@ class SupportCaseRecognizer(LocalRecognizer):
         self.supported_entity = "SUPPORT_CASE_NUMBER"
 
     def load(self) -> None:  # required by EntityRecognizer, nothing to load
+        """Nothing to load; required by the recognizer interface."""
         return None
 
-    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+    def analyze(
+        self,
+        text: str,
+        entities: list[str],
+        nlp_artifacts: NlpArtifacts | None = None,
+        regex_flags: int | None = None,
+    ) -> list[RecognizerResult]:
+        """Return a result for every eight-digit number introduced by a case, ticket, SR or incident phrase."""
         if entities and self.supported_entity not in entities:
             return []
         return [
@@ -368,10 +390,12 @@ class SupportCaseRecognizer(LocalRecognizer):
 #: Presidio built-ins reused verbatim. Reuse over reimplementation: these two
 #: are pattern-based and run without an NLP engine, exactly like the custom set.
 def builtins() -> list[PatternRecognizer]:
+    """The reused Presidio built-in recognizers: email and IP address."""
     return [EmailRecognizer(), IpRecognizer()]
 
 
 def custom() -> list[LocalRecognizer]:
+    """Hider's own tier 1 recognizers, in registration order."""
     return [
         upn_email(),
         any_guid(),

@@ -38,6 +38,13 @@ def collect(paths: list[str]) -> list[tuple[str, str]]:
 
 
 def merge(files: list[tuple[str, str]], meta: dict | None = None) -> dict:
+    """Merge CSV parts into one document: metadata, ``parts`` and ``records``.
+
+    Parts are ordered by their ``-partN`` number and each part's header row is
+    dropped. ``session_start`` is taken from the first file name when ``meta``
+    does not set it. Raises ValueError when no files are given or a part's
+    columns differ from the first part's.
+    """
     if not files:
         raise ValueError("no CSV files given")
     files = sorted(files, key=lambda f: (_part_no(f[0]), f[0]))

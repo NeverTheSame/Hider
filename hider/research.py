@@ -271,6 +271,13 @@ def _unmask_bare(chunk: str, mapping: dict[str, str]) -> tuple[str, int]:
 
 
 def claude_command(prompt: str | None = None, model: str | None = None) -> list[str]:
+    """The locked-down ``claude`` command line.
+
+    With ``prompt`` it is a headless one-shot run with JSON output and no saved
+    session; without it, the command for an interactive session. Either way it
+    uses restricted mode, no MCP servers, only Read, Grep and Glob, and the
+    data-handling instructions.
+    """
     cmd = ["claude"]
     if prompt is not None:
         cmd += ["-p", prompt, "--output-format", "json", "--no-session-persistence"]

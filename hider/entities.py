@@ -436,6 +436,7 @@ SECRET_TYPES: frozenset[str] = frozenset(s.name for s in SPECS if s.handling == 
 
 
 def spec(name: str) -> EntitySpec:
+    """The spec for an entity type by name; raises KeyError listing the known types."""
     try:
         return BY_NAME[name]
     except KeyError:

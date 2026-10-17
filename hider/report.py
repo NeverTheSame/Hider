@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import html
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import entities
 from .evaluate import FREETEXT_RECALL_FLOOR, NER_USD_PER_1K_CHARS, Report
+
+if TYPE_CHECKING:
+    from .generator import Corpus
+    from .pipeline import Pipeline, Span
 
 CSS = """
 :root {
@@ -118,6 +123,7 @@ def build(
     *,
     title: str = "Hider: what the model provider actually sees",
 ) -> str:
+    """Render the self-contained HTML report for a run, its baseline and a demo excerpt."""
     tier2_short = {"classifier": "trained classifier", "spacy": "local spaCy NER"}.get(
         report.tier2_backend, report.tier2_backend or "tier 2"
     )
@@ -370,7 +376,9 @@ generated locally.</footer>
 """
 
 
-def excerpt_from(corpus, pipe, *, unit_hint: str = "", n: int = 14):
+def excerpt_from(
+    corpus: Corpus, pipe: Pipeline, *, unit_hint: str = "", n: int = 14
+) -> list[tuple[str, str, list[Span], list[str]]]:
     """Pick a demo excerpt and run it, returning rows for the side-by-side view."""
     unit = None
     for u in corpus.units:
@@ -391,6 +399,7 @@ def excerpt_from(corpus, pipe, *, unit_hint: str = "", n: int = 14):
 
 
 def write(path: str | Path, htmltext: str) -> Path:
+    """Write the report HTML to ``path``, creating parent folders, and return the path."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(htmltext, encoding="utf-8")

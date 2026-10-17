@@ -23,6 +23,8 @@ from typing import Protocol
 
 
 class Backend(Protocol):
+    """Anything that turns a prompt into raw completion text."""
+
     name: str
 
     def complete(self, prompt: str) -> str:
@@ -67,6 +69,11 @@ class OpenAIBackend:
         self._client = OpenAI(api_key=key)
 
     def complete(self, prompt: str) -> str:
+        """Send ``prompt`` as one user message at temperature 0 and return the reply.
+
+        Any transport failure, or a reply with no content, raises BackendError so
+        the tier fails closed.
+        """
         try:
             resp = self._client.chat.completions.create(
                 model=self.model,
@@ -125,6 +132,12 @@ class CassetteBackend:
             raise ValueError("recording requires an inner backend")
 
     def complete(self, prompt: str) -> str:
+        """Return the recorded response for ``prompt``.
+
+        In replay mode a prompt with no entry raises BackendError. In record mode a
+        miss calls the wrapped backend and appends the new entry to the cassette
+        file.
+        """
         key = _key(prompt)
         if self.mode == "replay":
             try:

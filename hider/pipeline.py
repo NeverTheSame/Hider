@@ -47,6 +47,7 @@ class Span:
 
     @property
     def length(self) -> int:
+        """Number of characters the span covers."""
         return self.end - self.start
 
 
@@ -61,7 +62,9 @@ class Tier(Protocol):
     name: str
     cost_per_1k_chars: float
 
-    def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]: ...
+    def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        """Return the spans this tier finds, in offsets of ``text``."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +96,7 @@ class RegexTier:
             self.recognizers = recognizers.builtins()
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        """Run the tier 1 recognizers over the whole text and return their spans."""
         return [
             Span(
                 r.start,
@@ -139,6 +143,7 @@ class ManagedNerTier:
         self._clf = classifier.get_trained(seed=seed)
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        """Run the trained classifier over each residue segment and return spans in document offsets."""
         spans: list[Span] = []
         for start, end in residue:
             segment = text[start:end]
@@ -197,6 +202,7 @@ class LlmPassTier:
         self.backend = backend
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        """Run the tier 3 LLM pass over the residue; see ``llm_tier.detect``."""
         from . import llm_tier
 
         return llm_tier.detect(self.backend, text, residue, tier_name=self.name)
@@ -250,6 +256,8 @@ def residue_segments(length: int, spans: Sequence[Span]) -> list[tuple[int, int]
 
 @dataclass
 class TierStat:
+    """Per-tier counters for one run: characters offered and redacted, spans, time and errors."""
+
     name: str
     chars_offered: int = 0
     spans_found: int = 0
@@ -259,11 +267,14 @@ class TierStat:
 
     @property
     def estimated_cost(self) -> float:
+        """Always 0.0 here; the eval report prices tiers from character counts instead."""
         return 0.0
 
 
 @dataclass
 class Redaction:
+    """One redacted unit: the output text, the spans applied, whether it degraded, and the log events."""
+
     text: str
     spans: list[Span]
     degraded: bool = False
@@ -272,6 +283,8 @@ class Redaction:
 
 @dataclass
 class Stats:
+    """Counters for a whole pipeline run, across units and tiers."""
+
     chars_in: int = 0
     lines: int = 0
     tiers: dict[str, TierStat] = field(default_factory=dict)
@@ -282,6 +295,7 @@ class Stats:
     degraded_units: int = 0
 
     def tier(self, name: str) -> TierStat:
+        """The stats for the named tier, created on first use."""
         return self.tiers.setdefault(name, TierStat(name))
 
 
@@ -351,6 +365,12 @@ class Pipeline:
     # -- rewriting ---------------------------------------------------------
 
     def redact(self, text: str, *, unit: str = "", line_no: int = 0) -> Redaction:
+        """Redact one unit of text and return the result with its decision events.
+
+        Secrets are replaced by a destroyed marker; every other span gets a vault
+        pseudonym. The events record the substitute and never the original value.
+        A degraded detection is counted in the run stats.
+        """
         spans, degraded = self.detect(text, unit=unit, line_no=line_no)
         self.stats.chars_in += len(text)
         self.stats.lines += 1
