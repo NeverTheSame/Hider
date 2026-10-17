@@ -1,4 +1,4 @@
-"""The sync gateway: an OpenAI-compatible proxy that redacts in flight.
+"""The optional redaction proxy: an OpenAI-compatible adapter that redacts in flight.
 
 This is the boundary the whole stack defends. A chat completion is
 intercepted on its way to the provider, every text field the caller wrote is

@@ -1,20 +1,38 @@
 # Hider
 
-A tiered redaction layer for log bundles on their way to a third-party LLM
-provider, and the gateway that enforces it in the request path. Detectors are
-chosen per data class on cost, latency and accuracy grounds: high-volume
-secret and identifier patterns go to regex (tier 1), free-text names and
-organisations go to a trained classifier (tier 2, with a pretrained-NER
-backend as an alternative), and the free-text edge cases that classifier
-cannot resolve go to an LLM pass (tier 3). A measured eval harness gates every
-promotion: no tier ships, and no change to a shipped tier lands, without a
-number attached to it. The OpenAI-compatible gateway intercepts a chat
-completion, redacts it, forwards only the redacted payload, and de-tokenises
-the answer on the way back.
+Hider is a tiered redaction library that strips secrets and personal data from
+log bundles before they leave your environment. Identifiers become stable,
+shape-preserving pseudonyms, so a redacted log still reads as a log and two
+lines about the same session still visibly belong together; credentials are
+destroyed outright.
 
-No real data has ever passed through this repository. The templates in
-`templates/` hold log line skeletons with typed placeholders and no values, and
-every value in the corpus, the metrics and the report is generated locally.
+Detectors are chosen per data class on cost, latency and accuracy grounds:
+high-volume secret and identifier patterns go to regex (tier 1), free-text
+names and organisations go to a small local token classifier (tier 2, with a
+pretrained spaCy NER backend as an alternative), and an optional tier 3 can
+hand the free text that is still left to an LLM for one more detection pass.
+JSON exports get a field-aware layer on top (`hider/jsonscrub.py`) that maps
+every identifier to a label and keeps the label -> original mapping local.
+
+Redaction can also be applied at a boundary, through two optional adapters:
+
+- an **OpenAI-compatible proxy** (`hider/proxy.py`) that applies redaction in
+  flight: it redacts a chat completion request, forwards only the redacted
+  payload to the upstream the caller configured, and maps pseudonyms in the
+  reply back to real values for the caller. It does not host, serve or run a
+  model;
+- a **loopback-only web UI** (`hider/webserver.py`) for obfuscating JSON
+  exports, with an optional step that hands only the obfuscated file to a
+  locked-down Claude Code session and unmasks the answer locally.
+
+An evaluation harness (`python -m hider eval`) measures Hider's own redaction
+recall and false-redaction rate on a synthetic, seeded corpus, and gates every
+change to a detector on those numbers.
+
+No real data is committed to this repository. The templates in `templates/`
+hold log line skeletons with typed placeholders and no values, and every value
+in the corpus, the metrics and the report is generated locally from a fixed
+seed.
 
 ## Why it exists
 
@@ -30,6 +48,28 @@ That second half is the hard part. Replacing everything with `***` is trivially
 safe and completely worthless: you can no longer tell that line 4,000 and line
 91,000 are about the same session, which is the only reason anyone was reading
 the log.
+
+## Scope and non-goals
+
+Hider is a data-protection library: it finds sensitive values and replaces or
+destroys them. It is not machine learning infrastructure.
+
+- Hider does **not** train, fine-tune or evaluate language models.
+- Hider does **not** host, serve or run inference for models. The proxy is a
+  redaction adapter in front of an upstream the caller chooses.
+- The eval harness is **not** a model benchmark. It measures how much of a
+  synthetic corpus Hider's detectors redact, and how often they redact
+  something that should have stayed.
+
+Two components involve a model and are worth stating plainly:
+
+- Tier 2's default backend is a small scikit-learn token classifier that Hider
+  fits locally, at startup, on synthetic sentences, purely to detect names and
+  organisations. Nothing is downloaded and nothing leaves the machine.
+- Tier 3 and the web UI's "Ask Claude Code" step call an external LLM, and both
+  are off unless explicitly enabled. Tier 3's injection measurement below
+  reports how well that redaction tier held up with one recorded model behind
+  it; it is a property of the tier, not a ranking of models.
 
 ## The design
 
@@ -59,7 +99,7 @@ never gets a chance to see, or leak, anything a cheaper tier already redacted.
   - `spacy` (`hider/ner.py`) runs Presidio's NLP engine (spaCy's pretrained
     `en_core_web_sm`) in-process over the same residue, with its own named
     suppression rules for the log-structure noise NER misreads as a name.
-  Either way, nothing a name appears in ever leaves the machine — a strictly
+  Either way, nothing a name appears in ever leaves the machine, a strictly
   stronger boundary than "inside your cloud account", which is what a managed
   cloud NER service would give you; that variant remains a written contract in
   `pipeline.py` (`ManagedNerTier`'s docstring) for operators who out-scale a
@@ -74,9 +114,9 @@ never gets a chance to see, or leak, anything a cheaper tier already redacted.
   default backend is wired in, because a paid, network-calling tier must never
   run by accident.
 
-The boundary itself is code, not aspiration: `hider/proxy.py` is an
-OpenAI-compatible gateway that intercepts `/v1/chat/completions`, redacts every
-caller-authored text field, refuses (503, unforwarded) any request whose
+The boundary itself is code, not aspiration: `hider/proxy.py` is an optional
+OpenAI-compatible proxy that applies redaction in flight. It intercepts
+`/v1/chat/completions`, redacts every caller-authored text field, refuses (503, unforwarded) any request whose
 redaction degraded, and de-tokenises the reply through the vault so the caller
 sees real values where the model saw pseudonyms. It is standard library only,
 holds no provider credentials of its own, and passes the caller's
@@ -97,36 +137,35 @@ Three invariants hold everywhere, enforced by tests rather than by convention:
   at all.
 - **Fail closed.** A tier that errors, times out or returns malformed spans does
   not degrade to passthrough. The unit keeps what earlier tiers found and is
-  marked degraded, and the gateway refuses to forward a degraded request at
+  marked degraded, and the proxy refuses to forward a degraded request at
   all. Both halves are tested: the engine half in `test_pipeline.py`, the
   boundary half in `test_proxy.py`.
 - **Secrets are destroyed, identifiers are pseudonymised.** Decided by the
   entity spec, never by the call site.
 
-## Measured
+## Measured redaction quality
 
 From `python -m hider eval` (tier 2 = `classifier`, the default; tier 3 not
-active — see below) on a 5,029 line, 695,840 character synthetic bundle with
-6,681 planted values across 18 entity types:
+active, see below), which measures Hider's own redaction recall and
+false-redaction rate on a 5,029 line, 695,840 character synthetic bundle with
+6,681 planted values across 18 entity types. The corpus comes from a fixed
+seed, so rerunning the command reproduces these figures:
 
 | | |
 |---|---|
 | Recall on shaped identifier types | 99.89% |
 | Same corpus, stock Presidio patterns only | 17.64% |
 | Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 92.09% |
-| Recall across all types | 99.19% |
+| Recall across all types | 99.22% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
 | Seeded values still findable verbatim in the output | 0 unexplained, 6 known gap |
 | Adversarial surprises across 21 hostile placements | 0 |
 | Characters cleared before any paid or model tier is consulted | 40.3% |
 | Units degraded during the run | 0 |
-| Tier 1 throughput | ~136 microseconds per line, single threaded |
-| Tier 2 (classifier) throughput | ~0.5 milliseconds per line over the residue only |
 
-Swapping in `--tier2 spacy` on the same corpus: 86.82% free-text recall, ~3.9ms
-per line over the residue. On this corpus the from-scratch classifier is both
-faster (roughly 8x) and higher-recall (92.1% vs 86.8%) than the pretrained
-general-purpose model, which is not the result to expect going in and is
+Swapping in `--tier2 spacy` on the same corpus: 86.82% free-text recall. On
+this corpus the from-scratch classifier has higher recall (92.1% vs 86.8%)
+than the pretrained general-purpose model, which is not the result to expect going in and is
 exactly why both are reported rather than one asserted: a classifier trained
 tightly on the shape of *this* log format's free text (short operator notes,
 a narrow set of introducing verbs, no other entity classes to confuse it with)
@@ -171,9 +210,11 @@ rate can read 0% even with a fully-complying tier 3 (verified in
 isolation of tier 3's own behaviour is `--tier2 none --tier3 openai`, which
 takes tier 2 out of the way and lets a bypass show up as a bypass.
 
-Run once against a live model (`gpt-4o-mini`, `--tier2 none --tier3 openai
---record`), then replayable forever from the committed cassette
-(`cassettes/tier3-injection-run1.jsonl`) with no key and no network:
+Example run: recorded once against a live model (`--tier2 none --tier3 openai
+--record`, with the backend's default model, `gpt-4o-mini`; the cassette
+stores prompts and responses but not the model name), then replayable from the
+committed cassette (`cassettes/tier3-injection-run1.jsonl`) with no key and no
+network. Replaying it reproduces these figures:
 
 | | |
 |---|---|
@@ -370,7 +411,7 @@ Without it those hosts are masked like any other, which only over-redacts.
 | `hider/llm_backend.py` | Tier 3's backends: a real OpenAI-calling backend, and the cassette that records or replays one so a run never needs a key to be checked. |
 | `hider/llm_tier.py` | Tier 3's detection logic: prompt assembly with the residue fenced as untrusted data, strict JSON parsing, and literal-citation verification that never trusts a model-reported offset. |
 | `hider/pipeline.py` | The engine. Tier ordering, span algebra, monotonicity, fail-closed handling, the decision log. Every tier slot (including tier 2's managed-cloud variant, never built) is one interface. |
-| `hider/proxy.py` | The gateway. Redacts chat completions in flight, refuses degraded requests unforwarded, de-tokenises replies, logs decisions. Standard library only. |
+| `hider/proxy.py` | The optional redaction proxy. Redacts chat completions in flight, refuses degraded requests unforwarded, de-tokenises replies, logs decisions. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
 | `hider/adversarial.py` | 16 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
@@ -410,8 +451,8 @@ of which fully solves it:
    name and organisation recognition on a first/last-name and org-word list
    that shares no entry with the one `entities.py` seeds the eval corpus from.
    Without that split, a linear model could reach the same recall number by
-   memorising the eight organisation names and twenty-eight given names in the
-   corpus, which would say nothing about whether it generalises to a name that
+   memorising the eight organisation words, fifteen given names and thirteen
+   surnames in the corpus, which would say nothing about whether it generalises to a name that
    is not in this file - which, in a real bundle, none of them are.
 
 ## Working from real bundles safely
@@ -448,13 +489,13 @@ recall will never be exactly 100%.
   NER service remains a documented, unbuilt contract behind the same
   interface for operators who out-scale both.
 - **The classifier's training grammar is narrow.** Twelve sentence templates,
-  two names per organisation, a fixed suffix vocabulary. It generalises past
+  two-word organisation names, a fixed suffix vocabulary. It generalises past
   its own training vocabulary (proven by the disjoint train/eval split,
   `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary`), but an
   organisation suffix outside its trained set (`Tailspin Technology` versus a
-  trained `Tailspin Industries`) is a realistic way for it to miss — caught
+  trained `Tailspin Industries`) is a realistic way for it to miss, caught
   while building the injection-adjacent adversarial cases, not by inspection.
-- **The gateway does not stream.** `stream: true` gets a 400 with the reason in
+- **The proxy does not stream.** `stream: true` gets a 400 with the reason in
   the body. Rewriting an SSE stream means buffering it (which silently disables
   streaming) or detokenising fragments (which corrupts labels cut across chunk
   boundaries); both are worse than an honest error.
@@ -474,11 +515,9 @@ recall will never be exactly 100%.
 
 ## Roadmap
 
-Tier 2 shipped with two interchangeable backends, tier 3 shipped and has a
-real recorded run against it, plus the gateway. Next: a larger and more
-adversarial injection-payload set against tier 3, a second model for
-comparison, an async bundle-ingest flow for whole-bundle jobs, and streaming
-support if a way is found to rewrite SSE honestly.
+Concrete, independently startable tasks are listed in [ROADMAP.md](ROADMAP.md).
+Contribution rules, above all that no real data ever enters the repository,
+are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Authors
 

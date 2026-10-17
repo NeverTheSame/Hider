@@ -1,11 +1,15 @@
 """Command line entry point.
 
-    python -m hider eval      run the harness, write JSON metrics and the HTML report
+    python -m hider eval      measure redaction recall on the synthetic corpus, write metrics and the HTML report
     python -m hider generate  write a synthetic bundle to disk
     python -m hider redact    redact a file or stdin
-    python -m hider proxy     run the redacting OpenAI-compatible gateway
+    python -m hider proxy     run the optional OpenAI-compatible redaction proxy
     python -m hider serve     run the local JSON obfuscation web UI
     python -m hider scrub-json FILE   obfuscate a JSON file from the shell
+    python -m hider merge-csv DIR -o OUT   merge CSV log parts into one JSON document
+    python -m hider ask RUN PROMPT    ask restricted Claude Code about an obfuscated run
+    python -m hider workspace RUN     folder for an interactive restricted session
+    python -m hider unmask FILE --run RUN   put real values back into text with labels
 """
 
 from __future__ import annotations
