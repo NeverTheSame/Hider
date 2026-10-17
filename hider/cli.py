@@ -4,6 +4,8 @@
     python -m hider generate  write a synthetic bundle to disk
     python -m hider redact    redact a file or stdin
     python -m hider proxy     run the redacting OpenAI-compatible gateway
+    python -m hider serve     run the local JSON obfuscation web UI
+    python -m hider scrub-json FILE   obfuscate a JSON file from the shell
 """
 
 from __future__ import annotations
@@ -213,6 +215,97 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from . import webserver
+
+    _announce_profile()
+    host, _, port = args.listen.partition(":")
+    webserver.serve(host, int(port or "8790"), tier2=args.tier2,
+                    allow_remote=args.allow_remote)
+    return 0
+
+
+def _cmd_scrub_json(args: argparse.Namespace) -> int:
+    from . import webserver
+
+    _announce_profile()
+    raw = Path(args.path).read_text(encoding="utf-8-sig")
+    result = webserver.obfuscate_text(raw, Path(args.path).name, tier2=args.tier2,
+                                      terms=args.term)
+    s = result["stats"]
+    print(f"mapped {s['mapped_values']} values, destroyed {s['secrets_destroyed']} secrets, "
+          f"{len(s['leaks'])} leaks, {s['degraded_lines']} degraded lines", file=sys.stderr)
+    print(f"wrote {result['saved']['output']}", file=sys.stderr)
+    print(f"wrote {result['saved']['mapping']}", file=sys.stderr)
+    if s["leaks"] or s["degraded_lines"]:
+        print("REVIEW: leak check or degraded lines flagged; do not share as is",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_merge_csv(args: argparse.Namespace) -> int:
+    from . import csvmerge
+
+    meta = {"policy": args.policy, "workload_tenant": args.tenant, "backup_server": args.backup_server,
+            "region": args.region, "session_start": args.session_start,
+            "session_status": None if (args.session_status or "").startswith("<")
+            else args.session_status}
+    doc = csvmerge.merge(csvmerge.collect(args.paths), meta)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"{csvmerge.summary(doc)} -> {args.out}")
+    return 0
+
+
+def _cmd_ask(args: argparse.Namespace) -> int:
+    from . import research
+
+    mapping, terms, public = research.run_context(args.run)
+    prompt = args.prompt if args.prompt != "-" else sys.stdin.read()
+    masked, extra, n = research.mask_prompt(prompt, mapping, terms, public)
+    print(f"--- sent to Claude Code ({n} customer value(s) masked) ---\n{masked}\n---",
+          file=sys.stderr)
+    if not args.yes and input("send it? [y/N] ").strip().lower() != "y":
+        return 1
+    r = research.ask(args.run, masked, model=args.model, extra=extra)
+    print(r["answer"])
+    print(f"--- {r['replaced']} labels unmasked, {r['seconds']} s, cost ${r['cost_usd'] or 0:.2f}, "
+          f"{r['denied_tool_calls']} blocked tool calls; saved {r['saved']}", file=sys.stderr)
+    if r["unknown_labels"]:
+        print(f"labels not in the mapping: {', '.join(r['unknown_labels'])}", file=sys.stderr)
+    return 0
+
+
+def _cmd_workspace(args: argparse.Namespace) -> int:
+    import shlex
+
+    from . import research
+
+    ws = research.make_workspace(args.run, research.RESEARCH)
+    cmd = " ".join(shlex.quote(c) for c in research.claude_command())
+    print(f"workspace: {ws} (only {research.DATA_NAME} and CLAUDE.md)", file=sys.stderr)
+    print(f"start Claude Code there with:\n\n  cd {shlex.quote(str(ws))} && {cmd}\n", file=sys.stderr)
+    print(f"then unmask its answers with:  python -m hider unmask answer.md --run {args.run}",
+          file=sys.stderr)
+    return 0
+
+
+def _cmd_unmask(args: argparse.Namespace) -> int:
+    from . import research
+
+    path = args.mapping or research.resolve_run(args.run)[1]
+    mapping, _ = research.load_mapping(path)
+    text = sys.stdin.read() if args.path in (None, "-") else Path(args.path).read_text(
+        encoding="utf-8")
+    out, n, unknown = research.unmask(text, mapping)
+    sys.stdout.write(out)
+    print(f"\n--- {n} label(s) unmasked", file=sys.stderr)
+    if unknown:
+        print(f"labels not in the mapping: {', '.join(unknown)}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="hider", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -259,6 +352,47 @@ def main(argv: list[str] | None = None) -> int:
                    help="tier 2 backend in the sync path: the trained classifier "
                         "(default, fastest), local spaCy NER, or none")
     p.set_defaults(fn=_cmd_proxy)
+
+    w = sub.add_parser("serve", help="run the local JSON obfuscation web UI")
+    w.add_argument("--listen", default="127.0.0.1:8790", help="host:port to bind")
+    w.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
+    w.add_argument("--allow-remote", action="store_true",
+                   help="allow binding a non-loopback address")
+    w.set_defaults(fn=_cmd_serve)
+
+    j = sub.add_parser("scrub-json", help="obfuscate a JSON file without the web UI")
+    j.add_argument("path")
+    j.add_argument("--term", action="append", default=[],
+                   help="a customer term to always hide, whatever its length (repeatable)")
+    j.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
+    j.set_defaults(fn=_cmd_scrub_json)
+
+    m = sub.add_parser("merge-csv", help="merge the portal's Download logs CSV parts into JSON")
+    m.add_argument("paths", nargs="+", help="a folder of parts, or the part files")
+    m.add_argument("-o", "--out", required=True)
+    for opt in ("--policy", "--tenant", "--backup-server", "--region", "--session-start",
+                "--session-status"):
+        m.add_argument(opt)
+    m.set_defaults(fn=_cmd_merge_csv)
+
+    a = sub.add_parser("ask", help="ask Claude Code about an obfuscated run, unmask the answer")
+    a.add_argument("run", help="run name (see out/json) or path to its .obfuscated.json")
+    a.add_argument("prompt", help="the question, or - for stdin")
+    a.add_argument("--model")
+    a.add_argument("-y", "--yes", action="store_true", help="send without asking")
+    a.set_defaults(fn=_cmd_ask)
+
+    ws = sub.add_parser("workspace", help="folder with only the obfuscated file, "
+                                          "for an interactive restricted Claude Code session")
+    ws.add_argument("run")
+    ws.set_defaults(fn=_cmd_workspace)
+
+    u = sub.add_parser("unmask", help="put real values back into text with labels (no model)")
+    u.add_argument("path", nargs="?", help="text file, or - / nothing for stdin")
+    g2 = u.add_mutually_exclusive_group(required=True)
+    g2.add_argument("--run")
+    g2.add_argument("--mapping", help="path to a .mapping.json")
+    u.set_defaults(fn=_cmd_unmask)
 
     args = ap.parse_args(argv)
     return args.fn(args)

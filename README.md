@@ -279,7 +279,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # tier 1 + tier 2 (classifier, the default) need nothing else.
 
 .venv/bin/python -m hider eval          # tier1 + tier2=classifier; metrics + HTML report into out/
-.venv/bin/python -m pytest              # 247 tests
+.venv/bin/python -m pytest              # 275 tests
 .venv/bin/python -m hider generate      # write a synthetic bundle to out/bundle
 .venv/bin/python -m hider redact FILE --log out/decisions.jsonl --vault out/vault.json
 .venv/bin/python -m hider proxy --upstream https://api.openai.com \
@@ -321,6 +321,44 @@ Outputs land in `out/`: `hider-report.html`, `metrics.json`, and
 of the report is committed at [`docs/sample-report.html`](docs/sample-report.html)
 so it can be read without installing anything.
 
+## JSON exports, the local web UI and the Claude Code bridge
+
+Log lines are one shape of customer data; a JSON export (a support case, a
+contact record, a backup session log) is another, where most of the PII sits
+in fields whose key says what the value is. `jsonscrub.py` covers that shape,
+and a loopback-only web UI wraps the whole loop:
+
+```sh
+.venv/bin/python -m hider serve                       # http://127.0.0.1:8790
+.venv/bin/python -m hider merge-csv PARTS_DIR -o session.json
+.venv/bin/python -m hider scrub-json session.json --term ACME --term 'acme*'
+.venv/bin/python -m hider ask RUN "which sites failed and why?"
+.venv/bin/python -m hider workspace RUN               # for an interactive session
+.venv/bin/python -m hider unmask answer.md --run RUN
+```
+
+1. **Get the logs.** The page builds a prompt to paste into Claude Code that
+   downloads a session's CSV parts from an admin portal and merges them with
+   `merge-csv`, while forbidding the model from reading the rows.
+2. **Obfuscate.** Every identifier becomes a stable label; secrets are
+   destroyed. Short customer names a detector cannot be sure of go in as
+   terms, and a trailing `*` hides every word with that prefix. The output and
+   a label -> original mapping are written to `out/json/` (gitignored).
+3. **Ask Claude Code.** The prompt is masked with the same mapping, shown to
+   the user, and re-checked before it leaves: a prompt that still carries a
+   mapped value, or a word that only ever appeared inside a real value, is
+   refused. Claude Code runs headless in `--restricted` mode with no MCP
+   servers and only Read, Grep and Glob, in a temp folder holding nothing but
+   the obfuscated file, so it cannot reach the mapping, run commands or
+   browse.
+4. **Unmask.** Labels in the answer go back to real values by dictionary
+   lookup, no model. Labels the model rewrote are listed, not guessed.
+
+Deployment-specific settings (the portal URL the prompt opens, the vendor's own
+hosts the scrubber may leave readable) live in an uncommitted
+`hider.local.json` (or `HIDER_LOCAL`), described in `hider/localcfg.py`.
+Without it those hosts are masked like any other, which only over-redacts.
+
 ## Layout
 
 | Path | What it is |
@@ -338,6 +376,11 @@ so it can be read without installing anything.
 | `hider/adversarial.py` | 16 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/report.py` | The self-contained HTML page. |
+| `hider/jsonscrub.py` | JSON obfuscation: key-driven harvesting, known-value and pipeline spans resolved together, a final sweep and a leak check. |
+| `hider/webserver.py` | The loopback-only web UI and its API. Standard library only. |
+| `hider/csvmerge.py` | Merges an admin portal's "Download logs" CSV parts into one JSON document. |
+| `hider/research.py` | The Claude Code bridge: prompt masking, the restricted headless run, workspaces, unmasking. |
+| `hider/localcfg.py` | Loads the uncommitted `hider.local.json`. |
 | `templates/` | Sanitized log line skeletons. Typed placeholders only. |
 
 ## How the numbers avoid being circular
