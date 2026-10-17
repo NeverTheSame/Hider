@@ -41,7 +41,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import pipeline, pseudonym
+from . import pipeline
 
 #: Headers that must not be forwarded verbatim: hop-by-hop fields, and the
 #: ones whose value this gateway owns.

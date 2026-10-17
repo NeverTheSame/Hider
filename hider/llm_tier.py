@@ -20,7 +20,7 @@ Two failure modes get handled differently on purpose:
 from __future__ import annotations
 
 import json
-from typing import Sequence
+from collections.abc import Sequence
 
 from .llm_backend import Backend
 

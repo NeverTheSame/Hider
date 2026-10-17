@@ -55,7 +55,7 @@ def merge(files: list[tuple[str, str]], meta: dict | None = None) -> dict:
             raise ValueError(f"{name}: columns differ from the first part")
         for row in rows:
             if row:
-                records.append(dict(zip(keys, row)))
+                records.append(dict(zip(keys, row, strict=False)))
     doc: dict = {k: v for k, v in (meta or {}).items() if v}
     m = _STAMP.search(files[0][0])
     if m and "session_start" not in doc:

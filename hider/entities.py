@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import random
 import string
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 # ---------------------------------------------------------------------------
 # Handling classes

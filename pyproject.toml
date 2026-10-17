@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6"]
 # Tier 2, alternate backend: local pretrained NER over the free-text residue,
 # selected with --tier2 spacy. The default --tier2 classifier backend needs
 # nothing beyond scikit-learn above. See requirements-ner.txt.
@@ -48,3 +48,13 @@ packages = ["hider"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["out", "docs", "cassettes"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# Long string literals and comments are left to the formatter and to review.
+ignore = ["E501"]

@@ -9,8 +9,6 @@ that way.
 
 from __future__ import annotations
 
-import pytest
-
 from hider import cli
 
 NOTE = ("Rachel Mbeki at Contoso Group escalated case 08123456 for "
@@ -38,7 +36,9 @@ def test_redact_still_covers_the_shaped_types(tmp_path, capsys):
 
 
 def test_redact_and_proxy_build_the_same_tiers():
-    names = lambda ts: [t.name for t in ts]
+    def names(ts):
+        return [t.name for t in ts]
+
     assert names(cli._build_tiers("classifier")) == ["tier1", "tier2"]
     assert names(cli._build_tiers("none")) == ["tier1"]
 

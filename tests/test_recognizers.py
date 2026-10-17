@@ -155,7 +155,7 @@ def test_a_split_credential_leaves_nothing_in_the_residue():
     from hider import pipeline, pseudonym
     wrapped = f"[Auth] Authorization: Bearer {JWT_HEAD} \\\n    {JWT_SIG}"
     p = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k"))
-    for i, line in enumerate(wrapped.split("\n")):
+    for line in wrapped.split("\n"):
         spans, _ = p.detect(line)
         residue = "".join(line[s:e] for s, e in pipeline.residue_segments(len(line), spans))
         assert "eyJ" not in residue

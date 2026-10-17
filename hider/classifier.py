@@ -37,9 +37,9 @@ from __future__ import annotations
 
 import random
 import re
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Sequence
 
 from sklearn.feature_extraction import DictVectorizer
 from sklearn.linear_model import LogisticRegression

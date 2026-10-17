@@ -301,7 +301,8 @@ def ask(run: str, prompt: str, *, model: str | None = None, timeout: int = 1800,
     try:
         reply = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:400]}")
+        raise RuntimeError(
+            f"claude exited {proc.returncode}: {proc.stderr.strip()[:400]}") from None
     if reply.get("is_error") or proc.returncode:
         raise RuntimeError(f"claude failed: {str(reply.get('result') or proc.stderr)[:400]}")
     answer_masked = reply.get("result") or ""

@@ -27,8 +27,9 @@ Three rules hold in both:
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol, Sequence
+from typing import Protocol
 
 from . import classifier, entities, pseudonym, recognizers
 

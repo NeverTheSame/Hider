@@ -40,7 +40,8 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
-from typing import Protocol, Sequence
+from collections.abc import Sequence
+from typing import Protocol
 
 from .pipeline import Span
 

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import re
 
-from . import entities, profiles
 from presidio_analyzer import (
     LocalRecognizer,
     Pattern,
@@ -27,6 +26,8 @@ from presidio_analyzer.predefined_recognizers import (
     EmailRecognizer,
     IpRecognizer,
 )
+
+from . import entities, profiles
 
 TIER1 = "tier1"
 

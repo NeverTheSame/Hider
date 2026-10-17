@@ -132,7 +132,7 @@ def generate(
     # reused across the run instead of a new file per line.
     resolved = {id(f): _fill_placeholders(f["path"], rng) for f in files}
 
-    for i in range(lines):
+    for _ in range(lines):
         f = rng.choices(files, weights=weights, k=1)[0]
         path = resolved[id(f)]
         unit = by_path.get(path)

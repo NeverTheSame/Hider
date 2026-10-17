@@ -64,7 +64,7 @@ def _decodable(text: str) -> list[tuple[str, str]]:
 
 @pytest.mark.parametrize("path", SCANNED, ids=[str(p.relative_to(ROOT)) for p in SCANNED])
 def test_every_base64_fixture_payload_decodes_to_declared_vocabulary(path):
-    for blob, decoded in _decodable(path.read_text(errors="replace")):
+    for _blob, decoded in _decodable(path.read_text(errors="replace")):
         unknown = {w for w in WORD.findall(decoded) if w not in ALLOWED_TOKENS}
         assert not unknown, (
             f"{path.relative_to(ROOT)} contains a base64 payload decoding to "

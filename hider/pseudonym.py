@@ -165,7 +165,7 @@ class EntityVault:
         )
 
     @classmethod
-    def load(cls, path: str | Path, key: bytes | None = None) -> "EntityVault":
+    def load(cls, path: str | Path, key: bytes | None = None) -> EntityVault:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         v = cls(key=key or _load_key(), entries=raw["entries"], _counters=raw["counters"])
         v.by_label = {

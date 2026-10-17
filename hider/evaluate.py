@@ -25,9 +25,9 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field, asdict
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Sequence
 
 from . import adversarial, entities, generator, ner, pipeline, pseudonym
 from .llm_backend import Backend

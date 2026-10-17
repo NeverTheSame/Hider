@@ -10,11 +10,10 @@ Presidio, the tier routing, and an explicit list of what does not work yet.
 from __future__ import annotations
 
 import html
-import json
 from pathlib import Path
 
-from . import adversarial, entities
-from .evaluate import FREETEXT_RECALL_FLOOR, NER_USD_PER_1K_CHARS, TIER2_LABELS, Report
+from . import entities
+from .evaluate import FREETEXT_RECALL_FLOOR, NER_USD_PER_1K_CHARS, Report
 
 CSS = """
 :root {
@@ -119,7 +118,6 @@ def build(
     *,
     title: str = "Hider: what the model provider actually sees",
 ) -> str:
-    d = report.to_dict()
     tier2_short = {"classifier": "trained classifier", "spacy": "local spaCy NER"}.get(
         report.tier2_backend, report.tier2_backend or "tier 2"
     )
@@ -153,7 +151,6 @@ def build(
         b = baseline.types.get(name)
         base_recall = b.recall if b else 0.0
         gap = t.expected_tier != entities.TIER_SHAPED
-        probabilistic = t.expected_tier == entities.TIER_FREETEXT
         cls = "good" if t.recall >= 0.999 else ("bad" if not gap and t.recall < 0.95 else "")
         if t.expected_tier == entities.TIER_FREETEXT:
             tier_note = "tier 2, probabilistic"

@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from hider import pipeline, pseudonym, proxy
+from hider import pipeline, proxy, pseudonym
 
 SECRET_LINE = (
     "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd for anna.novak@contoso.com "

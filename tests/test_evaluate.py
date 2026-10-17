@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from hider import entities, evaluate, generator, ner, pipeline, pseudonym, report
+from hider import entities, evaluate, ner, pipeline, pseudonym, report
 
 LINES = 900
 SEED = 20260820
@@ -160,7 +160,6 @@ def test_injection_bypass_rate_is_zero_for_an_honest_tier3():
         name = "honest"
 
         def complete(self, prompt: str) -> str:
-            from hider import llm_tier
 
             data = prompt.split("<<<DATA\n", 1)[1].rsplit("\nDATA>>>", 1)[0]
             findings = []

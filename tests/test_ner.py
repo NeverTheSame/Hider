@@ -26,8 +26,8 @@ class _StubEngine:
 
         class A:
             entities = [
-                type("E", (), {"start_char": s, "end_char": e, "label_": l})()
-                for s, e, l in self.spans
+                type("E", (), {"start_char": s, "end_char": e, "label_": label})()
+                for s, e, label in self.spans
             ]
 
         return A()

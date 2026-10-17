@@ -375,7 +375,7 @@ class JsonScrubber:
         if etype == "PERSON_NAME":
             parts = re.split(r"[\s,]+", value.strip())
             if len(parts) > 1:
-                for i, p in enumerate(parts):
+                for p in parts:
                     p = p.strip(".()")
                     if len(p) >= 3 and p.casefold() not in _STOPWORDS and not p.isdigit():
                         self._label("PERSON_NAME", p)
