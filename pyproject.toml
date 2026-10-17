@@ -5,7 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hider"
 version = "0.2.0"
-description = "Tiered redaction gateway for support log bundles on their way to an LLM provider"
+description = "Tiered redaction library that strips secrets and personal data from log bundles and JSON exports"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Kirill Kuklin"}]
+keywords = ["redaction", "pii", "secrets", "log-sanitization", "privacy", "pseudonymisation", "data-protection"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+    "Intended Audience :: Developers",
+]
 requires-python = ">=3.11"
 dependencies = [
     "presidio-analyzer>=2.2",
