@@ -8,8 +8,10 @@ DOC = {
     "number": "08123456",
     "sys_id": "9f2c1a8b3d4e5f60718293a4b5c6d7e8",
     "short_description": "Restore stuck for Northwind Traders",
-    "account": {"display_value": "Northwind Traders LLC",
-                "value": "4a1b2c3d4e5f60718293a4b5c6d7e8f9"},
+    "account": {
+        "display_value": "Northwind Traders LLC",
+        "value": "4a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    },
     "contact": {"display_value": "Gretchen Halvorsen"},
     "u_contact_email": "gretchen.halvorsen@northwindtraders.com",
     "u_contact_phone": "+1 (415) 555-0142",
@@ -17,11 +19,26 @@ DOC = {
     "priority": 2,
     "opened_at": "2026-10-01 09:12:00",
     "api_token": "sk-abcdefghijklmnopqrstuvwxyz123456",
-    "comments": [{"text": "Hi Gretchen,\nproxy bkp-prx01.corp.northwindtraders.com at "
-                          "10.20.30.40, call +44 20 7946 0958.\nBuild 8.1.0.7"}],
+    "comments": [
+        {
+            "text": "Hi Gretchen,\nproxy bkp-prx01.corp.northwindtraders.com at "
+            "10.20.30.40, call +44 20 7946 0958.\nBuild 8.1.0.7"
+        }
+    ],
 }
-ORIGINALS = ["northwind", "gretchen", "halvorsen", "08123456", "9f2c1a8b", "4a1b2c3d",
-             "555-0142", "7946", "10.20.30.40", "sk-abcdef", "bkp-prx01"]
+ORIGINALS = [
+    "northwind",
+    "gretchen",
+    "halvorsen",
+    "08123456",
+    "9f2c1a8b",
+    "4a1b2c3d",
+    "555-0142",
+    "7946",
+    "10.20.30.40",
+    "sk-abcdef",
+    "bkp-prx01",
+]
 
 
 def _run():
@@ -49,7 +66,7 @@ def test_structure_and_non_sensitive_fields_kept():
 def test_values_map_consistently_and_reversibly():
     res = _run()
     out = res.output
-    org =out["short_description"].split("for ", 1)[1]
+    org = out["short_description"].split("for ", 1)[1]
     assert res.mapping[org] == "Northwind Traders"
     assert res.mapping[out["number"]] == "08123456"
     assert res.mapping[out["u_contact_email"]] == DOC["u_contact_email"]
@@ -88,8 +105,12 @@ def test_descriptors_and_decimals_left_alone():
 
 
 def test_plain_keys_untouched_and_common_words_not_spread():
-    res = jsonscrub.scrub({"records": [{"message": "Server Records"}, {"message": "the server records"}],
-                           "backup_server": "x"})
+    res = jsonscrub.scrub(
+        {
+            "records": [{"message": "Server Records"}, {"message": "the server records"}],
+            "backup_server": "x",
+        }
+    )
     assert "records" in res.output
     assert res.output["records"][1]["message"] == "the server records"
 
@@ -97,21 +118,25 @@ def test_plain_keys_untouched_and_common_words_not_spread():
 def test_sharepoint_paths_tenant_hosts_and_terms():
     res = jsonscrub.scrub(
         {"message": "GET /sites/acmeUSA-01-X/_api/web for Acme_Prod.onmicrosoft.com by AC team"},
-        terms=["AC"])
+        terms=["AC"],
+    )
     msg = res.output["message"]
     assert "acmeUSA" not in msg and "onmicrosoft" not in msg and " AC " not in msg
     assert "/sites/<" in msg and "/_api/web" in msg
 
 
 def test_sweep_never_rewrites_inside_a_label():
-    res = jsonscrub.scrub({"message": "SharePoint said https://acme.sharepoint.com/sites/x",
-                           "account": "SharePoint"})
+    res = jsonscrub.scrub(
+        {"message": "SharePoint said https://acme.sharepoint.com/sites/x", "account": "SharePoint"}
+    )
     assert "https://tenant-01.sharepoint.example/spaces/Space-01" in res.output["message"]
 
 
 def test_log_vocabulary_is_not_a_name_and_prefix_terms():
-    res = jsonscrub.scrub({"message": "429 Too Many Requests on Site Pages for acmeimdInternalUse1"},
-                          terms=["acmeimd*"])
+    res = jsonscrub.scrub(
+        {"message": "429 Too Many Requests on Site Pages for acmeimdInternalUse1"},
+        terms=["acmeimd*"],
+    )
     msg = res.output["message"]
     assert "Too Many Requests" in msg and "Site Pages" in msg
     assert "acmeimd" not in msg.lower()

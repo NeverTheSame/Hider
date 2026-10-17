@@ -41,11 +41,15 @@ def _fill_placeholders(text: str, rng: random.Random) -> str:
     def one(m: re.Match[str]) -> str:
         name = m.group(1)
         if name == "TS":
-            return (f"{rng.randint(1, 28):02d}.08.2026 {rng.randint(0, 23):02d}:"
-                    f"{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}.{rng.randint(0, 999):03d}")
+            return (
+                f"{rng.randint(1, 28):02d}.08.2026 {rng.randint(0, 23):02d}:"
+                f"{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}.{rng.randint(0, 999):03d}"
+            )
         if name == "TSZ":
-            return (f"2026-08-{rng.randint(1, 28):02d}T{rng.randint(0, 23):02d}:"
-                    f"{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}.{rng.randint(0, 999):03d}Z")
+            return (
+                f"2026-08-{rng.randint(1, 28):02d}T{rng.randint(0, 23):02d}:"
+                f"{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}.{rng.randint(0, 999):03d}Z"
+            )
         if name == "PID":
             return f"{rng.randint(1, 255):02x}"
         if name == "LEVEL":

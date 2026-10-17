@@ -32,22 +32,25 @@ def _clear_cache():
 
 def test_profile_adds_coverage_the_builtins_do_not_have(tmp_path):
     line = "[Agent] Agent zz-emea-prx42 claimed the session"
-    assert not any(r.entity_type == "WORKER_POD_ID"
-                   for r in recognizers.analyze(line, recognizers.all_recognizers()))
+    assert not any(
+        r.entity_type == "WORKER_POD_ID"
+        for r in recognizers.analyze(line, recognizers.all_recognizers())
+    )
     prof = profiles.load(write(tmp_path, GOOD))
     regs = recognizers.all_recognizers(profile=prof)
     hits = [r for r in recognizers.analyze(line, regs) if r.entity_type == "WORKER_POD_ID"]
-    assert hits and line[hits[0].start:hits[0].end] == "zz-emea-prx42"
+    assert hits and line[hits[0].start : hits[0].end] == "zz-emea-prx42"
 
 
 def test_a_profile_cannot_remove_a_builtin(tmp_path):
     """Additive only: whatever the built-ins caught, they still catch."""
-    line = ("session 6cafd2ac-dd19-d991-291a-8d565940996d for anna@contoso.com "
-            "on zz-emea-prx42")
+    line = "session 6cafd2ac-dd19-d991-291a-8d565940996d for anna@contoso.com on zz-emea-prx42"
     base = {(r.start, r.end) for r in recognizers.analyze(line, recognizers.all_recognizers())}
     prof = profiles.load(write(tmp_path, GOOD))
-    withp = {(r.start, r.end)
-             for r in recognizers.analyze(line, recognizers.all_recognizers(profile=prof))}
+    withp = {
+        (r.start, r.end)
+        for r in recognizers.analyze(line, recognizers.all_recognizers(profile=prof))
+    }
     assert base <= withp
     assert withp > base
 
@@ -66,18 +69,20 @@ def test_the_eval_baseline_ignores_any_local_profile(tmp_path, monkeypatch):
     profiles.active.cache_clear()
     tier = pipeline.RegexTier(use_active_profile=False)
     line = "[Agent] Agent zz-emea-prx42 heartbeat"
-    assert not [s for s in tier.detect(line, [(0, len(line))])
-                if s.entity_type == "WORKER_POD_ID"]
+    assert not [s for s in tier.detect(line, [(0, len(line))]) if s.entity_type == "WORKER_POD_ID"]
 
 
-@pytest.mark.parametrize("bad,fragment", [
-    ({"name": "x", "patterns": {"NOPE": ["a"]}}, "unknown entity label"),
-    ({"name": "x", "patterns": {"WORKER_POD_ID": ["("]}}, "does not compile"),
-    ({"name": "x", "patterns": {}}, "non-empty object"),
-    ({"name": "x", "patterns": {"WORKER_POD_ID": []}}, "non-empty list"),
-    ({"name": "x", "patterns": {"WORKER_POD_ID": [{"regex": "a", "score": 9}]}}, "outside"),
-    ({"name": "x", "patterns": {"WORKER_POD_ID": [{"nope": "a"}]}}, "must be a regex"),
-])
+@pytest.mark.parametrize(
+    "bad,fragment",
+    [
+        ({"name": "x", "patterns": {"NOPE": ["a"]}}, "unknown entity label"),
+        ({"name": "x", "patterns": {"WORKER_POD_ID": ["("]}}, "does not compile"),
+        ({"name": "x", "patterns": {}}, "non-empty object"),
+        ({"name": "x", "patterns": {"WORKER_POD_ID": []}}, "non-empty list"),
+        ({"name": "x", "patterns": {"WORKER_POD_ID": [{"regex": "a", "score": 9}]}}, "outside"),
+        ({"name": "x", "patterns": {"WORKER_POD_ID": [{"nope": "a"}]}}, "must be a regex"),
+    ],
+)
 def test_a_broken_profile_raises_rather_than_loading_less_protection(tmp_path, bad, fragment):
     with pytest.raises(profiles.ProfileError) as e:
         profiles.load(write(tmp_path, bad))
@@ -94,6 +99,7 @@ def test_missing_and_malformed_files_raise(tmp_path):
 def test_the_shipped_example_profile_is_valid():
     """The file people copy must itself load."""
     from pathlib import Path
+
     example = Path(__file__).resolve().parent.parent / "templates" / "profile.example.json"
     prof = profiles.load(example)
     assert prof.pattern_count >= 3
@@ -108,6 +114,7 @@ def test_the_example_profile_uses_only_the_invented_namespace():
     live under the invented ``acme`` namespace, and anything else fails.
     """
     from pathlib import Path
+
     example = Path(__file__).resolve().parent.parent / "templates" / "profile.example.json"
     prof = profiles.load(example)
     for label, items in prof.patterns.items():

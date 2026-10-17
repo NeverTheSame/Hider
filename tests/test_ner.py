@@ -49,10 +49,13 @@ def pipe(tier2):
 # Detection
 # ---------------------------------------------------------------------------
 
+
 def test_person_and_org_in_prose_are_redacted(pipe):
-    line = ("Call with Anna Novak at Northwind Holdings on case 07551234: "
-            "the restore into https://contoso22.sharepoint.com/sites/Finance "
-            "is still queued.")
+    line = (
+        "Call with Anna Novak at Northwind Holdings on case 07551234: "
+        "the restore into https://contoso22.sharepoint.com/sites/Finance "
+        "is still queued."
+    )
     r = pipe.redact(line)
     assert "Anna Novak" not in r.text
     assert "Northwind Holdings" not in r.text
@@ -68,11 +71,11 @@ def test_labels_map_to_the_spec_types(pipe):
 
 
 def test_tier2_is_billed_against_the_residue_only(tier2):
-    line = ("session a41f77c2-9be1-4c33-8f0e-1122aabbccdd on wkr-amer-prx117 "
-            "note: spoke with Anna Novak today")
-    p = pipeline.Pipeline(
-        [pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k")
+    line = (
+        "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd on wkr-amer-prx117 "
+        "note: spoke with Anna Novak today"
     )
+    p = pipeline.Pipeline([pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k"))
     p.redact(line)
     offered = p.stats.tiers["tier2"].chars_offered
     assert offered < len(line)
@@ -81,9 +84,9 @@ def test_tier2_is_billed_against_the_residue_only(tier2):
 
 def test_monotonic_with_tier1(tier2):
     line = "Anna Novak at anna.novak@contoso.com on wkr-emea-rg124"
-    only1 = pipeline.Pipeline(
-        [pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")
-    ).detect(line)[0]
+    only1 = pipeline.Pipeline([pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")).detect(
+        line
+    )[0]
     both = pipeline.Pipeline(
         [pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k")
     ).detect(line)[0]
@@ -95,9 +98,14 @@ def test_monotonic_with_tier1(tier2):
         return out
 
     assert cov(only1) <= cov(both)
-    assert "Anna Novak" not in pipeline.Pipeline(
-        [pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k")
-    ).redact(line).text
+    assert (
+        "Anna Novak"
+        not in pipeline.Pipeline(
+            [pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k")
+        )
+        .redact(line)
+        .text
+    )
 
 
 def test_fail_closed_when_the_engine_errors(tier2):
@@ -107,9 +115,7 @@ def test_fail_closed_when_the_engine_errors(tier2):
 
     tier2.engine, real = Boom(), tier2.engine
     try:
-        p = pipeline.Pipeline(
-            [pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k")
-        )
+        p = pipeline.Pipeline([pipeline.RegexTier(), tier2], vault=pseudonym.EntityVault(key=b"k"))
         r = p.redact("session a41f77c2-9be1-4c33-8f0e-1122aabbccdd and Anna Novak")
         assert r.degraded is True
         assert p.stats.tiers["tier2"].errors == 1
@@ -132,6 +138,7 @@ def test_results_are_memoised_by_content():
 # Suppression rules
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "text,expected",
     [
@@ -139,12 +146,12 @@ def test_results_are_memoised_by_content():
         ("Anna Novak", 1),
         ("Northwind Holdings", 1),
         # Dropped: log machinery and identifiers the model misreads.
-        ("the Daily-EXCH-AUS", 0),   # job policy code behind an article
-        ("ETA", 0),                  # acronym
-        ("MB/s.", 0),                # unit
-        ("TimeoutMs", 0),            # CamelCase config key
-        ("Cache] Evicted", 0),       # glued across log structure
-        ("8301 MB", 0),              # quantity tagged as a person
+        ("the Daily-EXCH-AUS", 0),  # job policy code behind an article
+        ("ETA", 0),  # acronym
+        ("MB/s.", 0),  # unit
+        ("TimeoutMs", 0),  # CamelCase config key
+        ("Cache] Evicted", 0),  # glued across log structure
+        ("8301 MB", 0),  # quantity tagged as a person
     ],
 )
 def test_suppression_rules(text, expected):

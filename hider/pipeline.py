@@ -75,8 +75,13 @@ class RegexTier:
     name = "tier1"
     cost_per_1k_chars = 0.0
 
-    def __init__(self, *, include_builtins: bool = True, include_custom: bool = True,
-                 use_active_profile: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        include_builtins: bool = True,
+        include_custom: bool = True,
+        use_active_profile: bool = True,
+    ) -> None:
         if include_custom:
             self.recognizers = recognizers.all_recognizers(
                 include_builtins=include_builtins,
@@ -89,9 +94,16 @@ class RegexTier:
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
         return [
-            Span(r.start, r.end, r.entity_type, float(r.score or 0.0), self.name,
-                 detector=getattr(r, "recognition_metadata", {}).get(
-                     "recognizer_name", "") if getattr(r, "recognition_metadata", None) else "")
+            Span(
+                r.start,
+                r.end,
+                r.entity_type,
+                float(r.score or 0.0),
+                self.name,
+                detector=getattr(r, "recognition_metadata", {}).get("recognizer_name", "")
+                if getattr(r, "recognition_metadata", None)
+                else "",
+            )
             for r in recognizers.analyze(text, self.recognizers)
         ]
 
@@ -133,8 +145,16 @@ class ManagedNerTier:
             if not segment.strip():
                 continue
             for s0, e0, etype, score in classifier.predict_spans(self._clf, segment):
-                spans.append(Span(start + s0, start + e0, etype, float(score),
-                                   self.name, detector="trained-classifier"))
+                spans.append(
+                    Span(
+                        start + s0,
+                        start + e0,
+                        etype,
+                        float(score),
+                        self.name,
+                        detector="trained-classifier",
+                    )
+                )
         return spans
 
 
@@ -178,6 +198,7 @@ class LlmPassTier:
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
         from . import llm_tier
+
         return llm_tier.detect(self.backend, text, residue, tier_name=self.name)
 
 
@@ -315,10 +336,7 @@ class Pipeline:
             finally:
                 stat.elapsed_s += time.perf_counter() - t0
 
-            kept = [
-                s for s in _sane(found, len(text))
-                if s.score >= self.min_score
-            ]
+            kept = [s for s in _sane(found, len(text)) if s.score >= self.min_score]
             before = _covered(accumulated)
             candidate = resolve(accumulated + kept)
             # Monotonicity, enforced rather than trusted: any character masked
@@ -343,8 +361,8 @@ class Pipeline:
         events: list[dict] = []
         cursor = 0
         for s in spans:
-            out.append(text[cursor:s.start])
-            original = text[s.start:s.end]
+            out.append(text[cursor : s.start])
+            original = text[s.start : s.end]
             if _is_secret(s.entity_type):
                 replacement = pseudonym.destroyed_marker(s.entity_type, original)
                 action = "destroyed"

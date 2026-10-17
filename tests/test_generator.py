@@ -12,7 +12,7 @@ def test_ground_truth_offsets_point_at_the_recorded_value():
     assert corpus.truth
     for occ in corpus.truth:
         line = corpus.unit(occ.unit).lines[occ.line_no]
-        assert line[occ.start:occ.end] == occ.value, f"offset drift in {occ.unit}:{occ.line_no}"
+        assert line[occ.start : occ.end] == occ.value, f"offset drift in {occ.unit}:{occ.line_no}"
 
 
 def test_no_marker_survives_into_the_corpus():
@@ -62,13 +62,13 @@ def test_markup_records_offsets_for_a_hand_written_line():
     text, found = markup.render("pod <<POD_ID|wkr-amer-prx117>> ok", __import__("random").Random(1))
     assert text == "pod wkr-amer-prx117 ok"
     assert len(found) == 1
-    assert text[found[0].start:found[0].end] == "wkr-amer-prx117"
+    assert text[found[0].start : found[0].end] == "wkr-amer-prx117"
 
 
 def test_adversarial_offsets_are_exact():
     lines, truth, _ = adversarial.build(seed=3)
     for occ in truth:
-        assert lines[occ.line_no][occ.start:occ.end] == occ.value
+        assert lines[occ.line_no][occ.start : occ.end] == occ.value
 
 
 def test_adversarial_gaps_carry_an_owner():

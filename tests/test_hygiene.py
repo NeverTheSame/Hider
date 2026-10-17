@@ -34,16 +34,35 @@ BLOB = re.compile(r"[A-Za-z0-9_-]{16,}={0,2}")
 #: payload means adding its vocabulary here, deliberately and in review, which
 #: is the point: a payload nobody can describe has no business being committed.
 ALLOWED_TOKENS = {
-    "alg", "typ", "HS256", "JWT", "sub", "iat", "svc", "abc", "001",
-    "1755000000", "anna", "novak", "contosocorp", "com", "acme", "example",
+    "alg",
+    "typ",
+    "HS256",
+    "JWT",
+    "sub",
+    "iat",
+    "svc",
+    "abc",
+    "001",
+    "1755000000",
+    "anna",
+    "novak",
+    "contosocorp",
+    "com",
+    "acme",
+    "example",
     "sDfGhJkLMnOpQrStUvWxYzAbCdEfGhIjKlMnOpQrStUvWxYzAbCd",
     "CWDfnkLxVsHtbJPwGrNmXyZcAsDfgHjkL",
     # Truncated variants of the two filler runs above, as they appear in the
     # shorter recognizer fixtures.
-    "sDfGhJkLMnOpQrStUvWx", "CWDfnkLxVsHtbJPwGrNm",
+    "sDfGhJkLMnOpQrStUvWx",
+    "CWDfnkLxVsHtbJPwGrNm",
     # The canonical RFC 7519 example subject, and the deliberately meaningless
     # opaque bearer value used to prove position alone is enough to redact.
-    "1234567890", "hello", "world", "opaque", "token",
+    "1234567890",
+    "hello",
+    "world",
+    "opaque",
+    "token",
 }
 
 WORD = re.compile(r"[A-Za-z0-9]+")
@@ -77,8 +96,11 @@ def test_no_profile_file_is_committed():
     """A filled-in site profile describes an estate and must stay local."""
     for name in ("profile.json", "site.json"):
         assert not (ROOT / name).exists()
-    committed = [p.name for p in ROOT.rglob("*.profile.json")
-                 if ".venv" not in str(p) and "out" not in p.parts]
+    committed = [
+        p.name
+        for p in ROOT.rglob("*.profile.json")
+        if ".venv" not in str(p) and "out" not in p.parts
+    ]
     assert committed == []
 
 

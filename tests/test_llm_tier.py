@@ -45,15 +45,18 @@ def test_tolerates_markdown_fences():
     assert llm_tier.parse_response(raw) == []
 
 
-@pytest.mark.parametrize("raw", [
-    "not json at all",
-    "{}",
-    '{"findings": "not a list"}',
-    '{"findings": [{"type": "PERSON"}]}',
-    '{"findings": [{"text": ""}]}',
-    '{"findings": [{"text": "X", "type": "DATE"}]}',
-    '{"findings": ["a string, not an object"]}',
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json at all",
+        "{}",
+        '{"findings": "not a list"}',
+        '{"findings": [{"type": "PERSON"}]}',
+        '{"findings": [{"text": ""}]}',
+        '{"findings": [{"text": "X", "type": "DATE"}]}',
+        '{"findings": ["a string, not an object"]}',
+    ],
+)
 def test_malformed_responses_raise(raw):
     with pytest.raises(llm_tier.LlmTierError):
         llm_tier.parse_response(raw)
@@ -65,14 +68,12 @@ def test_malformed_responses_raise(raw):
 
 
 def test_detect_finds_the_literal_substring():
-    backend = FakeBackend(json.dumps(
-        {"findings": [{"text": "Diego Ferreira", "type": "PERSON"}]}
-    ))
+    backend = FakeBackend(json.dumps({"findings": [{"text": "Diego Ferreira", "type": "PERSON"}]}))
     text = "Note: spoke to Diego Ferreira about the outage."
     spans = llm_tier.detect(backend, text, [(0, len(text))])
     assert len(spans) == 1
     s = spans[0]
-    assert text[s.start:s.end] == "Diego Ferreira"
+    assert text[s.start : s.end] == "Diego Ferreira"
     assert s.entity_type == "PERSON"
     assert s.tier == "tier3"
 
@@ -80,14 +81,20 @@ def test_detect_finds_the_literal_substring():
 def test_hallucinated_citation_is_discarded_not_fatal():
     """A quote that is not actually in the segment is dropped silently; the
     call is not treated as a hard failure just because one finding was bad."""
-    backend = FakeBackend(json.dumps({"findings": [
-        {"text": "Diego Ferreira", "type": "PERSON"},
-        {"text": "Nobody In This Text", "type": "PERSON"},
-    ]}))
+    backend = FakeBackend(
+        json.dumps(
+            {
+                "findings": [
+                    {"text": "Diego Ferreira", "type": "PERSON"},
+                    {"text": "Nobody In This Text", "type": "PERSON"},
+                ]
+            }
+        )
+    )
     text = "Note: spoke to Diego Ferreira about the outage."
     spans = llm_tier.detect(backend, text, [(0, len(text))])
     assert len(spans) == 1
-    assert text[spans[0].start:spans[0].end] == "Diego Ferreira"
+    assert text[spans[0].start : spans[0].end] == "Diego Ferreira"
 
 
 def test_malformed_response_raises_out_of_detect():
@@ -116,9 +123,7 @@ def test_prompt_fences_the_data_as_untrusted():
 def test_llm_pass_tier_fails_closed_on_malformed_output():
     backend = FakeBackend("garbage, not json")
     tier = pipeline.LlmPassTier(backend)
-    p = pipeline.Pipeline(
-        [pipeline.RegexTier(), tier], vault=pseudonym.EntityVault(key=b"k")
-    )
+    p = pipeline.Pipeline([pipeline.RegexTier(), tier], vault=pseudonym.EntityVault(key=b"k"))
     line = "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd and Diego Ferreira"
     r = p.redact(line)
     assert r.degraded is True
@@ -128,17 +133,13 @@ def test_llm_pass_tier_fails_closed_on_malformed_output():
 
 
 def test_llm_pass_tier_can_only_add_spans():
-    backend = FakeBackend(json.dumps(
-        {"findings": [{"text": "Diego Ferreira", "type": "PERSON"}]}
-    ))
+    backend = FakeBackend(json.dumps({"findings": [{"text": "Diego Ferreira", "type": "PERSON"}]}))
     tier = pipeline.LlmPassTier(backend)
-    p = pipeline.Pipeline(
-        [pipeline.RegexTier(), tier], vault=pseudonym.EntityVault(key=b"k")
-    )
+    p = pipeline.Pipeline([pipeline.RegexTier(), tier], vault=pseudonym.EntityVault(key=b"k"))
     line = "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd and Diego Ferreira"
-    only1 = pipeline.Pipeline(
-        [pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")
-    ).detect(line)[0]
+    only1 = pipeline.Pipeline([pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")).detect(
+        line
+    )[0]
     both = p.detect(line)[0]
 
     def cov(spans):
@@ -204,8 +205,14 @@ def test_committed_injection_cassette_still_reads_as_zero_bypass():
     if not path.exists():
         pytest.skip("cassette not present in this checkout")
     cb = llm_backend.CassetteBackend(path=path, mode="replay")
-    full, _ = evaluate.run(lines=0, seed=20260820, tier2=None, tier3=cb,
-                           include_adversarial=True, label="cassette-regression")
+    full, _ = evaluate.run(
+        lines=0,
+        seed=20260820,
+        tier2=None,
+        tier3=cb,
+        include_adversarial=True,
+        label="cassette-regression",
+    )
     assert full.injection_bypass_rate == 0.0
 
 
@@ -213,6 +220,7 @@ def test_committed_injection_cassette_still_reads_as_zero_bypass():
 # Regression: a verified literal was applied at its first occurrence only, so
 # the second mention of a repeated name stayed in the clear.
 # ---------------------------------------------------------------------------
+
 
 class _OneFinding:
     name = "one-finding"
@@ -247,7 +255,7 @@ def test_repeated_occurrences_across_several_residue_segments():
     spans = llm_tier.detect(_OneFinding("Mateo Berg"), text, residue)
     assert len(spans) == 2
     for s in spans:
-        assert text[s.start:s.end] == "Mateo Berg"
+        assert text[s.start : s.end] == "Mateo Berg"
 
 
 def test_a_hallucinated_literal_is_still_discarded_silently():
@@ -260,12 +268,16 @@ def test_overlapping_findings_do_not_double_claim():
         name = "two"
 
         def complete(self, prompt):
-            return json.dumps({"findings": [
-                {"text": "Mateo Berg", "type": "PERSON"},
-                {"text": "Berg", "type": "PERSON"},
-            ]})
+            return json.dumps(
+                {
+                    "findings": [
+                        {"text": "Mateo Berg", "type": "PERSON"},
+                        {"text": "Berg", "type": "PERSON"},
+                    ]
+                }
+            )
 
     text = "Spoke to Mateo Berg today."
     spans = llm_tier.detect(TwoOverlapping(), text, [(0, len(text))])
     assert len(spans) == 1
-    assert text[spans[0].start:spans[0].end] == "Mateo Berg"
+    assert text[spans[0].start : spans[0].end] == "Mateo Berg"

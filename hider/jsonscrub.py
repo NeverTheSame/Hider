@@ -39,50 +39,217 @@ from . import evaluate, localcfg, pipeline, pseudonym
 # ---------------------------------------------------------------------------
 
 _PERSON_WORDS = {
-    "name", "firstname", "lastname", "fullname", "displayname", "givenname",
-    "surname", "middlename", "nickname", "contact", "caller", "requester",
-    "requestor", "requested", "opened", "assigned", "assignee", "owner", "user",
-    "username", "login", "author", "creator", "engineer", "manager", "tam",
-    "sender", "recipient", "employee", "agent", "approver", "reporter",
-    "watcher", "member", "person", "signer", "submitter", "attendee",
-    "participant", "commenter", "resolver", "closer", "updater", "modifier",
+    "name",
+    "firstname",
+    "lastname",
+    "fullname",
+    "displayname",
+    "givenname",
+    "surname",
+    "middlename",
+    "nickname",
+    "contact",
+    "caller",
+    "requester",
+    "requestor",
+    "requested",
+    "opened",
+    "assigned",
+    "assignee",
+    "owner",
+    "user",
+    "username",
+    "login",
+    "author",
+    "creator",
+    "engineer",
+    "manager",
+    "tam",
+    "sender",
+    "recipient",
+    "employee",
+    "agent",
+    "approver",
+    "reporter",
+    "watcher",
+    "member",
+    "person",
+    "signer",
+    "submitter",
+    "attendee",
+    "participant",
+    "commenter",
+    "resolver",
+    "closer",
+    "updater",
+    "modifier",
 }
 _WHOLE_KEY_PERSON = {"to", "cc", "bcc", "from", "replyto", "by", "who"}
 _ORG_WORDS = {
-    "account", "company", "organization", "organisation", "org", "tenant",
-    "customer", "client", "vendor", "partner", "reseller", "employer",
-    "business", "enterprise", "firm",
+    "account",
+    "company",
+    "organization",
+    "organisation",
+    "org",
+    "tenant",
+    "customer",
+    "client",
+    "vendor",
+    "partner",
+    "reseller",
+    "employer",
+    "business",
+    "enterprise",
+    "firm",
 }
 _EMAIL_WORDS = {"email", "mail", "upn", "emailaddress"}
 _PHONE_WORDS = {"phone", "mobile", "tel", "telephone", "fax", "cell", "msisdn"}
 _ADDRESS_WORDS = {
-    "address", "street", "city", "zip", "zipcode", "postal", "postcode",
-    "country", "province", "county", "location", "building", "floor",
+    "address",
+    "street",
+    "city",
+    "zip",
+    "zipcode",
+    "postal",
+    "postcode",
+    "country",
+    "province",
+    "county",
+    "location",
+    "building",
+    "floor",
 }
-_NET_WORDS = {"ip", "ipaddress", "host", "hostname", "fqdn", "server", "machine",
-              "computer", "device", "domain", "mac", "dns", "endpoint"}
+_NET_WORDS = {
+    "ip",
+    "ipaddress",
+    "host",
+    "hostname",
+    "fqdn",
+    "server",
+    "machine",
+    "computer",
+    "device",
+    "domain",
+    "mac",
+    "dns",
+    "endpoint",
+}
 _LINK_WORDS = {"url", "uri", "link", "href", "site", "path", "web", "website"}
 _ID_WORDS = {
-    "id", "ids", "sysid", "guid", "uuid", "number", "num", "no", "nr", "case",
-    "ticket", "serial", "license", "licence", "contract", "subscription",
-    "invoice", "reference", "ref", "correlation", "session", "sn",
-    "key", "sid", "oid", "objectid", "tenantid", "vat",
-    "tax", "iban", "swift", "passport", "ssn",
+    "id",
+    "ids",
+    "sysid",
+    "guid",
+    "uuid",
+    "number",
+    "num",
+    "no",
+    "nr",
+    "case",
+    "ticket",
+    "serial",
+    "license",
+    "licence",
+    "contract",
+    "subscription",
+    "invoice",
+    "reference",
+    "ref",
+    "correlation",
+    "session",
+    "sn",
+    "key",
+    "sid",
+    "oid",
+    "objectid",
+    "tenantid",
+    "vat",
+    "tax",
+    "iban",
+    "swift",
+    "passport",
+    "ssn",
 }
-_DESCRIPTOR_SUFFIX = {"status", "state", "type", "kind", "count", "total", "time", "date",
-                      "start", "end", "duration", "size", "rate", "percent", "version",
-                      "mode", "level", "result", "utc", "at", "on", "flag", "enabled"}
-_SECRET_WORDS = {"password", "passwd", "pwd", "secret", "token", "apikey",
-                 "credential", "credentials", "authorization", "auth", "cookie",
-                 "privatekey", "accesskey", "sas", "signature"}
+_DESCRIPTOR_SUFFIX = {
+    "status",
+    "state",
+    "type",
+    "kind",
+    "count",
+    "total",
+    "time",
+    "date",
+    "start",
+    "end",
+    "duration",
+    "size",
+    "rate",
+    "percent",
+    "version",
+    "mode",
+    "level",
+    "result",
+    "utc",
+    "at",
+    "on",
+    "flag",
+    "enabled",
+}
+_SECRET_WORDS = {
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "credential",
+    "credentials",
+    "authorization",
+    "auth",
+    "cookie",
+    "privatekey",
+    "accesskey",
+    "sas",
+    "signature",
+}
 
 #: Values that are never worth mapping even under a sensitive key, and that
 #: must never be substituted into free text (they are ordinary words).
 _STOPWORDS = {
-    "", "system", "admin", "administrator", "guest", "none", "null", "unknown",
-    "support", "true", "false", "yes", "no", "n/a", "na", "default", "user",
-    "test", "service", "other", "customer", "internal", "external", "new",
-    "open", "closed", "the", "and", "for", "mr", "mrs", "ms", "dr", "team",
+    "",
+    "system",
+    "admin",
+    "administrator",
+    "guest",
+    "none",
+    "null",
+    "unknown",
+    "support",
+    "true",
+    "false",
+    "yes",
+    "no",
+    "n/a",
+    "na",
+    "default",
+    "user",
+    "test",
+    "service",
+    "other",
+    "customer",
+    "internal",
+    "external",
+    "new",
+    "open",
+    "closed",
+    "the",
+    "and",
+    "for",
+    "mr",
+    "mrs",
+    "ms",
+    "dr",
+    "team",
 }
 
 _LEGAL_SUFFIX = re.compile(
@@ -161,7 +328,9 @@ _LABEL_RE = re.compile(
 _SP_PATH = re.compile(r"(?i)/(?:sites|teams|personal|lists)/([^/\s\"'<>?#&|,;]+)")
 #: Tenant hosts, including the underscore and mixed-case forms the generic
 #: hostname rule refuses.
-_TENANT_HOST = re.compile(r"(?i)(?<![\w.-])[\w-]+(?:\.[\w-]+)*\.(?:onmicrosoft|sharepoint)\.com(?![\w-])")
+_TENANT_HOST = re.compile(
+    r"(?i)(?<![\w.-])[\w-]+(?:\.[\w-]+)*\.(?:onmicrosoft|sharepoint)\.com(?![\w-])"
+)
 _PLAIN_KEY = re.compile(r"^(?!.*\d{4})[A-Za-z_][A-Za-z0-9_ ()/-]{0,63}$")
 _COMMON: set[str] | None = None
 
@@ -194,6 +363,8 @@ def _is_common(word: str) -> bool:
     if w.endswith("ing"):
         cands.update({w[:-3], w[:-3] + "e"})
     return any(c in words for c in cands)
+
+
 _BOUND_L = r"(?<![A-Za-z0-9])"
 _BOUND_R = r"(?![A-Za-z0-9])"
 
@@ -214,20 +385,117 @@ _NAME_TYPES = {"PERSON", "PERSON_NAME", "ORGANIZATION", "ORG_NAME"}
 #: classifier was trained on prose and reads "Too Many Requests" or
 #: "Site Pages" as a name; masking those destroys the signal being triaged.
 _LOG_VOCAB = {
-    "too", "many", "request", "requests", "access", "denied", "display", "name", "language",
-    "master", "site", "sites", "page", "pages", "list", "lists", "library", "document",
-    "documents", "folder", "item", "items", "error", "warning", "forbidden", "not", "found",
-    "internal", "server", "service", "unavailable", "bad", "gateway", "timeout",
-    "unauthorized", "conflict", "throttled", "throttling", "retry", "after", "processing",
-    "backup", "restore", "job", "session", "policy", "object", "sharepoint", "onedrive",
-    "teams", "exchange", "mailbox", "user", "group", "web", "app", "catalog", "style",
-    "form", "forms", "templates", "template", "workflow", "history", "tasks", "calendar",
-    "contacts", "announcements", "links", "discussion", "survey", "picture", "assets",
-    "shared", "microsoft", "graph", "office", "owners", "members", "visitors", "gallery",
-    "solution", "theme", "composed", "looks", "content", "type", "types", "field",
-    "fields", "view", "views", "version", "versions", "attachment", "attachments",
-    "permission", "permissions", "role", "roles", "file", "files", "upload", "download",
-    "success", "failed", "failure", "skipped", "completed", "running", "stopped",
+    "too",
+    "many",
+    "request",
+    "requests",
+    "access",
+    "denied",
+    "display",
+    "name",
+    "language",
+    "master",
+    "site",
+    "sites",
+    "page",
+    "pages",
+    "list",
+    "lists",
+    "library",
+    "document",
+    "documents",
+    "folder",
+    "item",
+    "items",
+    "error",
+    "warning",
+    "forbidden",
+    "not",
+    "found",
+    "internal",
+    "server",
+    "service",
+    "unavailable",
+    "bad",
+    "gateway",
+    "timeout",
+    "unauthorized",
+    "conflict",
+    "throttled",
+    "throttling",
+    "retry",
+    "after",
+    "processing",
+    "backup",
+    "restore",
+    "job",
+    "session",
+    "policy",
+    "object",
+    "sharepoint",
+    "onedrive",
+    "teams",
+    "exchange",
+    "mailbox",
+    "user",
+    "group",
+    "web",
+    "app",
+    "catalog",
+    "style",
+    "form",
+    "forms",
+    "templates",
+    "template",
+    "workflow",
+    "history",
+    "tasks",
+    "calendar",
+    "contacts",
+    "announcements",
+    "links",
+    "discussion",
+    "survey",
+    "picture",
+    "assets",
+    "shared",
+    "microsoft",
+    "graph",
+    "office",
+    "owners",
+    "members",
+    "visitors",
+    "gallery",
+    "solution",
+    "theme",
+    "composed",
+    "looks",
+    "content",
+    "type",
+    "types",
+    "field",
+    "fields",
+    "view",
+    "views",
+    "version",
+    "versions",
+    "attachment",
+    "attachments",
+    "permission",
+    "permissions",
+    "role",
+    "roles",
+    "file",
+    "files",
+    "upload",
+    "download",
+    "success",
+    "failed",
+    "failure",
+    "skipped",
+    "completed",
+    "running",
+    "stopped",
 }
 
 
@@ -243,14 +511,13 @@ def _is_noise(text: str) -> bool:
         # SiteAssetsLibrary, SPWebPartManager: code identifiers, not names
         return len(re.findall(r"[A-Z]", w)) >= 3 and any(c.islower() for c in w)
     low = [w.casefold() for w in words]
-    return (all(_is_common(w) or w in _LOG_VOCAB for w in low)
-            and any(w in _LOG_VOCAB for w in low))
+    return all(_is_common(w) or w in _LOG_VOCAB for w in low) and any(w in _LOG_VOCAB for w in low)
 
 
 def _trim_name(s: pipeline.Span, line: str) -> pipeline.Span | None:
     """Drop greetings and punctuation the classifier glued onto a name or a
     URL, and classifier hits that are log vocabulary rather than names."""
-    text = line[s.start:s.end]
+    text = line[s.start : s.end]
     if s.entity_type in ("SITE_URL", "URL"):
         # "...sites/x: 429" - sentence punctuation is not part of the URL
         end = s.start + len(text.rstrip(".,:;!?'\")"))
@@ -270,17 +537,68 @@ def _trim_name(s: pipeline.Span, line: str) -> pipeline.Span | None:
 #: Shared hosts of the platforms a case talks about. They identify a vendor,
 #: not the customer, and keeping them keeps the text readable.
 #: Your own vendor's hosts come from hider.local.json, never from the repo.
-_VENDOR_SUFFIXES = ("microsoft.com", "microsoftonline.com", "office.com", "office365.com",
-                    "windows.net", "azure.com",
-                    *localcfg.settings().get("vendor_suffixes", []))
-_VENDOR_HOSTS = {"www", "graph", "login", "outlook", "management", "portal", "api",
-                 "docs", "learn", "support", "admin",
-                 *localcfg.settings().get("vendor_hosts", [])}
-_FILE_EXT = {"log", "txt", "json", "xml", "dll", "exe", "zip", "csv", "config", "html",
-             "htm", "pdf", "png", "jpg", "gz", "db", "md", "ps", "cs", "js", "py", "sh",
-             "ts", "rs", "go", "rb", "yml", "yaml", "ini", "bak", "tmp", "evtx", "etl"}
-_FQDN = re.compile(r"(?<![\w@.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}"
-                   r"[A-Za-z]{2,24}(?![\w-])")
+_VENDOR_SUFFIXES = (
+    "microsoft.com",
+    "microsoftonline.com",
+    "office.com",
+    "office365.com",
+    "windows.net",
+    "azure.com",
+    *localcfg.settings().get("vendor_suffixes", []),
+)
+_VENDOR_HOSTS = {
+    "www",
+    "graph",
+    "login",
+    "outlook",
+    "management",
+    "portal",
+    "api",
+    "docs",
+    "learn",
+    "support",
+    "admin",
+    *localcfg.settings().get("vendor_hosts", []),
+}
+_FILE_EXT = {
+    "log",
+    "txt",
+    "json",
+    "xml",
+    "dll",
+    "exe",
+    "zip",
+    "csv",
+    "config",
+    "html",
+    "htm",
+    "pdf",
+    "png",
+    "jpg",
+    "gz",
+    "db",
+    "md",
+    "ps",
+    "cs",
+    "js",
+    "py",
+    "sh",
+    "ts",
+    "rs",
+    "go",
+    "rb",
+    "yml",
+    "yaml",
+    "ini",
+    "bak",
+    "tmp",
+    "evtx",
+    "etl",
+}
+_FQDN = re.compile(
+    r"(?<![\w@.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}"
+    r"[A-Za-z]{2,24}(?![\w-])"
+)
 
 
 def _fqdn_spans(line: str) -> list[pipeline.Span]:
@@ -336,8 +654,9 @@ class JsonScrubber:
         n = _norm(value)
         if n in self.known:
             return self.known[n]
-        if (etype in {"PERSON_NAME", "ORG_NAME", "UPN_EMAIL"} or etype.startswith("NAME:")) \
-                and _ID_SHAPE.match(value.strip()):
+        if (
+            etype in {"PERSON_NAME", "ORG_NAME", "UPN_EMAIL"} or etype.startswith("NAME:")
+        ) and _ID_SHAPE.match(value.strip()):
             etype = "ID:ID"  # a reference field's sys_id is an id, not a name
         if etype in {"UPN_EMAIL", "IPV4", "HOSTNAME_FQDN", "PERSON_NAME", "ORG_NAME"}:
             vtype = etype
@@ -353,21 +672,28 @@ class JsonScrubber:
         self._remember(value, label, vtype)
         return label
 
-    def _remember(self, value: str, label: str, etype: str, *, index: bool = True,
-                  force: bool = False) -> None:
+    def _remember(
+        self, value: str, label: str, etype: str, *, index: bool = True, force: bool = False
+    ) -> None:
         n = _norm(value)
         if n in self.known or value in self.mapping:
             return  # already mapped, or it is one of our own labels
         self.known[n] = label
         self.mapping.setdefault(label, value)
         self.counts[etype] = self.counts.get(etype, 0) + 1
-        if force or index and n not in _STOPWORDS and (len(n) >= 4 or (len(n) >= 3 and not n.isdigit())):
+        if (
+            force
+            or index
+            and n not in _STOPWORDS
+            and (len(n) >= 4 or (len(n) >= 3 and not n.isdigit()))
+        ):
             toks = list(_TOKEN.finditer(n))
             if toks:
                 # Index under the least-shared token, so a word every URL has
                 # ("https", "sharepoint") never becomes a bucket of thousands.
-                tok = min(toks, key=lambda t: (len(self._index.get(t.group(0), ())),
-                                               -len(t.group(0))))
+                tok = min(
+                    toks, key=lambda t: (len(self._index.get(t.group(0), ())), -len(t.group(0)))
+                )
                 self._index.setdefault(tok.group(0), []).append((n, tok.start()))
 
     def _register_parts(self, etype: str, value: str, label: str) -> None:
@@ -438,13 +764,15 @@ class JsonScrubber:
             return []
         hits = []
         guard = [(m.start(), m.end()) for m in _LABEL_RE.finditer(text)]
-        for m in (_WORD.finditer(text) if self._prefixes else ()):
+        for m in _WORD.finditer(text) if self._prefixes else ():
             w = m.group(0).casefold()
             if any(w.startswith(p) for p in self._prefixes) and not any(
-                    m.start() < ge and gs < m.end() for gs, ge in guard):
+                m.start() < ge and gs < m.end() for gs, ge in guard
+            ):
                 if w not in self.known:
-                    self._remember(m.group(0), self.vault.pseudonym("ORG_NAME", m.group(0)),
-                                   "TERM", force=True)
+                    self._remember(
+                        m.group(0), self.vault.pseudonym("ORG_NAME", m.group(0)), "TERM", force=True
+                    )
                 hits.append((m.start(), m.end(), w))
         for tok in _TOKEN.finditer(text):
             for v, off in self._index.get(tok.group(0).casefold(), ()):
@@ -489,10 +817,15 @@ class JsonScrubber:
             found = [s for s in found if s.tier == "tier1"]
         found = [t for t in (_trim_name(s, line) for s in found) if t is not None]
         found += _fqdn_spans(line)
-        found += [pipeline.Span(m.start(1), m.end(1), "SITE_NAME", 0.95, "jsonsp")
-                  for m in _SP_PATH.finditer(line) if not _LABEL_RE.fullmatch(m.group(1))]
-        found += [pipeline.Span(m.start(), m.end(), "TENANT_DOMAIN", 0.95, "jsonsp")
-                  for m in _TENANT_HOST.finditer(line)]
+        found += [
+            pipeline.Span(m.start(1), m.end(1), "SITE_NAME", 0.95, "jsonsp")
+            for m in _SP_PATH.finditer(line)
+            if not _LABEL_RE.fullmatch(m.group(1))
+        ]
+        found += [
+            pipeline.Span(m.start(), m.end(), "TENANT_DOMAIN", 0.95, "jsonsp")
+            for m in _TENANT_HOST.finditer(line)
+        ]
         if len(self._detect_cache) < 500_000:
             self._detect_cache[key] = (found, degraded)
         return found, degraded
@@ -512,8 +845,8 @@ class JsonScrubber:
             spans = pipeline.resolve(spans + found)
             buf, cur = [], 0
             for s in spans:
-                original = line[s.start:s.end]
-                buf.append(line[cur:s.start])
+                original = line[s.start : s.end]
+                buf.append(line[cur : s.start])
                 if s.entity_type == "KNOWN":
                     buf.append(self.known[" ".join(original.split()).casefold()])
                 elif pipeline._is_secret(s.entity_type):
@@ -523,15 +856,20 @@ class JsonScrubber:
                     buf.append(original)  # already one of our labels
                 else:
                     label = self.known.get(_norm(original)) or self.vault.pseudonym(
-                        s.entity_type, original)
+                        s.entity_type, original
+                    )
                     # A lone dictionary word the classifier called a name
                     # ("Records", "Server") is masked here but not spread
                     # through the document, or every "server" would go.
                     common = s.tier == "tier2" and all(
-                        _is_common(w) for w in original.casefold().split())
-                    self._remember(original, label,
-                                   pseudonym._canonical_type(s.entity_type, original),
-                                   index=not common)
+                        _is_common(w) for w in original.casefold().split()
+                    )
+                    self._remember(
+                        original,
+                        label,
+                        pseudonym._canonical_type(s.entity_type, original),
+                        index=not common,
+                    )
                     if s.entity_type in {"EMAIL_ADDRESS", "UPN_EMAIL"}:
                         self._register_parts("UPN_EMAIL", original, label)
                     buf.append(label)

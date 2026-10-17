@@ -115,9 +115,7 @@ class EntityVault:
         """
         canonical = _canonical_type(entity_type, value)
         if canonical in entities.SECRET_TYPES:
-            raise ValueError(
-                f"{canonical} is a secret; it must be destroyed, not vaulted"
-            )
+            raise ValueError(f"{canonical} is a secret; it must be destroyed, not vaulted")
         d = _digest(self.key, _identity_type(canonical), value)
         hit = self.entries.get(d)
         if hit:
@@ -140,7 +138,8 @@ class EntityVault:
         for label in sorted(self.by_label, key=len, reverse=True):
             text = text.replace(label, self.by_label[label])
         bare = {
-            label[1:-1]: value for label, value in self.by_label.items()
+            label[1:-1]: value
+            for label, value in self.by_label.items()
             if label.startswith("<") and label.endswith(">")
         }
         for label in sorted(bare, key=len, reverse=True):
@@ -154,8 +153,8 @@ class EntityVault:
             json.dumps(
                 {
                     "note": "Stands in for a Key Vault backed store. Holds real "
-                            "values, so it is the sensitive half of the system "
-                            "and never leaves the engagement boundary.",
+                    "values, so it is the sensitive half of the system "
+                    "and never leaves the engagement boundary.",
                     "entries": self.entries,
                     "counters": self._counters,
                 },
@@ -169,8 +168,7 @@ class EntityVault:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         v = cls(key=key or _load_key(), entries=raw["entries"], _counters=raw["counters"])
         v.by_label = {
-            e["label"]: e["value"] for e in raw["entries"].values()
-            if not e["type"].startswith("_")
+            e["label"]: e["value"] for e in raw["entries"].values() if not e["type"].startswith("_")
         }
         return v
 

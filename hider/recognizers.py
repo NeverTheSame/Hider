@@ -58,9 +58,11 @@ def upn_email() -> PatternRecognizer:
         patterns=[
             Pattern(
                 name="upn",
-                regex=(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}"
-                       r"@[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})"
-                       r"(?:\.[A-Za-z0-9-]{1,63})+"),
+                regex=(
+                    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}"
+                    r"@[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})"
+                    r"(?:\.[A-Za-z0-9-]{1,63})+"
+                ),
                 score=0.85,
             ),
         ],
@@ -137,12 +139,11 @@ def tenant_site_url() -> PatternRecognizer:
             Pattern(
                 name="tenant-site",
                 regex=rf"https?://[A-Za-z0-9-]{{1,63}}(?:-my)?\.(?:{hosts})"
-                      rf"(?:/[^\s\"'<>,;)\]]*)?",
+                rf"(?:/[^\s\"'<>,;)\]]*)?",
                 score=0.9,
             ),
             # Bare host with no scheme still identifies the tenant.
-            Pattern(name="tenant-host",
-                    regex=rf"\b[A-Za-z0-9-]{{1,63}}\.(?:{hosts})\b", score=0.8),
+            Pattern(name="tenant-host", regex=rf"\b[A-Za-z0-9-]{{1,63}}\.(?:{hosts})\b", score=0.8),
         ],
         context=["site", "tenant", "workspace", "target"],
     )
@@ -156,8 +157,10 @@ def presigned_url() -> PatternRecognizer:
         patterns=[
             Pattern(
                 name="sas",
-                regex=(r"https?://[A-Za-z0-9.-]+\.(?:blob|file|queue|table|dfs)"
-                       r"\.core\.windows\.net/[^\s\"'<>]*[?&]s(?:ig|v)=[^\s\"'<>]+"),
+                regex=(
+                    r"https?://[A-Za-z0-9.-]+\.(?:blob|file|queue|table|dfs)"
+                    r"\.core\.windows\.net/[^\s\"'<>]*[?&]s(?:ig|v)=[^\s\"'<>]+"
+                ),
                 score=0.95,
             ),
             # A signature parameter alone is enough: the grant is the secret.
@@ -174,9 +177,11 @@ def connection_string() -> PatternRecognizer:
         patterns=[
             Pattern(
                 name="conn",
-                regex=(r"(?:DefaultEndpointsProtocol|AccountName|AccountKey|"
-                       r"SharedAccessSignature|Server|Data Source|Password|Pwd)"
-                       r"=[^\s\"']*(?:;[^\s\"';]+)*"),
+                regex=(
+                    r"(?:DefaultEndpointsProtocol|AccountName|AccountKey|"
+                    r"SharedAccessSignature|Server|Data Source|Password|Pwd)"
+                    r"=[^\s\"']*(?:;[^\s\"';]+)*"
+                ),
                 score=0.9,
             ),
             Pattern(name="accountkey", regex=r"AccountKey=[A-Za-z0-9+/=_-]{20,}", score=0.95),
@@ -257,8 +262,13 @@ class ContinuationFragmentRecognizer(LocalRecognizer):
         if entities and self.supported_entity not in entities:
             return []
         return [
-            RecognizerResult(entity_type=self.supported_entity, start=m.start(1),
-                             end=m.end(1), score=0.85, analysis_explanation=None)
+            RecognizerResult(
+                entity_type=self.supported_entity,
+                start=m.start(1),
+                end=m.end(1),
+                score=0.85,
+                analysis_explanation=None,
+            )
             for m in self.FRAGMENT.finditer(text)
         ]
 
@@ -285,7 +295,9 @@ def windows_user_path() -> PatternRecognizer:
                 regex=r"[A-Za-z]:\\Users\\[^\\\s\"'<>|]+(?:\\[^\s\"'<>|]*)*",
                 score=0.85,
             ),
-            Pattern(name="unc-home", regex=r"\\\\[A-Za-z0-9.-]+\\users?\$?\\[^\s\"'<>|]+", score=0.8),
+            Pattern(
+                name="unc-home", regex=r"\\\\[A-Za-z0-9.-]+\\users?\$?\\[^\s\"'<>|]+", score=0.8
+            ),
         ],
         context=["path", "cache", "export", "profile"],
     )
@@ -305,8 +317,8 @@ def hostname_fqdn() -> PatternRecognizer:
             Pattern(
                 name="internal-tld",
                 regex=r"\b[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-                      r"(?:\.[A-Za-z0-9-]{1,63})*"
-                      r"\.(?:internal|local|lan|corp|intra|ad)\b",
+                r"(?:\.[A-Za-z0-9-]{1,63})*"
+                r"\.(?:internal|local|lan|corp|intra|ad)\b",
                 score=0.85,
             ),
         ],
@@ -325,9 +337,7 @@ class SupportCaseRecognizer(LocalRecognizer):
     variable-length lookbehind and no ``\\K``), so the span is narrowed here.
     """
 
-    PHRASE = re.compile(
-        r"(?i)\b(?:case|ticket|sr|incident)\s*(?:number|no\.?|#)?\s*:?\s*(\d{8})\b"
-    )
+    PHRASE = re.compile(r"(?i)\b(?:case|ticket|sr|incident)\s*(?:number|no\.?|#)?\s*:?\s*(\d{8})\b")
 
     def __init__(self) -> None:
         super().__init__(
@@ -439,6 +449,7 @@ def analyze(text: str, recognizers: list[LocalRecognizer]) -> list[RecognizerRes
         out.extend(rec.analyze(text, entities=rec.supported_entities, nlp_artifacts=None))
     return refine(text, suppress(text, out))
 
+
 # ---------------------------------------------------------------------------
 # Suppression: the precision half of the job
 # ---------------------------------------------------------------------------
@@ -469,12 +480,27 @@ _PUBLIC_HOSTS = re.compile(
 #: calls a tenant id "Session-02" invites a model to reason about two sessions
 #: where there is one session and one tenant.
 _GUID_KINDS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?i)\b(?:tenant|directory|organisation|organization|customer)\b"
-                r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"), "TENANT_ID"),
-    (re.compile(r"(?i)\b(?:session|job|run|execution|task|activity)\b"
-                r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"), "SESSION_GUID"),
-    (re.compile(r"(?i)\b(?:mailbox|item|object|site|collection|folder|user|drive)\b"
-                r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"), "OBJECT_GUID"),
+    (
+        re.compile(
+            r"(?i)\b(?:tenant|directory|organisation|organization|customer)\b"
+            r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"
+        ),
+        "TENANT_ID",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:session|job|run|execution|task|activity)\b"
+            r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"
+        ),
+        "SESSION_GUID",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:mailbox|item|object|site|collection|folder|user|drive)\b"
+            r"(?:\W{0,4}(?:id|guid|uuid)\b)?\W{0,14}$"
+        ),
+        "OBJECT_GUID",
+    ),
 )
 
 
@@ -491,15 +517,20 @@ def refine(text: str, results: list[RecognizerResult]) -> list[RecognizerResult]
         if r.entity_type != "GUID":
             out.append(r)
             continue
-        before = text[max(0, r.start - 48):r.start]
+        before = text[max(0, r.start - 48) : r.start]
         label = "GUID"
         for rx, kind in _GUID_KINDS:
             if rx.search(before):
                 label = kind
                 break
         out.append(
-            RecognizerResult(entity_type=label, start=r.start, end=r.end,
-                             score=r.score, analysis_explanation=r.analysis_explanation)
+            RecognizerResult(
+                entity_type=label,
+                start=r.start,
+                end=r.end,
+                score=r.score,
+                analysis_explanation=r.analysis_explanation,
+            )
         )
     return out
 
@@ -513,13 +544,12 @@ def suppress(text: str, results: list[RecognizerResult]) -> list[RecognizerResul
     """
     kept: list[RecognizerResult] = []
     for r in results:
-        value = text[r.start:r.end]
+        value = text[r.start : r.end]
         if r.entity_type == "IP_ADDRESS" and ":" not in value:
-            if _VERSION_CONTEXT.search(text[max(0, r.start - 40):r.start]):
+            if _VERSION_CONTEXT.search(text[max(0, r.start - 40) : r.start]):
                 continue
         if r.entity_type in {"HOSTNAME_FQDN", "SITE_URL", "URL"}:
             if _PUBLIC_HOSTS.fullmatch(value):
                 continue
         kept.append(r)
     return kept
-

@@ -46,8 +46,15 @@ from . import pipeline
 #: Headers that must not be forwarded verbatim: hop-by-hop fields, and the
 #: ones whose value this gateway owns.
 HOP_BY_HOP = {
-    "host", "content-length", "connection", "keep-alive", "transfer-encoding",
-    "upgrade", "proxy-authorization", "te", "trailer",
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-authorization",
+    "te",
+    "trailer",
 }
 
 DEGRADED_STATUS = 503
@@ -155,16 +162,18 @@ class RedactionGateway:
     # -- upstream ----------------------------------------------------------
 
     def forward(self, path: str, payload: bytes, headers: dict) -> tuple[int, bytes, str]:
-        req = urllib.request.Request(
-            self.upstream_base + path, data=payload, method="POST"
-        )
+        req = urllib.request.Request(self.upstream_base + path, data=payload, method="POST")
         for k, v in headers.items():
             if k.lower() not in HOP_BY_HOP:
                 req.add_header(k, v)
         req.add_header("X-Hider-Redacted", "v1")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return resp.status, resp.read(), resp.headers.get("Content-Type", "application/json")
+                return (
+                    resp.status,
+                    resp.read(),
+                    resp.headers.get("Content-Type", "application/json"),
+                )
         except urllib.error.HTTPError as e:
             return e.code, e.read(), e.headers.get("Content-Type", "application/json")
         except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
@@ -242,12 +251,14 @@ def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTT
 
         def do_GET(self):
             if self.path == "/healthz":
-                body = json.dumps({
-                    "status": "ok",
-                    "upstream": gateway.upstream_base,
-                    "tiers": [getattr(t, "name", "?") for t in gateway.pipe.tiers],
-                    "vault_entries": gateway.pipe.vault.size,
-                }).encode()
+                body = json.dumps(
+                    {
+                        "status": "ok",
+                        "upstream": gateway.upstream_base,
+                        "tiers": [getattr(t, "name", "?") for t in gateway.pipe.tiers],
+                        "vault_entries": gateway.pipe.vault.size,
+                    }
+                ).encode()
                 self._reply(200, body)
             else:
                 self._reply(404, _error_body("not found"))
@@ -273,8 +284,10 @@ def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTT
 
 def serve(host: str, port: int, gateway: RedactionGateway) -> None:
     httpd = make_server(host, port, gateway)
-    print(f"hider gateway on http://{host}:{port} -> {gateway.upstream_base} "
-          f"(tiers: {', '.join(getattr(t, 'name', '?') for t in gateway.pipe.tiers)})")
+    print(
+        f"hider gateway on http://{host}:{port} -> {gateway.upstream_base} "
+        f"(tiers: {', '.join(getattr(t, 'name', '?') for t in gateway.pipe.tiers)})"
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

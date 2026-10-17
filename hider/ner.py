@@ -50,8 +50,8 @@ from .pipeline import Span
 #: it hands the spans over, both are accepted to be robust to that mapping
 #: being configured either way.
 LABEL_MAP = {
-    "PERSON": "PERSON",          # -> PERSON_NAME via the canonical type map
-    "ORG": "ORGANIZATION",       # -> ORG_NAME
+    "PERSON": "PERSON",  # -> PERSON_NAME via the canonical type map
+    "ORG": "ORGANIZATION",  # -> ORG_NAME
     "ORGANIZATION": "ORGANIZATION",
 }
 
@@ -78,9 +78,7 @@ def default_engine() -> NlpEngine:
     """
     from presidio_analyzer.nlp_engine import SpacyNlpEngine
 
-    engine = SpacyNlpEngine(
-        models=[{"lang_code": "en", "model_name": "en_core_web_sm"}]
-    )
+    engine = SpacyNlpEngine(models=[{"lang_code": "en", "model_name": "en_core_web_sm"}])
     engine.load()
     return engine
 
@@ -180,7 +178,7 @@ class LocalNerTier:
             return hit
         artifacts = self.engine.process_text(segment, self.language)
         raw = [
-            (e.start_char, e.end_char, LABEL_MAP[e.label_], segment[e.start_char:e.end_char])
+            (e.start_char, e.end_char, LABEL_MAP[e.label_], segment[e.start_char : e.end_char])
             for e in artifacts.entities
             if e.label_ in LABEL_MAP
         ]
@@ -199,7 +197,13 @@ class LocalNerTier:
                 continue
             for s, e, label in self._analyse(segment):
                 out.append(
-                    Span(start + s, start + e, label, SPAN_SCORE, self.name,
-                         detector=f"spacy:{label}")
+                    Span(
+                        start + s,
+                        start + e,
+                        label,
+                        SPAN_SCORE,
+                        self.name,
+                        detector=f"spacy:{label}",
+                    )
                 )
         return out

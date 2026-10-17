@@ -18,7 +18,9 @@ MAPPING = {
 def test_mask_prompt_replaces_known_values_and_terms():
     masked, extra, n = research.mask_prompt(
         "Why did nwHR-Payroll fail for Northwind? Ask gretchen halvorsen. Also nwlegal2.",
-        MAPPING, terms=["nw*"])
+        MAPPING,
+        terms=["nw*"],
+    )
     assert "Northwind" not in masked and "nwHR" not in masked and "gretchen" not in masked
     assert "<Site_Name-12>" in masked and "<Org-01>" in masked and "<Person-03>" in masked
     assert "nwlegal2" not in masked and extra == {"<Term-01>": "nwlegal2"}
@@ -32,9 +34,11 @@ def test_mask_prompt_leaves_existing_labels_alone():
 
 
 def test_unmask_round_trip_and_bare_labels():
-    text = ("`<Site_Name-12>` failed; owner Person-03 at "
-            "https://tenant-01.sharepoint.example/spaces/Space-02/Lists/x. <Guid-99> unknown. "
-            "<REDACTED:SECRET> stays.")
+    text = (
+        "`<Site_Name-12>` failed; owner Person-03 at "
+        "https://tenant-01.sharepoint.example/spaces/Space-02/Lists/x. <Guid-99> unknown. "
+        "<REDACTED:SECRET> stays."
+    )
     out, n, unknown = research.unmask(text, MAPPING)
     assert "`nwHR-Payroll` failed; owner Gretchen Halvorsen at " in out
     assert "https://northwind.sharepoint.com/sites/nwHR-Payroll/Lists/x" in out
@@ -49,8 +53,10 @@ def test_unmask_bare_label_only_when_bracketed_form_is_mapped():
 
 def test_csv_merge_orders_parts_and_drops_repeated_headers():
     head = "Creation Time (UTC),Status,Message\n"
-    files = [("Pol-08-12-2026-07-18-01-part2.csv", head + '1/1/2026 0:02,Error,"b, c"\n'),
-             ("Pol-08-12-2026-07-18-01-part1.csv", head + "1/1/2026 0:01,Success,a\n")]
+    files = [
+        ("Pol-08-12-2026-07-18-01-part2.csv", head + '1/1/2026 0:02,Error,"b, c"\n'),
+        ("Pol-08-12-2026-07-18-01-part1.csv", head + "1/1/2026 0:01,Success,a\n"),
+    ]
     doc = csvmerge.merge(files, {"policy": "Pol", "region": None})
     assert doc["policy"] == "Pol" and "region" not in doc
     assert doc["session_start"] == "2026-08-12 07:18:01" and doc["parts"] == 2
@@ -69,10 +75,12 @@ def run(tmp_path, monkeypatch):
     monkeypatch.setattr(research, "RUNS", tmp_path / "json")
     monkeypatch.setattr(research, "RESEARCH", tmp_path / "research")
     research.RUNS.mkdir()
-    (research.RUNS / "r1.obfuscated.json").write_text(json.dumps(
-        {"records": [{"message": "<Site_Name-12> failed for <Org-01>"}]}))
-    (research.RUNS / "r1.mapping.json").write_text(json.dumps(
-        {"note": "x", "terms": ["nw*"], "mapping": MAPPING}))
+    (research.RUNS / "r1.obfuscated.json").write_text(
+        json.dumps({"records": [{"message": "<Site_Name-12> failed for <Org-01>"}]})
+    )
+    (research.RUNS / "r1.mapping.json").write_text(
+        json.dumps({"note": "x", "terms": ["nw*"], "mapping": MAPPING})
+    )
     return "r1"
 
 
@@ -82,8 +90,12 @@ def test_ask_sends_only_masked_data_in_a_locked_down_run(run, monkeypatch):
     def fake_run(cmd, cwd, **kw):
         seen["cmd"], seen["files"] = cmd, sorted(p.name for p in cwd.iterdir())
         seen["data"] = (cwd / research.DATA_NAME).read_text()
-        reply = {"result": "`<Site_Name-12>` failed 1 time for `<Org-01>`.", "is_error": False,
-                 "total_cost_usd": 0.01, "permission_denials": []}
+        reply = {
+            "result": "`<Site_Name-12>` failed 1 time for `<Org-01>`.",
+            "is_error": False,
+            "total_cost_usd": 0.01,
+            "permission_denials": [],
+        }
         return subprocess.CompletedProcess(cmd, 0, json.dumps(reply), "")
 
     monkeypatch.setattr(research.subprocess, "run", fake_run)
@@ -111,14 +123,18 @@ def test_words_only_seen_inside_real_values_are_masked():
     public = "https://tenant-01.sharepoint.example/spaces/Space-02 failed"
     only_url = {k: v for k, v in MAPPING.items() if k.startswith("https://")}
     masked, extra, n = research.mask_prompt(
-        "Did northwind sharepoint sites fail?", only_url, public=public)
+        "Did northwind sharepoint sites fail?", only_url, public=public
+    )
     assert "northwind" not in masked.lower() and "sharepoint" in masked
     assert list(extra.values()) == ["northwind"]
 
 
 def test_url_label_does_not_swallow_trailing_punctuation():
     from hider import jsonscrub
-    res = jsonscrub.scrub({"message": "Failed site https://acme.sharepoint.com/sites/HR-Pay: 429 Too Many Requests"},
-                          tier2="none")
+
+    res = jsonscrub.scrub(
+        {"message": "Failed site https://acme.sharepoint.com/sites/HR-Pay: 429 Too Many Requests"},
+        tier2="none",
+    )
     assert ": 429 Too Many Requests" in res.output["message"]
     assert all(not v.endswith(":") for v in res.mapping.values())

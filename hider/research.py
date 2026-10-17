@@ -59,17 +59,23 @@ _BARE_LABEL = re.compile(r"(?<![<\w-])([A-Z][A-Za-z_]+-\d+)(?![\w>-])")
 
 # -- runs and mappings ------------------------------------------------------
 
+
 def list_runs() -> list[dict]:
     """Obfuscation runs that have both halves on disk, newest first."""
     runs = []
-    for out in sorted(RUNS.glob("*.obfuscated.json"), key=lambda p: p.stat().st_mtime,
-                      reverse=True):
+    for out in sorted(
+        RUNS.glob("*.obfuscated.json"), key=lambda p: p.stat().st_mtime, reverse=True
+    ):
         stem = out.name[: -len(".obfuscated.json")]
         mp = RUNS / f"{stem}.mapping.json"
         if mp.exists():
-            runs.append({"run": stem, "size_mb": round(out.stat().st_size / 2**20, 1),
-                         "saved": time.strftime("%Y-%m-%d %H:%M",
-                                                time.localtime(out.stat().st_mtime))})
+            runs.append(
+                {
+                    "run": stem,
+                    "size_mb": round(out.stat().st_size / 2**20, 1),
+                    "saved": time.strftime("%Y-%m-%d %H:%M", time.localtime(out.stat().st_mtime)),
+                }
+            )
     return runs
 
 
@@ -101,14 +107,16 @@ def load_mapping(path: str | Path) -> tuple[dict[str, str], list[str]]:
 
 # -- outbound: mask the prompt ----------------------------------------------
 
+
 def _term_regex(term: str) -> re.Pattern:
     if term.endswith("*"):
         return re.compile(r"(?<![A-Za-z0-9])" + re.escape(term[:-1]) + r"[A-Za-z0-9_]*", re.I)
     return re.compile(r"(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])", re.I)
 
 
-def mask_prompt(text: str, mapping: dict[str, str], terms: list[str] | None = None,
-                public: str | None = None) -> tuple[str, dict[str, str], int]:
+def mask_prompt(
+    text: str, mapping: dict[str, str], terms: list[str] | None = None, public: str | None = None
+) -> tuple[str, dict[str, str], int]:
     """Replace every mapped original (and term) in the prompt with its label.
 
     ``public`` is the obfuscated file's text: a word that occurs inside a real
@@ -127,16 +135,20 @@ def mask_prompt(text: str, mapping: dict[str, str], terms: list[str] | None = No
     count = 0
     if forward:
         alts = sorted(forward, key=len, reverse=True)
-        rx = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, alts))
-                        + r")(?![A-Za-z0-9])", re.I)
+        rx = re.compile(
+            r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, alts)) + r")(?![A-Za-z0-9])", re.I
+        )
         text, count = _sub_outside_labels(rx, lambda m: forward[m.group(0).lower()], text)
     extra: dict[str, str] = {}
     seen: dict[str, str] = {}
     # A word that only ever appeared inside a mapped value (the tenant in a
     # site URL, a site name) is not a mapped value itself, but it is still the
     # customer's. Hide it too, unless it is an ordinary word.
-    words = {w for w in _WORDS.findall(_outside_labels(text))
-             if len(w) >= 3 and not w.isdigit() and not _is_common(w)}
+    words = {
+        w
+        for w in _WORDS.findall(_outside_labels(text))
+        if len(w) >= 3 and not w.isdigit() and not _is_common(w)
+    }
     if words:
         real = "\n".join(mapping.values())
         for w in sorted(words, key=len, reverse=True):
@@ -163,8 +175,10 @@ _WORDS = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*[A-Za-z0-9]")
 
 
 def _has_word(blob: str, word: str) -> bool:
-    return re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])", blob,
-                     re.I) is not None
+    return (
+        re.search(r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])", blob, re.I)
+        is not None
+    )
 
 
 _PUBLIC: dict[str, tuple[float, str]] = {}
@@ -199,14 +213,16 @@ def _sub_outside_labels(rx: re.Pattern, repl, text: str) -> tuple[str, int]:
     return "".join(out), n
 
 
-def prompt_leaks(text: str, mapping: dict[str, str], terms: list[str] | None = None,
-                 public: str | None = None) -> int:
+def prompt_leaks(
+    text: str, mapping: dict[str, str], terms: list[str] | None = None, public: str | None = None
+) -> int:
     """How many mapped originals or terms are still in a prompt about to be sent."""
     _, _, n = mask_prompt(text, mapping, terms, public)
     return n
 
 
 # -- inbound: unmask the answer -----------------------------------------------
+
 
 def unmask(text: str, mapping: dict[str, str]) -> tuple[str, int, list[str]]:
     """Labels back to real values. Returns (text, replaced, labels not in the mapping).
@@ -228,7 +244,7 @@ def unmask(text: str, mapping: dict[str, str]) -> tuple[str, int, list[str]]:
 
     parts, pos = [], 0
     for m in _LABEL_RE.finditer(text):
-        parts.append(_unmask_bare(text[pos:m.start()], mapping))
+        parts.append(_unmask_bare(text[pos : m.start()], mapping))
         parts.append(full(m))
         pos = m.end()
     parts.append(_unmask_bare(text[pos:], mapping))
@@ -253,12 +269,19 @@ def _unmask_bare(chunk: str, mapping: dict[str, str]) -> tuple[str, int]:
 
 # -- Claude Code ------------------------------------------------------------
 
+
 def claude_command(prompt: str | None = None, model: str | None = None) -> list[str]:
     cmd = ["claude"]
     if prompt is not None:
         cmd += ["-p", prompt, "--output-format", "json", "--no-session-persistence"]
-    cmd += ["--restricted", "--strict-mcp-config", "--tools", TOOLS,
-            "--append-system-prompt", INSTRUCTIONS]
+    cmd += [
+        "--restricted",
+        "--strict-mcp-config",
+        "--tools",
+        TOOLS,
+        "--append-system-prompt",
+        INSTRUCTIONS,
+    ]
     if model:
         cmd += ["--model", model]
     return cmd
@@ -278,8 +301,14 @@ def make_workspace(run: str, where: Path | None = None) -> Path:
     return ws
 
 
-def ask(run: str, prompt: str, *, model: str | None = None, timeout: int = 1800,
-        extra: dict[str, str] | None = None) -> dict:
+def ask(
+    run: str,
+    prompt: str,
+    *,
+    model: str | None = None,
+    timeout: int = 1800,
+    extra: dict[str, str] | None = None,
+) -> dict:
     """Mask the prompt, run Claude Code headless on the obfuscated file, unmask the answer.
 
     The prompt must already be clean: callers show the masked prompt first, and
@@ -294,15 +323,22 @@ def ask(run: str, prompt: str, *, model: str | None = None, timeout: int = 1800,
     ws = make_workspace(run)
     t0 = time.time()
     try:
-        proc = subprocess.run(claude_command(masked, model), cwd=ws, capture_output=True,
-                              text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        proc = subprocess.run(
+            claude_command(masked, model),
+            cwd=ws,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
     finally:
         shutil.rmtree(ws, ignore_errors=True)
     try:
         reply = json.loads(proc.stdout)
     except json.JSONDecodeError:
         raise RuntimeError(
-            f"claude exited {proc.returncode}: {proc.stderr.strip()[:400]}") from None
+            f"claude exited {proc.returncode}: {proc.stderr.strip()[:400]}"
+        ) from None
     if reply.get("is_error") or proc.returncode:
         raise RuntimeError(f"claude failed: {str(reply.get('result') or proc.stderr)[:400]}")
     answer_masked = reply.get("result") or ""

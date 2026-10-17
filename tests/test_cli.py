@@ -11,8 +11,10 @@ from __future__ import annotations
 
 from hider import cli
 
-NOTE = ("Rachel Mbeki at Contoso Group escalated case 08123456 for "
-        "session 6cafd2ac-dd19-d991-291a-8d565940996d\n")
+NOTE = (
+    "Rachel Mbeki at Contoso Group escalated case 08123456 for "
+    "session 6cafd2ac-dd19-d991-291a-8d565940996d\n"
+)
 
 
 def run_redact(tmp_path, capsys, text=NOTE, extra=None):
@@ -69,5 +71,6 @@ def test_a_saved_vault_round_trips_the_answer(tmp_path, capsys):
     vault_path = tmp_path / "vault.json"
     cli.main(["redact", str(src), "--vault", str(vault_path)])
     from hider import pseudonym
+
     v = pseudonym.EntityVault.load(vault_path)
     assert "Rachel Mbeki" in v.detokenize("<Person-01> asked for an update")

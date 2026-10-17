@@ -49,12 +49,36 @@ from sklearn.linear_model import LogisticRegression
 # ---------------------------------------------------------------------------
 
 _TRAIN_FIRST = [
-    "mateo", "freya", "kwame", "ivy", "luca", "nadia", "oskar", "ren",
-    "talia", "viktor", "elin", "boas", "sana", "irwin", "meret",
+    "mateo",
+    "freya",
+    "kwame",
+    "ivy",
+    "luca",
+    "nadia",
+    "oskar",
+    "ren",
+    "talia",
+    "viktor",
+    "elin",
+    "boas",
+    "sana",
+    "irwin",
+    "meret",
 ]
 _TRAIN_LAST = [
-    "berg", "calderon", "dubois", "eriksen", "farah", "giles", "hoxha",
-    "imai", "jansen", "kade", "lund", "mercer", "nkemdirim",
+    "berg",
+    "calderon",
+    "dubois",
+    "eriksen",
+    "farah",
+    "giles",
+    "hoxha",
+    "imai",
+    "jansen",
+    "kade",
+    "lund",
+    "mercer",
+    "nkemdirim",
 ]
 _TRAIN_ORG_WORDS = ["Meridian", "Vantage", "Solace", "Anchorpoint", "Cobalt", "Driftwood"]
 _TRAIN_ORG_SUFFIX = ["Systems", "Networks", "Holdings", "Collective", "Works"]
@@ -64,22 +88,75 @@ _TRAIN_ORG_SUFFIX = ["Systems", "Networks", "Holdings", "Collective", "Works"]
 #: are the words a naive title-case heuristic would flag, so they are trained
 #: as hard negatives rather than left for the classifier to guess about.
 _HARD_NEGATIVES = [
-    "Session", "Transport", "Retry", "Scheduler", "Stats", "Service", "Queue",
-    "Cache", "Info", "Warning", "Error", "Debug", "Audit", "Backup", "Restore",
-    "Agent", "Mail", "Graph", "Net", "Dump", "Auth", "Monday", "Tuesday",
-    "Wednesday", "January", "February", "Exchange", "SharePoint", "Outlook",
-    "Teams", "Engineering", "Support", "Finance", "Legal",
+    "Session",
+    "Transport",
+    "Retry",
+    "Scheduler",
+    "Stats",
+    "Service",
+    "Queue",
+    "Cache",
+    "Info",
+    "Warning",
+    "Error",
+    "Debug",
+    "Audit",
+    "Backup",
+    "Restore",
+    "Agent",
+    "Mail",
+    "Graph",
+    "Net",
+    "Dump",
+    "Auth",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "January",
+    "February",
+    "Exchange",
+    "SharePoint",
+    "Outlook",
+    "Teams",
+    "Engineering",
+    "Support",
+    "Finance",
+    "Legal",
 ]
 
 _TRIGGER_WORDS = {
-    "spoke", "escalated", "reported", "reassigned", "called", "notified",
-    "confirmed", "contacted", "informed", "from", "to", "at", "with",
-    "loop", "reached", "on", "behalf", "of",
+    "spoke",
+    "escalated",
+    "reported",
+    "reassigned",
+    "called",
+    "notified",
+    "confirmed",
+    "contacted",
+    "informed",
+    "from",
+    "to",
+    "at",
+    "with",
+    "loop",
+    "reached",
+    "on",
+    "behalf",
+    "of",
 }
 
 _ORG_SUFFIX_WORDS = {w.lower() for w in _TRAIN_ORG_SUFFIX} | {
-    "inc", "corp", "corporation", "group", "partners", "holdings",
-    "industries", "advisory", "ag", "llc", "ltd",
+    "inc",
+    "corp",
+    "corporation",
+    "group",
+    "partners",
+    "holdings",
+    "industries",
+    "advisory",
+    "ag",
+    "llc",
+    "ltd",
 }
 
 _SENTENCE_TEMPLATES = [
@@ -246,8 +323,9 @@ def get_trained(seed: int = 20260821, n_sentences: int = 500) -> TrainedNerClass
     return train(seed=seed, n_sentences=n_sentences)
 
 
-def _decode_bio(tokens: Sequence[Token], labels: Sequence[str], scores: Sequence[float]
-                 ) -> list[tuple[int, int, str, float]]:
+def _decode_bio(
+    tokens: Sequence[Token], labels: Sequence[str], scores: Sequence[float]
+) -> list[tuple[int, int, str, float]]:
     spans: list[tuple[int, int, str, float]] = []
     i = 0
     while i < len(tokens):

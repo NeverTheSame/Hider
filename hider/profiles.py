@@ -38,8 +38,7 @@ ENV_PROFILE = "HIDER_PROFILE"
 #: labels the rest of the engine already understands, so a typo produces an
 #: error rather than a pattern that quietly matches nothing.
 ALLOWED_LABELS: frozenset[str] = frozenset(
-    {s.name for s in entities.SPECS}
-    | {label for s in entities.SPECS for label in s.detected_as}
+    {s.name for s in entities.SPECS} | {label for s in entities.SPECS for label in s.detected_as}
 )
 
 DEFAULT_SCORE = 0.9

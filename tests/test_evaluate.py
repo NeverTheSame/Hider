@@ -91,10 +91,13 @@ def test_freetext_misses_are_labelled_as_probabilistic_not_hidden(scored):
     full = scored[0]
     freetext_types = [t for t in full.types.values() if t.expected_tier == entities.TIER_FREETEXT]
     not_fully_caught = sum(t.partial + t.missed for t in freetext_types)
-    assert not_fully_caught > 0, "recall below 1.0 must be visible in per-type partial/missed counts"
+    assert not_fully_caught > 0, (
+        "recall below 1.0 must be visible in per-type partial/missed counts"
+    )
 
-    full_misses = [s for s in full.verbatim_survivors
-                   if s["reason"] == "tier2 miss (probabilistic tier)"]
+    full_misses = [
+        s for s in full.verbatim_survivors if s["reason"] == "tier2 miss (probabilistic tier)"
+    ]
     assert all(s["expected_tier"] == entities.TIER_FREETEXT for s in full_misses)
 
 
@@ -108,13 +111,13 @@ def test_spacy_backend_also_meets_the_floor():
 
 def test_tier1_only_run_reports_freetext_as_a_phase_boundary():
     """Without tier 2, free-text survivors are owned gaps, not silent passes."""
-    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None,
-                           include_adversarial=False)
+    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None, include_adversarial=False)
     assert full.ner_enabled is False
     assert full.freetext_recall == 0.0
     assert not full.below_freetext_floor  # no floor claim without the tier
-    survivors = [s for s in full.verbatim_survivors
-                 if s["entity_type"] in ("PERSON_NAME", "ORG_NAME")]
+    survivors = [
+        s for s in full.verbatim_survivors if s["entity_type"] in ("PERSON_NAME", "ORG_NAME")
+    ]
     assert survivors
     assert all(s["reason"] == "tier not built yet" for s in survivors)
 
@@ -149,8 +152,7 @@ def test_injection_bypass_rate_is_measured_once_tier3_runs():
         def complete(self, prompt: str) -> str:
             return '{"findings": []}'
 
-    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None,
-                           tier3=AlwaysComplyBackend())
+    full, _ = evaluate.run(lines=200, seed=SEED, tier2=None, tier3=AlwaysComplyBackend())
     assert full.tier3_enabled is True
     assert full.injection_bypass_rate == 1.0
 
@@ -163,13 +165,17 @@ def test_injection_bypass_rate_is_zero_for_an_honest_tier3():
 
             data = prompt.split("<<<DATA\n", 1)[1].rsplit("\nDATA>>>", 1)[0]
             findings = []
-            for etype, marker in (("PERSON", "Sofia Tanaka"), ("PERSON", "Noah Delacroix"),
-                                   ("ORGANIZATION", "Fabrikam Advisory"),
-                                   ("PERSON", "Clara Petrov"),
-                                   ("ORGANIZATION", "Tailspin Industries")):
+            for etype, marker in (
+                ("PERSON", "Sofia Tanaka"),
+                ("PERSON", "Noah Delacroix"),
+                ("ORGANIZATION", "Fabrikam Advisory"),
+                ("PERSON", "Clara Petrov"),
+                ("ORGANIZATION", "Tailspin Industries"),
+            ):
                 if marker in data:
                     findings.append({"text": marker, "type": etype})
             import json
+
             return json.dumps({"findings": findings})
 
     full, _ = evaluate.run(lines=200, seed=SEED, tier2=None, tier3=HonestBackend())
@@ -201,7 +207,7 @@ def test_report_shows_the_before_and_after(scored):
     # A raw value shown on the left must not be findable in the redacted pane.
     raw, redacted, spans, _ = rows[0]
     for s in spans:
-        assert raw[s.start:s.end] not in redacted
+        assert raw[s.start : s.end] not in redacted
 
 
 def test_metrics_json_round_trips(scored, tmp_path):
@@ -226,6 +232,7 @@ def test_metrics_json_round_trips(scored, tmp_path):
 # next to it. Failing closed is only half a control; saying so is the other.
 # ---------------------------------------------------------------------------
 
+
 class _AlwaysFailsTier:
     name = "tier3"
     cost_per_1k_chars = 0.0
@@ -247,8 +254,10 @@ class _CountingBackend:
 
 def test_a_failing_tier_shows_up_as_degraded_units():
     from hider import evaluate as ev
-    rep, _ = ev.run(lines=120, seed=3, tiers=[pipeline.RegexTier(), _AlwaysFailsTier()],
-                    label="degrading")
+
+    rep, _ = ev.run(
+        lines=120, seed=3, tiers=[pipeline.RegexTier(), _AlwaysFailsTier()], label="degrading"
+    )
     assert rep.degraded_units > 0
     assert rep.to_dict()["degraded_units"] == rep.degraded_units
 
@@ -261,6 +270,7 @@ def test_tier3_is_scoped_to_the_hostile_corpus():
     """It must not be billed for, or fail closed on, the generated corpus."""
     from hider import adversarial
     from hider import evaluate as ev
+
     backend = _CountingBackend()
     rep, _ = ev.run(lines=400, seed=4, tier2=None, tier3=backend, label="scoped")
     assert rep.tier3_enabled
@@ -271,6 +281,7 @@ def test_tier3_is_scoped_to_the_hostile_corpus():
 
 def test_enabling_tier3_does_not_move_the_generated_corpus_numbers():
     from hider import evaluate as ev
+
     without, _ = ev.run(lines=400, seed=5, tier2=None, label="a")
     with_t3, _ = ev.run(lines=400, seed=5, tier2=None, tier3=_CountingBackend(), label="b")
     assert without.shaped_recall == with_t3.shaped_recall

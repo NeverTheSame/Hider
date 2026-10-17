@@ -86,8 +86,8 @@ def _highlight_raw(line: str, spans) -> str:
     out: list[str] = []
     cursor = 0
     for s in sorted(spans, key=lambda x: x.start):
-        out.append(html.escape(line[cursor:s.start]))
-        out.append(f"<mark>{html.escape(line[s.start:s.end])}</mark>")
+        out.append(html.escape(line[cursor : s.start]))
+        out.append(f"<mark>{html.escape(line[s.start : s.end])}</mark>")
         cursor = s.end
     out.append(html.escape(line[cursor:]))
     return "".join(out)
@@ -126,24 +126,42 @@ def build(
     out_lines = "\n".join(_highlight_out(red, reps) for _, red, _, reps in excerpt)
 
     # ---- KPI row ----
-    kpis = "".join([
-        _kpi(_pct(report.shaped_recall), "recall on shaped identifiers",
-             f"{report.covered} of {report.seeded} seeded values, tier 1"),
-        _kpi(
-            _pct(report.freetext_recall) if report.ner_enabled else "not run",
-            "recall on free-text names",
-            f"tier 2, {tier2_short}; gated at a floor, not at zero"
-            if report.ner_enabled else "no tier 2 backend selected for this run",
-        ),
-        _kpi(_pct(report.false_redaction_rate), "false-redaction rate",
-             f"on {report.clean_lines} lines known to hold nothing sensitive"),
-        _kpi(str(len(report.unexpected_survivors)), "unexplained survivors",
-             "seeded values still findable verbatim in the output"),
-        _kpi(_pct(report.cost_reduction), "paid-tier spend avoided",
-             "tier 1 clears this share of characters before any paid tier"),
-        _kpi(f"{report.tier_elapsed_s.get('tier1', 0) / max(report.lines, 1) * 1e6:,.0f} us",
-             "tier 1 per line", "single-threaded, no network, no NLP model"),
-    ])
+    kpis = "".join(
+        [
+            _kpi(
+                _pct(report.shaped_recall),
+                "recall on shaped identifiers",
+                f"{report.covered} of {report.seeded} seeded values, tier 1",
+            ),
+            _kpi(
+                _pct(report.freetext_recall) if report.ner_enabled else "not run",
+                "recall on free-text names",
+                f"tier 2, {tier2_short}; gated at a floor, not at zero"
+                if report.ner_enabled
+                else "no tier 2 backend selected for this run",
+            ),
+            _kpi(
+                _pct(report.false_redaction_rate),
+                "false-redaction rate",
+                f"on {report.clean_lines} lines known to hold nothing sensitive",
+            ),
+            _kpi(
+                str(len(report.unexpected_survivors)),
+                "unexplained survivors",
+                "seeded values still findable verbatim in the output",
+            ),
+            _kpi(
+                _pct(report.cost_reduction),
+                "paid-tier spend avoided",
+                "tier 1 clears this share of characters before any paid tier",
+            ),
+            _kpi(
+                f"{report.tier_elapsed_s.get('tier1', 0) / max(report.lines, 1) * 1e6:,.0f} us",
+                "tier 1 per line",
+                "single-threaded, no network, no NLP model",
+            ),
+        ]
+    )
 
     # ---- recall table ----
     rows = []
@@ -168,8 +186,7 @@ def build(
     recall_table = (
         "<div class='scroll'><table><thead><tr><th>Entity type</th><th>Seeded</th>"
         "<th>Fully redacted</th><th>Partial</th><th>Recall</th><th>Typed recall</th>"
-        "<th>Stock Presidio</th></tr></thead><tbody>"
-        + "".join(rows) + "</tbody></table></div>"
+        "<th>Stock Presidio</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
     )
 
     # ---- adversarial table ----
@@ -194,7 +211,8 @@ def build(
     adv_table = (
         "<div class='scroll'><table><thead><tr><th>Hostile placement</th>"
         "<th>Shaped caught</th><th>Free text caught</th><th>Verdict</th></tr></thead><tbody>"
-        + "".join(arows) + "</tbody></table></div>"
+        + "".join(arows)
+        + "</tbody></table></div>"
     )
 
     # ---- tier routing ----
@@ -240,8 +258,12 @@ def build(
 <style>{CSS}</style>
 <div class="wrap">
 <h1>{html.escape(title)}</h1>
-<p class="sub">Hider. {"Three" if report.tier3_enabled else "Two" if report.ner_enabled else "One"} live
-tier{"s" if report.ner_enabled else ""} &mdash; deterministic patterns{f", then {tier2_short} over what they leave" if report.ner_enabled else ""}{", then an LLM pass over the rest" if report.tier3_enabled else ""}
+<p class="sub">Hider. {
+        "Three" if report.tier3_enabled else "Two" if report.ner_enabled else "One"
+    } live
+tier{"s" if report.ner_enabled else ""} &mdash; deterministic patterns{
+        f", then {tier2_short} over what they leave" if report.ner_enabled else ""
+    }{", then an LLM pass over the rest" if report.tier3_enabled else ""}
 &mdash; measured on a synthetic bundle of
 {report.lines:,} lines and {report.chars:,} characters with {report.seeded}
 planted values whose type and position are known exactly.</p>
@@ -323,14 +345,18 @@ organisational. Recall on shaped types should be read as an upper bound.</li>
 <li><strong>Tier 2 recall is a model's recall.</strong> Free-text names are
 caught at {_pct(report.freetext_recall) if report.ner_enabled else "n/a"},
 against a floor of {_pct(FREETEXT_RECALL_FLOOR)}. A miss is not a defect the
-way a tier 1 miss is; it is the honest ceiling of a {tier2_short if report.ner_enabled else "small"} model, and the
+way a tier 1 miss is; it is the honest ceiling of a {
+        tier2_short if report.ner_enabled else "small"
+    } model, and the
 reasons are listed per survivor in the JSON metrics.</li>
 <li><strong>Prompt-injection resistance{"" if report.tier3_enabled else " is untested"}.</strong>
-{f"{report.injection_bypass_rate:.1%} of injection-adjacent names in this run survived a payload sitting next to them, with tier2={report.tier2_backend or 'off'} also in the pipeline. Tiers 1 and 2 have no notion of an instruction at all, so this number isolates what tier 3 alone would allow through only when tier 2 is disabled for the same run."
-if report.tier3_enabled else
-f"The {report.injection_canaries} pure-text canaries and 5 name-adjacent cases are already in the corpus, but "
-f"no tier 3 backend ran this time, and tiers 1-2 have no instructions to subvert, so reporting a pass "
-f"would be dishonest. Pass --tier3 openai (with a cassette) to measure it."}</li>
+{
+        f"{report.injection_bypass_rate:.1%} of injection-adjacent names in this run survived a payload sitting next to them, with tier2={report.tier2_backend or 'off'} also in the pipeline. Tiers 1 and 2 have no notion of an instruction at all, so this number isolates what tier 3 alone would allow through only when tier 2 is disabled for the same run."
+        if report.tier3_enabled
+        else f"The {report.injection_canaries} pure-text canaries and 5 name-adjacent cases are already in the corpus, but "
+        f"no tier 3 backend ran this time, and tiers 1-2 have no instructions to subvert, so reporting a pass "
+        f"would be dishonest. Pass --tier3 openai (with a cassette) to measure it."
+    }</li>
 <li><strong>The hypothetical cost figures use an assumed list rate,</strong>
 not an invoice. Characters offered per tier are measured; the dollar
 conversion is arithmetic on a published price.</li>

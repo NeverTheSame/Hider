@@ -61,10 +61,15 @@ class StubUpstream:
                     if isinstance(msg.get("content"), str):
                         user_text += msg["content"]
                 resp = {
-                    "id": "stub-1", "object": "chat.completion",
-                    "choices": [{"index": 0, "finish_reason": "stop",
-                                 "message": {"role": "assistant",
-                                             "content": user_text}}],
+                    "id": "stub-1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": user_text},
+                        }
+                    ],
                 }
                 raw = json.dumps(resp).encode()
                 self2.send_response(upstream.status)
@@ -85,9 +90,7 @@ class StubUpstream:
 
 def _gateway(stub, tiers=None):
     vault = pseudonym.EntityVault(key=b"proxy-tests")
-    pipe = pipeline.Pipeline(
-        tiers if tiers is not None else [pipeline.RegexTier()], vault=vault
-    )
+    pipe = pipeline.Pipeline(tiers if tiers is not None else [pipeline.RegexTier()], vault=vault)
     return proxy.RedactionGateway(stub.url, pipe)
 
 
@@ -95,8 +98,7 @@ def _post(gateway, port, body: dict) -> tuple[int, dict]:
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer sk-test-12345"},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer sk-test-12345"},
         method="POST",
     )
     try:
@@ -128,11 +130,10 @@ def server(stub, tmp_path):
 # The boundary property
 # ---------------------------------------------------------------------------
 
+
 def test_upstream_body_contains_only_pseudonyms(stub, server):
     port, gw = server
-    _post(gw, port, {
-        "model": "gpt-x", "messages": [{"role": "user", "content": SECRET_LINE}]
-    })
+    _post(gw, port, {"model": "gpt-x", "messages": [{"role": "user", "content": SECRET_LINE}]})
     assert stub.bodies, "upstream saw no request"
     blob = json.dumps(stub.bodies)
     for forbidden in (
@@ -144,8 +145,8 @@ def test_upstream_body_contains_only_pseudonyms(stub, server):
         "Q1dEZm5rTHhWc0h0YkpQd0dyTm1YeVpjQXNEZmdIamtM",
     ):
         assert forbidden not in blob, forbidden
-    assert "<REDACTED:JWT>" in blob          # credentials destroyed, not renamed
-    assert "<Session-" in blob               # identifiers pseudonymised
+    assert "<REDACTED:JWT>" in blob  # credentials destroyed, not renamed
+    assert "<Session-" in blob  # identifiers pseudonymised
     assert stub.bodies[0]["model"] == "gpt-x"  # payload otherwise intact
 
 
@@ -158,10 +159,14 @@ def test_authorization_header_passes_through(stub, server):
 
 def test_client_sees_real_values_again(stub, server):
     port, gw = server
-    status, resp = _post(gw, port, {
-        "model": "gpt-x",
-        "messages": [{"role": "user", "content": SECRET_LINE}],
-    })
+    status, resp = _post(
+        gw,
+        port,
+        {
+            "model": "gpt-x",
+            "messages": [{"role": "user", "content": SECRET_LINE}],
+        },
+    )
     assert status == 200
     content = resp["choices"][0]["message"]["content"]
     # The upstream echoed what it received; the gateway detokenised the echo.
@@ -176,20 +181,22 @@ def test_client_sees_real_values_again(stub, server):
 # Fail closed at the boundary
 # ---------------------------------------------------------------------------
 
+
 def test_degraded_request_is_refused_and_never_forwarded(stub, tmp_path):
     gw = proxy.RedactionGateway(
         stub.url,
-        pipeline.Pipeline([pipeline.RegexTier(), ExplodingTier()],
-                          vault=pseudonym.EntityVault(key=b"k")),
+        pipeline.Pipeline(
+            [pipeline.RegexTier(), ExplodingTier()], vault=pseudonym.EntityVault(key=b"k")
+        ),
     )
     httpd = proxy.make_server("127.0.0.1", 0, gw)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     port = httpd.server_address[1]
     try:
-        status, resp = _post(gw, port, {
-            "model": "x", "messages": [{"role": "user", "content": SECRET_LINE}]
-        })
+        status, resp = _post(
+            gw, port, {"model": "x", "messages": [{"role": "user", "content": SECRET_LINE}]}
+        )
         assert status == 503
         assert "degraded" in resp["error"]["message"]
         assert stub.bodies == []  # nothing was sent
@@ -200,10 +207,15 @@ def test_degraded_request_is_refused_and_never_forwarded(stub, tmp_path):
 
 def test_streaming_is_refused_with_a_clear_error(stub, server):
     port, gw = server
-    status, resp = _post(gw, port, {
-        "model": "x", "stream": True,
-        "messages": [{"role": "user", "content": "hello"}],
-    })
+    status, resp = _post(
+        gw,
+        port,
+        {
+            "model": "x",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
     assert status == 400
     assert "stream:false" in resp["error"]["message"]
     assert stub.bodies == []
@@ -213,7 +225,9 @@ def test_unsupported_endpoint_is_404(stub, server):
     port, gw = server
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/embeddings",
-        data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     with pytest.raises(urllib.error.HTTPError) as e:
         urllib.request.urlopen(req, timeout=10)
@@ -228,9 +242,9 @@ def test_upstream_error_passes_through(stub):
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         port = httpd.server_address[1]
-        status, resp = _post(gw, port, {
-            "model": "x", "messages": [{"role": "user", "content": "hi"}]
-        })
+        status, resp = _post(
+            gw, port, {"model": "x", "messages": [{"role": "user", "content": "hi"}]}
+        )
         assert status == 500
         httpd.shutdown()
         httpd.server_close()
@@ -249,13 +263,22 @@ def test_healthz_reports_the_configuration(stub, server):
 
 def test_multimodal_text_parts_are_redacted(stub, server):
     port, gw = server
-    status, _ = _post(gw, port, {
-        "model": "x",
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": SECRET_LINE},
-            {"type": "image_url", "image_url": {"url": "https://x.example/a.png"}},
-        ]}],
-    })
+    status, _ = _post(
+        gw,
+        port,
+        {
+            "model": "x",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": SECRET_LINE},
+                        {"type": "image_url", "image_url": {"url": "https://x.example/a.png"}},
+                    ],
+                }
+            ],
+        },
+    )
     assert status == 200
     blob = json.dumps(stub.bodies)
     assert "anna.novak@contoso.com" not in blob

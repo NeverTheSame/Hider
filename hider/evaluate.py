@@ -68,6 +68,7 @@ def build_tier2(backend: str | None) -> pipeline.Tier | None:
         return ner.LocalNerTier()
     raise ValueError(f"unknown tier2 backend {backend!r}; expected 'classifier', 'spacy', or None")
 
+
 #: The recall floor for the free-text types tier 2 owns. Tier 1 is held to
 #: zero unexplained survivors because it is deterministic: a miss is a defect.
 #: Tier 2 is a model, so a miss is a measurement. The gate is therefore a
@@ -280,8 +281,7 @@ class Report:
             "verbatim_survivors": {
                 "total": len(self.verbatim_survivors),
                 "unexpected": len(self.unexpected_survivors),
-                "known_gap": len(self.verbatim_survivors)
-                - len(self.unexpected_survivors),
+                "known_gap": len(self.verbatim_survivors) - len(self.unexpected_survivors),
                 "detail": self.verbatim_survivors[:50],
             },
             "tiers": {
@@ -300,10 +300,15 @@ class Report:
             "vault_size": self.vault_size,
             "types": {
                 name: {
-                    "seeded": t.seeded, "covered": t.covered, "partial": t.partial,
-                    "typed": t.typed, "missed": t.missed,
-                    "recall": round(t.recall, 4), "typed_recall": round(t.typed_recall, 4),
-                    "expected_tier": t.expected_tier, "by_tier": dict(t.by_tier),
+                    "seeded": t.seeded,
+                    "covered": t.covered,
+                    "partial": t.partial,
+                    "typed": t.typed,
+                    "missed": t.missed,
+                    "recall": round(t.recall, 4),
+                    "typed_recall": round(t.typed_recall, 4),
+                    "expected_tier": t.expected_tier,
+                    "by_tier": dict(t.by_tier),
                 }
                 for name, t in sorted(self.types.items())
             },
@@ -428,8 +433,7 @@ def run(
     # recall and cost numbers comparable across runs with and without tier 3.
     main_tiers = [t for t in chosen if getattr(t, "name", "") != "tier3"]
     pipe = pipeline.Pipeline(main_tiers, vault=vault)
-    adv_pipe = (pipeline.Pipeline(chosen, vault=vault)
-                if len(main_tiers) != len(chosen) else pipe)
+    adv_pipe = pipeline.Pipeline(chosen, vault=vault) if len(main_tiers) != len(chosen) else pipe
     ner_ran = any(getattr(t, "name", "") == "tier2" for t in chosen)
     tier3_ran = any(getattr(t, "name", "") == "tier3" for t in chosen)
 
@@ -506,7 +510,9 @@ def run(
         report.injection_canaries = len(adversarial.INJECTION_CANARIES)
         report.cases = [
             CaseResult(
-                case_id=c.case_id, description=c.description, expect_tier1=c.expect_tier1,
+                case_id=c.case_id,
+                description=c.description,
+                expect_tier1=c.expect_tier1,
                 shaped_seeded=shaped_seeded.get(c.case_id, 0),
                 shaped_covered=shaped_covered.get(c.case_id, 0),
                 free_seeded=free_seeded.get(c.case_id, 0),
@@ -534,9 +540,7 @@ def run(
         seen.add(occ.value)
         if occ.value in all_out:
             spec = entities.BY_NAME.get(occ.entity_type)
-            documented_case = (
-                occ.unit == adversarial.UNIT and occ.line_no in adv_gap_lines
-            )
+            documented_case = occ.unit == adversarial.UNIT and occ.line_no in adv_gap_lines
             if spec is None or spec.expected_tier == entities.TIER_SHAPED:
                 # No tier is allowed to miss this: either a tier 1 leak or an
                 # unexplained failure. Fails the eval.
@@ -547,18 +551,24 @@ def run(
                 # in the report as exactly what they are. If tier 3 also ran
                 # and still missed it, that is the more expensive miss, so it
                 # is named separately rather than folded into the same label.
-                reason = ("tier2+tier3 miss (probabilistic tiers)" if tier3_ran
-                          else "tier2 miss (probabilistic tier)")
+                reason = (
+                    "tier2+tier3 miss (probabilistic tiers)"
+                    if tier3_ran
+                    else "tier2 miss (probabilistic tier)"
+                )
                 known_gap = True
             else:
                 reason, known_gap = "tier not built yet", True
             report.verbatim_survivors.append(
-                {"entity_type": occ.entity_type, "unit": occ.unit, "line": occ.line_no,
-                 "length": len(occ.value),
-                 "expected_tier": spec.expected_tier if spec else "",
-                 "reason": reason if not documented_case
-                           else "documented adversarial gap",
-                 "known_gap": known_gap or documented_case}
+                {
+                    "entity_type": occ.entity_type,
+                    "unit": occ.unit,
+                    "line": occ.line_no,
+                    "length": len(occ.value),
+                    "expected_tier": spec.expected_tier if spec else "",
+                    "reason": reason if not documented_case else "documented adversarial gap",
+                    "known_gap": known_gap or documented_case,
+                }
             )
 
     stats_sources = [pipe.stats] if adv_pipe is pipe else [pipe.stats, adv_pipe.stats]
@@ -570,11 +580,12 @@ def run(
     for source in stats_sources:
         for name, st in source.tiers.items():
             report.tier_chars_offered[name] = (
-                report.tier_chars_offered.get(name, 0) + st.chars_offered)
+                report.tier_chars_offered.get(name, 0) + st.chars_offered
+            )
             report.tier_chars_redacted[name] = (
-                report.tier_chars_redacted.get(name, 0) + st.chars_redacted)
-            report.tier_elapsed_s[name] = (
-                report.tier_elapsed_s.get(name, 0.0) + st.elapsed_s)
+                report.tier_chars_redacted.get(name, 0) + st.chars_redacted
+            )
+            report.tier_elapsed_s[name] = report.tier_elapsed_s.get(name, 0.0) + st.elapsed_s
 
     return report, redacted
 
@@ -594,10 +605,17 @@ def run_with_baseline(
     label = f"presidio + custom recognizers + tier2={tier2 or 'none'}"
     if tier3 is not None:
         label += " + tier3"
-    full, redacted = run(corpus=corp, seed=seed, include_custom=True,
-                         tier2=tier2, tier3=tier3, label=label, **kwargs)
-    base, _ = run(corpus=corp, seed=seed, include_custom=False,
-                  tier2=None, label="stock Presidio patterns only", **kwargs)
+    full, redacted = run(
+        corpus=corp, seed=seed, include_custom=True, tier2=tier2, tier3=tier3, label=label, **kwargs
+    )
+    base, _ = run(
+        corpus=corp,
+        seed=seed,
+        include_custom=False,
+        tier2=None,
+        label="stock Presidio patterns only",
+        **kwargs,
+    )
     return full, base, redacted, corp
 
 

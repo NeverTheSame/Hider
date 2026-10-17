@@ -40,9 +40,9 @@ class Occurrence:
     value: str
     start: int
     end: int
-    unit: str = ""        # file path or corpus-unit name
+    unit: str = ""  # file path or corpus-unit name
     line_no: int = 0
-    group: str = ""       # non-empty when this is a fragment of a split value
+    group: str = ""  # non-empty when this is a fragment of a split value
     canary: bool = False  # unique sentinel, must never survive redaction
 
     @property
@@ -64,7 +64,7 @@ def render(
     cursor = 0
     pos = 0
     for m in MARKER_RE.finditer(template):
-        out.append(template[cursor:m.start()])
+        out.append(template[cursor : m.start()])
         pos += m.start() - cursor
         etype, literal, group = m.group(1), m.group(2), m.group(3)
         spec = entities.spec(etype)
@@ -72,8 +72,13 @@ def render(
         out.append(value)
         found.append(
             Occurrence(
-                entity_type=etype, value=value, start=pos, end=pos + len(value),
-                unit=unit, line_no=line_no, group=group or "",
+                entity_type=etype,
+                value=value,
+                start=pos,
+                end=pos + len(value),
+                unit=unit,
+                line_no=line_no,
+                group=group or "",
                 canary=etype in canary_types,
             )
         )

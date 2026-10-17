@@ -69,5 +69,6 @@ def merge(files: list[tuple[str, str]], meta: dict | None = None) -> dict:
 def summary(doc: dict) -> str:
     """Counts only, never row content."""
     st = Counter(r.get("status", "") for r in doc["records"])
-    return (f"{len(doc['records'])} records from {doc['parts']} part(s); status: "
-            + ", ".join(f"{k or '(blank)'} {v}" for k, v in st.most_common()))
+    return f"{len(doc['records'])} records from {doc['parts']} part(s); status: " + ", ".join(
+        f"{k or '(blank)'} {v}" for k, v in st.most_common()
+    )

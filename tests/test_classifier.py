@@ -55,7 +55,7 @@ def test_get_trained_is_process_cached():
 def test_tokenizer_offsets_round_trip():
     text = "Wkr-amer-prx117, Anna's note: done."
     for tok in classifier.tokenize(text):
-        assert text[tok.start:tok.end] == tok.text
+        assert text[tok.start : tok.end] == tok.text
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +64,10 @@ def test_tokenizer_offsets_round_trip():
 
 
 def test_managed_ner_tier_bills_against_the_residue_only():
-    line = ("session a41f77c2-9be1-4c33-8f0e-1122aabbccdd on wkr-amer-prx117 "
-            "note: spoke with Anna Novak today")
+    line = (
+        "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd on wkr-amer-prx117 "
+        "note: spoke with Anna Novak today"
+    )
     p = pipeline.Pipeline(
         [pipeline.RegexTier(), pipeline.ManagedNerTier()],
         vault=pseudonym.EntityVault(key=b"k"),
@@ -77,9 +79,9 @@ def test_managed_ner_tier_bills_against_the_residue_only():
 
 def test_monotonic_with_tier1():
     line = "Anna Novak at anna.novak@contoso.com on wkr-emea-rg124"
-    only1 = pipeline.Pipeline(
-        [pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")
-    ).detect(line)[0]
+    only1 = pipeline.Pipeline([pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")).detect(
+        line
+    )[0]
     both = pipeline.Pipeline(
         [pipeline.RegexTier(), pipeline.ManagedNerTier()],
         vault=pseudonym.EntityVault(key=b"k"),
@@ -101,9 +103,7 @@ def test_fail_closed_when_the_classifier_errors(monkeypatch):
         raise RuntimeError("model exploded")
 
     monkeypatch.setattr(classifier, "predict_spans", boom)
-    p = pipeline.Pipeline(
-        [pipeline.RegexTier(), tier], vault=pseudonym.EntityVault(key=b"k")
-    )
+    p = pipeline.Pipeline([pipeline.RegexTier(), tier], vault=pseudonym.EntityVault(key=b"k"))
     r = p.redact("session a41f77c2-9be1-4c33-8f0e-1122aabbccdd and Anna Novak")
     assert r.degraded is True
     assert p.stats.tiers["tier2"].errors == 1

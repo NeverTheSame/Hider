@@ -59,8 +59,7 @@ class OpenAIBackend:
             from openai import OpenAI
         except ImportError as e:
             raise BackendError(
-                "the 'openai' package is required for OpenAIBackend; install "
-                "hider's 'llm' extra"
+                "the 'openai' package is required for OpenAIBackend; install hider's 'llm' extra"
             ) from e
         key = self.api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
@@ -141,6 +140,8 @@ class CassetteBackend:
             self._entries[key] = response
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps({"prompt_sha256": key, "prompt": prompt,
-                                     "response": response}) + "\n")
+                f.write(
+                    json.dumps({"prompt_sha256": key, "prompt": prompt, "response": response})
+                    + "\n"
+                )
         return response

@@ -11,8 +11,10 @@ import pytest
 
 from hider import entities, pipeline, pseudonym
 
-LINE = ("[Session] session a41f77c2-9be1-4c33-8f0e-1122aabbccdd on wkr-amer-prx117 "
-        "for anna.novak@contoso.com token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.QQQQQQQQQQ")
+LINE = (
+    "[Session] session a41f77c2-9be1-4c33-8f0e-1122aabbccdd on wkr-amer-prx117 "
+    "for anna.novak@contoso.com token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.QQQQQQQQQQ"
+)
 
 
 def fresh(tiers=None):
@@ -77,6 +79,7 @@ def covered_chars(spans):
 # Monotonicity
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("later", [NoopTier(), ExplodingTier(), LiarTier(), AdderTier()])
 def test_later_tier_can_never_reduce_coverage(later):
     tier1_only, _ = fresh([pipeline.RegexTier()]).detect(LINE)
@@ -94,6 +97,7 @@ def test_adder_tier_actually_adds():
 # Fail closed
 # ---------------------------------------------------------------------------
 
+
 def test_failing_tier_marks_the_unit_degraded_and_keeps_earlier_coverage():
     p = fresh([pipeline.RegexTier(), ExplodingTier()])
     r = p.redact(LINE)
@@ -103,8 +107,11 @@ def test_failing_tier_marks_the_unit_degraded_and_keeps_earlier_coverage():
 
 
 def test_fail_open_is_opt_in_only():
-    p = pipeline.Pipeline([pipeline.RegexTier(), ExplodingTier()],
-                          vault=pseudonym.EntityVault(key=b"k"), fail_closed=False)
+    p = pipeline.Pipeline(
+        [pipeline.RegexTier(), ExplodingTier()],
+        vault=pseudonym.EntityVault(key=b"k"),
+        fail_closed=False,
+    )
     with pytest.raises(RuntimeError):
         p.redact(LINE)
 
@@ -149,6 +156,7 @@ def test_malformed_spans_cannot_corrupt_the_rewrite():
 # Secret handling
 # ---------------------------------------------------------------------------
 
+
 def test_secrets_are_destroyed_not_pseudonymised():
     p = fresh()
     r = p.redact(LINE)
@@ -176,6 +184,7 @@ def test_overlap_resolution_prefers_the_secret():
 # Span algebra
 # ---------------------------------------------------------------------------
 
+
 def test_residue_is_what_no_tier_claimed():
     spans = [pipeline.Span(5, 10, "X", 1.0, "t"), pipeline.Span(20, 25, "X", 1.0, "t")]
     assert pipeline.residue_segments(30, spans) == [(0, 5), (10, 20), (25, 30)]
@@ -193,6 +202,7 @@ def test_overlapping_spans_collapse_to_one():
 # ---------------------------------------------------------------------------
 # Decision log
 # ---------------------------------------------------------------------------
+
 
 def test_decision_log_never_records_the_original_value():
     p = fresh()

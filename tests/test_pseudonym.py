@@ -20,8 +20,9 @@ def test_same_value_always_gets_the_same_pseudonym():
 
 def test_matching_is_case_and_whitespace_insensitive():
     a = v()
-    assert a.pseudonym("UPN_EMAIL", "Anna.Novak@Contoso.com") == \
-           a.pseudonym("UPN_EMAIL", " anna.novak@contoso.com ")
+    assert a.pseudonym("UPN_EMAIL", "Anna.Novak@Contoso.com") == a.pseudonym(
+        "UPN_EMAIL", " anna.novak@contoso.com "
+    )
 
 
 def test_different_values_get_different_pseudonyms():
@@ -47,16 +48,21 @@ def test_a_site_url_and_a_upn_agree_on_the_tenant():
     assert upn.split("@")[1].split(".")[0] in site
 
 
-@pytest.mark.parametrize("etype,value,check", [
-    ("UPN_EMAIL", "anna@contoso.com", lambda p: "@" in p and p.endswith(".example")),
-    ("IP_ADDRESS", "10.1.2.3", lambda p: p.startswith("203.0.113.")),
-    ("IP_ADDRESS", "fe80:0:0:0:0:0:0:1", lambda p: p.startswith("2001:db8::")),
-    ("WINDOWS_USER_PATH", r"C:\Users\anna\AppData\Local",
-     lambda p: p.startswith(r"C:\Users\user-") and p.endswith(r"AppData\Local")),
-    ("HOSTNAME_FQDN", "app01.contoso.internal", lambda p: p.endswith(".example")),
-    ("SITE_URL", "https://contoso.sharepoint.com/sites/HR",
-     lambda p: p.startswith("https://")),
-])
+@pytest.mark.parametrize(
+    "etype,value,check",
+    [
+        ("UPN_EMAIL", "anna@contoso.com", lambda p: "@" in p and p.endswith(".example")),
+        ("IP_ADDRESS", "10.1.2.3", lambda p: p.startswith("203.0.113.")),
+        ("IP_ADDRESS", "fe80:0:0:0:0:0:0:1", lambda p: p.startswith("2001:db8::")),
+        (
+            "WINDOWS_USER_PATH",
+            r"C:\Users\anna\AppData\Local",
+            lambda p: p.startswith(r"C:\Users\user-") and p.endswith(r"AppData\Local"),
+        ),
+        ("HOSTNAME_FQDN", "app01.contoso.internal", lambda p: p.endswith(".example")),
+        ("SITE_URL", "https://contoso.sharepoint.com/sites/HR", lambda p: p.startswith("https://")),
+    ],
+)
 def test_pseudonym_keeps_the_shape_of_what_it_replaced(etype, value, check):
     """A well-formed substitute keeps downstream parsers and the model working."""
     assert check(v().pseudonym(etype, value))
@@ -65,9 +71,9 @@ def test_pseudonym_keeps_the_shape_of_what_it_replaced(etype, value, check):
 def test_substituted_addresses_are_reserved_ranges():
     """A pseudonym must never be a real routable address or a real domain."""
     a = v()
-    assert a.pseudonym("IPV4", "8.8.8.8").startswith("203.0.113.")   # TEST-NET-3
+    assert a.pseudonym("IPV4", "8.8.8.8").startswith("203.0.113.")  # TEST-NET-3
     assert a.pseudonym("IPV6", "2606:4700::1").startswith("2001:db8::")  # RFC 3849
-    assert a.pseudonym("UPN_EMAIL", "x@real.com").endswith(".example")   # RFC 2606
+    assert a.pseudonym("UPN_EMAIL", "x@real.com").endswith(".example")  # RFC 2606
 
 
 def test_detokenize_round_trips():
@@ -108,10 +114,12 @@ def test_a_different_key_gives_a_different_mapping():
 
 def test_pseudonym_does_not_contain_the_original():
     a = v()
-    for etype, value in [("SESSION_GUID", "a41f77c2-9be1-4c33-8f0e-1122aabbccdd"),
-                         ("POD_ID", "wkr-amer-prx117"),
-                         ("UPN_EMAIL", "anna.novak@contoso.com"),
-                         ("HOSTNAME_FQDN", "app01.contoso.internal")]:
+    for etype, value in [
+        ("SESSION_GUID", "a41f77c2-9be1-4c33-8f0e-1122aabbccdd"),
+        ("POD_ID", "wkr-amer-prx117"),
+        ("UPN_EMAIL", "anna.novak@contoso.com"),
+        ("HOSTNAME_FQDN", "app01.contoso.internal"),
+    ]:
         p = a.pseudonym(etype, value)
         assert value not in p
         for part in value.replace("@", ".").replace("-", ".").split("."):
@@ -158,15 +166,19 @@ def test_distinct_guids_still_get_distinct_labels():
 # De-tokenisation through a model that reformats.
 # ---------------------------------------------------------------------------
 
+
 def test_detokenize_survives_a_model_dropping_the_brackets():
     a = v()
     label = a.pseudonym("SESSION_GUID", GUID_A)
     assert label.startswith("<") and label.endswith(">")
     bare = label[1:-1]
-    assert a.detokenize(f"The stall is on {bare}, retry it.") == \
-        f"The stall is on {GUID_A}, retry it."
-    assert a.detokenize(f"The stall is on {label}, retry it.") == \
-        f"The stall is on {GUID_A}, retry it."
+    assert (
+        a.detokenize(f"The stall is on {bare}, retry it.") == f"The stall is on {GUID_A}, retry it."
+    )
+    assert (
+        a.detokenize(f"The stall is on {label}, retry it.")
+        == f"The stall is on {GUID_A}, retry it."
+    )
 
 
 def test_detokenize_prefers_the_longest_label():

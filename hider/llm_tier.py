@@ -102,8 +102,9 @@ def _find_all(haystack: str, needle: str) -> list[int]:
     return out
 
 
-def detect(backend: Backend, text: str, residue: Sequence[tuple[int, int]], *,
-           tier_name: str = "tier3") -> list:
+def detect(
+    backend: Backend, text: str, residue: Sequence[tuple[int, int]], *, tier_name: str = "tier3"
+) -> list:
     from .pipeline import Span  # local import: pipeline imports this module lazily too
 
     spans: list[Span] = []
@@ -122,9 +123,7 @@ def detect(backend: Backend, text: str, residue: Sequence[tuple[int, int]], *,
             # exactly half redacted. The literal is verified once; applying it
             # everywhere it appears cannot over-reach, because every hit is the
             # same verified string.
-            hits = [
-                i for i in _find_all(segment, literal)
-            ]
+            hits = [i for i in _find_all(segment, literal)]
             if not hits:
                 # Hallucinated citation: quoted text that is not actually in
                 # the segment. Discarded, not trusted, not a hard failure.
@@ -134,6 +133,7 @@ def detect(backend: Backend, text: str, residue: Sequence[tuple[int, int]], *,
                 if any(s0 < e1 and s1 < e0 for s1, e1 in claimed):
                     continue
                 claimed.append((s0, e0))
-                spans.append(Span(start + s0, start + e0, etype, LLM_SCORE,
-                                   tier_name, detector="llm-pass"))
+                spans.append(
+                    Span(start + s0, start + e0, etype, LLM_SCORE, tier_name, detector="llm-pass")
+                )
     return spans

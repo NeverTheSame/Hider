@@ -41,8 +41,8 @@ DESTROY = "destroy"
 # Detection tiers (which layer is EXPECTED to own this entity type)
 # ---------------------------------------------------------------------------
 
-TIER_SHAPED = "tier1-shaped"        # deterministic pattern, regex owns it
-TIER_FREETEXT = "tier2-freetext"    # needs NER, no reliable shape
+TIER_SHAPED = "tier1-shaped"  # deterministic pattern, regex owns it
+TIER_FREETEXT = "tier2-freetext"  # needs NER, no reliable shape
 TIER_CONTEXTUAL = "tier3-contextual"  # disclosure depends on surrounding meaning
 
 
@@ -72,12 +72,48 @@ class EntitySpec:
 _HEX = "0123456789abcdef"
 _REGIONS = ["emea", "amer", "apj"]
 _AZ_REGIONS = ["westeu", "eastus", "eastau", "northeu", "cus"]
-_FIRST = ["anna", "marek", "priya", "tomas", "hanna", "yusuf", "lena", "diego",
-          "ingrid", "noah", "sofia", "kenji", "aisha", "pavel", "clara"]
-_LAST = ["novak", "lindqvist", "iyer", "moreau", "okafor", "vargas", "haddad",
-         "petrov", "schmitt", "delacroix", "tanaka", "olsen", "ferreira"]
-_ORG_WORDS = ["Northwind", "Contoso", "Fabrikam", "Litware", "Adventure",
-              "Tailspin", "Woodgrove", "Proseware"]
+_FIRST = [
+    "anna",
+    "marek",
+    "priya",
+    "tomas",
+    "hanna",
+    "yusuf",
+    "lena",
+    "diego",
+    "ingrid",
+    "noah",
+    "sofia",
+    "kenji",
+    "aisha",
+    "pavel",
+    "clara",
+]
+_LAST = [
+    "novak",
+    "lindqvist",
+    "iyer",
+    "moreau",
+    "okafor",
+    "vargas",
+    "haddad",
+    "petrov",
+    "schmitt",
+    "delacroix",
+    "tanaka",
+    "olsen",
+    "ferreira",
+]
+_ORG_WORDS = [
+    "Northwind",
+    "Contoso",
+    "Fabrikam",
+    "Litware",
+    "Adventure",
+    "Tailspin",
+    "Woodgrove",
+    "Proseware",
+]
 _ORG_SUFFIX = ["Holdings", "Group", "Partners", "Industries", "Advisory", "AG"]
 
 
@@ -114,8 +150,7 @@ def _pod_id(rng: random.Random) -> str:
 
 def _service_id(rng: random.Random) -> str:
     # e.g. svc-prod-cus-001
-    return (f"svc-{rng.choice(['prod', 'stage'])}-"
-            f"{rng.choice(_AZ_REGIONS)}-{rng.randint(1, 40):03d}")
+    return f"svc-{rng.choice(['prod', 'stage'])}-{rng.choice(_AZ_REGIONS)}-{rng.randint(1, 40):03d}"
 
 
 #: SaaS hosts whose subdomain is the customer's tenant name. The list is
@@ -135,8 +170,10 @@ _SITE_PATHS = {
 def _site_url(rng: random.Random) -> str:
     host = rng.choice(TENANT_SITE_HOSTS)
     leaf = rng.choice(["Finance", "HR-Records", "Legal", "ProjectPhoenix", "Audit"])
-    return (f"https://{_tenant_slug(rng)}.{host}{_SITE_PATHS[host]}{leaf}"
-            f"{rng.choice(['', str(rng.randint(2, 9))])}")
+    return (
+        f"https://{_tenant_slug(rng)}.{host}{_SITE_PATHS[host]}{leaf}"
+        f"{rng.choice(['', str(rng.randint(2, 9))])}"
+    )
 
 
 def _ipv4(rng: random.Random) -> str:
@@ -149,8 +186,13 @@ def _ipv6(rng: random.Random) -> str:
 
 def _win_user_path(rng: random.Random) -> str:
     user = f"{rng.choice(_FIRST)}.{rng.choice(_LAST)}"
-    tail = rng.choice(["AppData\\Local\\BackupAgent\\cache", "Documents\\Exports",
-                       "AppData\\Roaming\\BackupAgent"])
+    tail = rng.choice(
+        [
+            "AppData\\Local\\BackupAgent\\cache",
+            "Documents\\Exports",
+            "AppData\\Roaming\\BackupAgent",
+        ]
+    )
     return f"C:\\Users\\{user}\\{tail}"
 
 
@@ -174,15 +216,19 @@ def _jwt(rng: random.Random) -> str:
 
 def _sas_url(rng: random.Random) -> str:
     acct = f"stor{_hexs(rng, 10)}"
-    return (f"https://{acct}.blob.core.windows.net/repo/chunk{rng.randint(1, 9999)}.bin"
-            f"?sv=2024-11-04&ss=b&srt=sco&sp=racwdl&se=2026-12-31T23:59:59Z"
-            f"&st=2026-01-01T00:00:00Z&spr=https&sig={_b64(rng, 43)}%3D")
+    return (
+        f"https://{acct}.blob.core.windows.net/repo/chunk{rng.randint(1, 9999)}.bin"
+        f"?sv=2024-11-04&ss=b&srt=sco&sp=racwdl&se=2026-12-31T23:59:59Z"
+        f"&st=2026-01-01T00:00:00Z&spr=https&sig={_b64(rng, 43)}%3D"
+    )
 
 
 def _conn_string(rng: random.Random) -> str:
     acct = f"stor{_hexs(rng, 10)}"
-    return (f"DefaultEndpointsProtocol=https;AccountName={acct};"
-            f"AccountKey={_b64(rng, 86)}==;EndpointSuffix=core.windows.net")
+    return (
+        f"DefaultEndpointsProtocol=https;AccountName={acct};"
+        f"AccountKey={_b64(rng, 86)}==;EndpointSuffix=core.windows.net"
+    )
 
 
 def _api_key(rng: random.Random) -> str:
@@ -201,120 +247,186 @@ _GUID_LABELS = frozenset({"GUID"})
 
 SPECS: tuple[EntitySpec, ...] = (
     EntitySpec(
-        name="SESSION_GUID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="SESSION_GUID",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="backup and restore session identifiers as written in service logs",
         description="Backup or restore session id. Correlates lines across a bundle, so it must stay stable after redaction.",
-        generate=_guid, detected_as=_GUID_LABELS | {"SESSION_GUID"}, label_prefix="Session",
+        generate=_guid,
+        detected_as=_GUID_LABELS | {"SESSION_GUID"},
+        label_prefix="Session",
     ),
     EntitySpec(
-        name="TENANT_ID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="TENANT_ID",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="cloud identity provider tenant identifier, public format",
         description="Tenant id of the customer directory. Same shape as any other GUID on the wire.",
-        generate=_guid, detected_as=_GUID_LABELS | {"TENANT_ID"}, label_prefix="Tenant",
+        generate=_guid,
+        detected_as=_GUID_LABELS | {"TENANT_ID"},
+        label_prefix="Tenant",
     ),
     EntitySpec(
-        name="OBJECT_GUID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="OBJECT_GUID",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="per-object identifiers in SaaS APIs, mailboxes and document collections",
         description="Identifier of one backed-up object.",
-        generate=_guid, detected_as=_GUID_LABELS, label_prefix="Mailbox",
+        generate=_guid,
+        detected_as=_GUID_LABELS,
+        label_prefix="Mailbox",
     ),
     EntitySpec(
-        name="UPN_EMAIL", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="UPN_EMAIL",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="RFC 5322 addr-spec, cloud user principal names",
         description="User principal name or mailbox address. Directly identifies a person.",
-        generate=_upn, detected_as=frozenset({"EMAIL_ADDRESS", "UPN_EMAIL"}),
+        generate=_upn,
+        detected_as=frozenset({"EMAIL_ADDRESS", "UPN_EMAIL"}),
         label_prefix="User",
     ),
     EntitySpec(
-        name="POD_ID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="POD_ID",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="region-scoped worker pod and agent naming, e.g. wkr-amer-prx117",
         description="Worker proxy pod. Reveals region and internal topology.",
-        generate=_pod_id, detected_as=frozenset({"WORKER_POD_ID"}), label_prefix="Pod",
+        generate=_pod_id,
+        detected_as=frozenset({"WORKER_POD_ID"}),
+        label_prefix="Pod",
     ),
     EntitySpec(
-        name="SERVICE_INSTANCE_ID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="SERVICE_INSTANCE_ID",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="service instance naming, e.g. svc-prod-cus-001",
         description="Service instance serving a set of tenants.",
-        generate=_service_id, detected_as=frozenset({"SERVICE_INSTANCE_ID"}),
+        generate=_service_id,
+        detected_as=frozenset({"SERVICE_INSTANCE_ID"}),
         label_prefix="Service",
     ),
     EntitySpec(
-        name="SITE_URL", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="SITE_URL",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="public URL format of SaaS collaboration hosts, where the subdomain is the customer tenant",
         description="Collaboration site URL. Leaks both the customer tenant name and the business purpose of the site.",
-        generate=_site_url, detected_as=frozenset({"SITE_URL", "URL"}),
+        generate=_site_url,
+        detected_as=frozenset({"SITE_URL", "URL"}),
         label_prefix="Site",
     ),
     EntitySpec(
-        name="IPV4", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="IPV4",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="dotted-quad, standard",
         description="Host address from a customer or internal network.",
-        generate=_ipv4, detected_as=frozenset({"IP_ADDRESS"}), label_prefix="Host4",
+        generate=_ipv4,
+        detected_as=frozenset({"IP_ADDRESS"}),
+        label_prefix="Host4",
     ),
     EntitySpec(
-        name="IPV6", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="IPV6",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="RFC 4291 full form",
         description="IPv6 host address.",
-        generate=_ipv6, detected_as=frozenset({"IP_ADDRESS"}), label_prefix="Host6",
+        generate=_ipv6,
+        detected_as=frozenset({"IP_ADDRESS"}),
+        label_prefix="Host6",
     ),
     EntitySpec(
-        name="WINDOWS_USER_PATH", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="WINDOWS_USER_PATH",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="Windows profile path layout",
         description="Filesystem path containing an account name.",
-        generate=_win_user_path, detected_as=frozenset({"WINDOWS_USER_PATH"}),
+        generate=_win_user_path,
+        detected_as=frozenset({"WINDOWS_USER_PATH"}),
         label_prefix="Path",
     ),
     EntitySpec(
-        name="HOSTNAME_FQDN", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="HOSTNAME_FQDN",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="internal DNS naming in on-prem deployments",
         description="Internal hostname. Reveals customer naming conventions.",
-        generate=_fqdn, detected_as=frozenset({"HOSTNAME_FQDN"}), label_prefix="Node",
+        generate=_fqdn,
+        detected_as=frozenset({"HOSTNAME_FQDN"}),
+        label_prefix="Node",
     ),
     EntitySpec(
-        name="SUPPORT_CASE_NUMBER", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
+        name="SUPPORT_CASE_NUMBER",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_SHAPED,
         source="support ticket numbering, eight digits",
         description="Support case number. Internal reference that links a log excerpt back to a named account.",
-        generate=_case_number, detected_as=frozenset({"SUPPORT_CASE_NUMBER"}),
+        generate=_case_number,
+        detected_as=frozenset({"SUPPORT_CASE_NUMBER"}),
         label_prefix="Case",
     ),
     # ---- true secrets: destroyed, never vaulted ----
     EntitySpec(
-        name="JWT", handling=DESTROY, expected_tier=TIER_SHAPED,
+        name="JWT",
+        handling=DESTROY,
+        expected_tier=TIER_SHAPED,
         source="RFC 7519 compact serialisation",
         description="Bearer token. Live credential, so it is destroyed rather than pseudonymised.",
-        generate=_jwt, detected_as=frozenset({"JWT"}), label_prefix="Jwt",
+        generate=_jwt,
+        detected_as=frozenset({"JWT"}),
+        label_prefix="Jwt",
     ),
     EntitySpec(
-        name="PRESIGNED_URL", handling=DESTROY, expected_tier=TIER_SHAPED,
+        name="PRESIGNED_URL",
+        handling=DESTROY,
+        expected_tier=TIER_SHAPED,
         source="pre-signed object-storage URL query formats",
         description="Pre-signed storage URL granting direct data access to anyone holding it.",
-        generate=_sas_url, detected_as=frozenset({"PRESIGNED_URL"}), label_prefix="Presigned",
+        generate=_sas_url,
+        detected_as=frozenset({"PRESIGNED_URL"}),
+        label_prefix="Presigned",
     ),
     EntitySpec(
-        name="CONNECTION_STRING", handling=DESTROY, expected_tier=TIER_SHAPED,
+        name="CONNECTION_STRING",
+        handling=DESTROY,
+        expected_tier=TIER_SHAPED,
         source="object-storage connection string formats",
         description="Account key embedded in a connection string.",
-        generate=_conn_string, detected_as=frozenset({"CONNECTION_STRING"}),
+        generate=_conn_string,
+        detected_as=frozenset({"CONNECTION_STRING"}),
         label_prefix="Conn",
     ),
     EntitySpec(
-        name="API_KEY", handling=DESTROY, expected_tier=TIER_SHAPED,
+        name="API_KEY",
+        handling=DESTROY,
+        expected_tier=TIER_SHAPED,
         source="common provider key prefixes",
         description="API or client key.",
-        generate=_api_key, detected_as=frozenset({"API_KEY"}), label_prefix="Key",
+        generate=_api_key,
+        detected_as=frozenset({"API_KEY"}),
+        label_prefix="Key",
     ),
     # ---- free text: tier 1 is EXPECTED to miss these ----
     EntitySpec(
-        name="PERSON_NAME", handling=PSEUDONYMISE, expected_tier=TIER_FREETEXT,
+        name="PERSON_NAME",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_FREETEXT,
         source="engineer and end-user names written into notes and error text",
         description="A person's name in prose. No shape to match, so this is the managed-NER case.",
-        generate=_person, detected_as=frozenset({"PERSON"}), label_prefix="Person",
+        generate=_person,
+        detected_as=frozenset({"PERSON"}),
+        label_prefix="Person",
     ),
     EntitySpec(
-        name="ORG_NAME", handling=PSEUDONYMISE, expected_tier=TIER_FREETEXT,
+        name="ORG_NAME",
+        handling=PSEUDONYMISE,
+        expected_tier=TIER_FREETEXT,
         source="customer company names in operator notes",
         description="Customer organisation name in prose.",
-        generate=_org, detected_as=frozenset({"ORGANIZATION"}), label_prefix="Org",
+        generate=_org,
+        detected_as=frozenset({"ORGANIZATION"}),
+        label_prefix="Org",
     ),
 )
 

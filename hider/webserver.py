@@ -34,8 +34,10 @@ MAX_BYTES = 256 * 1024 * 1024
 _LOCK = threading.Lock()  # one scrub at a time: the classifier is shared
 _JOBS: dict[str, dict] = {}  # Claude Code runs: id -> status / result / error
 
-CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-       "connect-src 'self'; img-src data:; form-action 'none'; base-uri 'none'")
+CSP = (
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+    "connect-src 'self'; img-src data:; form-action 'none'; base-uri 'none'"
+)
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -255,8 +257,9 @@ def _safe_stem(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", stem)[:80] or "input"
 
 
-def obfuscate_text(raw: str, name: str = "input.json", tier2: str = "classifier",
-                   terms: list[str] | None = None) -> dict:
+def obfuscate_text(
+    raw: str, name: str = "input.json", tier2: str = "classifier", terms: list[str] | None = None
+) -> dict:
     doc, jsonl = jsonscrub.parse(raw)
     with _LOCK:
         res = jsonscrub.scrub(doc, tier2=tier2, terms=terms)
@@ -269,11 +272,25 @@ def obfuscate_text(raw: str, name: str = "input.json", tier2: str = "classifier"
     out_path = OUT / f"{stem}.obfuscated.json"
     map_path = OUT / f"{stem}.mapping.json"
     out_path.write_text(output_text, encoding="utf-8")
-    map_path.write_text(json.dumps(
-        {"note": "label -> original value. Holds real customer data; keep on this machine.",
-         "terms": terms or [], "mapping": res.mapping}, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"output_text": output_text, "mapping": res.mapping, "stats": res.stats,
-            "run": stem, "saved": {"output": str(out_path), "mapping": str(map_path)}}
+    map_path.write_text(
+        json.dumps(
+            {
+                "note": "label -> original value. Holds real customer data; keep on this machine.",
+                "terms": terms or [],
+                "mapping": res.mapping,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "output_text": output_text,
+        "mapping": res.mapping,
+        "stats": res.stats,
+        "run": stem,
+        "saved": {"output": str(out_path), "mapping": str(map_path)},
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -299,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path in ("/", "/index.html"):
             page = PAGE.replace("__REPO__", str(OUT.parent.parent)).replace(
-                "__PORTAL__", html.escape(localcfg.settings().get("portal_url", ""), quote=True))
+                "__PORTAL__", html.escape(localcfg.settings().get("portal_url", ""), quote=True)
+            )
             self._send(200, page.encode(), "text/html; charset=utf-8")
         elif url.path == "/api/runs":
             self._json(200, {"runs": research.list_runs()})
@@ -313,8 +331,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         url = urlparse(self.path)
-        if url.path not in ("/api/obfuscate", "/api/mask", "/api/ask", "/api/unmask",
-                            "/api/csv"):
+        if url.path not in ("/api/obfuscate", "/api/mask", "/api/ask", "/api/unmask", "/api/csv"):
             return self._json(404, {"error": "not found"})
         # Reject cross-site posts: only this page may call the API.
         origin = self.headers.get("Origin")
@@ -337,15 +354,23 @@ class Handler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             return self._json(400, {"error": f"not valid JSON or JSON Lines: {e}"})
         except Exception as e:  # fail closed: no partial output
-            return self._json(500, {"error": f"obfuscation failed, nothing returned: {type(e).__name__}"})
+            return self._json(
+                500, {"error": f"obfuscation failed, nothing returned: {type(e).__name__}"}
+            )
         self._json(200, result)
 
     def _research(self, path: str, body: dict) -> None:
         if path == "/api/csv":
-            doc = csvmerge.merge([(f["name"], f["text"]) for f in body.get("files") or []],
-                                 body.get("meta"))
-            return self._json(200, {"json_text": json.dumps(doc, ensure_ascii=False, indent=2),
-                                    "summary": csvmerge.summary(doc)})
+            doc = csvmerge.merge(
+                [(f["name"], f["text"]) for f in body.get("files") or []], body.get("meta")
+            )
+            return self._json(
+                200,
+                {
+                    "json_text": json.dumps(doc, ensure_ascii=False, indent=2),
+                    "summary": csvmerge.summary(doc),
+                },
+            )
         if path == "/api/unmask" and isinstance(body.get("mapping"), dict):
             mapping, terms, public = body["mapping"], [], None  # a dropped mapping file
         else:
@@ -365,9 +390,15 @@ class Handler(BaseHTTPRequestHandler):
 
         def work() -> None:
             try:
-                _JOBS[job_id].update(status="done", result=research.ask(
-                    str(body["run"]), text, model=body.get("model") or None,
-                    extra={str(k): str(v) for k, v in (body.get("extra") or {}).items()}))
+                _JOBS[job_id].update(
+                    status="done",
+                    result=research.ask(
+                        str(body["run"]),
+                        text,
+                        model=body.get("model") or None,
+                        extra={str(k): str(v) for k, v in (body.get("extra") or {}).items()},
+                    ),
+                )
             except Exception as e:  # reported to the page, never swallowed
                 _JOBS[job_id].update(status="error", error=f"{type(e).__name__}: {e}")
 
@@ -375,15 +406,18 @@ class Handler(BaseHTTPRequestHandler):
         self._json(202, {"job": job_id})
 
 
-def serve(host: str = "127.0.0.1", port: int = 8790, tier2: str = "classifier",
-          allow_remote: bool = False) -> None:
+def serve(
+    host: str = "127.0.0.1", port: int = 8790, tier2: str = "classifier", allow_remote: bool = False
+) -> None:
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
         loopback = host == "localhost"
     if not loopback and not allow_remote:
-        raise SystemExit(f"refusing to bind {host}: not a loopback address "
-                         f"(pass --allow-remote if you really mean it)")
+        raise SystemExit(
+            f"refusing to bind {host}: not a loopback address "
+            f"(pass --allow-remote if you really mean it)"
+        )
     Handler.tier2 = tier2
     # Train the tier 2 model now, not on the first request.
     jsonscrub.scrub({"warmup": "x"}, tier2=tier2)
