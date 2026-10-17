@@ -1,9 +1,49 @@
+# Python and tooling caches
 .venv/
-out/
+venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.DS_Store
+.playwright-mcp/
+
+# Everything Hider writes at runtime: generated corpora, metrics, obfuscated
+# exports and their mappings (which hold real values), research answers
+out/
+logs/
+*.log
+
+# Local, uncommitted configuration
 vault.json
 profile.json
 *.profile.json
 hider.local.json
+.claude/settings.local.json
+
+# Credentials and real data must never be committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+data/raw/
+
+# Model weight files
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.joblib
+*.bin
