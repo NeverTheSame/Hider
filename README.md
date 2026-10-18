@@ -479,3 +479,7 @@ real recorded run against it, plus the gateway. Next: a larger and more
 adversarial injection-payload set against tier 3, a second model for
 comparison, an async bundle-ingest flow for whole-bundle jobs, and streaming
 support if a way is found to rewrite SSE honestly.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
