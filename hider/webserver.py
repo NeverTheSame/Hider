@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import csvmerge, jsonscrub, localcfg, research
+from . import csvmerge, feedback, jsonscrub, localcfg, research
 
 OUT = Path(__file__).resolve().parent.parent / "out" / "json"
 MAX_BYTES = 256 * 1024 * 1024
@@ -98,7 +98,19 @@ details summary{cursor:pointer;color:var(--mut);margin-top:10px}
   <div class="card"><div class="grid" id="stats"></div><div id="types" style="margin-top:10px"></div><div id="leak" style="margin-top:10px"></div>
     <div class="row"><button id="dlOut">Download obfuscated JSON</button><button class="sec" id="dlMap">Download mapping (contains real values)</button></div>
     <p id="saved" class="mut" style="font-size:12px;margin:10px 0 0"></p>
-    <details><summary>Preview</summary><pre id="preview"></pre></details></div>
+    <details><summary>Preview</summary><pre id="preview"></pre></details>
+    <details><summary>Report a mistake (something missed, or something hidden that should not have been)</summary>
+      <div class="f">
+        <div><label>Kind</label><select id="fbKind"><option value="missed">Missed: this should have been hidden</option><option value="wrong">Wrong: this should not have been hidden</option></select></div>
+        <div><label>Type (optional)</label><input id="fbType" placeholder="PERSON_NAME, ORG_NAME, HOSTNAME_FQDN ..."></div>
+      </div>
+      <label>The text (the value that leaked, or the value or label that was wrongly hidden)</label>
+      <input id="fbText" style="width:100%">
+      <label>Note (optional)</label>
+      <input id="fbNote" style="width:100%" placeholder="where it appeared, what it actually is">
+      <div class="row"><button class="sec" id="fbSend">Report</button><span id="fbMsg" class="mut"></span></div>
+      <p class="mut" style="font-size:12px">Saved to <code>out/feedback.jsonl</code> on this machine only; a "missed" report holds the real value, so the file is as sensitive as a mapping. <code>python -m hider feedback</code> lists them.</p>
+    </details></div>
 </div>
 
 <div class="card">
@@ -210,6 +222,9 @@ const stem=()=>name.replace(/\.(jsonl?|txt)$/i,"");
 $("dlOut").onclick=()=>last&&dl(last.output_text,stem()+".obfuscated.json");
 $("dlMap").onclick=()=>last&&dl(JSON.stringify({note:"label -> original value. Keep on this machine.",mapping:last.mapping},null,2),stem()+".mapping.json");
 
+$("fbSend").onclick=async()=>{try{const j=await api("/api/feedback",{kind:$("fbKind").value,entity_type:$("fbType").value,text:$("fbText").value,note:$("fbNote").value,run:last?last.run:null});
+  $("fbMsg").innerHTML='<span class="ok">Recorded ('+esc(j.kind)+'). Thank you.</span>';$("fbText").value="";$("fbNote").value="";}catch(e){err($("fbMsg"),e)}};
+
 // runs list (steps 3 and 4)
 async function runs(select){try{const j=await api("/api/runs",null,"GET");
   const opts=j.runs.map(r=>'<option value="'+esc(r.run)+'">'+esc(r.run)+" ("+r.size_mb+" MB, "+esc(r.saved)+")</option>").join("")||'<option value="">no runs yet: obfuscate something first</option>';
@@ -314,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urlparse(self.path)
         if url.path not in ("/api/obfuscate", "/api/mask", "/api/ask", "/api/unmask",
-                            "/api/csv"):
+                            "/api/csv", "/api/feedback"):
             return self._json(404, {"error": "not found"})
         # Reject cross-site posts: only this page may call the API.
         origin = self.headers.get("Origin")
@@ -341,6 +356,11 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, result)
 
     def _research(self, path: str, body: dict) -> None:
+        if path == "/api/feedback":
+            row = feedback.record(str(body.get("kind") or ""), str(body.get("text") or ""),
+                                  entity_type=body.get("entity_type"), run=body.get("run"),
+                                  note=body.get("note"), source="web")
+            return self._json(200, {"kind": row["kind"], "ts": row["ts"]})
         if path == "/api/csv":
             doc = csvmerge.merge([(f["name"], f["text"]) for f in body.get("files") or []],
                                  body.get("meta"))

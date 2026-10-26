@@ -6,6 +6,8 @@
     python -m hider proxy     run the redacting OpenAI-compatible gateway
     python -m hider serve     run the local JSON obfuscation web UI
     python -m hider scrub-json FILE   obfuscate a JSON file from the shell
+    python -m hider utility   measure answer accuracy on raw vs redacted input
+    python -m hider feedback  list what users reported as missed or wrongly redacted
 """
 
 from __future__ import annotations
@@ -29,21 +31,70 @@ from . import (
 OUT = Path(__file__).resolve().parent.parent / "out"
 
 
-def _build_tier3_backend(args: argparse.Namespace):
-    """Construct the tier 3 backend from --tier3/--cassette/--record, or None."""
-    if args.tier3 == "none":
+def _real_backend(kind: str, model: str | None, base_url: str | None,
+                  usage: llm_backend.UsageMeter):
+    if kind == "openai":
+        kw = {"usage": usage}
+        if model:
+            kw["model"] = model
+        if base_url:
+            kw["base_url"] = base_url
+        return llm_backend.OpenAIBackend(**kw)
+    if kind == "anthropic":
+        kw = {"usage": usage}
+        if model:
+            kw["model"] = model
+        return llm_backend.AnthropicBackend(**kw)
+    raise SystemExit(f"error: unknown backend {kind!r}")
+
+
+def _build_llm_backend(args: argparse.Namespace, *, flag: str = "--tier3"):
+    """The backend behind ``--tier3``/``--backend``: cassette replay, or a
+    live backend wrapped in retries, a breaker and an optional fallback,
+    recording into the cassette. ``None`` when the flag is ``none``."""
+    kind = getattr(args, "tier3", None) or getattr(args, "backend", None) or "none"
+    if kind == "none":
         return None
     if not args.cassette:
-        print("error: --tier3 requires --cassette PATH (add --record to create one "
+        print(f"error: {flag} requires --cassette PATH (add --record to create one "
               "from a live call)", file=sys.stderr)
         raise SystemExit(2)
+    from .llm_tier import PROMPT_VERSION
     if args.record:
-        if args.tier3 == "openai":
-            real = llm_backend.OpenAIBackend()
-        else:
-            raise SystemExit(f"error: unknown --tier3 backend {args.tier3!r}")
-        return llm_backend.CassetteBackend(path=args.cassette, mode="record", inner=real)
-    return llm_backend.CassetteBackend(path=args.cassette, mode="replay")
+        usage = llm_backend.UsageMeter()
+        primary = _real_backend(kind, args.model, getattr(args, "base_url", None), usage)
+        fallback = None
+        if getattr(args, "fallback", None) and args.fallback != "none":
+            fallback = llm_backend.ResilientBackend(
+                _real_backend(args.fallback, getattr(args, "fallback_model", None),
+                              None, usage), retries=1)
+        resilient = llm_backend.ResilientBackend(primary, fallback=fallback)
+        return llm_backend.CassetteBackend(path=args.cassette, mode="record",
+                                           inner=resilient, prompt_version=PROMPT_VERSION)
+    return llm_backend.CassetteBackend(path=args.cassette, mode="replay",
+                                       prompt_version=PROMPT_VERSION)
+
+
+def _build_tier3_backend(args: argparse.Namespace):
+    return _build_llm_backend(args)
+
+
+def _add_llm_flags(sp: argparse.ArgumentParser, *, dest: str) -> None:
+    sp.add_argument(f"--{dest}", choices=["none", "openai", "anthropic"], default="none",
+                    help="LLM backend: an OpenAI-compatible API, the Anthropic API, "
+                         "or none (default)")
+    sp.add_argument("--model", help="model id for the live backend (provider default "
+                                    "otherwise)")
+    sp.add_argument("--base-url", help="OpenAI-compatible server to call instead of "
+                                       "api.openai.com (a local model, another vendor)")
+    sp.add_argument("--fallback", choices=["none", "openai", "anthropic"], default="none",
+                    help="backend to try when the primary is exhausted or its "
+                         "circuit breaker is open")
+    sp.add_argument("--fallback-model")
+    sp.add_argument("--cassette", help="cassette JSONL path (record or replay)")
+    sp.add_argument("--record", action="store_true",
+                    help="make live calls and append them to --cassette, instead of "
+                         "replaying")
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
@@ -51,6 +102,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     tier3_backend = _build_tier3_backend(args)
     full, base, _, corpus = evaluate.run_with_baseline(
         lines=args.lines, seed=args.seed, tier2=tier2, tier3=tier3_backend,
+        tier3_batch=args.batch, tier3_workers=args.workers,
     )
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +113,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     if full.ner_enabled:
         excerpt_tiers.append(evaluate.build_tier2(full.tier2_backend))
     if tier3_backend is not None:
-        excerpt_tiers.append(pipeline.LlmPassTier(tier3_backend))
+        excerpt_tiers.append(pipeline.LlmPassTier(tier3_backend, batch_size=args.batch,
+                                                  workers=args.workers))
     pipe = pipeline.Pipeline(
         excerpt_tiers, vault=pseudonym.EntityVault(key=b"hider-demo-fixed-key")
     )
@@ -88,6 +141,18 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         rate = full.injection_bypass_rate
         print(f"injection bypass  {rate:.1%} of injection-adjacent names survived "
               f"(tier 3 active, tier2={full.tier2_backend or 'off'})")
+        info = full.tier3_info or {}
+        rec = info.get("recording") or {}
+        print(f"tier 3 provenance backend={rec.get('backend') or info.get('backend')} "
+              f"model={rec.get('model') or info.get('model')} "
+              f"prompt={info.get('prompt_version')} "
+              f"batch={info.get('batch_size')} cache={info.get('cache')}")
+        if info.get("usage"):
+            u = info["usage"]
+            cost = u.get("cost_usd_list_price")
+            print(f"tier 3 usage      {u['calls']} calls, {u['input_tokens']} in / "
+                  f"{u['output_tokens']} out tokens, "
+                  f"cost {'$%.4f' % cost if cost is not None else 'unpriced model'}")
     print(f"tier 1 residue    {full.residue_chars:,} chars "
           f"({1 - full.cost_reduction:.1%} of input would reach a paid tier)")
     print(f"cost at ${evaluate.NER_USD_PER_1K_CHARS}/1k chars   "
@@ -113,6 +178,70 @@ def _cmd_eval(args: argparse.Namespace) -> int:
               f"floor {evaluate.FREETEXT_RECALL_FLOOR:.2f}", file=sys.stderr)
         failed = True
     return 1 if failed else 0
+
+
+def _cmd_utility(args: argparse.Namespace) -> int:
+    from . import utility
+
+    backend = _build_llm_backend(args, flag="--backend")
+    if backend is None:
+        print("error: --backend openai|anthropic is required (with --cassette)",
+              file=sys.stderr)
+        return 2
+    tier2 = None if args.tier2 == "none" else args.tier2
+    rep = utility.run(backend, lines=args.lines, seed=args.seed,
+                      excerpt_lines=args.excerpt_lines, tier2=tier2)
+    OUT.mkdir(parents=True, exist_ok=True)
+    utility.save(rep, OUT / "utility.json")
+    print(f"excerpt           {rep.excerpt_lines} lines, {rep.excerpt_chars:,} chars, "
+          f"{rep.seeded_in_excerpt} seeded values")
+    print(f"questions         {rep.n}")
+    print(f"accuracy raw      {rep.raw_accuracy:.4f}")
+    print(f"accuracy redacted {rep.redacted_accuracy:.4f}")
+    print(f"delta             {rep.delta:+.4f}   floor {utility.DELTA_FLOOR:.2f} "
+          f"(positive = redaction cost accuracy)")
+    for q in rep.questions:
+        flag = ("ok " if q.raw_correct else "-- ") + ("ok " if q.redacted_correct else "-- ")
+        err = q.redacted_error or q.raw_error or ""
+        print(f"  [{flag}] {q.qid:<40} {err}")
+    b = rep.backend or {}
+    u = b.get("usage") or {}
+    rec = b.get("recording") or {}
+    print(f"backend           {rec.get('backend') or b.get('name')} "
+          f"model={rec.get('model') or b.get('model')} prompt={rep.prompt_version}")
+    if u:
+        cost = u.get("cost_usd_list_price")
+        print(f"usage             {u['calls']} calls, {u['input_tokens']} in / "
+              f"{u['output_tokens']} out tokens, "
+              f"cost {'$%.4f' % cost if cost is not None else 'unpriced model'}")
+    print(f"wrote {OUT / 'utility.json'}")
+    failed = False
+    if rep.prompt_leaks:
+        print(f"\nFAIL: {rep.prompt_leaks} seeded value(s) would have left in a redacted "
+              f"prompt; those questions were refused", file=sys.stderr)
+        failed = True
+    if rep.below_floor:
+        print(f"\nFAIL: redaction cost {rep.delta:.1%} accuracy, above the "
+              f"{utility.DELTA_FLOOR:.0%} floor", file=sys.stderr)
+        failed = True
+    return 1 if failed else 0
+
+
+def _cmd_feedback(args: argparse.Namespace) -> int:
+    from . import feedback
+
+    rows = feedback.load(args.path)
+    s = feedback.summary(rows)
+    print(f"{s['total']} report(s): {s['by_kind']}")
+    for t, n in s["by_entity_type"].items():
+        print(f"  {t}: {n}")
+    for r in rows[-args.last:]:
+        text = r["text"] if args.show_values else f"<{len(r['text'])} chars>"
+        print(f"{r['ts']}  {r['kind']:<6} {r.get('entity_type') or '-':<16} "
+              f"run={r.get('run') or '-'}  {text}  {r.get('note') or ''}")
+    if rows and not args.show_values:
+        print("(values hidden; pass --show-values to print them)")
+    return 0
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
@@ -316,16 +445,31 @@ def main(argv: list[str] | None = None) -> int:
     e.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
                    help="tier 2 backend: the trained classifier (default), local "
                         "spaCy NER, or none")
-    e.add_argument("--tier3", choices=["none", "openai"], default="none",
-                   help="tier 3 backend: an LLM pass, or none (default)")
-    e.add_argument("--cassette", help="cassette JSONL path for --tier3 (record or replay)")
-    e.add_argument("--record", action="store_true",
-                   help="make a live --tier3 call and append it to --cassette, "
-                        "instead of replaying")
+    _add_llm_flags(e, dest="tier3")
+    e.add_argument("--batch", type=int, default=1,
+                   help="tier 3 residue segments per prompt (1 keeps the recorded "
+                        "single-segment prompt)")
+    e.add_argument("--workers", type=int, default=1,
+                   help="concurrent tier 3 batches per unit")
     e.add_argument("--excerpt", default="RestoreSession",
                    help="substring of the unit path to show in the before/after pane")
     e.add_argument("--excerpt-lines", type=int, default=14)
     e.set_defaults(fn=_cmd_eval)
+
+    ut = sub.add_parser("utility", help="measure answer accuracy on raw vs redacted input")
+    _add_llm_flags(ut, dest="backend")
+    ut.add_argument("--lines", type=int, default=300)
+    ut.add_argument("--seed", type=int, default=20260820)
+    ut.add_argument("--excerpt-lines", type=int, default=40)
+    ut.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
+    ut.set_defaults(fn=_cmd_utility)
+
+    fb = sub.add_parser("feedback", help="list redaction feedback reported from the web UI")
+    fb.add_argument("--path", help="feedback JSONL (default out/feedback.jsonl)")
+    fb.add_argument("--last", type=int, default=20)
+    fb.add_argument("--show-values", action="store_true",
+                    help="print the reported text (it may be real customer data)")
+    fb.set_defaults(fn=_cmd_feedback)
 
     g = sub.add_parser("generate", help="write a synthetic bundle to disk")
     g.add_argument("--lines", type=int, default=4000)

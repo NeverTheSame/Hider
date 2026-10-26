@@ -25,8 +25,9 @@ ner = [
     "spacy>=3.8",
     "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]
-# Tier 3: an LLM pass over the residue, selected with --tier3 openai.
-llm = ["openai>=1.0"]
+# Tier 3 (an LLM pass over the residue) and the utility eval: provider SDKs,
+# selected with --tier3/--backend openai|anthropic. Cassette replay needs neither.
+llm = ["openai>=1.0", "anthropic>=0.40"]
 
 [project.scripts]
 hider = "hider.cli:main"

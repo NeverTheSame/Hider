@@ -65,22 +65,40 @@ never gets a chance to see, or leak, anything a cheaper tier already redacted.
   `pipeline.py` (`ManagedNerTier`'s docstring) for operators who out-scale a
   local model.
 - **Tier 3, an LLM pass.** What tier 2's classifier still cannot resolve -
-  `--tier3 openai`, built and tested in `hider/llm_tier.py`. It is asked for
-  strict JSON and nothing else, and its output is never trusted on its own
-  say-so: every reported finding must be a literal, byte-identical quote from
-  the residue, or it is discarded as a hallucinated citation rather than
-  acted on. A response that isn't the shape asked for is a hard failure that
-  fails the whole call closed, the same as any other tier's exception. No
-  default backend is wired in, because a paid, network-calling tier must never
-  run by accident.
+  `--tier3 openai|anthropic`, built and tested in `hider/llm_tier.py`. It is
+  asked for strict JSON and nothing else (instructions in the system role,
+  the residue fenced in the user turn, provider JSON mode where the API has
+  one), and its output is never trusted on its own say-so: every reported
+  finding must be a literal, byte-identical quote from the residue, or it is
+  discarded as a hallucinated citation rather than acted on. A response that
+  isn't the shape asked for is a hard failure that fails the whole call
+  closed, the same as any other tier's exception. No default backend is wired
+  in, because a paid, network-calling tier must never run by accident. In
+  front of the backend sit three cost controls that change nothing about
+  what is verified: up to `--batch N` residue segments share one prompt, an
+  exact-match cache reuses verified findings for a segment seen before (no
+  semantic cache, on purpose: two lines that differ only in the name they
+  carry must never share a result), and `--workers N` batches run
+  concurrently. Around the backend sits a retry-with-backoff policy, a
+  circuit breaker that stops calling a provider that keeps failing, and an
+  optional `--fallback` backend; every exhausted path still fails closed.
 
 The boundary itself is code, not aspiration: `hider/proxy.py` is an
 OpenAI-compatible gateway that intercepts `/v1/chat/completions`, redacts every
 caller-authored text field, refuses (503, unforwarded) any request whose
 redaction degraded, and de-tokenises the reply through the vault so the caller
-sees real values where the model saw pseudonyms. It is standard library only,
-holds no provider credentials of its own, and passes the caller's
-`Authorization` through untouched.
+sees real values where the model saw pseudonyms. After the tiers run it sweeps
+the redacted payload for every identifier the vault already holds and replaces
+any hit with its existing pseudonym; the tiers past tier 1 are probabilistic,
+the vault is not. Streaming replies are rewritten in flight with a hold-back of
+one label length, so no pseudonym is ever cut in half. Labels the model wrote
+that the vault does not know are passed through and reported, never guessed.
+Every request leaves one structured log row (request id, redaction and
+upstream latency, counts per entity type and tier, token usage from the
+provider, the degraded flag, sweep hits, unknown labels) and `/healthz` carries
+the cumulative counters and a list-price cost from measured tokens. It is
+standard library only, holds no provider credentials of its own, and passes the
+caller's `Authorization` through untouched.
 
 Identifiers become stable pseudonyms that keep the shape of what they replaced,
 so cross-line correlation survives and an address still looks like an address.
@@ -193,6 +211,14 @@ count and fails on it, and tier 3 is scoped to the corpus it is measured
 against. The generated corpus keeps the deterministic tiers, which also means
 its recall and cost numbers are comparable across runs with and without tier 3.
 
+The cassette's first line is a header naming the prompt version (a hash of
+the instruction text), the model and the backend that produced it, and the
+same provenance is written into `metrics.json`, so the number above is
+traceable to the exact prompt and model behind it. A batch of one segment
+produces exactly the prompt that was recorded, which is why `--batch 1` (the
+default) replays this cassette unchanged and a larger batch needs a new
+recording.
+
 Two caveats on that number, stated the way the rest of this project states
 them. First, it is 5 payload variants against one model on one small corpus -
 enough to say this specific model did not fold under these specific attempts,
@@ -220,6 +246,46 @@ on clean lines cost four named suppression rules (acronyms, unit suffixes,
 CamelCase keys, spans glued across log structure), each found by the same
 measurement rather than by inspection and each with its own test in
 `test_ner.py`.
+
+### Utility, measured: does the answer survive the redaction?
+
+Recall says what was hidden. It says nothing about whether the answer an
+engineer gets back is still right, which is the only reason anyone tolerates a
+redaction layer in the request path. `python -m hider utility` asks a model
+questions about a 40-line excerpt of the synthetic bundle twice: once on the
+raw text, once on the text and question as the gateway would redact them,
+with the model's answer detokenised through the vault before scoring. The
+questions (how many distinct session GUIDs, which user appears most, list
+every pod id, on how many lines does *this* host appear) are derived
+mechanically from the generator's ground truth, so nothing is hand-labelled,
+and the same backend answers both sides, so the only variable is the
+redaction. The redacted prompt is checked for any surviving seeded value
+before it leaves; a question whose prompt would leak is refused and scored
+zero. Secret-bearing lines are excluded from the excerpt: the questions never
+ask about secrets (destroyed, so the redacted side could not answer), and the
+raw half of a committed cassette must not carry live-format credentials,
+synthetic or not.
+
+Recorded once against `claude-haiku-4-5-20251001` and replayable from
+`cassettes/utility-haiku-4-5-run1.jsonl`:
+
+| | |
+|---|---|
+| Questions | 13 across 6 identifier types |
+| Accuracy on raw text | 61.5% |
+| Accuracy on redacted text | 61.5% |
+| Accuracy lost to redaction | **0.0%** (the floor that fails the run is 15%) |
+| Seeded values that would have left in a redacted prompt | 0 |
+| Measured usage | 26 calls, 55,324 input / 2,370 output tokens, $0.067 at list price |
+
+Both accuracies are low because the questions are hard for a model (counting
+distinct GUIDs across forty dense log lines), not because of redaction, and
+that is exactly what the paired design is for: the delta is the number, not
+either absolute. On this run stable, shape-preserving pseudonyms cost nothing:
+the model traded two wins each way (the counting questions it got right only
+on the redacted side are ones where `<Session-01>` is easier to count than a
+GUID) and landed on the same score. One model, one excerpt, thirteen
+questions: a measurement that the design works at all, not a general claim.
 
 ### What the last round of measurement found
 
@@ -279,7 +345,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # tier 1 + tier 2 (classifier, the default) need nothing else.
 
 .venv/bin/python -m hider eval          # tier1 + tier2=classifier; metrics + HTML report into out/
-.venv/bin/python -m pytest              # 275 tests
+.venv/bin/python -m pytest              # 332 tests
 .venv/bin/python -m hider generate      # write a synthetic bundle to out/bundle
 .venv/bin/python -m hider redact FILE --log out/decisions.jsonl --vault out/vault.json
 .venv/bin/python -m hider proxy --upstream https://api.openai.com \
@@ -288,8 +354,10 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 Point any OpenAI-compatible client's base URL at `http://127.0.0.1:8787` and
 the redaction happens in flight: the provider sees pseudonyms and destroyed
-credentials, the caller sees real values in the answer. Streaming requests get
-an explicit 400 rather than a silently-buffered or corrupted stream.
+credentials, the caller sees real values in the answer, streamed or not. Each
+response carries `X-Hider-Request-Id` (and `X-Hider-Unknown-Labels` when the
+model wrote a label the vault does not know); `GET /healthz` returns the
+configuration and the cumulative counters.
 
 The alternate tier 2 backend and tier 3 are both optional and both need extra
 install steps:
@@ -298,11 +366,18 @@ install steps:
 .venv/bin/pip install -r requirements-ner.txt   # tier 2 alternate: spaCy + the small English model
 .venv/bin/python -m hider eval --tier2 spacy
 
-.venv/bin/pip install -r requirements-llm.txt   # tier 3: the openai package
-export OPENAI_API_KEY=...
+.venv/bin/pip install -r requirements-llm.txt   # tier 3: the openai and anthropic packages
+export OPENAI_API_KEY=...                       # or ANTHROPIC_API_KEY for --tier3 anthropic
 .venv/bin/python -m hider eval --tier3 openai --cassette cassettes/run1.jsonl --record
+.venv/bin/python -m hider eval --tier3 anthropic --model claude-haiku-4-5-20251001 \
+    --fallback openai --batch 4 --workers 4 --cassette cassettes/run2.jsonl --record
+.venv/bin/python -m hider eval --tier3 openai --base-url http://localhost:11434/v1 \
+    --model llama3 --cassette cassettes/local.jsonl --record   # any OpenAI-compatible server
 # later, or in CI, with no key and no network:
 .venv/bin/python -m hider eval --tier3 openai --cassette cassettes/run1.jsonl
+
+# the utility eval, same record-once-replay-forever shape:
+.venv/bin/python -m hider utility --backend anthropic --cassette cassettes/utility-haiku-4-5-run1.jsonl
 ```
 
 The cassette is what makes a committed metrics file checkable by somebody
@@ -311,7 +386,9 @@ skip) on a prompt the cassette has never seen.
 
 `eval` exits non-zero if any seeded value survives unexplained, if an
 adversarial case that was expected to pass fails, or if tier 2 recall drops
-below its floor, so it works as a CI gate.
+below its floor, so it works as a CI gate. `utility` exits non-zero if
+redaction costs more than 15 points of accuracy or if a redacted prompt would
+have carried a seeded value.
 
 Set `HIDER_VAULT_KEY` to keep pseudonyms stable across runs. Without it the key
 is ephemeral, which means nothing persists by accident.
@@ -359,6 +436,15 @@ hosts the scrubber may leave readable) live in an uncommitted
 `hider.local.json` (or `HIDER_LOCAL`), described in `hider/localcfg.py`.
 Without it those hosts are masked like any other, which only over-redacts.
 
+The results card has a "Report a mistake" form: something that should have
+been hidden and was not (`missed`), or something hidden that should not have
+been (`wrong`). Reports append to `out/feedback.jsonl` on this machine only; a
+`missed` report necessarily holds the real value, so that file is as sensitive
+as a mapping. `python -m hider feedback` lists them. This is the one channel
+through which real-bundle observations reach the synthetic corpus: each entry
+is meant to become a recognizer pattern, a classifier training sentence or an
+adversarial case, each with its own test.
+
 ## Layout
 
 | Path | What it is |
@@ -367,14 +453,16 @@ Without it those hosts are masked like any other, which only over-redacts.
 | `hider/recognizers.py` | Tier 1 detection, written against the contract rather than from it. Custom recognizers plus reused Presidio built-ins, and the suppression rules that keep precision up. |
 | `hider/classifier.py` | Tier 2, default backend: the trained per-token BIO classifier, its synthetic training-sentence generator, and the disjoint train/eval vocabulary split that keeps its recall honest. |
 | `hider/ner.py` | Tier 2, alternate backend: Presidio's pretrained NLP engine over the tier 1 residue, in-process, memoised, with its own named suppression rules. |
-| `hider/llm_backend.py` | Tier 3's backends: a real OpenAI-calling backend, and the cassette that records or replays one so a run never needs a key to be checked. |
-| `hider/llm_tier.py` | Tier 3's detection logic: prompt assembly with the residue fenced as untrusted data, strict JSON parsing, and literal-citation verification that never trusts a model-reported offset. |
+| `hider/llm_backend.py` | Tier 3's backends: OpenAI-compatible and Anthropic, the system/user split, token usage metering, the retry/circuit-breaker/fallback wrapper, and the cassette (with a provenance header) that records or replays a run so it never needs a key to be checked. |
+| `hider/llm_tier.py` | Tier 3's detection logic: prompt assembly with the residue fenced as untrusted data, multi-segment batching, the exact-match segment cache, strict JSON parsing, and literal-citation verification that never trusts a model-reported offset. |
 | `hider/pipeline.py` | The engine. Tier ordering, span algebra, monotonicity, fail-closed handling, the decision log. Every tier slot (including tier 2's managed-cloud variant, never built) is one interface. |
-| `hider/proxy.py` | The gateway. Redacts chat completions in flight, refuses degraded requests unforwarded, de-tokenises replies, logs decisions. Standard library only. |
+| `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
 | `hider/adversarial.py` | 16 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
+| `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
+| `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |
 | `hider/report.py` | The self-contained HTML page. |
 | `hider/jsonscrub.py` | JSON obfuscation: key-driven harvesting, known-value and pipeline spans resolved together, a final sweep and a leak check. |
 | `hider/webserver.py` | The loopback-only web UI and its API. Standard library only. |
@@ -454,10 +542,26 @@ recall will never be exactly 100%.
   organisation suffix outside its trained set (`Tailspin Technology` versus a
   trained `Tailspin Industries`) is a realistic way for it to miss — caught
   while building the injection-adjacent adversarial cases, not by inspection.
-- **The gateway does not stream.** `stream: true` gets a 400 with the reason in
-  the body. Rewriting an SSE stream means buffering it (which silently disables
-  streaming) or detokenising fragments (which corrupts labels cut across chunk
-  boundaries); both are worse than an honest error.
+- **Streaming adds a small delay and trusts the vault's label set.** Every
+  delta is held back by the length of the longest pseudonym the vault holds
+  before release, so the client sees text a few dozen characters behind the
+  provider. A label the model invents is passed through unchanged and named in
+  the log and in `X-Hider-Unknown-Labels`; it is not, and cannot be, restored.
+- **The sweep is identifiers only, by boundary.** It catches a value the vault
+  already knows, at word boundaries, four characters or longer. A name the vault
+  has never seen and tier 2 misses is still a tier 2 miss; the sweep narrows
+  the window, it does not close it.
+- **The utility number is one model, one excerpt, thirteen questions.** It
+  shows the pseudonym design does not cost accuracy on counting and
+  which-value questions over a short excerpt. Longer excerpts, reasoning
+  questions, and other models have not been tried, and the per-question
+  results in `out/utility.json` matter more than the headline.
+- **Redaction in the gateway is serialised.** One request's tiers run at a
+  time, because the classifier, the vault and the stats are shared and not
+  thread-safe; the upstream call and the stream rewrite run concurrently.
+  Throughput is bounded by tier 2's half-millisecond per line, which is far
+  from the bottleneck for a workstation gateway and would be the first thing
+  to change for a shared one.
 - **Tier 3's injection number is one model, one small run.** `gpt-4o-mini`
   caught all 5 injection-adjacent cases in the one recorded run
   (`cassettes/tier3-injection-run1.jsonl`). That is evidence this model
@@ -465,20 +569,39 @@ recall will never be exactly 100%.
   resistance claim for any LLM slotted into this tier - a different model, a
   larger or more creative payload set, or a longer run could read differently,
   and none of those have been tried.
-- **Cost figures use an assumed list rate.** Characters offered per tier are
-  measured; the dollar conversion is arithmetic on a published price, not an
-  invoice.
+- **Cost figures are list price.** Where a provider returns token counts
+  (tier 3, the utility eval, the gateway) the tokens are measured and the
+  dollars are those tokens at the published rate; a model whose rate is not in
+  `llm_backend.PRICES_USD_PER_M` is reported as unpriced rather than guessed.
+  The managed-NER comparison in `eval` is still an assumed per-character rate.
 - **Two known one-line gaps are deliberately left unfixed** so they stay visible
   in the numbers: zero-padded IPv4 octets, and Windows profile paths written
   with forward slashes. Both are in the adversarial table with an owner.
 
 ## Roadmap
 
-Tier 2 shipped with two interchangeable backends, tier 3 shipped and has a
-real recorded run against it, plus the gateway. Next: a larger and more
-adversarial injection-payload set against tier 3, a second model for
-comparison, an async bundle-ingest flow for whole-bundle jobs, and streaming
-support if a way is found to rewrite SSE honestly.
+Tier 2 shipped with two interchangeable backends, tier 3 shipped with two
+provider backends and a recorded run, the gateway streams and reports on
+itself, and utility has a number. Next: a larger and more adversarial
+injection-payload set against tier 3 and a second recorded model for it; a
+longer, harder utility question set with reasoning questions; an async
+bundle-ingest flow that batches tier 3 across lines rather than within one;
+and turning the first real feedback entries into adversarial cases.
+
+## Feedback, contributing, picking this up
+
+- **A redaction mistake on your own data** goes through the built-in channel
+  (the "Report a mistake" form in the web UI, listed by `python -m hider
+  feedback`); it stays on your machine because a *missed* report holds the
+  value that leaked.
+- **Bugs, ideas and questions** go to
+  [GitHub issues](https://github.com/NeverTheSame/Hider/issues) — reproduced
+  on synthetic data, never with real log content. Details, and what a pull
+  request must satisfy, are in [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Continuing the work**: [AGENTS.md](AGENTS.md) is the maintainer's map —
+  the three invariants, the no-real-data rule, the measurement gates every
+  change must pass, and how to extend each tier. Written for a new
+  contributor or a coding agent picking the project up cold.
 
 ## License
 

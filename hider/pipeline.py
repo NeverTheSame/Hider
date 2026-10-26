@@ -166,18 +166,65 @@ class LlmPassTier:
 
     Constructing this tier requires a ``Backend`` (see ``llm_backend.py``); the
     engine has no default one, because a paid, network-calling tier must never
-    be reached by accident.
+    be reached by accident. ``batch_size`` segments share one prompt,
+    ``workers`` batches run concurrently, and ``cache`` (on by default) reuses
+    verified findings for a segment seen before; see ``llm_tier`` for why none
+    of the three changes what gets verified.
     """
 
     name = "tier3"
     cost_per_1k_chars = 0.02  # placeholder until measured against real usage
 
-    def __init__(self, backend) -> None:
+    def __init__(self, backend, *, batch_size: int = 1, workers: int = 1,
+                 cache: "llm_tier.SegmentCache | None | bool" = True) -> None:
+        from . import llm_tier
         self.backend = backend
+        self.batch_size = batch_size
+        self.workers = workers
+        if cache is True:
+            cache = llm_tier.SegmentCache()
+        elif cache is False:
+            cache = None
+        self.cache = cache
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
         from . import llm_tier
-        return llm_tier.detect(self.backend, text, residue, tier_name=self.name)
+        return llm_tier.detect(self.backend, text, residue, tier_name=self.name,
+                               batch_size=self.batch_size, workers=self.workers,
+                               cache=self.cache)
+
+    def to_dict(self) -> dict:
+        """Backend, model, prompt version, cache and token usage, for reports."""
+        from . import llm_tier
+        b = self.backend
+        info: dict = {
+            "backend": getattr(b, "name", "?"),
+            "model": getattr(b, "model", None),
+            "prompt_version": llm_tier.PROMPT_VERSION,
+            "batch_size": self.batch_size,
+            "workers": self.workers,
+            "cache": self.cache.to_dict() if self.cache is not None else None,
+        }
+        if hasattr(b, "provenance"):
+            info["recording"] = b.provenance()
+        usage = _find_usage(b)
+        if usage is not None:
+            info["usage"] = usage.to_dict()
+        if hasattr(b, "stats"):
+            info["resilience"] = dict(b.stats)
+        return info
+
+
+def _find_usage(backend):
+    """The UsageMeter behind a possibly wrapped backend, if any."""
+    seen = 0
+    while backend is not None and seen < 5:
+        u = getattr(backend, "usage", None)
+        if u is not None and hasattr(u, "to_dict"):
+            return u
+        backend = getattr(backend, "inner", None)
+        seen += 1
+    return None
 
 
 # ---------------------------------------------------------------------------
