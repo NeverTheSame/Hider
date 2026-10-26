@@ -13,17 +13,26 @@ Invariants, in the order that matters:
   request is refused with 503 and the upstream is never contacted. Fail
   closed is a pipeline property; refusing to forward a degraded unit is the
   boundary property, and it is tested here rather than assumed.
+* **A known value never crosses.** After the tiers run, the redacted payload
+  is swept for every identifier the vault already holds. A hit is replaced
+  with its existing pseudonym and logged as a ``sweep`` event; if a value
+  somehow still remains, the request is refused. This is the output guardrail
+  on the request side: the tiers are probabilistic past tier 1, the vault is
+  not.
 * **The path stays the caller's.** The Authorization header and vendor
   headers pass through untouched; this gateway holds no provider
   credentials of its own. Point the client's base URL at it and nothing else
   changes.
-* **Streaming is refused, not faked.** ``stream: true`` gets a 400 with a
-  plain reason: rewriting an SSE stream means buffering it, which silently
-  turns streaming off, or detokenising fragments, which corrupts labels cut
-  across chunk boundaries. Both are worse than an honest error. Re-send
-  with ``stream: false``.
-* **The decision log records decisions, not data.** Same schema as the
-  batch path: the substitute, never the original.
+* **Streaming is rewritten honestly.** ``stream: true`` is forwarded as a
+  stream. Each delta is released as soon as it cannot be the start of a
+  pseudonym that is still arriving (``HoldbackDetokenizer``), so the client
+  sees real values with a delay of at most one label length and never a
+  label cut in half. A label the model wrote that the vault does not know is
+  left as-is and reported.
+* **The decision log records decisions, not data.** One row per request:
+  request id, timings, upstream status, counts per entity type, token usage
+  from the provider, the degraded flag, sweep hits and unknown labels. The
+  substitute, never the original.
 
 Implemented with the standard library only, because a data boundary that
 grows a web framework also grows that framework's request logging, error
@@ -35,13 +44,19 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
+import time
 import urllib.error
 import urllib.request
+import uuid
+from collections import Counter
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Iterator
 
-from . import pipeline, pseudonym
+from . import llm_backend, pipeline, pseudonym
 
 #: Headers that must not be forwarded verbatim: hop-by-hop fields, and the
 #: ones whose value this gateway owns.
@@ -52,6 +67,10 @@ HOP_BY_HOP = {
 
 DEGRADED_STATUS = 503
 UPSTREAM_TIMEOUT_S = 120
+LOG_SCHEMA = "hider.proxy.v2"
+
+#: A bracketed label as the pipeline mints them, or a destroyed-secret marker.
+_LABEL_RE = re.compile(r"<[A-Za-z][A-Za-z_]*-\d+>|<REDACTED:[A-Z_0-9]+>")
 
 
 class Refused(Exception):
@@ -65,6 +84,163 @@ class Refused(Exception):
 
 def _error_body(message: str) -> bytes:
     return json.dumps({"error": {"message": message, "type": "hider_gateway"}}).encode()
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GatewayMetrics:
+    """Cumulative counters since start, exposed on ``/healthz``."""
+
+    requests: int = 0
+    forwarded: int = 0
+    streamed: int = 0
+    refused: Counter = field(default_factory=Counter)        # by status
+    upstream_status: Counter = field(default_factory=Counter)
+    degraded: int = 0
+    sweep_hits: int = 0
+    unknown_labels: int = 0
+    redactions_by_type: Counter = field(default_factory=Counter)
+    redact_s: float = 0.0
+    upstream_s: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    tokens_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
+    started_at: float = field(default_factory=time.time)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record(self, row: dict) -> None:
+        with self._lock:
+            self.requests += 1
+            if row.get("refused_status"):
+                self.refused[str(row["refused_status"])] += 1
+            else:
+                self.forwarded += 1
+                self.upstream_status[str(row.get("upstream_status"))] += 1
+            if row.get("stream"):
+                self.streamed += 1
+            self.degraded += int(bool(row.get("degraded")))
+            self.sweep_hits += int(row.get("sweep_hits") or 0)
+            self.unknown_labels += len(row.get("unknown_labels") or [])
+            for k, v in (row.get("redactions_by_type") or {}).items():
+                self.redactions_by_type[k] += v
+            self.redact_s += float(row.get("redact_ms") or 0) / 1000
+            self.upstream_s += float(row.get("upstream_ms") or 0) / 1000
+            usage = row.get("usage") or {}
+            if usage:
+                self.input_tokens += int(usage.get("input_tokens") or 0)
+                self.output_tokens += int(usage.get("output_tokens") or 0)
+                m = self.tokens_by_model.setdefault(
+                    str(row.get("model") or "?"),
+                    {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+                m["requests"] += 1
+                m["input_tokens"] += int(usage.get("input_tokens") or 0)
+                m["output_tokens"] += int(usage.get("output_tokens") or 0)
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            n = max(1, self.forwarded)
+            cost = 0.0
+            priced = True
+            for model, m in self.tokens_by_model.items():
+                p = llm_backend.price_for(model)
+                if p is None:
+                    priced = False
+                    break
+                cost += m["input_tokens"] / 1e6 * p[0] + m["output_tokens"] / 1e6 * p[1]
+            return {
+                "uptime_s": round(time.time() - self.started_at, 1),
+                "requests": self.requests,
+                "forwarded": self.forwarded,
+                "streamed": self.streamed,
+                "refused_by_status": dict(self.refused),
+                "upstream_status": dict(self.upstream_status),
+                "degraded": self.degraded,
+                "sweep_hits": self.sweep_hits,
+                "unknown_labels": self.unknown_labels,
+                "redactions_by_type": dict(self.redactions_by_type),
+                "mean_redact_ms": round(self.redact_s / max(1, self.requests) * 1000, 2),
+                "mean_upstream_ms": round(self.upstream_s / n * 1000, 2),
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "tokens_by_model": {k: dict(v) for k, v in self.tokens_by_model.items()},
+                "cost_usd_list_price": round(cost, 6) if priced else None,
+            }
+
+
+# ---------------------------------------------------------------------------
+# Streaming: hold back, then release
+# ---------------------------------------------------------------------------
+
+
+class HoldbackDetokenizer:
+    """Detokenise a stream without ever cutting a pseudonym in half.
+
+    Text is buffered; everything except the last ``H - 1`` characters is
+    released on each feed, where ``H`` is the longest label the vault holds.
+    Any complete label that straddles the cut moves the cut past itself. A
+    label that starts inside the held-back tail cannot be complete yet (it
+    would need more than ``H`` characters), so holding ``H - 1`` is exactly
+    enough and no more. ``flush`` releases the tail at end of stream.
+    """
+
+    def __init__(self, vault: pseudonym.EntityVault) -> None:
+        self.vault = vault
+        labels = list(vault.by_label)
+        bare = [l[1:-1] for l in labels if l.startswith("<") and l.endswith(">")]
+        forms = sorted(set(labels + bare), key=len, reverse=True)
+        self.holdback = max((len(l) for l in forms), default=1) - 1
+        self._rx = re.compile("|".join(map(re.escape, forms))) if forms else None
+        self.pending = ""
+        self.unknown: list[str] = []
+        self._window = ""  # the last few hundred chars fed, for unknown-label spotting
+
+    def _note_unknown(self, text: str) -> None:
+        # Scanned over a rolling window of everything fed, not over what was
+        # released: an unknown label is not in the vault's regex, so nothing
+        # stops the cut from landing inside it.
+        self._window = (self._window + text)[-512:]
+        for m in _LABEL_RE.finditer(self._window):
+            lab = m.group(0)
+            if lab.startswith("<REDACTED:") or lab in self.vault.by_label:
+                continue
+            if lab not in self.unknown:
+                self.unknown.append(lab)
+
+    def feed(self, text: str) -> str:
+        self._note_unknown(text)
+        self.pending += text
+        cut = len(self.pending) - self.holdback
+        if cut <= 0:
+            return ""
+        if self._rx is not None:
+            for m in self._rx.finditer(self.pending):
+                if m.start() < cut < m.end():
+                    cut = m.end()
+                if m.start() >= cut:
+                    break
+        out, self.pending = self.pending[:cut], self.pending[cut:]
+        return self.vault.detokenize(out)
+
+    def flush(self) -> str:
+        out, self.pending = self.pending, ""
+        return self.vault.detokenize(out)
+
+
+# ---------------------------------------------------------------------------
+# The gateway
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Response:
+    status: int
+    headers: dict[str, str]
+    body: bytes | None = None
+    chunks: Iterator[bytes] | None = None
 
 
 class RedactionGateway:
@@ -84,25 +260,14 @@ class RedactionGateway:
         self.vault_path = vault_path
         self.log_path = log_path
         self.timeout = timeout
+        self.metrics = GatewayMetrics()
         self._log_lock = threading.Lock()
         self._redact_lock = threading.Lock()
 
     # -- request rewriting -------------------------------------------------
 
-    def redact_payload(self, body: dict) -> list[dict]:
-        """Redact every caller-authored text field, in place.
-
-        Returns the decision events. Raises :class:`Refused` when a unit is
-        degraded or the payload has a shape this gateway does not safely
-        understand; in both cases nothing has been sent.
-        """
-        if body.get("stream"):
-            raise Refused(
-                400,
-                "streaming is not supported through the redaction gateway; "
-                "resend with stream:false. See hider/proxy.py for why.",
-            )
-        events: list[dict] = []
+    @staticmethod
+    def _collect_texts(body: dict) -> list[str]:
         texts: list[str] = []
         messages = body.get("messages")
         if isinstance(messages, list):
@@ -119,42 +284,108 @@ class RedactionGateway:
             texts.append(prompt)
         elif isinstance(prompt, list):
             texts.extend(p for p in prompt if isinstance(p, str))
+        return texts
 
-        for i, text in enumerate(texts):
-            with self._redact_lock:
-                r = self.pipe.redact(text, unit=f"request[{i}]", line_no=0)
-            if r.degraded:
-                raise Refused(
-                    DEGRADED_STATUS,
-                    "redaction degraded on this request; refusing to forward it",
-                )
-            texts[i] = r.text
-            events.extend(r.events)
-
-        # Rewrite in the same order the texts were collected.
+    @staticmethod
+    def _write_texts(body: dict, texts: list[str]) -> None:
         it = iter(texts)
-
-        def nxt() -> str:
-            return next(it)
-
+        messages = body.get("messages")
         if isinstance(messages, list):
             for msg in messages:
                 content = msg.get("content") if isinstance(msg, dict) else None
                 if isinstance(content, str):
-                    msg["content"] = nxt()
+                    msg["content"] = next(it)
                 elif isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and isinstance(part.get("text"), str):
-                            part["text"] = nxt()
+                            part["text"] = next(it)
+        prompt = body.get("prompt")
         if isinstance(prompt, str):
-            body["prompt"] = nxt()
+            body["prompt"] = next(it)
         elif isinstance(prompt, list):
-            body["prompt"] = [nxt() if isinstance(p, str) else p for p in prompt]
+            body["prompt"] = [next(it) if isinstance(p, str) else p for p in prompt]
+
+    def redact_payload(self, body: dict) -> list[dict]:
+        """Redact every caller-authored text field, in place.
+
+        Returns the decision events. Raises :class:`Refused` when a unit is
+        degraded, when a known value survives the sweep, or when the payload
+        has a shape this gateway does not safely understand; in every case
+        nothing has been sent.
+        """
+        events: list[dict] = []
+        texts = self._collect_texts(body)
+        with self._redact_lock:
+            for i, text in enumerate(texts):
+                r = self.pipe.redact(text, unit=f"request[{i}]", line_no=0)
+                if r.degraded:
+                    raise Refused(
+                        DEGRADED_STATUS,
+                        "redaction degraded on this request; refusing to forward it",
+                    )
+                texts[i] = r.text
+                events.extend(r.events)
+            for i, text in enumerate(texts):
+                texts[i], swept = self.sweep(text, unit=f"request[{i}]")
+                events.extend(swept)
+            leftovers = [i for i, t in enumerate(texts) if self._known_values_in(t)]
+        if leftovers:
+            raise Refused(
+                DEGRADED_STATUS,
+                "a known identifier survived redaction; refusing to forward it",
+            )
+        self._write_texts(body, texts)
         return events
+
+    # -- the sweep ---------------------------------------------------------
+
+    def _known_values_rx(self) -> re.Pattern | None:
+        values = {v: l for l, v in self.pipe.vault.by_label.items() if len(v) >= 4}
+        if not values:
+            return None
+        alts = sorted(values, key=len, reverse=True)
+        return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, alts))
+                          + r")(?![A-Za-z0-9])", re.IGNORECASE)
+
+    def _known_values_in(self, text: str) -> list[str]:
+        rx = self._known_values_rx()
+        return [m.group(0) for m in rx.finditer(text)] if rx else []
+
+    def sweep(self, text: str, *, unit: str = "") -> tuple[str, list[dict]]:
+        """Replace any identifier the vault already knows with its pseudonym.
+
+        The tiers past tier 1 are probabilistic; the vault is not. A value
+        that was pseudonymised in an earlier request and missed in this one
+        gets the same label it had before, so correlation across requests
+        survives and the value never crosses. Secrets are never in the vault
+        (they are destroyed), so this sweep is identifiers only.
+        """
+        rx = self._known_values_rx()
+        if rx is None:
+            return text, []
+        by_value = {e["value"].casefold(): (e["label"], e["type"])
+                    for e in self.pipe.vault.entries.values()
+                    if not e["type"].startswith("_")}
+        events: list[dict] = []
+
+        def repl(m: re.Match) -> str:
+            hit = by_value.get(m.group(0).casefold())
+            if hit is None:
+                return m.group(0)
+            label, etype = hit
+            events.append({
+                "schema": "hider.redaction.v1", "unit": unit, "line": 0,
+                "start": m.start(), "end": m.end(), "entity_type": etype,
+                "action": "pseudonymised", "tier": "sweep", "score": 1.0,
+                "marker": label, "replacement": label,
+            })
+            return label
+
+        return rx.sub(repl, text), events
 
     # -- upstream ----------------------------------------------------------
 
-    def forward(self, path: str, payload: bytes, headers: dict) -> tuple[int, bytes, str]:
+    def _request(self, path: str, payload: bytes, headers: dict) -> urllib.request.Request:
         req = urllib.request.Request(
             self.upstream_base + path, data=payload, method="POST"
         )
@@ -162,8 +393,12 @@ class RedactionGateway:
             if k.lower() not in HOP_BY_HOP:
                 req.add_header(k, v)
         req.add_header("X-Hider-Redacted", "v1")
+        return req
+
+    def forward(self, path: str, payload: bytes, headers: dict) -> tuple[int, bytes, str]:
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(self._request(path, payload, headers),
+                                        timeout=self.timeout) as resp:
                 return resp.status, resp.read(), resp.headers.get("Content-Type", "application/json")
         except urllib.error.HTTPError as e:
             return e.code, e.read(), e.headers.get("Content-Type", "application/json")
@@ -175,26 +410,121 @@ class RedactionGateway:
             reason = getattr(e, "reason", None) or e
             raise Refused(502, f"upstream unreachable: {reason}") from e
 
+    def forward_stream(self, path: str, payload: bytes, headers: dict):
+        """Open the upstream stream. Returns (status, response-or-bytes, ctype).
+
+        A non-2xx answer is read whole and returned as bytes so the caller
+        can pass it through as an ordinary error body.
+        """
+        try:
+            resp = urllib.request.urlopen(self._request(path, payload, headers),
+                                          timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), e.headers.get("Content-Type", "application/json")
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            reason = getattr(e, "reason", None) or e
+            raise Refused(502, f"upstream unreachable: {reason}") from e
+        return resp.status, resp, resp.headers.get("Content-Type", "text/event-stream")
+
     # -- response rewriting ------------------------------------------------
 
-    def detokenize_response(self, body: dict) -> None:
+    def detokenize_response(self, body: dict) -> list[str]:
+        """Detokenise the reply in place. Returns labels the vault does not know."""
+        unknown: list[str] = []
+
+        def fix(text: str) -> str:
+            for m in _LABEL_RE.finditer(text):
+                lab = m.group(0)
+                if not lab.startswith("<REDACTED:") and lab not in self.pipe.vault.by_label \
+                        and lab not in unknown:
+                    unknown.append(lab)
+            return self.pipe.vault.detokenize(text)
+
         choices = body.get("choices")
         if not isinstance(choices, list):
-            return
+            return unknown
         for choice in choices:
             if not isinstance(choice, dict):
                 continue
             msg = choice.get("message")
             if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-                msg["content"] = self.pipe.vault.detokenize(msg["content"])
+                msg["content"] = fix(msg["content"])
             if isinstance(choice.get("text"), str):
-                choice["text"] = self.pipe.vault.detokenize(choice["text"])
+                choice["text"] = fix(choice["text"])
+        return unknown
+
+    @staticmethod
+    def _usage_of(body: dict) -> dict | None:
+        u = body.get("usage") if isinstance(body, dict) else None
+        if not isinstance(u, dict):
+            return None
+        return {"input_tokens": u.get("prompt_tokens", u.get("input_tokens")),
+                "output_tokens": u.get("completion_tokens", u.get("output_tokens"))}
+
+    def _rewrite_stream(self, upstream, row: dict) -> Iterator[bytes]:
+        """Yield rewritten SSE bytes, detokenising deltas with hold-back."""
+        holders: dict[int, HoldbackDetokenizer] = {}
+        last_chunk: dict | None = None
+        t0 = time.perf_counter()
+
+        def hold(i: int) -> HoldbackDetokenizer:
+            h = holders.get(i)
+            if h is None:
+                h = holders[i] = HoldbackDetokenizer(self.pipe.vault)
+            return h
+
+        def final_chunks() -> Iterator[bytes]:
+            for i, h in holders.items():
+                tail = h.flush()
+                if tail and last_chunk is not None:
+                    chunk = {**last_chunk, "choices": [{
+                        "index": i, "delta": {"content": tail}, "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+
+        try:
+            with upstream:
+                for raw_line in upstream:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    if not line.startswith("data:"):
+                        yield raw_line
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        yield from final_chunks()
+                        yield raw_line
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        yield raw_line
+                        continue
+                    if isinstance(chunk, dict):
+                        usage = self._usage_of(chunk)
+                        if usage:
+                            row["usage"] = usage
+                        if chunk.get("model"):
+                            row["model"] = chunk["model"]
+                        for choice in chunk.get("choices") or []:
+                            if not isinstance(choice, dict):
+                                continue
+                            delta = choice.get("delta")
+                            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                                idx = int(choice.get("index") or 0)
+                                delta["content"] = hold(idx).feed(delta["content"])
+                                last_chunk = {k: v for k, v in chunk.items() if k != "choices"}
+                    yield f"data: {json.dumps(chunk)}\n".encode()
+            # Upstream closed without [DONE]: release what is held.
+            yield from final_chunks()
+        finally:
+            row["upstream_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            row["unknown_labels"] = sorted({u for h in holders.values() for u in h.unknown})
+            self._record(row)
 
     # -- persistence -------------------------------------------------------
 
-    def _record(self, path: str, events: list[dict]) -> None:
+    def _record(self, row: dict) -> None:
+        self.metrics.record(row)
         if self.log_path:
-            row = {"schema": "hider.proxy.v1", "path": path, "events": events}
             with self._log_lock:
                 with Path(self.log_path).open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(row) + "\n")
@@ -204,24 +534,74 @@ class RedactionGateway:
 
     # -- one request -------------------------------------------------------
 
-    def handle(self, path: str, payload: bytes, headers: dict) -> tuple[int, bytes, str]:
+    def handle(self, path: str, payload: bytes, headers: dict) -> Response:
+        rid = uuid.uuid4().hex[:16]
+        row: dict = {"schema": LOG_SCHEMA, "request_id": rid, "path": path,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "stream": False, "degraded": False}
+        out_headers = {"X-Hider-Request-Id": rid}
+        try:
+            return self._handle(path, payload, headers, row, out_headers)
+        except Refused as r:
+            row["refused_status"] = r.status
+            row["refused_reason"] = r.message
+            row["degraded"] = r.status == DEGRADED_STATUS
+            self._record(row)
+            return Response(r.status, {**out_headers, "Content-Type": "application/json"},
+                            body=_error_body(r.message))
+
+    def _handle(self, path: str, payload: bytes, headers: dict, row: dict,
+                out_headers: dict) -> Response:
         try:
             body = json.loads(payload.decode("utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("payload is not a JSON object")
         except (ValueError, UnicodeDecodeError) as e:
             raise Refused(400, f"unparseable payload: {e}") from e
+        row["model"] = body.get("model") if isinstance(body.get("model"), str) else None
+        row["stream"] = bool(body.get("stream"))
+
+        t0 = time.perf_counter()
         events = self.redact_payload(body)
-        status, raw, ctype = self.forward(path, json.dumps(body).encode("utf-8"), headers)
+        row["redact_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+        row["redactions"] = len(events)
+        row["redactions_by_type"] = dict(Counter(e["entity_type"] for e in events))
+        row["redactions_by_tier"] = dict(Counter(e["tier"] for e in events))
+        row["sweep_hits"] = sum(1 for e in events if e["tier"] == "sweep")
+        row["events"] = events
+        forwarded = json.dumps(body).encode("utf-8")
+
+        if row["stream"]:
+            status, resp, ctype = self.forward_stream(path, forwarded, headers)
+            row["upstream_status"] = status
+            if isinstance(resp, bytes):
+                row["upstream_ms"] = 0.0
+                self._record(row)
+                return Response(status, {**out_headers, "Content-Type": ctype}, body=resp)
+            return Response(status, {**out_headers, "Content-Type": ctype,
+                                     "Cache-Control": "no-cache"},
+                            chunks=self._rewrite_stream(resp, row))
+
+        t1 = time.perf_counter()
+        status, raw, ctype = self.forward(path, forwarded, headers)
+        row["upstream_ms"] = round((time.perf_counter() - t1) * 1000, 2)
+        row["upstream_status"] = status
+        unknown: list[str] = []
         if status < 400:
             try:
-                resp = json.loads(raw.decode("utf-8"))
-                self.detokenize_response(resp)
-                raw = json.dumps(resp).encode("utf-8")
+                resp_body = json.loads(raw.decode("utf-8"))
+                unknown = self.detokenize_response(resp_body)
+                row["usage"] = self._usage_of(resp_body)
+                if isinstance(resp_body, dict) and resp_body.get("model"):
+                    row["model"] = resp_body["model"]
+                raw = json.dumps(resp_body).encode("utf-8")
             except (ValueError, UnicodeDecodeError):
                 pass  # non-JSON upstream body: pass through untouched
-        self._record(path, events)
-        return status, raw, ctype
+        row["unknown_labels"] = unknown
+        if unknown:
+            out_headers["X-Hider-Unknown-Labels"] = ",".join(unknown)
+        self._record(row)
+        return Response(status, {**out_headers, "Content-Type": ctype}, body=raw)
 
 
 def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTTPServer:
@@ -233,12 +613,31 @@ def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTT
         def log_message(self, fmt, *args):  # default handler prints to stderr
             return
 
-        def _reply(self, status: int, body: bytes, ctype: str = "application/json") -> None:
+        def _reply(self, status: int, body: bytes, headers: dict | None = None) -> None:
             self.send_response(status)
-            self.send_header("Content-Type", ctype)
+            for k, v in (headers or {"Content-Type": "application/json"}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _stream(self, resp: Response) -> None:
+            self.send_response(resp.status)
+            for k, v in resp.headers.items():
+                self.send_header(k, v)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                for chunk in resp.chunks or ():
+                    if not chunk:
+                        continue
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                    self.wfile.flush()
+            finally:
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                except OSError:
+                    pass
 
         def do_GET(self):
             if self.path == "/healthz":
@@ -247,6 +646,7 @@ def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTT
                     "upstream": gateway.upstream_base,
                     "tiers": [getattr(t, "name", "?") for t in gateway.pipe.tiers],
                     "vault_entries": gateway.pipe.vault.size,
+                    "metrics": gateway.metrics.to_dict(),
                 }).encode()
                 self._reply(200, body)
             else:
@@ -262,11 +662,11 @@ def make_server(host: str, port: int, gateway: RedactionGateway) -> ThreadingHTT
                 length = 0
             payload = self.rfile.read(length) if length else b""
             headers = {k: v for k, v in self.headers.items()}
-            try:
-                status, body, ctype = gateway.handle(self.path, payload, headers)
-            except Refused as r:
-                status, body, ctype = r.status, _error_body(r.message), "application/json"
-            self._reply(status, body, ctype)
+            resp = gateway.handle(self.path, payload, headers)
+            if resp.chunks is not None:
+                self._stream(resp)
+            else:
+                self._reply(resp.status, resp.body or b"", resp.headers)
 
     return ThreadingHTTPServer((host, port), Handler)
 

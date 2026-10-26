@@ -163,6 +163,10 @@ class Report:
     #: tiers 1 and 2 have no notion of an instruction at all, so the
     #: injection-bypass numbers are only meaningful once this is set.
     tier3_enabled: bool = False
+    #: Backend, model, prompt version, cache and token usage of the tier 3
+    #: slot, when one ran. This is what makes a published injection number
+    #: traceable to the exact prompt and model that produced it.
+    tier3_info: dict | None = None
 
     # -- rolled-up numbers -------------------------------------------------
 
@@ -266,6 +270,7 @@ class Report:
             "ner_enabled": self.ner_enabled,
             "tier2_backend": self.tier2_backend,
             "tier3_enabled": self.tier3_enabled,
+            "tier3": self.tier3_info,
             "seeded": self.seeded,
             "covered": self.covered,
             "groups": {"total": self.groups_total, "caught": self.groups_caught},
@@ -392,6 +397,8 @@ def run(
     include_adversarial: bool = True,
     tier2: str | None = "classifier",
     tier3: Backend | None = None,
+    tier3_batch: int = 1,
+    tier3_workers: int = 1,
     label: str = "tier1-custom",
     corpus: generator.Corpus | None = None,
     vault_key: bytes = b"hider-eval-fixed-key",
@@ -413,7 +420,8 @@ def run(
         if t2 is not None:
             chosen.append(t2)
         if tier3 is not None:
-            chosen.append(pipeline.LlmPassTier(tier3))
+            chosen.append(pipeline.LlmPassTier(tier3, batch_size=tier3_batch,
+                                               workers=tier3_workers))
     else:
         chosen = list(tiers)
     # Tier 3 is scoped to the hostile corpus, and only there.
@@ -567,6 +575,9 @@ def run(
     report.residue_chars = sum(st.residue_chars for st in stats_sources)
     report.degraded_units = sum(st.degraded_units for st in stats_sources)
     report.vault_size = vault.size
+    for t in chosen:
+        if getattr(t, "name", "") == "tier3" and hasattr(t, "to_dict"):
+            report.tier3_info = t.to_dict()
     for source in stats_sources:
         for name, st in source.tiers.items():
             report.tier_chars_offered[name] = (
@@ -580,7 +591,8 @@ def run(
 
 
 def run_with_baseline(
-    *, tier2: str | None = "classifier", tier3: Backend | None = None, **kwargs
+    *, tier2: str | None = "classifier", tier3: Backend | None = None,
+    tier3_batch: int = 1, tier3_workers: int = 1, **kwargs
 ) -> tuple[Report, Report, dict[str, list[str]], generator.Corpus]:
     """Run the full configuration and the stock-Presidio baseline on one corpus.
 
@@ -595,7 +607,8 @@ def run_with_baseline(
     if tier3 is not None:
         label += " + tier3"
     full, redacted = run(corpus=corp, seed=seed, include_custom=True,
-                         tier2=tier2, tier3=tier3, label=label, **kwargs)
+                         tier2=tier2, tier3=tier3, tier3_batch=tier3_batch,
+                         tier3_workers=tier3_workers, label=label, **kwargs)
     base, _ = run(corpus=corp, seed=seed, include_custom=False,
                   tier2=None, label="stock Presidio patterns only", **kwargs)
     return full, base, redacted, corp

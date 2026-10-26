@@ -1,3 +1,5 @@
-# Tier 3 (an LLM pass) requirements.
-# Tiers 1-2 run without this; --tier3 openai does not.
+# Tier 3 (an LLM pass) and the utility eval: provider SDKs.
+# Tiers 1-2 run without these. --tier3/--backend openai needs openai;
+# --tier3/--backend anthropic needs anthropic. Replaying a cassette needs neither.
 openai>=1.0
+anthropic>=0.40
