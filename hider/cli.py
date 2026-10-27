@@ -24,6 +24,7 @@ from . import (
     ner,
     pipeline,
     profiles,
+    proxy,
     pseudonym,
     report,
 )
@@ -330,7 +331,7 @@ def _announce_profile() -> None:
 
 
 def _cmd_proxy(args: argparse.Namespace) -> int:
-    from . import proxy as proxy_mod
+    proxy_mod = proxy
 
     _announce_profile()
     tiers = _build_tiers(args.tier2)
@@ -340,7 +341,9 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         vault = pseudonym.EntityVault()
     pipe = pipeline.Pipeline(tiers, vault=vault)
     gateway = proxy_mod.RedactionGateway(
-        args.upstream, pipe, vault_path=args.vault, log_path=args.log
+        args.upstream, pipe, vault_path=args.vault, log_path=args.log,
+        log_max_bytes=args.log_max_bytes or None, log_backups=args.log_backups,
+        log_request_bodies=args.log_request_bodies,
     )
     host, _, port = args.listen.partition(":")
     proxy_mod.serve(host, int(port or "8787"), gateway)
@@ -495,6 +498,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--listen", default="127.0.0.1:8787", help="host:port to bind")
     p.add_argument("--vault", help="persist the pseudonym vault here")
     p.add_argument("--log", help="append the JSONL decision log here")
+    p.add_argument("--log-max-bytes", type=int, default=proxy.LOG_MAX_BYTES,
+                   help="rotate the decision log when it would grow past this many "
+                        "bytes (default 50 MiB); 0 disables rotation")
+    p.add_argument("--log-backups", type=int, default=proxy.LOG_BACKUPS,
+                   help="numbered backups to keep after rotation, .1 newest "
+                        "(default 5); 0 discards the full log")
+    p.add_argument("--log-request-bodies", action="store_true",
+                   help="DEBUG ONLY: record the raw, unredacted request body in each "
+                        "decision log row. The log then holds the original data; "
+                        "never use on a shared machine or with a log you may share")
     p.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
                    help="tier 2 backend in the sync path: the trained classifier "
                         "(default, fastest), local spaCy NER, or none")

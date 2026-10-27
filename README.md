@@ -95,8 +95,11 @@ one label length, so no pseudonym is ever cut in half. Labels the model wrote
 that the vault does not know are passed through and reported, never guessed.
 Every request leaves one structured log row (request id, redaction and
 upstream latency, counts per entity type and tier, token usage from the
-provider, the degraded flag, sweep hits, unknown labels) and `/healthz` carries
-the cumulative counters and a list-price cost from measured tokens. It is
+provider, the degraded flag, sweep hits, unknown labels), rotated at 50 MiB
+into five numbered backups, and `/healthz` carries the cumulative counters and
+a list-price cost from measured tokens. A debug-only `--log-request-bodies`
+flag, off by default, adds the raw request body to each row; that log then
+holds the original data and must never leave the machine. It is
 standard library only, holds no provider credentials of its own, and passes the
 caller's `Authorization` through untouched.
 
@@ -342,7 +345,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # tier 1 + tier 2 (classifier, the default) need nothing else.
 
 .venv/bin/python -m hider eval          # tier1 + tier2=classifier; metrics + HTML report into out/
-.venv/bin/python -m pytest              # 331 tests
+.venv/bin/python -m pytest              # 341 tests
 .venv/bin/python -m hider generate      # write a synthetic bundle to out/bundle
 .venv/bin/python -m hider redact FILE --log out/decisions.jsonl --vault out/vault.json
 .venv/bin/python -m hider proxy --upstream https://api.openai.com \

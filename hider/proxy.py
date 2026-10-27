@@ -32,7 +32,11 @@ Invariants, in the order that matters:
 * **The decision log records decisions, not data.** One row per request:
   request id, timings, upstream status, counts per entity type, token usage
   from the provider, the degraded flag, sweep hits and unknown labels. The
-  substitute, never the original.
+  substitute, never the original. The file is rotated at 50 MiB into five
+  numbered backups (``.1`` newest) so it cannot fill a disk. One debugging
+  switch, ``log_request_bodies`` / ``--log-request-bodies``, off by default,
+  adds the raw request body to each row; with it on the log *is* the data
+  and must stay on the machine.
 
 Implemented with the standard library only, because a data boundary that
 grows a web framework also grows that framework's request logging, error
@@ -68,6 +72,8 @@ HOP_BY_HOP = {
 DEGRADED_STATUS = 503
 UPSTREAM_TIMEOUT_S = 120
 LOG_SCHEMA = "hider.proxy.v2"
+LOG_MAX_BYTES = 50 * 1024 * 1024   # rotate the decision log past this size
+LOG_BACKUPS = 5                    # keep .1 (newest) .. .5 (oldest), delete older
 
 #: A bracketed label as the pipeline mints them, or a destroyed-secret marker.
 _LABEL_RE = re.compile(r"<[A-Za-z][A-Za-z_]*-\d+>|<REDACTED:[A-Z_0-9]+>")
@@ -253,12 +259,25 @@ class RedactionGateway:
         *,
         vault_path: str | Path | None = None,
         log_path: str | Path | None = None,
+        log_max_bytes: int | None = LOG_MAX_BYTES,
+        log_backups: int = LOG_BACKUPS,
+        log_request_bodies: bool = False,
         timeout: int = UPSTREAM_TIMEOUT_S,
     ) -> None:
         self.upstream_base = upstream_base.rstrip("/")
         self.pipe = pipe
         self.vault_path = vault_path
         self.log_path = log_path
+        if log_max_bytes is not None and log_max_bytes <= 0:
+            raise ValueError("log_max_bytes must be a positive number of bytes")
+        self.log_max_bytes = log_max_bytes
+        if log_backups < 0:
+            raise ValueError("log_backups must be zero or more")
+        self.log_backups = log_backups
+        # Debugging aid, off by default: the raw request body is the original
+        # data, so a log that carries it is a second copy of what the gateway
+        # exists to keep from leaving the machine. Never enable on a shared box.
+        self.log_request_bodies = log_request_bodies
         self.timeout = timeout
         self.metrics = GatewayMetrics()
         self._log_lock = threading.Lock()
@@ -525,12 +544,49 @@ class RedactionGateway:
     def _record(self, row: dict) -> None:
         self.metrics.record(row)
         if self.log_path:
+            line = json.dumps(row) + "\n"
             with self._log_lock:
-                with Path(self.log_path).open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(row) + "\n")
+                path = Path(self.log_path)
+                if self.log_max_bytes is not None and self._log_would_overflow(path, line):
+                    self._rotate_log(path)
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
         if self.vault_path:
             with self._redact_lock:
                 self.pipe.vault.save(self.vault_path)
+
+    def _log_would_overflow(self, path: Path, line: str) -> bool:
+        """True when appending ``line`` would take the active log past the cap.
+
+        A row is never split across files: the check runs before the write,
+        so a row that does not fit goes whole into a fresh file. A single row
+        larger than the cap on its own is still written whole, into an
+        otherwise empty file, rather than dropped. Called under ``_log_lock``.
+        """
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        return size > 0 and size + len(line.encode("utf-8")) > self.log_max_bytes
+
+    def _rotate_log(self, path: Path) -> None:
+        """Move the full active log aside so a fresh one can start at ``path``.
+
+        Numbered backups: ``path.1`` is the most recent full file, ``path.N``
+        the oldest, with ``N = log_backups``; anything older is deleted. With
+        ``log_backups == 0`` the active file is simply discarded. Called under
+        ``_log_lock``.
+        """
+        backup = lambda n: path.with_name(f"{path.name}.{n}")  # noqa: E731
+        if self.log_backups == 0:
+            path.unlink(missing_ok=True)
+            return
+        backup(self.log_backups).unlink(missing_ok=True)
+        for n in range(self.log_backups - 1, 0, -1):
+            src = backup(n)
+            if src.exists():
+                src.replace(backup(n + 1))
+        path.replace(backup(1))
 
     # -- one request -------------------------------------------------------
 
@@ -540,6 +596,8 @@ class RedactionGateway:
                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      "stream": False, "degraded": False}
         out_headers = {"X-Hider-Request-Id": rid}
+        if self.log_request_bodies:
+            row["request_body"] = payload.decode("utf-8", errors="replace")
         try:
             return self._handle(path, payload, headers, row, out_headers)
         except Refused as r:

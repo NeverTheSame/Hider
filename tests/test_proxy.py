@@ -498,3 +498,153 @@ def test_usage_and_measured_cost_come_from_the_provider_response():
         assert m["cost_usd_list_price"] == pytest.approx(1000 / 1e6 * 0.15 + 500 / 1e6 * 0.60)
     finally:
         up.close()
+
+
+# ---------------------------------------------------------------------------
+# Decision log size cap
+# ---------------------------------------------------------------------------
+
+
+def _gateway_with_log(stub, log, **kw):
+    return proxy.RedactionGateway(
+        stub.url, pipeline.Pipeline([pipeline.RegexTier()], vault=pseudonym.EntityVault(key=b"k")),
+        log_path=log, **kw)
+
+
+def test_log_cap_must_be_positive(stub, tmp_path):
+    with pytest.raises(ValueError):
+        _gateway_with_log(stub, tmp_path / "p.jsonl", log_max_bytes=0)
+    with pytest.raises(ValueError):
+        _gateway_with_log(stub, tmp_path / "p.jsonl", log_max_bytes=-1)
+
+
+def test_default_cap_leaves_the_row_format_unchanged(stub, tmp_path):
+    """Rotation is on by default at 50 MiB; the rows themselves are untouched."""
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log)
+    assert gw.log_max_bytes == 50 * 1024 * 1024 and gw.log_backups == 5
+    rotated = []
+    gw._rotate_log = lambda path: rotated.append(path)
+    gw.handle("/v1/chat/completions", json.dumps(
+        {"model": "gpt-x", "messages": [{"role": "user", "content": SECRET_LINE}]}).encode(), {})
+    assert rotated == []
+    row = json.loads(log.read_text().splitlines()[0])
+    assert list(row) == ["schema", "request_id", "path", "ts", "stream", "degraded", "model",
+                         "redact_ms", "redactions", "redactions_by_type", "redactions_by_tier",
+                         "sweep_hits", "events", "upstream_ms", "upstream_status", "usage",
+                         "unknown_labels"]
+    assert log.read_text() == json.dumps(row) + "\n"  # compact separators, one row per line
+
+
+def test_rows_are_never_split_and_rotation_fires_before_the_overflowing_row(stub, tmp_path):
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log, log_max_bytes=None)
+    tiny = {"model": "gpt-x", "messages": [{"role": "user", "content": "hi"}]}
+    gw.handle("/v1/chat/completions", json.dumps(tiny).encode(), {})
+    one_row = len(log.read_bytes())
+    log.unlink()
+
+    rotated: list = []
+    gw._rotate_log = lambda path: (rotated.append(log.read_bytes()), log.unlink())
+    gw.log_max_bytes = one_row * 2 + 10          # two rows fit, the third does not
+    for _ in range(3):
+        gw.handle("/v1/chat/completions", json.dumps(tiny).encode(), {})
+
+    assert len(rotated) == 1
+    archived = rotated[0].decode().splitlines()
+    active = log.read_text().splitlines()
+    assert len(archived) == 2 and len(active) == 1
+    for line in archived + active:
+        json.loads(line)                          # every line in every file is a whole row
+    assert len(rotated[0]) <= gw.log_max_bytes
+
+
+def test_a_single_row_larger_than_the_cap_is_still_written_whole(stub, tmp_path):
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log, log_max_bytes=1)
+    rotated: list = []
+    gw._rotate_log = lambda path: (rotated.append(log.read_bytes()), log.unlink())
+    body = {"model": "gpt-x", "messages": [{"role": "user", "content": SECRET_LINE}]}
+    gw.handle("/v1/chat/completions", json.dumps(body).encode(), {})
+    assert rotated == []                          # nothing to rotate: file was empty
+    first = json.loads(log.read_text())
+    assert first["redactions_by_type"]["JWT"] == 1
+    gw.handle("/v1/chat/completions", json.dumps(body).encode(), {})
+    assert len(rotated) == 1                      # the second row forced a fresh file
+    json.loads(log.read_text())
+
+
+def test_refusals_count_toward_the_cap_too(stub, tmp_path):
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log, log_max_bytes=1)
+    rotated: list = []
+    gw._rotate_log = lambda path: (rotated.append(log.read_bytes()), log.unlink())
+    gw.handle("/v1/chat/completions", b"not json", {})
+    gw.handle("/v1/chat/completions", b"not json", {})
+    assert len(rotated) == 1
+    assert json.loads(rotated[0])["refused_status"] == 400
+
+
+def test_rotation_happens_under_the_log_lock(stub, tmp_path):
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log, log_max_bytes=1)
+    seen = []
+    gw._rotate_log = lambda path: (seen.append(gw._log_lock.locked()), log.unlink())
+    tiny = {"model": "gpt-x", "messages": [{"role": "user", "content": "hi"}]}
+    gw.handle("/v1/chat/completions", json.dumps(tiny).encode(), {})
+    gw.handle("/v1/chat/completions", json.dumps(tiny).encode(), {})
+    assert seen == [True]
+
+
+def _fill(gw, log, rows: int) -> None:
+    tiny = {"model": "gpt-x", "messages": [{"role": "user", "content": "hi"}]}
+    for _ in range(rows):
+        gw.handle("/v1/chat/completions", json.dumps(tiny).encode(), {})
+
+
+def test_numbered_backups_shift_and_the_oldest_is_deleted(stub, tmp_path):
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log, log_max_bytes=1, log_backups=3)
+    _fill(gw, log, 1)
+    first = log.read_text()
+    _fill(gw, log, 1)
+    assert (tmp_path / "proxy.jsonl.1").read_text() == first
+    assert log.read_text() != first
+    _fill(gw, log, 4)                              # total 6 rows, 1 active, 3 kept, 2 gone
+    names = sorted(q.name for q in tmp_path.iterdir())
+    assert names == ["proxy.jsonl", "proxy.jsonl.1", "proxy.jsonl.2", "proxy.jsonl.3"]
+    ids = [json.loads((tmp_path / n).read_text())["request_id"]
+           for n in ("proxy.jsonl.3", "proxy.jsonl.2", "proxy.jsonl.1", "proxy.jsonl")]
+    assert len(set(ids)) == 4                      # .3 oldest .. active newest, each a whole row
+    assert json.loads(first)["request_id"] not in ids
+
+
+def test_zero_backups_discards_the_full_log(stub, tmp_path):
+    log = tmp_path / "proxy.jsonl"
+    gw = _gateway_with_log(stub, log, log_max_bytes=1, log_backups=0)
+    _fill(gw, log, 3)
+    assert [q.name for q in tmp_path.iterdir()] == ["proxy.jsonl"]
+    assert len(log.read_text().splitlines()) == 1
+
+
+def test_negative_backups_rejected(stub, tmp_path):
+    with pytest.raises(ValueError):
+        _gateway_with_log(stub, tmp_path / "p.jsonl", log_backups=-1)
+
+
+def test_request_bodies_are_not_logged_by_default_and_are_when_asked(stub, tmp_path):
+    body = json.dumps({"model": "gpt-x", "messages": [{"role": "user", "content": SECRET_LINE}]})
+    log = tmp_path / "off.jsonl"
+    _gateway_with_log(stub, log).handle("/v1/chat/completions", body.encode(), {})
+    row = json.loads(log.read_text())
+    assert "request_body" not in row and "anna.novak@contoso.com" not in log.read_text()
+
+    log = tmp_path / "on.jsonl"
+    gw = _gateway_with_log(stub, log, log_request_bodies=True)
+    gw.handle("/v1/chat/completions", body.encode(), {})
+    gw.handle("/v1/chat/completions", b"not json", {})
+    rows = [json.loads(l) for l in log.read_text().splitlines()]
+    assert rows[0]["request_body"] == body            # verbatim, before redaction
+    assert rows[1]["request_body"] == "not json"       # refusals carry it too
+    assert list(rows[0])[:7] == ["schema", "request_id", "path", "ts", "stream", "degraded",
+                                 "request_body"]

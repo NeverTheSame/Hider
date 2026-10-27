@@ -47,7 +47,9 @@ design conversation, not a code change.
    committed cassette is not a figure, it is a claim. Re-record and update the
    README together.
 7. **Logs record decisions, not data.** Decision logs, metrics and feedback
-   summaries carry the substitute, never the original.
+   summaries carry the substitute, never the original. The one exception is
+   the gateway's `--log-request-bodies` debug switch, off by default, which
+   writes the raw body into the decision log; a test pins the default off.
 
 ## Layout, by what you are likely to touch
 
