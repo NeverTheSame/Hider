@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from hider import pipeline, pseudonym, proxy
+from hider import evaluate, generator, pipeline, pseudonym, proxy
 
 SECRET_LINE = (
     "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd for anna.novak@contoso.com "
@@ -494,9 +494,9 @@ def test_sweep_catches_a_known_identifier_the_tiers_missed(stub):
     port = httpd.server_address[1]
     try:
         status, resp = _post(gw, port, {
-            "model": "x", "messages": [{"role": "user", "content": "call diego ferreira back"}]})
+            "model": "x", "messages": [{"role": "user", "content": "call Diego Ferreira back"}]})
         assert status == 200
-        assert "ferreira" not in json.dumps(stub.bodies).lower()
+        assert "Ferreira" not in json.dumps(stub.bodies)
         assert label in json.dumps(stub.bodies)
         assert "Diego Ferreira" in resp["choices"][0]["message"]["content"]
         m = gw.metrics.to_dict()
@@ -507,42 +507,122 @@ def test_sweep_catches_a_known_identifier_the_tiers_missed(stub):
         httpd.server_close()
 
 
-def test_sweep_catches_short_identifiers_and_the_cost_is_measured(stub):
-    """The four-character floor in ``_known_values_rx`` let a short identifier
-    the vault already knew cross to the provider when the tiers missed it in
-    a later request, and the leftover check shared the floor so nothing was
-    refused. On this synthetic set of 300 requests, before: 136/150 of those
-    mentioning a short known identifier crossed (the 14 that did not were the
-    five-character "Bo Li", already above the floor), 0 refused. After: 0 cross,
-    0 refused, and 0 of 150 innocent requests had a word swept, because the
-    match is still by word boundary. The cost that remains is a known short
-    value that is also an ordinary word ("Ann", "Ed") being swept wherever it
-    stands alone; that is the trade for closing the gap, and it is stated."""
+def test_sweep_wordlike_values_are_case_sensitive_and_measured():
+    """The measurement behind the README's sweep numbers, committed as the
+    gate on the policy: person and org values match case-sensitively (stored
+    casing plus Title/UPPER), shaped values stay case-insensitive.
+
+    The vault is built the way weeks of gateway use would build it: a 600-line
+    slice of the synthetic bundle redacted line by line through tier 1 and the
+    tier 2 classifier, then operator prose through the same pipeline (tier 2
+    vaults single capitalised words from it on its own), then seventeen
+    declared short identifiers of the kind real traffic teaches. 200 innocent
+    prompts are built from support sentences dense with the colliding words
+    ("please bill the extra hours", "et al. agreed"), and 200 mentioning
+    prompts write a short identifier as learned (70%), lowercased (20%) or
+    uppercased (10%).
+
+    Measured on this harness: the previous policy (every value
+    case-insensitive, no floor) wrongly rewrote 611 of 4,161 innocent words
+    and let 0 mentions cross. Policy H rewrites 142 (the residue is the
+    identical word in the identical casing, "Mark the mailbox read, Bill"),
+    lets every as-learned and uppercase mention be swept, and by accepted
+    trade lets all 37 lowercased mentions ("call ann") cross. The leftover
+    check shares the sweep's pattern, so none of those 37 turns into a 503.
+    """
     import random
-    rng = random.Random(20260831)
-    vault = pseudonym.EntityVault(key=b"k")
-    short = {"ORG_NAME": ["ACM", "Zed", "Qo", "IBX"], "PERSON_NAME": ["Bo Li", "Ann", "Ed"],
-             "HOSTNAME_FQDN": ["db1", "ws7"]}
-    for et, vals in short.items():
+
+    corp = generator.generate(lines=600, seed=20260820)
+    vault = pseudonym.EntityVault(key=b"weeks")
+    pipe = pipeline.Pipeline([pipeline.RegexTier(), evaluate.build_tier2("classifier")],
+                             vault=vault)
+    for u in corp.units:
+        for i, line in enumerate(u.lines):
+            pipe.redact(line, unit=u.path, line_no=i)
+    prose = ["Spoke to Al Ng at AL Group about the restore.", "Contact Ann about this.",
+             "Mark Olsen reported the issue.", "Bill Tan closed the case.",
+             "Will Ito asked for an ETA.", "May Lin approved the window.",
+             "Escalated to Max Berg at SAP AG."]
+    for i, line in enumerate(prose):
+        pipe.redact(line, unit="prose", line_no=i)
+    declared = {"PERSON_NAME": ["Al", "Ann", "Ed", "Bo", "Max", "Sun", "Mark", "Bill",
+                                "Will", "May"],
+                "ORG_NAME": ["AL", "3M", "SAP", "HR", "Art"],
+                "HOSTNAME_FQDN": ["db1", "ws7"]}
+    for etype, vals in declared.items():
         for v in vals:
-            vault.pseudonym(et, v)
-    vault.pseudonym("PERSON_NAME", "Diego Ferreira")
-    gw = proxy.RedactionGateway(stub.url, pipeline.Pipeline([pipeline.RegexTier()], vault=vault))
-    innocent = ["the", "and", "retry", "queue", "ok", "ms", "run", "set", "edited", "zedlike"]
-    crossed = refused = swept_innocent = 0
-    for i in range(300):
-        if i % 2 == 0:
-            v = rng.choice([x for vs in short.values() for x in vs])
-            text = f"please call {v} about the {rng.choice(innocent)} issue, then {v.lower()} again"
-            out, events = gw.sweep(text)
-            if re.search(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])", out, re.I):
-                crossed += 1
-            refused += bool(gw._known_values_in(out))
-            assert len(events) == 2 and all(e["tier"] == "sweep" for e in events)
-        else:
-            out, events = gw.sweep(" ".join(rng.choice(innocent) for _ in range(8)))
-            swept_innocent += bool(events)
-    assert crossed == 0 and refused == 0 and swept_innocent == 0
+            vault.pseudonym(etype, v)
+
+    rng = random.Random(20260901)
+    sentences = [
+        "will the restore finish before the maintenance window?",
+        "we may need to mark the ticket resolved",
+        "please bill the extra hours to the project", "set the max parallel jobs to 4",
+        "the sun was in the office all day", "al fine here, et al. agreed on the plan",
+        "the ed of the file was corrupted", "the art of debugging is patience",
+        "hr asked for the report by friday", "3m later the queue was empty",
+        "sap it all up and summarise", "Will do, Max effort on this one",
+        "Mark the mailbox read, Bill", "ok so what does this error mean",
+        "retry count is 482 and climbing", "the queue depth went up then down",
+        "the group of partners holds the tenant"]
+    innocent = [" ".join(rng.sample(sentences, 3)) for _ in range(200)]
+    mention = []
+    for _ in range(200):
+        v = rng.choice([x for xs in declared.values() for x in xs])
+        r = rng.random()
+        form = v if r < 0.7 else (v.lower() if r < 0.9 else v.upper())
+        casing = "as-learned" if form == v else ("lower" if form == v.lower() else "upper")
+        mention.append((v, form, casing, f"call {form} about the queue issue"))
+
+    gw = proxy.RedactionGateway("http://127.0.0.1:1",
+                                pipeline.Pipeline([pipeline.RegexTier()], vault=vault))
+    # the previous policy, inlined: every vault value, one case-insensitive set
+    before_rx = re.compile(
+        r"(?<![A-Za-z0-9])(?:" + "|".join(
+            map(re.escape, sorted(vault.by_label.values(), key=len, reverse=True)))
+        + r")(?![A-Za-z0-9])", re.IGNORECASE)
+
+    total_words = sum(len(re.findall(r"[A-Za-z0-9]+", p)) for p in innocent)
+    assert total_words == 4161
+    before_wrong = sum(len(before_rx.findall(p)) for p in innocent)
+    after_wrong = 0
+    for p in innocent:
+        out, events = gw.sweep(p)
+        after_wrong += len(events)
+        assert gw._known_values_in(out) == []  # an innocent prompt never 503s
+    assert before_wrong == 611
+    assert after_wrong == 142
+
+    crossed = {"as-learned": 0, "lower": 0, "upper": 0}
+    totals = {"as-learned": 0, "lower": 0, "upper": 0}
+    for v, form, casing, p in mention:
+        totals[casing] += 1
+        out, _ = gw.sweep(p)
+        # consistency with the refusal: whatever the sweep skipped, the
+        # leftover check must skip too, or a permitted miss becomes a 503
+        assert gw._known_values_in(out) == []
+        if out.startswith(f"call {form} "):
+            crossed[casing] += 1
+    assert totals == {"as-learned": 154, "lower": 37, "upper": 9}
+    assert crossed == {"as-learned": 0, "lower": 37, "upper": 0}
+
+
+def test_leftover_check_still_refuses_what_the_sweep_must_catch(stub):
+    """The other half of the consistency contract: a value the policy says
+    must be swept (stored casing, Title or UPPER of a person) is still seen
+    by ``_known_values_in``, so if it ever survived redaction the request
+    would be refused, exactly as before."""
+    vault = pseudonym.EntityVault(key=b"k")
+    vault.pseudonym("PERSON_NAME", "Ann")
+    vault.pseudonym("ORG_NAME", "AL")
+    gw = proxy.RedactionGateway(stub.url,
+                                pipeline.Pipeline([pipeline.RegexTier()], vault=vault))
+    for must_catch in ("Ann", "ANN", "Al", "AL"):
+        assert gw._known_values_in(f"call {must_catch} back") == [must_catch]
+        out, _ = gw.sweep(f"call {must_catch} back")
+        assert gw._known_values_in(out) == []  # and sweeping it clears it
+    for may_skip in ("ann", "al"):
+        assert gw._known_values_in(f"call {may_skip} back") == []
 
 
 def test_sweep_short_identifier_is_relabelled_across_requests(stub):

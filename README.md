@@ -568,14 +568,31 @@ recall will never be exactly 100%.
   the mean lag fell from ~21 to ~2 characters, measured by
   `test_holdback_releases_plain_text_immediately_and_lag_is_small`). A label the model invents is passed through unchanged and named in
   the log and in `X-Hider-Unknown-Labels`; it is not, and cannot be, restored.
-- **The sweep is identifiers only, by boundary.** It catches a value the vault
-  already knows, at word boundaries, whatever its length (a four-character
-  floor used to let a short identifier the tiers missed cross to the provider
-  without a refusal; on a synthetic set 136 of 150 such requests crossed, now
-  none do, at the cost of a known two-letter name also being swept out of prose
-  where it is an ordinary word). A name the vault has never seen and tier 2
+- **The sweep is identifiers only, by boundary, and word-like values are
+  case-sensitive.** It catches a value the vault already knows, at word
+  boundaries, whatever its length. Shaped values (GUIDs, IPs, hosts, case
+  numbers) match in any case; person and org values match only in the casing
+  the vault stored plus its Title/UPPER forms, because those are the values
+  that are also ordinary words. Measured on a vault built from 600 corpus
+  lines plus operator prose and 200 collision-dense innocent prompts
+  (`test_sweep_wordlike_values_are_case_sensitive_and_measured`): matching
+  everything case-insensitively wrongly rewrote 611 of 4,161 innocent words;
+  the current policy rewrites 142, all of them the identical word in the
+  identical casing, and sweeps every short identifier mentioned as learned or
+  uppercased. The accepted trade: a name the user lowercases ("call ann")
+  crosses to the provider, 37 of 200 mentioning prompts on that set, and the
+  leftover check shares the sweep's pattern so a skipped lowercase name is
+  never refused as a leftover. A name the vault has never seen and tier 2
   misses is still a tier 2 miss; the sweep narrows the window, it does not
   close it.
+- **Tier 2 vaults generic words as organisations.** Given ordinary operator
+  prose, the classifier stores single capitalised words such as "Group",
+  "Holdings" or "Partners" as ORG_NAME values, and the sweep then rewrites
+  them in every later request where they appear capitalised ("the Partners
+  meeting"). This is a classifier precision gap, not a sweep gap: the fix is
+  training-grammar and feature work in `hider/classifier.py`, owner tier 2,
+  deliberately not patched over in the sweep where it would hide the
+  misclassification instead of fixing it.
 - **The utility number is one model, one excerpt, fifteen questions.** It
   shows the pseudonym design does not cost accuracy on counting and
   which-value questions over a short excerpt. Longer excerpts, reasoning

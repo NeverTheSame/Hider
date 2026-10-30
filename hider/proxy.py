@@ -384,21 +384,46 @@ class RedactionGateway:
     # -- the sweep ---------------------------------------------------------
 
     def _known_values_rx(self) -> re.Pattern | None:
-        # Every value the vault holds, however short. There used to be a
-        # four-character floor so that a two-letter name or a three-letter
-        # org did not get swept out of ordinary prose, but a value the vault
-        # pseudonymised in one request and the tiers missed in the next
-        # crossed to the provider for no better reason than being short, and
-        # the leftover check below shared the floor, so it did not refuse
-        # either. Word boundaries still apply, so "Ed" is matched as a word
-        # and not inside "edited". The over-redaction cost is measured in
-        # ``test_sweep_catches_short_identifiers_and_the_cost_is_measured``.
-        values = {v: l for l, v in self.pipe.vault.by_label.items() if v}
-        if not values:
+        # Every value the vault holds, however short (a four-character floor
+        # used to let a short identifier the tiers missed cross to the
+        # provider, with the leftover check sharing the floor so nothing was
+        # refused). Two match modes, by what the value is:
+        #
+        # * Shaped values (GUIDs, IPs, hosts, URLs, case numbers, ...) match
+        #   case-insensitively. They never collide with ordinary words, and
+        #   loggers and users re-case them freely.
+        # * Person and org values match case-sensitively, against the casing
+        #   the vault stored plus its Title/UPPER forms. These are the values
+        #   that are also words: a vault that has learned the person "Bill"
+        #   must not rewrite "please bill the extra hours". The accepted
+        #   trade, chosen deliberately: a name the user lowercases
+        #   ("call ann") is not swept and crosses to the provider.
+        #
+        # The leftover check (``_known_values_in``) uses this same pattern,
+        # so what the sweep skips it skips too: a lowercase name cannot 503,
+        # and anything this pattern matches is either replaced by ``sweep``
+        # or refused. Costs in both directions are measured in
+        # ``test_sweep_wordlike_values_are_case_sensitive_and_measured``.
+        shaped: list[str] = []
+        wordlike: set[str] = set()
+        for e in self.pipe.vault.entries.values():
+            v = e["value"]
+            if not v:
+                continue
+            if e["type"] in ("PERSON_NAME", "ORG_NAME"):
+                wordlike.update({v, v.title(), v.upper()})
+            else:
+                shaped.append(v)
+        parts = []
+        if shaped:
+            parts.append("(?i:" + "|".join(
+                map(re.escape, sorted(shaped, key=len, reverse=True))) + ")")
+        if wordlike:
+            parts.append("|".join(
+                map(re.escape, sorted(wordlike, key=len, reverse=True))))
+        if not parts:
             return None
-        alts = sorted(values, key=len, reverse=True)
-        return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, alts))
-                          + r")(?![A-Za-z0-9])", re.IGNORECASE)
+        return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(parts) + r")(?![A-Za-z0-9])")
 
     def _known_values_in(self, text: str) -> list[str]:
         rx = self._known_values_rx()
