@@ -48,6 +48,8 @@ CASES = [
     ("IP_ADDRESS", "[Net] peer 10.20.30.40 reset the connection", "10.20.30.40"),
     ("IP_ADDRESS", "registered on fe80:0000:0000:0000:0202:b3ff:fe1e:8329 ok",
      "fe80:0000:0000:0000:0202:b3ff:fe1e:8329"),
+    ("IP_ADDRESS", "[Net] peer 010.020.030.040 reset the connection", "010.020.030.040"),
+    ("IP_ADDRESS", "[Net] connected to 192.168.001.010:443 ok", "192.168.001.010"),
     ("WINDOWS_USER_PATH", r"[Cache] path C:\Users\anna.novak\AppData\Local\BackupAgent is full",
      r"C:\Users\anna.novak\AppData\Local\BackupAgent"),
     ("HOSTNAME_FQDN", "[Repo] endpoint app01.contosocorp.internal reachable",
@@ -99,6 +101,42 @@ def test_version_numbers_are_not_addresses(line):
 def test_real_address_survives_a_nearby_version_word():
     line = "[Net] Build 8.1.0.7 talking to peer 10.20.30.40 now"
     assert covered(line, "10.20.30.40")
+
+
+# ---------------------------------------------------------------------------
+# Zero-padded IPv4. Was a documented tier 1 gap: Presidio's regex matched the
+# quad and its validator then rejected it, because Python's ipaddress refuses
+# leading zeros. A narrow recognizer now covers the padded shape only.
+# ---------------------------------------------------------------------------
+
+def test_zero_padded_ipv4_is_the_custom_set_not_stock():
+    """Stock Presidio still drops it, so the eval's baseline is still stock."""
+    line = "[Net] peer 010.020.030.040 reset the connection"
+    assert "IP_ADDRESS" not in {r.entity_type for r in R.analyze(line, R.builtins())}
+    assert covered(line, "010.020.030.040")
+
+
+def test_zero_padded_recognizer_leaves_plain_quads_to_stock():
+    reg = [R.zero_padded_ipv4()]
+    assert R.analyze("peer 10.20.30.40 reset", reg) == []
+    assert len(R.analyze("peer 10.20.030.40 reset", reg)) == 1
+
+
+@pytest.mark.parametrize("line", [
+    "[Service] Build 8.01.0.7 loaded",
+    "[Agent] agent 08.0.0.101 connected",
+])
+def test_zero_padded_version_numbers_are_not_addresses(line):
+    assert "IP_ADDRESS" not in types_in(line)
+
+
+@pytest.mark.parametrize("line", [
+    "[Stats] 01.02.2026 completed 300 items",
+    "[Net] peer 010.020.030.0400 odd",
+    "[Net] peer 010.020.030.256 out of range",
+])
+def test_zero_padded_pattern_does_not_over_match(line):
+    assert "IP_ADDRESS" not in types_in(line)
 
 
 def test_public_microsoft_endpoint_is_not_customer_data():

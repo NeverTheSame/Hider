@@ -132,12 +132,12 @@ active — see below) on a 5,029 line, 695,840 character synthetic bundle with
 
 | | |
 |---|---|
-| Recall on shaped identifier types | 99.89% |
+| Recall on shaped identifier types | 99.90% |
 | Same corpus, stock Presidio patterns only | 17.64% |
-| Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 92.09% |
-| Recall across all types | 99.19% |
+| Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 100.00% |
+| Recall across all types | 99.91% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Seeded values still findable verbatim in the output | 0 unexplained, 6 known gap |
+| Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
 | Adversarial surprises across 21 hostile placements | 0 |
 | Characters cleared before any paid or model tier is consulted | 40.3% |
 | Units degraded during the run | 0 |
@@ -146,7 +146,7 @@ active — see below) on a 5,029 line, 695,840 character synthetic bundle with
 
 Swapping in `--tier2 spacy` on the same corpus: 86.82% free-text recall, ~3.9ms
 per line over the residue. On this corpus the from-scratch classifier is both
-faster (roughly 8x) and higher-recall (92.1% vs 86.8%) than the pretrained
+faster (roughly 8x) and higher-recall (100% vs 86.8%) than the pretrained
 general-purpose model, which is not the result to expect going in and is
 exactly why both are reported rather than one asserted: a classifier trained
 tightly on the shape of *this* log format's free text (short operator notes,
@@ -170,12 +170,19 @@ The gates differ by tier, on purpose. Tier 1 is deterministic, so its gate is
 zero unexplained survivors: a miss is a defect and fails the eval. Tier 2 is a
 model, so its gate is a recall floor (0.75) that it must clear with its misses
 listed one by one; a tier 2 miss is a measurement, reported next to the tier 1
-number instead of blended into it. Passing 92.1% (or 86.8% for the spaCy
+number instead of blended into it. Passing 100% (or 86.8% for the spaCy
 backend) against a 0.75 floor is a statement with headroom, not a rounding
-exercise. The classifier's actual failure mode here is worth naming: it is
-mostly partial catches (part of a two-word organisation name redacted, not the
-whole one) rather than clean zero-detection misses, which is a smaller leak
-than it sounds like but is still counted as a miss in the recall number above.
+exercise. The 100% deserves suspicion and here is what is behind it: the
+previous grammar scored 92.1%, and every one of its misses was the same
+shape, a two-letter all-caps legal suffix ("Fabrikam AG") that a grammar with
+only title-case suffixes had never produced, so the model cut the
+organisation in half. Widening the grammar to abbreviated suffixes, one- and
+two-word heads, single-entity sentences, and log-shaped negatives closed all
+of them without adding the eval corpus's own suffixes to the training set
+(`test_training_grammar_keeps_the_eval_suffixes_out`). The eval corpus seeds
+free text from three templates, so 100% says those three shapes are now
+inside the grammar, not that the model is finished; the spaCy figure is the
+same corpus scored by a model that never saw this grammar.
 
 ### Tier 3, measured against the injection-adjacent cases
 
@@ -419,12 +426,19 @@ and a loopback-only web UI wraps the whole loop:
    `merge-csv`, while forbidding the model from reading the rows.
 2. **Obfuscate.** Every identifier becomes a stable label; secrets are
    destroyed. Short customer names a detector cannot be sure of go in as
-   terms, and a trailing `*` hides every word with that prefix. The output and
-   a label -> original mapping are written to `out/json/` (gitignored).
-3. **Ask Claude Code.** The prompt is masked with the same mapping, shown to
-   the user, and re-checked before it leaves: a prompt that still carries a
-   mapped value, or a word that only ever appeared inside a real value, is
-   refused. Claude Code runs headless in `--restricted` mode with no MCP
+   terms, and a trailing `*` hides every word with that prefix. The output,
+   a label -> original mapping, and the scrubber's verdict (`.scrub.json`:
+   leak-check labels, degraded line count, a hash of the output; no values)
+   are written to `out/json/` (gitignored).
+3. **Ask Claude Code.** The run is checked first, against its own verdict:
+   a run the leak check flagged, one with degraded lines, one whose record
+   is missing, malformed or does not match the file on disk, is refused
+   before the prompt is looked at. The same rule as the gateway's: a run the
+   bridge cannot show was clean does not go. Then the prompt is masked with
+   the same mapping, shown to the user, and re-checked before it leaves: a
+   prompt that still carries a mapped value, or a word that only ever
+   appeared inside a real value, is refused. Claude Code runs headless in
+   `--restricted` mode with no MCP
    servers and only Read, Grep and Glob, in a temp folder holding nothing but
    the obfuscated file, so it cannot reach the mapping, run commands or
    browse.
@@ -529,28 +543,39 @@ recall will never be exactly 100%.
   shaped-type recall figure should be read as an upper bound.
 - **Independence is procedural, not organisational.** One person wrote both
   sides of the contract.
-- **Tier 2 recall is a model's recall, whichever backend runs.** 92.1%
-  (classifier) or 86.8% (spaCy) on free-text names means the rest passes
-  through, listed in the metrics as individual survivors. The floor gate
+- **Tier 2 recall is a model's recall, whichever backend runs.** 100%
+  (classifier) on this corpus or 86.8% (spaCy) on free-text names; whatever
+  passes through is listed in the metrics as individual survivors. The floor gate
   catches regressions; it cannot make either backend perfect. A managed cloud
   NER service remains a documented, unbuilt contract behind the same
   interface for operators who out-scale both.
-- **The classifier's training grammar is narrow.** Twelve sentence templates,
-  two names per organisation, a fixed suffix vocabulary. It generalises past
-  its own training vocabulary (proven by the disjoint train/eval split,
-  `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary`), but an
-  organisation suffix outside its trained set (`Tailspin Technology` versus a
-  trained `Tailspin Industries`) is a realistic way for it to miss — caught
-  while building the injection-adjacent adversarial cases, not by inspection.
-- **Streaming adds a small delay and trusts the vault's label set.** Every
-  delta is held back by the length of the longest pseudonym the vault holds
-  before release, so the client sees text a few dozen characters behind the
-  provider. A label the model invents is passed through unchanged and named in
+- **The classifier's training grammar is generated and small.** Nineteen
+  paired templates, eight single-entity ones, nine negative ones, one- and
+  two-word organisation heads, and a suffix list of trade words and legal
+  abbreviations. It generalises past its own training vocabulary (proven by
+  the disjoint train/eval split,
+  `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary`), and the
+  suffix miss that used to be the example here (`Tailspin AG` cut to
+  `Tailspin`) is fixed, but a mention shaped unlike anything the grammar
+  draws (a lowercase brand, an ampersand in the name, a hyphenated surname at
+  sentence start) remains a realistic way for it to miss. The eval corpus
+  seeds free text from three templates and cannot tell you how often.
+- **Streaming adds a small delay and trusts the vault's label set.** A delta
+  is held back only while the tail of the stream is still the prefix of a
+  pseudonym the vault holds, so plain prose is released immediately and the
+  worst case is one label length while a label is actually arriving
+  (previously every delta was held a full label length: on a sample stream
+  the mean lag fell from ~21 to ~2 characters, measured by
+  `test_holdback_releases_plain_text_immediately_and_lag_is_small`). A label the model invents is passed through unchanged and named in
   the log and in `X-Hider-Unknown-Labels`; it is not, and cannot be, restored.
 - **The sweep is identifiers only, by boundary.** It catches a value the vault
-  already knows, at word boundaries, four characters or longer. A name the vault
-  has never seen and tier 2 misses is still a tier 2 miss; the sweep narrows
-  the window, it does not close it.
+  already knows, at word boundaries, whatever its length (a four-character
+  floor used to let a short identifier the tiers missed cross to the provider
+  without a refusal; on a synthetic set 136 of 150 such requests crossed, now
+  none do, at the cost of a known two-letter name also being swept out of prose
+  where it is an ordinary word). A name the vault has never seen and tier 2
+  misses is still a tier 2 miss; the sweep narrows the window, it does not
+  close it.
 - **The utility number is one model, one excerpt, fifteen questions.** It
   shows the pseudonym design does not cost accuracy on counting and
   which-value questions over a short excerpt. Longer excerpts, reasoning
@@ -574,9 +599,15 @@ recall will never be exactly 100%.
   dollars are those tokens at the published rate; a model whose rate is not in
   `llm_backend.PRICES_USD_PER_M` is reported as unpriced rather than guessed.
   The managed-NER comparison in `eval` is still an assumed per-character rate.
-- **Two known one-line gaps are deliberately left unfixed** so they stay visible
-  in the numbers: zero-padded IPv4 octets, and Windows profile paths written
-  with forward slashes. Both are in the adversarial table with an owner.
+- **One known one-line gap is deliberately left unfixed** so it stays visible
+  in the numbers: Windows profile paths written with forward slashes. It is in
+  the adversarial table with an owner. The other, zero-padded IPv4 octets, is
+  now covered by a recognizer that fires only on the padded shape; stock
+  Presidio matched the quad and then discarded it because Python's `ipaddress`
+  rejects leading zeros. The committed tier 3 injection cassette predates that
+  fix: the padded-IP line's residue changed, so replaying it reports one
+  degraded unit until it is re-recorded. The injection figure itself is
+  unaffected, since those cases are separate segments.
 
 ## Roadmap
 

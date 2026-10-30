@@ -8,6 +8,8 @@ data deliberately never touches.
 
 from __future__ import annotations
 
+import pytest
+
 from hider import classifier, pipeline, pseudonym
 
 
@@ -30,6 +32,49 @@ def test_generalises_to_names_never_seen_in_training():
     found = {(text[s:e], t) for s, e, t, _ in spans}
     assert ("Anna Novak", "PERSON") in found
     assert ("Contoso Holdings", "ORGANIZATION") in found
+
+
+def test_unseen_short_capitalised_suffix_is_part_of_the_organisation():
+    """Regression: every tier 2 miss in one eval run was a two-letter legal
+    suffix ("AG") that the old grammar, with only title-case suffixes, had
+    never produced. The eval's suffixes are still not in the training set, so
+    this has to come from shape: a short all-caps token after a capitalised
+    head in organisation context continues the organisation."""
+    clf = classifier.get_trained()
+    assert "AG" not in classifier._TRAIN_ORG_SUFFIX
+    text = "Escalation note: Fabrikam AG is asking for an ETA on the restore."
+    found = {(text[s:e], t) for s, e, t, _ in classifier.predict_spans(clf, text)}
+    assert found == {("Fabrikam AG", "ORGANIZATION")}
+
+
+def test_organisation_without_a_person_nearby_is_still_found():
+    clf = classifier.get_trained()
+    text = "Waiting on Litware Group for the change approval."
+    found = {(text[s:e], t) for s, e, t, _ in classifier.predict_spans(clf, text)}
+    assert ("Litware Group", "ORGANIZATION") in found
+
+
+@pytest.mark.parametrize("text", [
+    "The Scheduler API returned an ETA of 5 minutes.",
+    "Checked the VPN for the Transport module; DNS is fine.",
+    "Session SLA and Queue MFA are both healthy.",
+])
+def test_acronyms_after_a_capitalised_word_are_not_an_organisation(text):
+    """The widened suffix grammar must not turn 'capitals after a title-case
+    word' into a signal on its own, or component names followed by a unit or
+    protocol get redacted and the engineer stops using the tool."""
+    clf = classifier.get_trained()
+    assert classifier.predict_spans(clf, text) == []
+
+
+def test_training_grammar_keeps_the_eval_suffixes_out():
+    """The suffix list is where train and eval are allowed to share generic
+    words, but the grammar itself must not draw the eval corpus's suffixes:
+    that would be training on the answer. 'Holdings' is the one pre-existing
+    overlap, named in the module docstring."""
+    from hider import entities
+    overlap = set(classifier._TRAIN_ORG_SUFFIX) & set(entities._ORG_SUFFIX)
+    assert overlap <= {"Holdings"}
 
 
 def test_hard_negatives_are_not_flagged():

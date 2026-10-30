@@ -313,6 +313,34 @@ def hostname_fqdn() -> PatternRecognizer:
     )
 
 
+_IPV4_OCTET = r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)"
+
+
+def zero_padded_ipv4() -> PatternRecognizer:
+    """IPv4 with zero-padded octets, as some loggers emit (``010.020.030.040``).
+
+    Presidio's stock ``IpRecognizer`` regex matches these, then throws the
+    match away: its validator runs ``ipaddress.ip_interface`` and Python
+    rejects leading zeros as ambiguous octal. This recognizer only fires when
+    at least one octet is padded, so plain dotted quads stay the stock
+    recognizer's job and the eval's stock baseline stays stock. It emits the
+    same ``IP_ADDRESS`` label, so the version-number suppression and the
+    IPv4/IPv6 pseudonym split apply to it unchanged.
+    """
+    return PatternRecognizer(
+        supported_entity="IP_ADDRESS",
+        name="ZeroPaddedIpv4Recognizer",
+        patterns=[
+            Pattern(
+                name="ipv4-zero-padded",
+                regex=r"\b(?=[\d.]*\b0\d)" + _IPV4_OCTET + r"(?:\." + _IPV4_OCTET + r"){3}\b",
+                score=0.6,
+            ),
+        ],
+        context=["ip", "ipv4", "peer", "address"],
+    )
+
+
 class SupportCaseRecognizer(LocalRecognizer):
     """Eight-digit case number.
 
@@ -373,6 +401,7 @@ def custom() -> list[LocalRecognizer]:
         api_key(),
         windows_user_path(),
         hostname_fqdn(),
+        zero_padded_ipv4(),
         SupportCaseRecognizer(),
         ContinuationFragmentRecognizer(),
     ]

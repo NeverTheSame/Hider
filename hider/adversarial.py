@@ -125,8 +125,8 @@ CASES: tuple[Case, ...] = (
         "ipv4-leading-zeros",
         "IPv4 with leading zeros, which some loggers emit",
         "[21.08.2026 09:02:23.100] <2f> Info [Net] peer <<IPV4|010.020.030.040>> reset the connection",
-        expect_tier1=False,
-        owner="known gap: stock IP pattern rejects zero-padded octets. One-line pattern addition, deliberately left visible in the numbers rather than quietly fixed before measuring.",
+        expect_tier1=True,
+        owner="was a known gap: Presidio's stock IPv4 regex matches the quad but its validator rejects leading zeros. Covered by recognizers.zero_padded_ipv4.",
     ),
     Case(
         "forward-slash-path",

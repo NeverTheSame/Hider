@@ -11,10 +11,18 @@ Read, Grep and Glob tools, in a fresh folder that holds nothing but the
 obfuscated file, so it cannot reach the mapping, run commands or browse.
 
 What never leaves: the mapping. Unmasking is a dictionary lookup, no model.
+
+What never goes in: a run the scrubber flagged. The obfuscation writes its
+verdict (leak-check labels, degraded line count, a hash of the output) next
+to the run as ``.scrub.json``; ``ask`` and ``make_workspace`` refuse unless
+that record exists, parses, matches the file on disk and is clean. The
+gateway's rule applies here: not being able to show a run was clean is a
+refusal, not a pass.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -29,6 +37,8 @@ OUT = Path(__file__).resolve().parent.parent / "out"
 RUNS = OUT / "json"
 RESEARCH = OUT / "research"
 DATA_NAME = "data.json"  # the run's file name may itself name the customer
+SCRUB_SUFFIX = ".scrub.json"
+SCRUB_SCHEMA = "hider.scrub.v1"
 
 TOOLS = "Read,Grep,Glob"
 
@@ -67,9 +77,16 @@ def list_runs() -> list[dict]:
         stem = out.name[: -len(".obfuscated.json")]
         mp = RUNS / f"{stem}.mapping.json"
         if mp.exists():
+            try:
+                # listing does not hash every file on each page load; ask does
+                scrub_verdict(stem, verify_hash=False)
+                clean, why = True, ""
+            except RunRefused as e:
+                clean, why = False, str(e)
             runs.append({"run": stem, "size_mb": round(out.stat().st_size / 2**20, 1),
                          "saved": time.strftime("%Y-%m-%d %H:%M",
-                                                time.localtime(out.stat().st_mtime))})
+                                                time.localtime(out.stat().st_mtime)),
+                         "clean": clean, "refusal": why})
     return runs
 
 
@@ -87,6 +104,87 @@ def resolve_run(run: str) -> tuple[Path, Path]:
     if not out.exists() or not mp.exists():
         raise FileNotFoundError(f"no obfuscated + mapping pair for run {stem!r} in {base}")
     return out, mp
+
+
+class RunRefused(ValueError):
+    """The bridge will not put this run in front of Claude Code.
+
+    A ``ValueError`` so the web API answers 400 with the reason and the CLI
+    exits non-zero; the subclass lets callers tell a refusal from a bad
+    argument.
+    """
+
+
+def scrub_record_path(out_path: Path) -> Path:
+    stem = out_path.name[: -len(".obfuscated.json")]
+    return out_path.with_name(f"{stem}{SCRUB_SUFFIX}")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_scrub_record(out_path: Path, output_text: str, stats: dict) -> Path:
+    """Persist the scrubber's verdict next to its output. Decisions, not data:
+    the leak list holds labels, never the values they stand for.
+
+    Written by the obfuscation (web UI and ``scrub-json`` both go through
+    ``webserver.obfuscate_text``), read by ``scrub_verdict`` before any run
+    reaches Claude Code. The hash ties the verdict to the exact bytes it was
+    computed over, so an output edited after the fact has no valid record.
+    """
+    record = {
+        "schema": SCRUB_SCHEMA,
+        "leaks": [str(l) for l in stats.get("leaks") or []],
+        "degraded_lines": int(stats.get("degraded_lines") or 0),
+        "mapped_values": int(stats.get("mapped_values") or 0),
+        "secrets_destroyed": int(stats.get("secrets_destroyed") or 0),
+        "output_sha256": _sha256(output_text.encode("utf-8")),
+        "written": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    path = scrub_record_path(out_path)
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def scrub_verdict(run: str, *, verify_hash: bool = True) -> dict:
+    """The scrub record for ``run``, or ``RunRefused`` with the reason.
+
+    Refuses when the record is missing, unreadable, of an unknown schema,
+    malformed, does not match the obfuscated file on disk, or reports leaks
+    or degraded lines. Every branch here is a refusal; nothing maps a defect
+    in the record to "no findings".
+    """
+    out, _ = resolve_run(run)
+    path = scrub_record_path(out)
+    stem = out.name[: -len(".obfuscated.json")]
+    if not path.exists():
+        raise RunRefused(f"run {stem!r} has no scrub record ({path.name}); cannot establish "
+                         "that it was clean. Re-run the obfuscation to produce one.")
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise RunRefused(f"run {stem!r}: scrub record unreadable ({type(e).__name__}); "
+                         "refusing rather than assuming it was clean") from e
+    if not isinstance(rec, dict) or rec.get("schema") != SCRUB_SCHEMA:
+        raise RunRefused(f"run {stem!r}: scrub record has an unknown schema; refusing")
+    leaks, degraded, digest = rec.get("leaks"), rec.get("degraded_lines"), rec.get("output_sha256")
+    if (not isinstance(leaks, list) or not all(isinstance(l, str) for l in leaks)
+            or isinstance(degraded, bool) or not isinstance(degraded, int) or degraded < 0
+            or not isinstance(digest, str)):
+        raise RunRefused(f"run {stem!r}: scrub record is malformed; refusing")
+    if verify_hash and _sha256(out.read_bytes()) != digest:
+        raise RunRefused(f"run {stem!r}: the obfuscated file does not match its scrub record "
+                         "(edited or replaced since the leak check ran); refusing")
+    if leaks:
+        raise RunRefused(f"run {stem!r}: the leak check flagged {len(leaks)} value(s) still "
+                         f"present in the output ({', '.join(leaks)}); it must not reach "
+                         "Claude Code. Fix the input or add terms and obfuscate again.")
+    if degraded:
+        raise RunRefused(f"run {stem!r}: {degraded} line(s) degraded during redaction (a tier "
+                         "failed), so the output is not the redaction the leak check "
+                         "describes; it must not reach Claude Code.")
+    return rec
 
 
 def load_mapping(path: str | Path) -> tuple[dict[str, str], list[str]]:
@@ -265,7 +363,12 @@ def claude_command(prompt: str | None = None, model: str | None = None) -> list[
 
 
 def make_workspace(run: str, where: Path | None = None) -> Path:
-    """A folder holding only the obfuscated file (as data.json) and the rules."""
+    """A folder holding only the obfuscated file (as data.json) and the rules.
+
+    Refuses (``RunRefused``) a run whose scrub record is missing, stale or
+    flagged: a workspace exists only to be opened in Claude Code.
+    """
+    scrub_verdict(run)
     out, _ = resolve_run(run)
     stem = out.name[: -len(".obfuscated.json")]
     if where is None:
@@ -282,10 +385,14 @@ def ask(run: str, prompt: str, *, model: str | None = None, timeout: int = 1800,
         extra: dict[str, str] | None = None) -> dict:
     """Mask the prompt, run Claude Code headless on the obfuscated file, unmask the answer.
 
-    The prompt must already be clean: callers show the masked prompt first, and
-    this refuses one that still carries a mapped value. ``extra`` is the
-    label -> original map the preview made for terms with no label yet.
+    The run must be clean and the prompt must already be clean. The run is
+    checked first, against its scrub record (``scrub_verdict``): a leak-check
+    hit, a degraded line, or no usable record at all is a refusal before the
+    prompt is even looked at. Callers show the masked prompt first, and this
+    refuses one that still carries a mapped value. ``extra`` is the label ->
+    original map the preview made for terms with no label yet.
     """
+    scrub_verdict(run)
     out, _ = resolve_run(run)
     mapping, terms, public = run_context(run)
     masked, _, n = mask_prompt(prompt, mapping, terms, public)

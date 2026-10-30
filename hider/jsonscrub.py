@@ -18,8 +18,13 @@ in four passes:
 3. **Sweep.** A second pass over every string with everything learned in pass
    2, so a value first seen late in the document is also gone from the strings
    that came before it.
-4. **Leak check.** Every original value is searched for in the output. The
-   result reports how many survived (by label, never by value).
+4. **Leak check.** Every original value is searched for in the output, at
+   word boundaries, whatever its length. The result reports how many survived
+   (by label, never by value). This is the verdict the Claude Code bridge
+   refuses on, so it has no blind spot by design: a mapped value in the
+   output is a leak even when it is three characters long and probably a
+   count. The sweep is held to the same rule, so an output this check
+   passes is one in which no mapped value appears at all.
 
 No tier 3, no network. The mapping (label -> original) is the sensitive half
 and is returned separately so it can stay on this machine.
@@ -361,7 +366,15 @@ class JsonScrubber:
         self.known[n] = label
         self.mapping.setdefault(label, value)
         self.counts[etype] = self.counts.get(etype, 0) + 1
-        if force or index and n not in _STOPWORDS and (len(n) >= 4 or (len(n) >= 3 and not n.isdigit())):
+        # Every mapped value is indexed, however short. There used to be a
+        # four-character floor (three for non-digits) to keep "482" or "x7"
+        # from being swept out of prose where they might mean something else,
+        # but a value that was worth mapping under its key is worth removing
+        # from the notes that quote it, and the leak check cannot call an
+        # output clean while that value is still in it. The cost is
+        # over-redaction of coincidental short tokens; the trade is measured
+        # in ``test_short_values_are_swept_and_the_trade_is_measured``.
+        if force or index and n not in _STOPWORDS:
             toks = list(_TOKEN.finditer(n))
             if toks:
                 # Index under the least-shared token, so a word every URL has
@@ -576,6 +589,14 @@ class JsonScrubber:
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             if etype is not None and etype != "SECRET":
                 return self.known.get(_norm(str(v)), self._label(etype, str(v)))
+            if sweep and _norm(str(v)) in self.known:
+                # A bare number under an innocent key ("retry_count": 482)
+                # that equals a mapped value ("account_id": 482). It is the
+                # mapped value, byte for byte, so the leak check would flag
+                # it and the bridge would refuse the run; replacing it is
+                # over-redaction, leaving it is a leak by the check's own
+                # definition, and this layer fails closed.
+                return self.known[_norm(str(v))]
             return v
         if not isinstance(v, str):
             return v
@@ -624,8 +645,7 @@ class JsonScrubber:
                     walk(v)
             elif isinstance(node, (str, int, float)) and not isinstance(node, bool):
                 for _, _, v in self._find_known(str(node)):
-                    if len(v) >= 4:
-                        leaked.add(self.known[v])
+                    leaked.add(self.known[v])
 
         walk(out)
         return sorted(leaked)

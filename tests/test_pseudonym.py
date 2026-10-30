@@ -169,6 +169,48 @@ def test_detokenize_survives_a_model_dropping_the_brackets():
         f"The stall is on {GUID_A}, retry it."
 
 
+def test_detokenize_restores_labels_written_back_to_back():
+    """The full ordered-pair matrix behind the fix: 47 labels of three shapes,
+    every pair concatenated with no separator. The old longest-first
+    whole-string replace restored 50 of the 2209 pairs wrongly, because a
+    longer label matched across the join and took characters from both
+    ("203.0.113.2" twice came back as "10.20.30.2103.0.113.2"). The
+    coverage-maximising parse restores all 2209."""
+    a = v()
+    labs = [a.pseudonym("IPV4", f"10.20.30.{i + 1}") for i in range(30)]
+    labs += [a.pseudonym("SESSION_GUID",
+                         f"a41f77c2-9be1-4c33-8f0e-1122aabbcc{i:02x}") for i in range(12)]
+    labs += [a.pseudonym("UPN_EMAIL", f"user{i}.n@contosocorp.com") for i in range(5)]
+    assert len(labs) == 47
+    val = dict(a.by_label)
+    wrong = [(x, y) for x in labs for y in labs
+             if a.detokenize(x + y) != val[x] + val[y]]
+    assert wrong == []
+
+
+def test_detokenize_standalone_ambiguous_token_is_still_the_longest_label():
+    """"203.0.113.22" alone is label 22, not label 2 plus a stray digit: the
+    longer single match restores more characters, so the coverage rule keeps
+    the documented longest-wins behaviour where nothing follows."""
+    a = v()
+    labs = [a.pseudonym("IPV4", f"10.20.30.{i + 1}") for i in range(22)]
+    long_lab = labs[21]
+    short_lab = [l for l in labs if long_lab.startswith(l) and l != long_lab]
+    assert short_lab, "vault produced no prefix pair; the test needs one"
+    assert a.detokenize(f"peer {long_lab} reset") ==         f"peer {a.by_label[long_lab]} reset"
+
+
+def test_detokenize_never_rescans_a_restored_value():
+    """A restored value must not be re-read as more labels. The old replace
+    chain rescanned its own output, so a real value containing another
+    label's text was corrupted after being restored correctly."""
+    a = v()
+    inner = a.pseudonym("SESSION_GUID", GUID_A)
+    # a second entry whose real value contains the first entry's label text
+    outer = a.pseudonym("UPN_EMAIL", f"x{inner}y@contosocorp.com")
+    assert a.detokenize(f"see {outer} here") == f"see x{inner}y@contosocorp.com here"
+
+
 def test_detokenize_prefers_the_longest_label():
     a = v()
     a.pseudonym("SESSION_GUID", GUID_A)

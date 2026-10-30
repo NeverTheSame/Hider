@@ -185,12 +185,18 @@ class GatewayMetrics:
 class HoldbackDetokenizer:
     """Detokenise a stream without ever cutting a pseudonym in half.
 
-    Text is buffered; everything except the last ``H - 1`` characters is
-    released on each feed, where ``H`` is the longest label the vault holds.
-    Any complete label that straddles the cut moves the cut past itself. A
-    label that starts inside the held-back tail cannot be complete yet (it
-    would need more than ``H`` characters), so holding ``H - 1`` is exactly
-    enough and no more. ``flush`` releases the tail at end of stream.
+    Text is buffered; on each feed everything is released except the longest
+    tail that is still a proper prefix of some pseudonym the vault holds, so
+    the client lags only while a label might actually be arriving. A tail that
+    is not the start of any label cannot become one by growing on the right,
+    and a tail that is one must be held whole: a cut inside it could release
+    the first half of a pseudonym, including a short pseudonym that is itself
+    the prefix of a longer one, which is why the prefix set is built over
+    proper prefixes (a complete label at the tail is released, and
+    detokenised, the moment nothing longer can extend it). The worst case is
+    ``H - 1`` characters, ``H`` the longest label, which is what the previous
+    implementation held on every feed regardless of content. ``flush``
+    releases the tail at end of stream.
     """
 
     def __init__(self, vault: pseudonym.EntityVault) -> None:
@@ -199,6 +205,17 @@ class HoldbackDetokenizer:
         bare = [l[1:-1] for l in labels if l.startswith("<") and l.endswith(">")]
         forms = sorted(set(labels + bare), key=len, reverse=True)
         self.holdback = max((len(l) for l in forms), default=1) - 1
+        #: Every proper prefix of every form. A buffer tail is held back iff
+        #: it is in this set; membership is O(1) and the longest candidate is
+        #: ``holdback`` chars, so each feed costs at most ``holdback`` lookups.
+        self._prefixes = frozenset(
+            form[:k] for form in forms for k in range(1, len(form))
+        )
+        #: Longest-first alternation over the complete forms, for the straddle
+        #: check in ``feed``: the longest tail that is a label *prefix* can
+        #: start inside a *complete* label ("203.0.113.20" ends in "20", a
+        #: prefix of other labels), so the prefix rule alone can put the cut
+        #: mid-label; any complete label crossing the cut moves it past itself.
         self._rx = re.compile("|".join(map(re.escape, forms))) if forms else None
         self.pending = ""
         self.unknown: list[str] = []
@@ -219,15 +236,23 @@ class HoldbackDetokenizer:
     def feed(self, text: str) -> str:
         self._note_unknown(text)
         self.pending += text
-        cut = len(self.pending) - self.holdback
-        if cut <= 0:
-            return ""
+        hold = 0
+        for k in range(min(len(self.pending), self.holdback), 0, -1):
+            if self.pending[-k:] in self._prefixes:
+                hold = k
+                break
+        cut = len(self.pending) - hold
         if self._rx is not None:
             for m in self._rx.finditer(self.pending):
                 if m.start() < cut < m.end():
+                    # Safe to release whole: were this label still extendable,
+                    # it would be a proper prefix of a longer form and the
+                    # suffix loop above would already be holding all of it.
                     cut = m.end()
                 if m.start() >= cut:
                     break
+        if cut <= 0:
+            return ""
         out, self.pending = self.pending[:cut], self.pending[cut:]
         return self.vault.detokenize(out)
 
@@ -359,7 +384,16 @@ class RedactionGateway:
     # -- the sweep ---------------------------------------------------------
 
     def _known_values_rx(self) -> re.Pattern | None:
-        values = {v: l for l, v in self.pipe.vault.by_label.items() if len(v) >= 4}
+        # Every value the vault holds, however short. There used to be a
+        # four-character floor so that a two-letter name or a three-letter
+        # org did not get swept out of ordinary prose, but a value the vault
+        # pseudonymised in one request and the tiers missed in the next
+        # crossed to the provider for no better reason than being short, and
+        # the leftover check below shared the floor, so it did not refuse
+        # either. Word boundaries still apply, so "Ed" is matched as a word
+        # and not inside "edited". The over-redaction cost is measured in
+        # ``test_sweep_catches_short_identifiers_and_the_cost_is_measured``.
+        values = {v: l for l, v in self.pipe.vault.by_label.items() if v}
         if not values:
             return None
         alts = sorted(values, key=len, reverse=True)

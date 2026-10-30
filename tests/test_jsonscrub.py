@@ -1,6 +1,8 @@
 """JSON obfuscation layer. Synthetic values only."""
 
 import json
+import random
+import re
 
 from hider import jsonscrub
 
@@ -115,3 +117,97 @@ def test_log_vocabulary_is_not_a_name_and_prefix_terms():
     msg = res.output["message"]
     assert "Too Many Requests" in msg and "Site Pages" in msg
     assert "acmeimd" not in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# Short values. A value mapped from a sensitive key but under four characters
+# used to be neither swept from free text nor counted by the leak check, so
+# {"account_id": 482, "notes": "Account 482 escalated"} came back with 482 in
+# the notes and leaks: []. The bridge refuses on the leak check, so a blind
+# spot there was a blind spot in the bridge.
+# ---------------------------------------------------------------------------
+
+def _texts(node):
+    if isinstance(node, dict):
+        for v in node.values():
+            yield from _texts(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _texts(v)
+    elif isinstance(node, (str, int, float)) and not isinstance(node, bool):
+        yield str(node)
+
+
+def _present(tok, out):
+    rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(tok) + r"(?![A-Za-z0-9])", re.I)
+    return any(rx.search(t) for t in _texts(out))
+
+
+def test_short_value_is_swept_from_prose_and_the_user_example_round_trips():
+    res = jsonscrub.scrub({"account_id": 482, "notes": "Account 482 escalated"}, tier2="none")
+    label = res.output["account_id"]
+    assert label.startswith("<") and res.output["notes"] == f"Account {label} escalated"
+    assert res.stats["leaks"] == []
+    for one_char in ("q", "7"):  # single characters too, once a sensitive key mapped them
+        res = jsonscrub.scrub({"account_id": one_char, "notes": f"account {one_char} flagged"},
+                              tier2="none")
+        assert res.mapping, one_char
+        assert not _present(one_char, res.output), one_char
+
+
+def test_leak_check_counts_a_short_value_it_still_holds():
+    """The check itself, not the sweep: hand it an output that still carries
+    the three-character original and it must say so."""
+    s = jsonscrub.JsonScrubber(tier2="none")
+    res = s.run({"account_id": 482, "notes": "fine"})
+    label = res.output["account_id"]
+    tampered = {**res.output, "notes": "Account 482 escalated"}
+    assert s.leak_check(tampered) == [label]
+    assert s.leak_check(res.output) == []
+
+
+def test_short_values_are_swept_and_the_trade_is_measured():
+    """The synthetic export set behind the README numbers. Ninety exports in
+    three groups of thirty: prose that quotes the short account id and a
+    1-2 character code; prose that never does; and a collision, where an
+    innocent count equals the account id both in prose and as a bare number.
+
+    Before (four-character floor):  mentions 30/30 still in output, collision
+    30/30 still in output, leak check flagged 0 in every group.
+    After:                          0 still in output anywhere, 0 flagged,
+    and all 30 collisions over-redacted. That last number is the price: a
+    count that equals a mapped value is removed, because leaving it means the
+    leak check is lying when it says clean."""
+    rng = random.Random(20260830)
+    groups = {"mentions": [], "silent": [], "collision": []}
+    for i in range(90):
+        acct = rng.randint(1, 999)
+        code = rng.choice(["ab", "x7", "q", "Z9", "k2"])
+        other = rng.randint(1, 999)
+        while other == acct:
+            other = rng.randint(1, 999)
+        g = ("mentions", "silent", "collision")[i % 3]
+        if g == "mentions":
+            doc = {"account_id": acct, "region_code": code, "retry_count": other,
+                   "notes": f"Account {acct} escalated, code {code} applied; retried {other} times"}
+        elif g == "silent":
+            doc = {"account_id": acct, "region_code": code, "retry_count": other,
+                   "notes": f"Escalated after {other} retries, see runbook section 4"}
+        else:
+            doc = {"account_id": acct, "region_code": code, "retry_count": acct,
+                   "notes": f"Escalated after {acct} retries by the on-call"}
+        groups[g].append((doc, str(acct), str(other)))
+
+    for g, docs in groups.items():
+        still_present = flagged = coincidental_removed = 0
+        for doc, acct, other in docs:
+            res = jsonscrub.scrub(doc, tier2="none")
+            shorts = [v for v in res.mapping.values() if len(v) < 4]
+            still_present += any(_present(v, res.output) for v in shorts)
+            flagged += bool(res.stats["leaks"])
+            innocent = acct if g == "collision" else other
+            coincidental_removed += not _present(innocent, res.output)
+        assert len(docs) == 30
+        assert still_present == 0, g
+        assert flagged == 0, g
+        assert coincidental_removed == (30 if g == "collision" else 0), g

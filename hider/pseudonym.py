@@ -130,22 +130,65 @@ class EntityVault:
     def detokenize(self, text: str) -> str:
         """Turn pseudonyms in a model response back into real values.
 
-        Labels are matched in their bracketed form first, then bare. Models
-        routinely drop the angle brackets when they quote a token back at you,
-        so ``<Session-01>`` comes home as ``Session-01``; matching only the
-        exact form left those un-restored, which looks like the vault failing
-        when it is the model reformatting. Longest first, so a short label
-        cannot clip a longer one.
+        One left-to-right, non-overlapping scan over every form at once:
+        bracketed labels and their bare spellings (models routinely drop the
+        angle brackets when they quote a token back, so ``<Session-01>`` comes
+        home as ``Session-01``). Where two forms match at the same position
+        the longest wins, so a short label cannot clip a longer one.
+
+        It used to be a sequence of whole-string ``str.replace`` calls,
+        longest label first, and that order is wrong in two ways this is not.
+        Two pseudonyms written back to back let a longer label match across
+        their boundary and take characters from both: ``203.0.113.2`` twice
+        with no separator came back as ``10.20.30.2103.0.113.2``, because
+        ``203.0.113.21`` matched astride the join. And a restored value was
+        itself rescanned by every later replace, so a real value that happened
+        to contain a shorter label's text was corrupted after being restored
+        correctly.
+
+        Back-to-back labels make the parse genuinely ambiguous (the text above
+        also *starts with* the complete label ``203.0.113.22``), so greedy
+        longest-at-position is not enough either: it would take label 22 and
+        strand ``03.0.113.2``. The rule that resolves every such case in the
+        measured pair matrix is: of all ways to segment the text into labels
+        and plain text, take the one that restores the most label characters,
+        and where two parses tie, the longer label at the earlier position
+        wins. That keeps the documented behaviour for a standalone ambiguous
+        token - ``203.0.113.22`` alone is label 22, not label 2 plus a stray
+        digit - because the longer single match covers more characters.
+        Matched spans are consumed, never rescanned.
         """
-        for label in sorted(self.by_label, key=len, reverse=True):
-            text = text.replace(label, self.by_label[label])
-        bare = {
-            label[1:-1]: value for label, value in self.by_label.items()
-            if label.startswith("<") and label.endswith(">")
-        }
-        for label in sorted(bare, key=len, reverse=True):
-            text = text.replace(label, bare[label])
-        return text
+        forms = dict(self.by_label)
+        for label, value in self.by_label.items():
+            if label.startswith("<") and label.endswith(">"):
+                forms.setdefault(label[1:-1], value)
+        if not forms:
+            return text
+        lengths = sorted({len(f) for f in forms}, reverse=True)
+        n = len(text)
+        # best[i]: most label characters restorable in text[i:]; one entry per
+        # position, O(len(text) * distinct label lengths), no recursion.
+        best = [0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            best[i] = best[i + 1]
+            for l in lengths:
+                if i + l <= n and text[i:i + l] in forms:
+                    best[i] = max(best[i], l + best[i + l])
+        out: list[str] = []
+        i = 0
+        while i < n:
+            taken = False
+            if best[i] > best[i + 1]:
+                for l in lengths:  # longest first: ties go to the longer label
+                    if i + l <= n and text[i:i + l] in forms                             and l + best[i + l] == best[i]:
+                        out.append(forms[text[i:i + l]])
+                        i += l
+                        taken = True
+                        break
+            if not taken:
+                out.append(text[i])
+                i += 1
+        return "".join(out)
 
     # -- persistence -------------------------------------------------------
 

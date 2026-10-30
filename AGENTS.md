@@ -111,11 +111,11 @@ default and needs neither. The test suite never touches the network.
 Listed with owners in the README's Limitations section and in
 `adversarial.CASES`. The ones most likely to matter:
 
-- Two tier 1 gaps are deliberately left open so they stay visible in the
-  numbers: zero-padded IPv4 octets and forward-slash Windows profile paths.
+- One tier 1 gap is deliberately left open so it stays visible in the
+  numbers: forward-slash Windows profile paths.
 - Tier 2 recall is a model's recall. The classifier's training grammar is
-  narrow (twelve templates); an organisation suffix outside its trained set
-  is a realistic miss.
+  generated and small; a mention shaped unlike anything in it is a realistic
+  miss, and the misses are listed one by one in `metrics.json`.
 - The injection number is one model, five payloads, one run.
 - The utility number is one model, one 40-line excerpt, fifteen questions.
 - The gateway serialises redaction; fine for a workstation, the first thing

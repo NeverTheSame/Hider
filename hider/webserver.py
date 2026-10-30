@@ -216,6 +216,7 @@ function show(j){$("res").hidden=false;const s=j.stats;
   $("types").innerHTML=Object.entries(s.by_type).map(([k,v])=>'<span class="pill">'+esc(k)+': '+v+'</span>').join("");
   $("leak").innerHTML=s.leaks.length?'<span class="bad">Original values still present for: '+s.leaks.map(esc).join(", ")+'. Review before sharing.</span>'
     :(s.degraded_lines?'<span class="bad">Some lines degraded (a tier failed). Review before sharing.</span>':'<span class="ok">Leak check passed: no mapped original value appears in the output.</span>');
+  if(s.leaks.length||s.degraded_lines)$("leak").innerHTML+=' <span class="bad">This run is recorded as flagged and the Claude Code step will refuse it.</span>';
   $("saved").textContent="Saved as run "+j.run+": "+j.saved.output+"  |  "+j.saved.mapping;
   $("preview").textContent=j.output_text.length>200000?j.output_text.slice(0,200000)+"\n... (truncated preview, download for full file)":j.output_text;}
 const stem=()=>name.replace(/\.(jsonl?|txt)$/i,"");
@@ -227,7 +228,7 @@ $("fbSend").onclick=async()=>{try{const j=await api("/api/feedback",{kind:$("fbK
 
 // runs list (steps 3 and 4)
 async function runs(select){try{const j=await api("/api/runs",null,"GET");
-  const opts=j.runs.map(r=>'<option value="'+esc(r.run)+'">'+esc(r.run)+" ("+r.size_mb+" MB, "+esc(r.saved)+")</option>").join("")||'<option value="">no runs yet: obfuscate something first</option>';
+  const opts=j.runs.map(r=>'<option value="'+esc(r.run)+'">'+esc(r.run)+" ("+r.size_mb+" MB, "+esc(r.saved)+(r.clean?"":", FLAGGED: will be refused")+")</option>").join("")||'<option value="">no runs yet: obfuscate something first</option>';
   for(const id of ["aRun","uRun"]){const el=$(id),cur=el.value;el.innerHTML=opts;if(select)el.value=select;else if(cur)el.value=cur;}
   wsCmd();}catch(e){}}
 function wsCmd(){$("wsCmd").textContent='cd "'+REPO+'" && .venv/bin/python -m hider workspace '+($("aRun").value||"<run>")}
@@ -287,8 +288,13 @@ def obfuscate_text(raw: str, name: str = "input.json", tier2: str = "classifier"
     map_path.write_text(json.dumps(
         {"note": "label -> original value. Holds real customer data; keep on this machine.",
          "terms": terms or [], "mapping": res.mapping}, ensure_ascii=False, indent=2), encoding="utf-8")
+    # The verdict the bridge will check before this run may reach Claude Code.
+    # Written last: a run with no record is refused, so a failure here cannot
+    # produce a usable-looking run with no leak check behind it.
+    rec_path = research.write_scrub_record(out_path, output_text, res.stats)
     return {"output_text": output_text, "mapping": res.mapping, "stats": res.stats,
-            "run": stem, "saved": {"output": str(out_path), "mapping": str(map_path)}}
+            "run": stem, "saved": {"output": str(out_path), "mapping": str(map_path),
+                                   "scrub": str(rec_path)}}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -377,7 +383,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/unmask":
             out, n, unknown = research.unmask(text, mapping)
             return self._json(200, {"text": out, "replaced": n, "unknown_labels": unknown})
-        # /api/ask: refuse up front, then run Claude Code in the background
+        # /api/ask: refuse up front, then run Claude Code in the background.
+        # The run first (its own scrub verdict), then the prompt; research.ask
+        # re-checks both, this just answers 400 instead of a failed job.
+        research.scrub_verdict(str(body.get("run")))
         if research.prompt_leaks(text, mapping, terms, public):
             raise ValueError("the prompt still contains customer values: press Preview again")
         job_id = uuid.uuid4().hex[:12]

@@ -10,6 +10,7 @@ sides of the boundary from one round trip.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -319,6 +320,112 @@ def test_holdback_with_empty_vault_releases_immediately():
     assert h.feed("hello") == "hello"
 
 
+def test_holdback_releases_plain_text_immediately_and_lag_is_small():
+    """The number behind the README's streaming note. Text that cannot be the
+    start of any pseudonym must not wait on the longest-label worst case; the
+    old implementation held every feed a full label length (~21 chars mean on
+    this sample), the prefix-based one holds only while a label could actually
+    be arriving."""
+    vault = pseudonym.EntityVault(key=b"k")
+    lab1 = vault.pseudonym("SESSION_GUID", "a41f77c2-9be1-4c33-8f0e-1122aabbccdd")
+    lab2 = vault.pseudonym("UPN_EMAIL", "anna.novak@contosocorp.com")
+    lab3 = vault.pseudonym("IPV4", "10.20.30.40")
+
+    h = proxy.HoldbackDetokenizer(vault)
+    plain = "no labels anywhere in this stream, just ordinary prose repeated. " * 10
+    lags = []
+    for ch in plain:
+        h.feed(ch)
+        lags.append(len(h.pending))
+    # a one-or-two char tail may match a pseudonym's first characters; that is
+    # the honest minimum, not the longest-label worst case
+    assert max(lags) <= 3
+    assert sum(lags) / len(lags) < 0.5
+
+    text = (f"The session {lab1} for user {lab2} reconnected from {lab3} after a "
+            "retry. The transport layer reported no further errors. " * 5)
+    h = proxy.HoldbackDetokenizer(vault)
+    out, lags = "", []
+    for ch in text:
+        out += h.feed(ch)
+        lags.append(len(h.pending))
+    out += h.flush()
+    assert out == vault.detokenize(text)
+    assert max(lags) <= h.holdback  # worst case is still one label length
+    assert sum(lags) / len(lags) < 5  # measured ~2.3; the old code held ~21
+
+
+def test_holdback_never_releases_a_label_that_prefixes_a_longer_one():
+    """A complete short pseudonym at the tail may still be the first half of
+    a longer one, and releasing it would detokenise the wrong value. The
+    prefix set is built over proper prefixes of every form so the shorter
+    label waits until the next character settles it."""
+    vault = pseudonym.EntityVault(key=b"k")
+    short = None
+    for i in range(40):
+        lab = vault.pseudonym("IPV4", f"10.20.30.{i + 1}")
+        others = set(vault.by_label) - {lab}
+        prefixed = [o for o in vault.by_label if o != lab and o.startswith(lab)]
+        if prefixed:
+            short, longer = lab, prefixed[0]
+            break
+        if (match := [o for o in others if lab.startswith(o)]):
+            short, longer = match[0], lab
+            break
+    assert short is not None, "vault produced no prefix pair to test with"
+
+    h = proxy.HoldbackDetokenizer(vault)
+    released = h.feed("peer " + short)
+    assert short not in released and h.pending == short  # ambiguous: held whole
+    # the next char disambiguates to the longer label; nothing partial ever left
+    out = released + h.feed(longer[len(short)] ) + h.flush()
+    full = "peer " + short + longer[len(short)]
+    assert out == vault.detokenize(full)
+
+
+def test_holdback_round_trips_adversarial_chunkings():
+    """Deterministic fuzz: labels back to back, label fragments as literal
+    text, and random chunk sizes. The oracle is a left-to-right, longest-first,
+    non-overlapping scan - what a stream must produce - rather than
+    ``vault.detokenize``, whose global longest-first ``str.replace`` can match
+    across the boundary of two adjacent labels and mangle both (a pre-existing
+    artifact of that function, present before the prefix-based holdback)."""
+    import random
+    import re as _re
+
+    rng = random.Random(7)
+    vault = pseudonym.EntityVault(key=b"k")
+    labs = [vault.pseudonym("IPV4", f"10.20.30.{i + 1}") for i in range(30)]
+    labs += [vault.pseudonym("SESSION_GUID",
+                             f"a41f77c2-9be1-4c33-8f0e-1122aabbcc{i:02x}") for i in range(12)]
+    bare = {l[1:-1]: val for l, val in vault.by_label.items()
+            if l.startswith("<") and l.endswith(">")}
+    table = {**vault.by_label, **bare}
+    rx = _re.compile("|".join(map(_re.escape, sorted(table, key=len, reverse=True))))
+
+    fragments = ["peer ", " and ", "x", "20", "3.0.", "<Se", "ssion-0", " ok\n"]
+    for _ in range(200):
+        text = "".join(rng.choice(labs) if rng.random() < 0.5 else rng.choice(fragments)
+                       for _ in range(rng.randint(1, 12)))
+        h = proxy.HoldbackDetokenizer(vault)
+        out, i = "", 0
+        while i < len(text):
+            n = rng.randint(1, 7)
+            out += h.feed(text[i:i + n])
+            i += n
+        out += h.flush()
+        assert out == rx.sub(lambda m: table[m.group(0)], text), text
+
+
+def test_holdback_releases_a_complete_unambiguous_label_without_waiting():
+    vault = pseudonym.EntityVault(key=b"k")
+    lab = vault.pseudonym("SESSION_GUID", "a41f77c2-9be1-4c33-8f0e-1122aabbccdd")
+    h = proxy.HoldbackDetokenizer(vault)
+    out = h.feed("session " + lab)
+    assert out == "session a41f77c2-9be1-4c33-8f0e-1122aabbccdd"
+    assert h.pending == ""
+
+
 def test_unsupported_endpoint_is_404(stub, server):
     port, gw = server
     req = urllib.request.Request(
@@ -395,6 +502,66 @@ def test_sweep_catches_a_known_identifier_the_tiers_missed(stub):
         m = gw.metrics.to_dict()
         assert m["sweep_hits"] == 1
         assert m["redactions_by_type"] == {"PERSON_NAME": 1}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_sweep_catches_short_identifiers_and_the_cost_is_measured(stub):
+    """The four-character floor in ``_known_values_rx`` let a short identifier
+    the vault already knew cross to the provider when the tiers missed it in
+    a later request, and the leftover check shared the floor so nothing was
+    refused. On this synthetic set of 300 requests, before: 136/150 of those
+    mentioning a short known identifier crossed (the 14 that did not were the
+    five-character "Bo Li", already above the floor), 0 refused. After: 0 cross,
+    0 refused, and 0 of 150 innocent requests had a word swept, because the
+    match is still by word boundary. The cost that remains is a known short
+    value that is also an ordinary word ("Ann", "Ed") being swept wherever it
+    stands alone; that is the trade for closing the gap, and it is stated."""
+    import random
+    rng = random.Random(20260831)
+    vault = pseudonym.EntityVault(key=b"k")
+    short = {"ORG_NAME": ["ACM", "Zed", "Qo", "IBX"], "PERSON_NAME": ["Bo Li", "Ann", "Ed"],
+             "HOSTNAME_FQDN": ["db1", "ws7"]}
+    for et, vals in short.items():
+        for v in vals:
+            vault.pseudonym(et, v)
+    vault.pseudonym("PERSON_NAME", "Diego Ferreira")
+    gw = proxy.RedactionGateway(stub.url, pipeline.Pipeline([pipeline.RegexTier()], vault=vault))
+    innocent = ["the", "and", "retry", "queue", "ok", "ms", "run", "set", "edited", "zedlike"]
+    crossed = refused = swept_innocent = 0
+    for i in range(300):
+        if i % 2 == 0:
+            v = rng.choice([x for vs in short.values() for x in vs])
+            text = f"please call {v} about the {rng.choice(innocent)} issue, then {v.lower()} again"
+            out, events = gw.sweep(text)
+            if re.search(r"(?<![A-Za-z0-9])" + re.escape(v) + r"(?![A-Za-z0-9])", out, re.I):
+                crossed += 1
+            refused += bool(gw._known_values_in(out))
+            assert len(events) == 2 and all(e["tier"] == "sweep" for e in events)
+        else:
+            out, events = gw.sweep(" ".join(rng.choice(innocent) for _ in range(8)))
+            swept_innocent += bool(events)
+    assert crossed == 0 and refused == 0 and swept_innocent == 0
+
+
+def test_sweep_short_identifier_is_relabelled_across_requests(stub):
+    """End to end: a two-letter name pseudonymised in request one, missed by
+    the tiers in request two, leaves as the same label and comes back."""
+    vault = pseudonym.EntityVault(key=b"k")
+    label = vault.pseudonym("PERSON_NAME", "Ed")
+    gw = proxy.RedactionGateway(stub.url, pipeline.Pipeline([pipeline.RegexTier()], vault=vault))
+    httpd = proxy.make_server("127.0.0.1", 0, gw)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        status, resp = _post(gw, port, {
+            "model": "x", "messages": [{"role": "user", "content": "ask Ed; the file was edited"}]})
+        assert status == 200
+        sent = json.dumps(stub.bodies)
+        assert f"ask {label}; the file was edited" in sent  # boundary: "edited" untouched
+        assert "Ed" in resp["choices"][0]["message"]["content"]
+        assert gw.metrics.to_dict()["sweep_hits"] == 1
     finally:
         httpd.shutdown()
         httpd.server_close()
