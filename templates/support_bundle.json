@@ -121,6 +121,19 @@
     "The retry window was widened after the last release, see the internal runbook section {N}.",
     "No further action needed on the transport layer, throughput is back to {MB} MB/s.",
     "  \"Limits\": { \"MaxParallelJobs\": {N}, \"TimeoutMs\": {MS} },",
-    "[{TS}] <{PID}> Info     [Cache] Evicted {N} entries, {MB} MB reclaimed"
+    "[{TS}] <{PID}> Info     [Cache] Evicted {N} entries, {MB} MB reclaimed",
+    "[{TS}] <{PID}> Info     [Rotate] archived backup.log and metrics.csv, wrote summary.xlsx",
+    "[{TS}] <{PID}> Error    [Worker]    at Backup.Proxy.SessionWorker.Run() in /src/SessionWorker.cs:line {N}",
+    "[{TS}] <{PID}> Error    [Worker] caught System.Net.Sockets.SocketException after {MS} ms",
+    "[{TS}] <{PID}> Info     [Auth] token endpoint login.microsoftonline.com responded in {MS} ms",
+    "[{TS}] <{PID}> Info     [Rest] docs at learn.microsoft.com and graph.microsoft.com reachable",
+    "[{TS}] <{PID}> Info     [Deploy] running main.py and helper.ps1 from the tools folder",
+    "The retry fired twice.then the queue drained, no action needed.",
+    "Exported the report as plan_v2.docx, the raw dump stays in trace.etl.",
+    "[{TS}] <{PID}> Info     [Pkg] verified installer.msi and agent.tar.gz checksums",
+    "[{TS}] <{PID}> Error    [Worker] caught System.Net.Http.HttpRequestException after {MS} ms",
+    "[{TS}] <{PID}> Info     [Boot] loaded Microsoft.Extensions.Logging.Abstractions v8.0.0",
+    "[{TS}] <{PID}> Error    [Worker] System.Collections.Generic.KeyNotFoundException at depth {N}",
+    "[{TS}] <{PID}> Info     [Boot] resolved Newtonsoft.Json.Serialization.DefaultContractResolver"
   ]
 }

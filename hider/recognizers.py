@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from . import entities, profiles
+from . import entities, profiles, vendors
 from presidio_analyzer import (
     LocalRecognizer,
     Pattern,
@@ -129,6 +129,15 @@ def tenant_site_url() -> PatternRecognizer:
     so adding a vendor is a one-line change in one place.
     """
     hosts = "|".join(h.replace(".", r"\.") for h in entities.TENANT_SITE_HOSTS)
+    # Unencoded spaces in document paths ("/Shared Documents/Q3 support
+    # plans.xlsx") used to stop the match at the first space and leak the file
+    # name. The space-tolerant tail is fenced twice so it can never swallow
+    # prose after a URL: it must contain a path separator (a continuation of a
+    # path has one; " from archive backup.zip" does not), and it must end in a
+    # document extension. The declared remainder: a space-separated file name
+    # in the final segment with no further slash still leaks its tail.
+    space_tail = (r"(?:(?:[ ][\w.%()&-]{1,40})*[ ]?/[^\"'<>\n]{0,80}?"
+                  r"\.(?:xlsx|xls|docx|doc|pptx|ppt|pdf|csv|msg|eml|one|vsdx|txt|rtf|zip)\b)?")
     return PatternRecognizer(
         supported_entity="SITE_URL",
         name="TenantSiteRecognizer",
@@ -136,7 +145,7 @@ def tenant_site_url() -> PatternRecognizer:
             Pattern(
                 name="tenant-site",
                 regex=rf"https?://[A-Za-z0-9-]{{1,63}}(?:-my)?\.(?:{hosts})"
-                      rf"(?:/[^\s\"'<>,;)\]]*)?",
+                      rf"(?:/[^\s\"'<>,;)\]]*)?{space_tail}",
                 score=0.9,
             ),
             # Bare host with no scheme still identifies the tenant.
@@ -273,17 +282,694 @@ def api_key() -> PatternRecognizer:
     )
 
 
+#: Authorities on the left of a backslash that name Windows itself, not a
+#: customer. ``NT AUTHORITY\SYSTEM`` is the same string on every machine on
+#: earth; redacting it destroys triage value and protects nobody. Registry
+#: hives and the common all-caps path roots are here for the same reason:
+#: they look exactly like a NETBIOS domain and never are one.
+_WELL_KNOWN_AUTHORITIES = frozenset({
+    "NT", "AUTHORITY", "BUILTIN", "SERVICE", "SYSTEM", "SELF", "EVERYONE",
+    "HKLM", "HKCU", "HKCR", "HKU", "HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER",
+    "HKEY_CLASSES_ROOT", "HKEY_USERS", "SOFTWARE", "IIS", "APPPOOL",
+    "TEMP", "TMP", "WINDIR", "WINDOWS", "PUBLIC", "DEFAULT", "USERS",
+})
+
+
+class DomainLogonRecognizer(LocalRecognizer):
+    """``DOMAIN\\user`` logons, the on-prem spelling of a person.
+
+    The shape is two tokens around a backslash, which is also the shape of a
+    registry path, a well-known principal and an all-caps directory pair, so
+    the pattern alone is not enough. Three guards carry the precision:
+
+    * the authority must be all-caps, which is how NETBIOS domains are written
+      and how prose is not;
+    * the character before it must not be ``\\``, ``:`` or a word character,
+      which excludes every segment inside a longer path (``D:\\BACKUP\\x``);
+    * the authority must not be a well-known one, so ``NT AUTHORITY\\SYSTEM``
+      and ``BUILTIN\\Administrators`` survive verbatim - they are structure,
+      not customer data, and an engineer needs to see them.
+
+    A denylist cannot be complete, which is acceptable in this direction: an
+    unlisted authority means a well-known principal gets pseudonymised, not
+    that a customer logon leaks.
+    """
+
+    # The account tail must end on an alphanumeric or the $ of a machine
+    # account (WKS041$); ending on . or - would swallow sentence punctuation.
+    LOGON = re.compile(
+        r"(?<![\w\\:.\-])([A-Z][A-Z0-9-]{1,14})\\"
+        r"([A-Za-z](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?\$?)(?![\w$\\])"
+    )
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["DOMAIN_LOGON"],
+            name="DomainLogonRecognizer",
+            context=["logon", "user", "account", "domain"],
+        )
+        self.supported_entity = "DOMAIN_LOGON"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        out: list[RecognizerResult] = []
+        for m in self.LOGON.finditer(text):
+            if m.group(1) in _WELL_KNOWN_AUTHORITIES:
+                continue
+            out.append(RecognizerResult(
+                entity_type=self.supported_entity, start=m.start(),
+                end=m.end(), score=0.85, analysis_explanation=None))
+        return out
+
+
+def windows_sid() -> PatternRecognizer:
+    """Domain and Azure AD SIDs, and deliberately nothing else.
+
+    Only ``S-1-5-21-…`` (a domain plus its accounts) and ``S-1-12-1-…`` (an
+    Azure AD identity projected into Windows) carry customer identity. The
+    well-known SIDs - ``S-1-5-18``, ``S-1-5-32-544``, ``S-1-1-0`` - are
+    constants shared by every Windows installation, and redacting them is pure
+    loss, so the pattern requires the domain-form subauthorities and cannot
+    match the short well-known forms.
+    """
+    return PatternRecognizer(
+        supported_entity="WINDOWS_SID",
+        name="WindowsSidRecognizer",
+        patterns=[
+            Pattern(
+                name="domain-sid",
+                regex=r"\bS-1-(?:5-21|12-1)-\d{1,10}-\d{1,10}-\d{1,10}(?:-\d{1,10})?\b",
+                score=0.9,
+            ),
+        ],
+        context=["sid", "account", "token", "group"],
+    )
+
+
+class CertThumbprintRecognizer(LocalRecognizer):
+    """Certificate thumbprints, which are 40 hex characters - and so is every
+    git commit hash.
+
+    The shape is worthless on its own: redacting bare 40-hex would eat every
+    deploy line in the bundle. The gate is the word that names it, same
+    approach as the support-case rule, and the span is narrowed to the digits
+    so the word "thumbprint" itself survives to say what was removed. Python's
+    ``re`` has no variable-length lookbehind, hence a recognizer rather than a
+    pattern.
+    """
+
+    PHRASE = re.compile(
+        r"(?i)\b(?:thumbprint|cert(?:ificate)?\s*hash)\b\W{0,24}([0-9A-Fa-f]{40})\b"
+    )
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["CERT_THUMBPRINT"],
+            name="CertThumbprintRecognizer",
+            context=["certificate", "thumbprint", "auth", "app"],
+        )
+        self.supported_entity = "CERT_THUMBPRINT"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        return [
+            RecognizerResult(entity_type=self.supported_entity, start=m.start(1),
+                             end=m.end(1), score=0.9, analysis_explanation=None)
+            for m in self.PHRASE.finditer(text)
+        ]
+
+
+def onmicrosoft_tenant_domain() -> PatternRecognizer:
+    """``*.onmicrosoft.com`` domains: the subdomain IS the customer tenant.
+
+    ``jsonscrub`` already caught these in JSON exports; plain log text did
+    not. Not added to ``entities.TENANT_SITE_HOSTS`` because the generator
+    reads that constant, and widening generation reshuffles the corpus and
+    invalidates the committed utility cassette. Same idea, separate rule.
+    """
+    return PatternRecognizer(
+        supported_entity="TENANT_DOMAIN",
+        name="OnmicrosoftTenantRecognizer",
+        patterns=[
+            Pattern(
+                name="onmicrosoft",
+                regex=r"\b[A-Za-z0-9][A-Za-z0-9-]{0,62}\.(?:mail\.)?onmicrosoft\.com\b",
+                score=0.9,
+            ),
+        ],
+        context=["tenant", "domain", "directory", "verified"],
+    )
+
+
+class FormattedPhoneRecognizer(LocalRecognizer):
+    """Phone numbers in free text, via the ``phonenumbers`` library - gated on
+    the number actually being written like one.
+
+    The library alone is not safe here, in both directions. At every leniency
+    level it claims ``4255550147`` in "transferred 4255550147 bytes" and even
+    the eight-digit support-case shape ``07551234``; and it reads the head of
+    every bracketed log timestamp, ``[21.08.2026 09``, as a formatted European
+    number - measured at 96 of 1,000 clean lines redacted, which would have
+    gutted the bundle. The gate that kills all of it is the writing system
+    phones actually use: a kept match consists of digits plus ``+ - ( )`` and
+    spaces only, and is not a pure digit run. Dots, colons and brackets mean a
+    timestamp, a version or log structure, never a phone.
+
+    The declared cost: an unformatted phone number in a note
+    ("call 4255550147") and a dotted European spelling ("0043.1.5125.0") are
+    missed, documented gaps rather than silent ones, because the alternatives
+    redact byte counts and timestamps and the engineer stops trusting the
+    output.
+    """
+
+    _PHONE_CHARS = frozenset("0123456789 -()+")
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["PHONE_NUMBER"],
+            name="FormattedPhoneRecognizer",
+            context=["phone", "call", "callback", "contact", "mobile"],
+        )
+        self.supported_entity = "PHONE_NUMBER"
+        from presidio_analyzer.predefined_recognizers import PhoneRecognizer
+        self._inner = PhoneRecognizer()
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        out: list[RecognizerResult] = []
+        for r in self._inner.analyze(text, ["PHONE_NUMBER"], nlp_artifacts=nlp_artifacts):
+            value = text[r.start:r.end]
+            if value.isdigit() or not set(value) <= self._PHONE_CHARS:
+                continue  # a count, a timestamp or log structure, not a phone
+            out.append(RecognizerResult(
+                entity_type=self.supported_entity, start=r.start, end=r.end,
+                score=min(r.score, 0.85), analysis_explanation=None))
+        return out
+
+
+#: Dotted tokens that are files, not hosts. Shared with jsonscrub (one list,
+#: one judgement). The two-letter source extensions (py, js, ts, rs, md, sh,
+#: ps, go, rb, cs, db) shadow the matching country TLDs on purpose: in a log
+#: bundle "main.py" outnumbers Paraguayan domains by orders of magnitude, and
+#: the loss is declared rather than discovered.
+FILE_EXT = frozenset({
+    "log", "txt", "json", "xml", "dll", "exe", "zip", "csv", "config", "html",
+    "htm", "pdf", "png", "jpg", "gz", "db", "md", "ps", "cs", "js", "py", "sh",
+    "ts", "rs", "go", "rb", "yml", "yaml", "ini", "bak", "tmp", "evtx", "etl",
+    "xlsx", "xls", "docx", "doc", "pptx", "ppt", "msg", "eml", "one", "vsdx",
+    "rtf", "jpeg", "bmp", "gif", "svg", "ico", "tar", "bz2", "7z", "rar",
+    "dat", "dmp", "pcap", "reg", "ps1", "psm1", "bat", "cmd", "vbs", "msi",
+    "cab", "jar", "war", "class", "pyc", "whl", "toml", "lock", "sql", "pem",
+    "crt", "cer", "key", "pfx", "der", "jsonl", "parquet", "php", "aspx",
+    "jsp", "css", "map", "wasm", "so", "dylib", "pdb", "cpp", "hpp",
+})
+
+#: Public TLDs the customer-domain rule will claim under. Deliberately an
+#: allowlist: an open [a-z]{2,24} tail also matches "service.then" when a note
+#: drops the space after a sentence. An exotic TLD outside this list is a
+#: declared miss, and a site profile can add a pattern for it.
+_PUBLIC_TLDS = frozenset((
+    "com net org io co edu gov mil info biz dev app cloud tech online site "
+    "store blog news media email group team live global world "
+    "uk de fr nl be it es pt se no dk fi pl cz sk at ch ie au nz ca us mx br "
+    "ar cl jp cn kr in sg hk tw th my id ph vn ru ua tr il ae sa za eg ng ke "
+    "gr hu ro bg hr si ee lv lt lu is mt cy eu asia"
+).split())
+
+#: Multi-part public suffixes: in "contoso.co.uk" the organisation is
+#: "contoso", not "co". Only the common second-level forms are handled.
+_SECOND_LEVEL = frozenset({"co", "com", "org", "net", "ac", "gov", "edu"})
+
+
+class CustomerDomainRecognizer(LocalRecognizer):
+    """Any public FQDN that is not a known vendor service is a customer host.
+
+    This closes the "backup.fabrikamedu.org" gap: a host outside the internal
+    suffix list used to pass untouched because no rule owned the open
+    namespace. The rule fails toward redaction - an unknown host is a customer
+    host until the vendor list (repo core plus hider.local.json) says
+    otherwise - and it fires in prose as well as in host positions, because an
+    operator note names the customer's estate as readily as a Host: header.
+
+    The fences, each with a test and a measured false-redaction cost of zero:
+
+    * last label must be a listed public TLD (kills "service.then" typos);
+    * last label must not be a file extension ("backup.log", "report.xlsx");
+    * no mixed-case label ("Backup.Proxy.SessionWorker" is a namespace);
+    * not inside a longer dotted chain ("system.net" inside
+      "system.net.sockets" is a namespace segment, blocked by the lookahead);
+    * not an email domain (the @ lookbehind leaves those to the UPN rule);
+    * hosts other rules own are skipped: vendor services, internal TLDs,
+      onmicrosoft and key-vault and tenant-site hosts.
+    """
+
+    FQDN = re.compile(
+        r"(?<![\w@.-])"
+        r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24})"
+        r"(?![\w-])(?!\.[A-Za-z0-9])"
+    )
+
+    #: Suffixes owned by a more specific rule; claiming them here would only
+    #: fight that rule in overlap resolution.
+    OWNED = ("onmicrosoft.com", "vault.azure.net", ".internal", ".local",
+             ".lan", ".corp", ".intra", ".ad") + entities.TENANT_SITE_HOSTS
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["CUSTOMER_DOMAIN"],
+            name="CustomerDomainRecognizer",
+            context=["host", "domain", "server", "endpoint", "repository"],
+        )
+        self.supported_entity = "CUSTOMER_DOMAIN"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        out: list[RecognizerResult] = []
+        for m in self.FQDN.finditer(text):
+            host = m.group(1)
+            labels = host.split(".")
+            if labels[-1].lower() not in _PUBLIC_TLDS:
+                continue
+            if labels[-1].lower() in FILE_EXT:
+                continue
+            if any(lb != lb.lower() and lb != lb.upper() for lb in labels):
+                continue  # TitleCase label: a namespace, not a host
+            low = host.lower()
+            if low.endswith(self.OWNED) or vendors.is_vendor_host(low):
+                continue
+            out.append(RecognizerResult(
+                entity_type=self.supported_entity, start=m.start(1),
+                end=m.end(1), score=0.75, analysis_explanation=None))
+        return out
+
+
+def onedrive_personal_account() -> PatternRecognizer:
+    """The identity segment of a OneDrive ``/personal/`` path.
+
+    OneDrive flattens the owner's UPN into the path - dots and the @ become
+    underscores, so ``anna.novak@contoso.com`` travels as
+    ``/personal/anna_novak_contoso_com/...`` even when the host has been
+    stripped from the log line. The segment is the person; the rest of the
+    path stays, which keeps "which folder failed" answerable.
+
+    The flattening is not invertible (an underscore in the original local part
+    is indistinguishable from a flattened dot), so this pseudonym cannot share
+    the owner's UPN vault entry; it gets its own user ordinal. File names
+    deeper in a hostless path are out of scope here and documented in the
+    adversarial case.
+    """
+    return PatternRecognizer(
+        supported_entity="ONEDRIVE_ACCOUNT",
+        name="OneDrivePersonalRecognizer",
+        patterns=[
+            Pattern(
+                name="personal-segment",
+                # Fixed-width lookbehind keeps the span on the identity
+                # segment, so "/personal/" itself survives as structure.
+                regex=r"(?<=/personal/)[A-Za-z0-9][A-Za-z0-9_-]{4,128}(?=/|\b)",
+                score=0.9,
+            ),
+        ],
+        context=["personal", "onedrive", "site", "path"],
+    )
+
+
+def azure_key_vault() -> PatternRecognizer:
+    """Key vault URLs: the vault name is the customer, the secret name is the
+    purpose, and both go.
+
+    Only names travel in these URLs - the secret *value* never appears, which
+    is why this is pseudonymised rather than destroyed: "the job read
+    sql-conn-primary from the same vault twice" is exactly the correlation an
+    engineer needs, and the vault can give it back. Not added to
+    ``entities.TENANT_SITE_HOSTS`` for the usual reason: the generator reads
+    that constant and widening it invalidates the committed utility cassette.
+    """
+    return PatternRecognizer(
+        supported_entity="AZURE_KEY_VAULT",
+        name="AzureKeyVaultRecognizer",
+        patterns=[
+            Pattern(
+                name="kv-url",
+                regex=(r"(?:https?://)?[A-Za-z0-9-]{3,24}\.vault\.azure\.net"
+                       r"(?:/[^\s\"'<>,;)\]]*)?"),
+                score=0.9,
+            ),
+        ],
+        context=["vault", "secret", "key", "certificate"],
+    )
+
+
+def exchange_item_id() -> PatternRecognizer:
+    """Exchange item and folder ids, the ``AAMkAD…`` base64 runs.
+
+    They encode mailbox and store identity and correlate every operation on
+    one item, so they are pseudonymised, not destroyed. The constant prefix is
+    the gate: EWS and Graph both stamp it, and a random base64 run opening
+    with it does not occur. Tier 2 used to half-claim these as organisation
+    names, which vaulted fragments of the id under the wrong type and left the
+    head in the clear.
+
+    Declared trade, owned by the adversarial case: an id alone on a wrapped
+    line is also a bare 40+ character base64 line, which the credential rules
+    destroy. Overlap resolution prefers the destroying span, so correlation is
+    lost but nothing leaks.
+    """
+    return PatternRecognizer(
+        supported_entity="EXCHANGE_ITEM_ID",
+        name="ExchangeItemIdRecognizer",
+        patterns=[
+            Pattern(
+                name="exchange-id",
+                regex=r"\bA[AQ]MkA[DG][A-Za-z0-9+/=_-]{30,}",
+                score=0.9,
+            ),
+        ],
+        context=["item", "folder", "mailbox", "message"],
+    )
+
+
+def url_userinfo() -> PatternRecognizer:
+    """Credentials in a URL's userinfo, ``scheme://user:password@host``.
+
+    This one was not merely missed, it was actively mishandled. The UPN rule
+    matches ``password@host`` as an address, so the password was pseudonymised
+    into the vault as if it were a user, and the username in front of the
+    colon was left in the clear. A vaulted credential is strictly worse than a
+    missed one: the secret is still in the text and is now also on disk under
+    a reversible mapping.
+
+    The span covers the whole ``user:password@``, because the service account
+    name identifies as surely as the password authenticates. ``pipeline.resolve``
+    prefers this span over the overlapping address span, since a secret outranks
+    an identifier. The host is left to the hostname and site rules, which is
+    what keeps "which endpoint was this" answerable after redaction.
+    """
+    return PatternRecognizer(
+        supported_entity="API_KEY",
+        name="UrlUserinfoRecognizer",
+        patterns=[
+            Pattern(
+                name="userinfo",
+                # Fixed-width lookbehind keeps the span off the scheme. The
+                # character classes exclude the delimiters that end an
+                # authority (/ ? # &): without them, an ordinary URL whose
+                # query string happens to contain an @, as in
+                # "https://host:8443?token=a@b.com", matched from the host
+                # onward and the host was destroyed.
+                regex=r"(?<=://)[^/\s:@?#&]{1,64}:[^/\s@?#&]{1,128}@",
+                score=0.95,
+            ),
+        ],
+        context=["url", "endpoint", "feed", "credential"],
+    )
+
+
+def http_credential_header() -> PatternRecognizer:
+    """Credentials carried in HTTP headers other than a bearer token.
+
+    ``Basic`` is not obfuscation, it is base64 of ``user:password``, and a
+    session cookie is a bearer credential in every sense that matters: anyone
+    holding it is the user until it expires. Both went upstream untouched
+    before this rule existed.
+
+    Cookie values are handled by ``CookieHeaderRecognizer`` rather than here,
+    because keeping the attribute names while destroying only the values needs
+    per-pair spans that the pattern engine cannot express.
+    """
+    return PatternRecognizer(
+        supported_entity="API_KEY",
+        name="HttpCredentialHeaderRecognizer",
+        patterns=[
+            # Fixed-width lookbehind; Presidio matches case-insensitively.
+            Pattern(name="basic-auth",
+                    regex=r"(?<=Basic )[A-Za-z0-9+/=_-]{8,}", score=0.95),
+            # Other schemes that carry a credential rather than a challenge.
+            Pattern(name="ntlm-negotiate",
+                    regex=r"(?<=Negotiate )[A-Za-z0-9+/=]{16,}", score=0.9),
+            Pattern(name="apikey-header",
+                    regex=r"(?<=X-Api-Key: )[^\s\"']{8,}", score=0.9),
+        ],
+        context=["authorization", "header", "credential", "auth"],
+    )
+
+
+#: Cookie attribute names, which are structure rather than secret. Keeping
+#: them is what lets an engineer still see that a cookie was Secure and
+#: SameSite=Lax after the value itself has been destroyed.
+_COOKIE_ATTRS = frozenset({
+    "expires", "max-age", "domain", "path", "secure", "httponly", "samesite",
+    "version", "comment", "priority", "partitioned",
+})
+
+
+class CookieHeaderRecognizer(LocalRecognizer):
+    """Values inside a ``Cookie`` or ``Set-Cookie`` header.
+
+    A session cookie authenticates, so it is destroyed, not pseudonymised.
+    Before this existed, tier 2 claimed parts of cookie values as organisation
+    names: the value was half-leaked and half-written to the vault.
+
+    Only the value half of each ``name=value`` pair is claimed, and attribute
+    pairs are skipped entirely. Cookie names and attributes are the part that
+    makes the line worth keeping ("the auth cookie was present, Secure, and
+    scoped to /api"), and they are not the part that authenticates. Expressing
+    "the value of each pair, except these names" needs per-pair offsets, which
+    is why this is a recognizer rather than a pattern.
+    """
+
+    HEADER = re.compile(r"(?i)\b(?:Set-)?Cookie\s*:[ \t]*")
+    PAIR = re.compile(r"([A-Za-z0-9_.-]+)[ \t]*=[ \t]*([^;,\r\n]*)")
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["API_KEY"],
+            name="CookieHeaderRecognizer",
+            context=["cookie", "session", "header"],
+        )
+        self.supported_entity = "API_KEY"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        out: list[RecognizerResult] = []
+        for header in self.HEADER.finditer(text):
+            # One header runs to the end of its line and no further.
+            line_end = text.find("\n", header.end())
+            stop = len(text) if line_end == -1 else line_end
+            for pair in self.PAIR.finditer(text, header.end(), stop):
+                name, value = pair.group(1), pair.group(2).strip()
+                if name.lower() in _COOKIE_ATTRS or not value:
+                    continue
+                start = pair.start(2) + (len(pair.group(2)) - len(pair.group(2).lstrip()))
+                out.append(RecognizerResult(
+                    entity_type=self.supported_entity, start=start,
+                    end=start + len(value), score=0.9, analysis_explanation=None))
+        return out
+
+
+class AwsSecretKeyRecognizer(LocalRecognizer):
+    """The AWS secret access key, which has no shape of its own.
+
+    Forty base64 characters is also a hash, a chunk id and half a certificate,
+    so the value cannot be matched on shape without redacting the bundle to
+    confetti. The key *name* beside it is the evidence, and it is a strong one:
+    nobody writes ``aws_secret_access_key =`` next to something harmless.
+
+    Reported as the value alone, not the whole assignment, so the key name
+    survives and the line still says what was removed. Python has no
+    variable-length lookbehind, which is why the span is narrowed here rather
+    than in a pattern.
+    """
+
+    PHRASE = re.compile(
+        r"(?i)\b(?:aws[_-]?)?secret[_-]?access[_-]?key\b[ \t]*[:=][ \t]*"
+        r"[\"']?([A-Za-z0-9/+=]{20,})"
+    )
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["API_KEY"],
+            name="AwsSecretKeyRecognizer",
+            context=["aws", "secret", "credentials", "profile"],
+        )
+        self.supported_entity = "API_KEY"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        return [
+            RecognizerResult(entity_type=self.supported_entity, start=m.start(1),
+                             end=m.end(1), score=0.95, analysis_explanation=None)
+            for m in self.PHRASE.finditer(text)
+        ]
+
+
+class PrivateKeyBlockRecognizer(LocalRecognizer):
+    """PEM private key material, whole block or one body line at a time.
+
+    Two matching modes because the engine sees text both ways. The proxy and
+    the JSON scrubber hand over a whole message, where the BEGIN/END markers
+    bracket the body and the block can be matched outright. The CLI and the
+    eval walk a bundle line by line, where a body line is a bare base64 run
+    with no context whatsoever - and that is exactly the line that was being
+    vaulted as an organisation name.
+
+    So a base64-only line is claimed on its own, anchored to the line and
+    floored at 40 characters. That floor is the whole precision argument: a
+    line consisting of nothing but a long unbroken base64 run is key material,
+    a chunk digest or a token, and none of those belong upstream. The false-
+    redaction measurement on the clean corpus is what keeps this honest.
+
+    The BEGIN and END markers are deliberately not claimed. They carry no key
+    material, and leaving them tells the engineer a key was removed here.
+    """
+
+    BLOCK = re.compile(
+        r"(?s)(?<=-----)\n?(.*?)(?=-----END[A-Z ]*PRIVATE KEY-----)"
+    )
+    MARKER = re.compile(r"(?i)-----BEGIN[A-Z ]*PRIVATE KEY-----")
+    BODY_LINE = re.compile(r"(?m)^[ \t]*([A-Za-z0-9+/]{40,}={0,2})[ \t]*$")
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["API_KEY"],
+            name="PrivateKeyBlockRecognizer",
+            context=["private", "key", "pem", "certificate"],
+        )
+        self.supported_entity = "API_KEY"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        out: list[RecognizerResult] = []
+        # Whole block, when the markers are both present in this text.
+        for marker in self.MARKER.finditer(text):
+            body = self.BLOCK.search(text, marker.end() - 5)
+            if body and body.group(1).strip():
+                out.append(RecognizerResult(
+                    entity_type=self.supported_entity, start=body.start(1),
+                    end=body.end(1), score=0.95, analysis_explanation=None))
+        # Bare base64 body lines, which is how a line-by-line walk sees them.
+        for m in self.BODY_LINE.finditer(text):
+            out.append(RecognizerResult(
+                entity_type=self.supported_entity, start=m.start(1),
+                end=m.end(1), score=0.85, analysis_explanation=None))
+        return out
+
+
+def vendor_credential() -> PatternRecognizer:
+    """Vendor-issued credentials that announce themselves with an issuer prefix.
+
+    These are the cheapest true positives in the whole system and the most
+    expensive misses. Each vendor deliberately stamps a constant prefix on its
+    tokens precisely so that scanners can find them, so the pattern needs no
+    context word and carries a high score: nothing else in a support bundle is
+    spelled ``ghp_`` followed by thirty-six base62 characters.
+
+    Lengths are lower bounds rather than exact, because a bundle contains
+    truncated and elided tokens ("ghp_abc...") far more often than pristine
+    ones, and a shortened credential is still a credential prefix worth
+    destroying. The floors are set high enough that no English word reaches
+    them.
+
+    These are reported as ``API_KEY`` rather than as a type of their own. The
+    handling class is identical - every one of them authenticates on its own,
+    so every one is destroyed, never vaulted - and a detector has no reason to
+    tell a GitHub PAT from a Slack token. ``entities.VENDOR_KEY_FORMATS``
+    documents the formats these patterns were written against.
+    """
+    return PatternRecognizer(
+        supported_entity="API_KEY",
+        name="VendorCredentialRecognizer",
+        patterns=[
+            # GitHub fine-grained PAT: github_pat_ + 22 + _ + 59 base62.
+            Pattern(name="github-pat-fine",
+                    regex=r"\bgithub_pat_[A-Za-z0-9_]{20,}", score=0.95),
+            # GitHub classic PAT and its siblings: user, OAuth, user-to-server,
+            # server-to-server and refresh tokens all share the shape.
+            Pattern(name="github-pat-classic",
+                    regex=r"\bgh[pousr]_[A-Za-z0-9]{20,}", score=0.95),
+            # AWS access key id: a resource-type prefix plus 16 characters.
+            # Presidio matches case-insensitively by default and that default
+            # is kept here, unlike the pod-id rule: a down-cased key id is
+            # still a key id, and the asymmetry is stark. Destroying a
+            # 20-character token that merely looked like one costs a line of
+            # triage detail; missing one puts a live AWS credential in a
+            # provider's request log.
+            Pattern(name="aws-access-key-id",
+                    regex=r"\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|AIPA|ABIA|ACCA)"
+                          r"[A-Z0-9]{16}\b",
+                    score=0.95),
+            # Google API key: AIza + 35 base64url characters.
+            Pattern(name="google-api-key",
+                    regex=r"\bAIza[A-Za-z0-9_-]{30,}", score=0.95),
+            # Slack bot, user, app, refresh, session and export tokens.
+            Pattern(name="slack-token",
+                    regex=r"\bxox[abeprs]-[A-Za-z0-9-]{10,}", score=0.95),
+            # Azure Entra application client secret. There is no constant
+            # prefix to key on, so the rule is the structure the format does
+            # guarantee: a short head, a tilde, and a long unbroken secret
+            # body. Thirty characters after a tilde with no whitespace is not
+            # something prose produces.
+            Pattern(name="entra-client-secret",
+                    regex=r"\b[A-Za-z0-9._-]{2,8}~[A-Za-z0-9._-]{30,}", score=0.85),
+        ],
+        context=["key", "secret", "token", "credential", "apikey", "authorization"],
+    )
+
+
 def windows_user_path() -> PatternRecognizer:
-    """Profile paths carry an account name inside the path."""
+    """Profile paths carry an account name inside the path.
+
+    The separator is a character class, not a literal backslash, because the
+    forward-slash spelling of a Windows path is not an exotic case: .NET's
+    ``Path`` APIs accept it, Python and PowerShell emit it, and anything that
+    round-trips a path through JSON or a URL tends to produce it. A rule that
+    only knew ``C:\\Users\\`` let ``C:/Users/anna.novak/...`` through with the
+    account name intact, which was this project's one deliberately open tier 1
+    gap. Mixed separators within one path match too, since string concatenation
+    across layers produces exactly that.
+    """
+    sep = r"[\\/]"
     return PatternRecognizer(
         supported_entity="WINDOWS_USER_PATH",
         name="WindowsUserPathRecognizer",
         patterns=[
             Pattern(
                 name="profile",
-                regex=r"[A-Za-z]:\\Users\\[^\\\s\"'<>|]+(?:\\[^\s\"'<>|]*)*",
+                regex=rf"[A-Za-z]:{sep}Users{sep}[^\\/\s\"'<>|]+(?:{sep}[^\s\"'<>|]*)*",
                 score=0.85,
             ),
+            # UNC stays backslash-only. A forward-slash "//host/users/..." is
+            # indistinguishable from the tail of an ordinary URL, and widening
+            # it would swallow every Graph call of the form
+            # https://graph.microsoft.com/users/<upn> as a filesystem path.
             Pattern(name="unc-home", regex=r"\\\\[A-Za-z0-9.-]+\\users?\$?\\[^\s\"'<>|]+", score=0.8),
         ],
         context=["path", "cache", "export", "profile"],
@@ -356,6 +1042,13 @@ class SupportCaseRecognizer(LocalRecognizer):
         r"(?i)\b(?:case|ticket|sr|incident)\s*(?:number|no\.?|#)?\s*:?\s*(\d{8})\b"
     )
 
+    #: Microsoft support tracking ids: longer digit runs after the word that
+    #: names them, written ``trackingID#2609150040004419`` in confirmation
+    #: mails and pasted into notes verbatim. Same context-gating argument as
+    #: the eight-digit form: the digits alone are indistinguishable from a
+    #: large count, the label in front of them is not.
+    TRACKING = re.compile(r"(?i)\btracking\s*id\b\s*(?:number|no\.?)?\s*[:#]?\s*(\d{12,19})\b")
+
     def __init__(self) -> None:
         super().__init__(
             supported_entities=["SUPPORT_CASE_NUMBER"],
@@ -378,7 +1071,8 @@ class SupportCaseRecognizer(LocalRecognizer):
                 score=0.7,
                 analysis_explanation=None,
             )
-            for m in self.PHRASE.finditer(text)
+            for rx in (self.PHRASE, self.TRACKING)
+            for m in rx.finditer(text)
         ]
 
 
@@ -399,6 +1093,21 @@ def custom() -> list[LocalRecognizer]:
         connection_string(),
         jwt(),
         api_key(),
+        vendor_credential(),
+        DomainLogonRecognizer(),
+        CustomerDomainRecognizer(),
+        onedrive_personal_account(),
+        azure_key_vault(),
+        exchange_item_id(),
+        windows_sid(),
+        CertThumbprintRecognizer(),
+        onmicrosoft_tenant_domain(),
+        FormattedPhoneRecognizer(),
+        url_userinfo(),
+        http_credential_header(),
+        CookieHeaderRecognizer(),
+        AwsSecretKeyRecognizer(),
+        PrivateKeyBlockRecognizer(),
         windows_user_path(),
         hostname_fqdn(),
         zero_padded_ipv4(),
@@ -480,15 +1189,12 @@ _VERSION_CONTEXT = re.compile(
     r"framework|agent|product)\b[\s:=v#]*$"
 )
 
-#: Shared provider endpoints. They identify the SaaS vendor, not a customer,
-#: and destroying them costs real triage value for no privacy gain. Note the
-#: contrast with TENANT_SITE_HOSTS: there the subdomain IS the customer, here
-#: the whole host is the same for every customer on earth.
-_PUBLIC_HOSTS = re.compile(
-    r"(?i)\b(?:outlook\.office365\.com|outlook\.office\.com|graph\.microsoft\.com|"
-    r"login\.microsoftonline\.com|login\.windows\.net|management\.azure\.com|"
-    r"api\.slack\.com|www\.googleapis\.com|sts\.amazonaws\.com|api\.github\.com)\b"
-)
+#: Shared provider endpoints identify the SaaS vendor, not a customer, and
+#: destroying them costs real triage value for no privacy gain. The judgement
+#: of which hosts those are lives in hider.vendors, shared with the JSON
+#: scrubber, so the two paths cannot drift. Note the contrast with
+#: TENANT_SITE_HOSTS: there the subdomain IS the customer, here the whole host
+#: is the same for every customer on earth.
 
 
 #: What a GUID is, when the surrounding text says so. Every GUID is the same
@@ -545,8 +1251,8 @@ def suppress(text: str, results: list[RecognizerResult]) -> list[RecognizerResul
         if r.entity_type == "IP_ADDRESS" and ":" not in value:
             if _VERSION_CONTEXT.search(text[max(0, r.start - 40):r.start]):
                 continue
-        if r.entity_type in {"HOSTNAME_FQDN", "SITE_URL", "URL"}:
-            if _PUBLIC_HOSTS.fullmatch(value):
+        if r.entity_type in {"HOSTNAME_FQDN", "SITE_URL", "URL", "CUSTOMER_DOMAIN"}:
+            if vendors.is_vendor_host(value):
                 continue
         kept.append(r)
     return kept

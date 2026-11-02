@@ -44,6 +44,11 @@ ALLOWED_TOKENS = {
     # The canonical RFC 7519 example subject, and the deliberately meaningless
     # opaque bearer value used to prove position alone is enough to redact.
     "1234567890", "hello", "world", "opaque", "token",
+    # The HTTP Basic fixture. Basic auth is base64 of "user:password", which
+    # is the entire reason it has to be destroyed rather than passed through,
+    # so the fixture has to decode to something that looks like a credential.
+    # Both halves are invented and say so.
+    "svcacct", "Hunter2ExampleNotReal",
 }
 
 WORD = re.compile(r"[A-Za-z0-9]+")

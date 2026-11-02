@@ -48,7 +48,10 @@ CASES: tuple[Case, ...] = (
         "UPN percent-encoded inside a query string",
         "[21.08.2026 09:02:12.100] <2f> Info [Graph] GET /users/<<UPN_EMAIL|marek.iyer%40northwindgrp.com>>/messages returned 429",
         expect_tier1=False,
-        owner="known gap: the @ is gone, so no address pattern matches. Fix is a decode-then-rescan pre-pass, cheap and deterministic.",
+        owner="known gap, now half the size: no address pattern matches without "
+              "the @, but the customer-domain rule claims the domain after %40, "
+              "so only the local part still leaks. Full fix remains a "
+              "decode-then-rescan pre-pass, cheap and deterministic.",
     ),
     Case(
         "guid-n-format",
@@ -132,8 +135,283 @@ CASES: tuple[Case, ...] = (
         "forward-slash-path",
         "Windows profile path written with forward slashes",
         "[21.08.2026 09:02:24.200] <2f> Info [Cache] path <<WINDOWS_USER_PATH|C:/Users/lena.petrov/AppData/Local/BackupAgent>> is 91% full",
+        expect_tier1=True,
+        owner="was the deliberately open gap: the profile pattern assumed backslashes, and .NET, Python and PowerShell all emit the forward-slash form freely. Covered now by a separator class in recognizers.windows_user_path.",
+    ),
+    Case(
+        "mixed-separator-path",
+        "Windows profile path with separators mixed within one path, as string concatenation produces",
+        "[21.08.2026 09:02:24.300] <2f> Info [Cache] staging <<WINDOWS_USER_PATH|C:\\Users\\ingrid.haddad/AppData/Local\\BackupAgent\\cache>> cleared",
+        expect_tier1=True,
+        owner="",
+    ),
+    # Vendor credentials. The literals below are shape-valid and value-dead:
+    # the bodies spell out that they are examples, so the corpus exercises the
+    # detection rule without committing anything that could ever authenticate.
+    Case(
+        "vendor-github-pat",
+        "GitHub classic PAT and a fine-grained PAT in a connector error",
+        "[21.08.2026 09:02:25.300] <2f> Error [Connector] github auth failed, token "
+        "<<API_KEY|ghp_EXAMPLEONLYnotarealtoken000000000000>> and fallback "
+        "<<API_KEY|github_pat_11AAAAAAA0EXAMPLEONLY0_notarealtokennotarealtokennotarealtoken00000000>>",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "vendor-aws-key-id",
+        "AWS access key ids, long-term and temporary, inside a CLI error",
+        "[21.08.2026 09:02:26.400] <2f> Error [S3] InvalidAccessKeyId for "
+        "<<API_KEY|AKIAEXAMPLEKEYID0000>>, retried as "
+        "<<API_KEY|ASIAEXAMPLEKEYID0001>>",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "vendor-slack-and-google",
+        "Slack bot token and a Google API key, both inside a JSON config dump",
+        '[21.08.2026 09:02:27.500] <2f> Debug [Config] {"slack":"<<API_KEY|xox' 'b-000000000000-0000000000000-ExampleOnlyNotARealToken>>",'
+        '"gcp":"<<API_KEY|AIzaSyEXAMPLE_ONLY_not_a_real_key_0000>>"}',
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "vendor-azure-client-secret",
+        "Entra application client secret, which carries a tilde rather than a dash",
+        "[21.08.2026 09:02:28.600] <2f> Warning [Auth] client secret "
+        "<<API_KEY|Ab18Q~cDeEXAMPLEONLYnotarealsecret00000>> expires in 7 days",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "vendor-key-lowercased",
+        "AWS access key id written in lower case, as some tools normalise it",
+        "[21.08.2026 09:02:29.700] <2f> Info [S3] using profile key <<API_KEY|akiaexamplekeyid0002>>",
+        expect_tier1=True,
+        owner="caught: the key-id rule matches case-insensitively, the opposite "
+              "choice from the pod-id rule. Over-destroying a token that only "
+              "looked like a key id costs a line of triage detail; missing one "
+              "leaks a live AWS credential.",
+    ),
+    # Credentials that a pseudonymising tier will happily VAULT if tier 1 does
+    # not claim them first, which is strictly worse than missing them: a miss
+    # leaves the secret in the text, a vault entry leaves the secret in the
+    # text AND writes it to disk under a reversible mapping. Every case below
+    # was observed doing exactly that before the rules that cover them existed.
+    Case(
+        "url-userinfo-password",
+        "Password in URL userinfo, which the email rule reads as an address and pseudonymises",
+        "[21.08.2026 09:02:30.100] <2f> Error [Feed] pull from https://<<API_KEY|svcacct:Hunter2Example>>@repo.contoso.internal/api/v1/pull failed",
+        expect_tier1=True,
+        owner="was a leak and a vault entry at once: the UPN rule matched "
+              "password@host, so the password went into the vault as a user "
+              "pseudonym and the username was left in the clear. The userinfo "
+              "rule now destroys both halves, and resolve() prefers it because "
+              "a secret outranks an identifier.",
+    ),
+    Case(
+        "aws-secret-access-key",
+        "AWS secret access key after its conventional key name, a value with no shape of its own",
+        "[21.08.2026 09:02:31.200] <2f> Debug [Cfg] aws_secret_access_key=<<API_KEY|wJalrXUtnFEMIexampleKEYnotrealbPxRfiCYEXAMPLEKEY>> loaded from profile",
+        expect_tier1=True,
+        owner="was vaulted as an organisation name by tier 2, which both leaked "
+              "the head of the key and stored the tail reversibly. The key name "
+              "is the only available evidence, so the rule anchors on it.",
+    ),
+    Case(
+        "pem-private-key-block",
+        "PEM private key block, whose body lines are bare base64 with no context of their own",
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "<<API_KEY|MIIEowIBAAKCAQEAxEXAMPLEONLYnotarealprivatekeymaterial0000000000|g-pem1>>\n"
+        "<<API_KEY|AAAAB3NzaC1yc2EAAAADAQABAAABgQEXAMPLEONLYnotarealkeymaterial1111|g-pem1>>\n"
+        "-----END RSA PRIVATE KEY-----",
+        expect_tier1=True,
+        owner="the body lines were vaulted as organisation names, and partial key "
+              "material survived around the span. The BEGIN and END markers are "
+              "deliberately left in the clear: they carry no key material and "
+              "tell the engineer a key was removed here.",
+    ),
+    Case(
+        "http-basic-authorization",
+        "HTTP Basic credentials, which are a username and password in reversible base64",
+        "[21.08.2026 09:02:33.400] <2f> Info [Auth] Authorization: Basic <<API_KEY|c3ZjYWNjdDpIdW50ZXIyRXhhbXBsZU5vdFJlYWw=>>",
+        expect_tier1=True,
+        owner="passed through untouched: the bearer rule only knew the word "
+              "Bearer. Basic is not an obfuscation, it is base64 of user:pass.",
+    ),
+    Case(
+        "http-cookie-header",
+        "Cookie header: a session cookie is a bearer credential, and the attribute names are not",
+        "[21.08.2026 09:02:34.500] <2f> Debug [Http] Cookie: session_id=<<API_KEY|abc123exampleonlynotarealcookievalue0000>>; theme=dark",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "http-set-cookie-header",
+        "Set-Cookie header, where the attributes after the value must survive to stay useful",
+        "[21.08.2026 09:02:35.600] <2f> Debug [Http] Set-Cookie: auth_token=<<API_KEY|ExampleOnlyNotARealTokenValue000000>>; HttpOnly; Secure; SameSite=Lax",
+        expect_tier1=True,
+        owner="",
+    ),
+    # Windows and Microsoft identifiers. All of these identify a customer, so
+    # they are pseudonymised, not destroyed. The markers borrow the closest
+    # existing spec type (a new spec type forces a template line and with it a
+    # utility-cassette re-record): a domain logon and a phone number directly
+    # identify a person like a UPN does, a domain SID identifies the directory
+    # the way a tenant id does, a thumbprint names one object, an onmicrosoft
+    # domain is a tenant-named host like a site URL. Each borrowed spec's
+    # ``detected_as`` lists the new detector label, so typed recall stays honest.
+    Case(
+        "domain-qualified-logon",
+        "DOMAIN\\user logon, with a well-known service principal beside it that must survive",
+        "[21.08.2026 09:02:36.700] <2f> Warning [Auth] Logon failure for <<UPN_EMAIL|FABRIKAM\\anna.novak>> from wks041, service context NT AUTHORITY\\SYSTEM",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "windows-domain-sid",
+        "Domain SID beside a well-known group SID, which must survive: S-1-5-32-544 is the same for every machine on earth",
+        "[21.08.2026 09:02:37.800] <2f> Info [Auth] token for SID <<TENANT_ID|S-1-5-21-3623811015-3361044348-30300820-1013>> added to BUILTIN group (S-1-5-32-544)",
+        expect_tier1=True,
+        owner="the domain SID is seeded; the well-known group SID is deliberately "
+              "not, and the SID rule requires the -21- (or Azure AD -12-1-) domain "
+              "subauthorities so it cannot match a well-known SID at all.",
+    ),
+    Case(
+        "certificate-thumbprint",
+        "Certificate thumbprint used for app-only auth: 40 hex characters, the same shape as a git commit hash",
+        "[21.08.2026 09:02:38.900] <2f> Info [Cert] App-only auth with certificate thumbprint <<OBJECT_GUID|A1B2C3D4E5F60718293A4B5C6D7E8F9012345678>>, expires 2027-01-01",
+        expect_tier1=True,
+        owner="context-gated on purpose: bare 40-hex is also every git commit "
+              "hash, so the rule only fires after a thumbprint-naming word and "
+              "a commit hash in a deploy line survives.",
+    ),
+    Case(
+        "onmicrosoft-tenant-domain",
+        "onmicrosoft.com tenant domains in plain log text, which jsonscrub already caught but the log path did not",
+        "[21.08.2026 09:02:39.100] <2f> Info [Dir] Tenant <<SITE_URL|contosocorp.onmicrosoft.com>> verified; initial mail domain <<SITE_URL|contosocorp.mail.onmicrosoft.com>>",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "support-tracking-id",
+        "Microsoft support trackingID beside an eight-digit internal case number",
+        "[21.08.2026 09:02:40.200] <2f> Info [Sup] Microsoft support trackingID#<<SUPPORT_CASE_NUMBER|2609150040004419>> linked to case <<SUPPORT_CASE_NUMBER|07551234>>",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "phone-in-free-text",
+        "Phone numbers in an operator note, in the two spellings notes actually use",
+        "Spoke to the tenant admin at <<UPN_EMAIL|+1 425 555 0147>>; callback on <<UPN_EMAIL|425-555-0183>> after 5pm.",
+        expect_tier1=True,
+        owner="matched with phonenumbers strict grouping, so an unformatted "
+              "digit run the same length - a byte count, say - does not match.",
+    ),
+    # URLs, paths and Azure resources. All identifiers, all pseudonymised.
+    # Markers borrow host specs for the usual cassette reason: a document URL
+    # is a SITE_URL however it is spelled, a /personal/ segment is a person
+    # like a UPN, a key vault is a tenant-named host, an Exchange id names one
+    # object.
+    Case(
+        "site-url-space-in-filename",
+        "Document path with unencoded spaces: the URL match used to stop at the first space, leaking the file name",
+        "[21.08.2026 09:02:41.300] <2f> Info [Restore] target <<SITE_URL|https://contosocorp.sharepoint.com/sites/Finance/Shared Documents/Q3 support plans.xlsx>> restored",
+        expect_tier1=True,
+        owner="the space-tolerant tail must contain a path separator and end in "
+              "a document extension, so prose after a URL is never swallowed; "
+              "a space-separated file name in the final segment with no further "
+              "slash is the declared remainder of this gap.",
+    ),
+    Case(
+        "onedrive-personal-path",
+        "Hostless OneDrive personal path, whose second segment is the user's UPN with dots and @ flattened to underscores",
+        "[21.08.2026 09:02:42.400] <2f> Info [Sync] item /personal/<<UPN_EMAIL|anna_novak_contosocorp_com>>/Documents/Reviews queued",
+        expect_tier1=True,
+        owner="the identity segment is claimed; file names deeper in a hostless "
+              "path are out of scope here and documented as such.",
+    ),
+    Case(
+        "azure-key-vault-url",
+        "Key vault URL: the vault name is the customer, the secret name is the purpose",
+        "[21.08.2026 09:02:43.500] <2f> Info [KV] fetching <<SITE_URL|https://fabrikam-prod-kv.vault.azure.net/secrets/sql-conn-primary/9f2c1a8b3d7e4f60>> took 41 ms",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "exchange-item-and-folder-id",
+        "Exchange item and folder ids, which tier 2 used to half-claim as organisation names",
+        "[21.08.2026 09:02:44.600] <2f> Info [Mail] moved item <<OBJECT_GUID|AAMkADY2YmZhNjdkLTM4MWEtNGUzMi1hYmMwLWZlODc5MzE1NDc1MABGAAAAAAB3EXAMPLEONLYnotreal0000AAA=>> to folder <<OBJECT_GUID|AQMkADY2YmZhNjdkEXAMPLEONLYfolder0000000000=>>",
+        expect_tier1=True,
+        owner="an Exchange id alone on a wrapped line is claimed by the bare-"
+              "base64-line credential rule instead and destroyed rather than "
+              "pseudonymised: correlation lost, nothing leaked. Declared trade.",
+    ),
+    # Customer domains in the open namespace. The rule is allowlist-of-vendors,
+    # fail toward redaction; the lookalikes that must survive (namespaces,
+    # file names, vendor hosts) sit in the same templates unseeded, and the
+    # clean corpus carries the measured false-redaction claim.
+    Case(
+        "customer-domain-host-position",
+        "Customer host on a public TLD in a host position, beside a vendor host that must stay readable",
+        "[21.08.2026 09:02:45.700] <2f> Error [Backup] repository <<HOSTNAME_FQDN|backup.fabrikamedu.org>> unreachable, auth via login.microsoftonline.com ok",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "customer-domain-in-prose",
+        "Bare registrable customer domain in an operator note, with a dotted namespace beside it that is not a host",
+        "Mail for <<HOSTNAME_FQDN|fabrikamedu.org>> is routed through the proxy; see Backup.Proxy.SessionWorker for the retry logic.",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
+        "customer-domain-deep-subdomain",
+        "Customer host with several labels and a ccTLD second-level suffix",
+        "[21.08.2026 09:02:46.800] <2f> Info [Net] peer <<HOSTNAME_FQDN|sql01.ops.woodgrove-trading.co.uk>> registered",
+        expect_tier1=True,
+        owner="",
+    ),
+    # Dotted organisation names in prose. The mirror image of the .NET
+    # namespace lookalikes in the clean corpus: same shape, opposite required
+    # answer. Tier 2 owns both, which is why the two must be measured as one
+    # pair - any rule that stops vaulting namespace tails will cost recall
+    # here, and the trade has to be visible rather than argued.
+    Case(
+        "dotted-org-in-prose",
+        "Organisation names written with a dot, which look exactly like a namespace tail",
+        "Escalated to <<ORG_NAME|Wood.Partners>> for review; contract held by <<ORG_NAME|Tailspin.Industries>> since March.",
         expect_tier1=False,
-        owner="known gap: the profile pattern assumes backslashes. Same one-line fix as above, left visible.",
+        owner="KNOWN GAP, tier 2, tracked as separate work: the dotted-org head "
+              "leak. Tier 2 owns this; tier 1 has no notion of an organisation "
+              "name. Measured, BOTH halves fail and neither is a regression: "
+              "Wood.Partners scores 0.375 against the pipeline's 0.4 floor and "
+              "is missed outright, and Tailspin.Industries is caught only from "
+              "the dot onward, so the distinctive head leaks while the tail is "
+              "vaulted under a name that is not the organisation. Across five "
+              "invented dotted organisations, nought are caught whole. "
+              "Suppression cannot fix this in either direction - a tier may "
+              "only remove spans or add them, never widen one - so the fix is "
+              "either a span-widening pass over dotted chains or training-"
+              "grammar work in classifier.py. The three-label floor added for "
+              "the namespace false positives deliberately stops short of this "
+              "line so the gap stays measurable.",
+    ),
+    Case(
+        "two-label-namespace-tail",
+        "Namespace tail only one dot deep, below the three-label floor the suppression uses",
+        "[21.08.2026 09:02:47.900] <2f> Error [Worker] threw Newtonsoft.JsonSerializationException at depth 3",
+        expect_tier1=False,
+        owner="declared miss, and a false-POSITIVE one: nothing here is "
+              "sensitive, but tier 2 still claims JsonSerializationException as "
+              "an organisation and the vault still stores it. The three-label "
+              "floor in pipeline.in_dotted_chain is what keeps one-dot "
+              "organisation names (Wood.Partners) catchable, so lowering it to "
+              "two would trade this false positive for a real miss. Deliberately "
+              "NOT in the clean corpus: it would reopen the false-redaction "
+              "figure that the floor was introduced to close, and a declared "
+              "miss measured as a failure is just a red test nobody can act on. "
+              "Fix belongs in the classifier's training grammar, which should "
+              "learn that a CamelCase *Exception token is not a company.",
     ),
     Case(
         "multiline-connection-string",

@@ -27,6 +27,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import re
 import secrets
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -35,6 +36,26 @@ from pathlib import Path
 from . import entities
 
 ENV_KEY = "HIDER_VAULT_KEY"
+
+#: Common second-level public suffixes, so "contoso.co.uk" pseudonymises the
+#: organisation ("contoso"), not "co".
+_SECOND_LEVEL_SUFFIX = frozenset({"co", "com", "org", "net", "ac", "gov", "edu"})
+
+#: The ``\Users\`` or ``/Users/`` segment of a Windows profile path, capturing
+#: the separator so the pseudonym can be written in the same style.
+_USERS_SEGMENT = re.compile(r"([\\/])Users[\\/]", re.IGNORECASE)
+
+
+def _split_first_path_segment(tail: str) -> tuple[str, str, str]:
+    """Split ``account\\rest`` (or ``account/rest``) into its three parts.
+
+    Returns the account segment, the separator that followed it (empty when
+    the account is the whole tail) and everything after it.
+    """
+    m = re.search(r"[\\/]", tail)
+    if not m:
+        return tail, "", ""
+    return tail[:m.start()], m.group(0), tail[m.end():]
 
 
 def _digest(key: bytes, entity_type: str, value: str) -> str:
@@ -85,12 +106,87 @@ class EntityVault:
             # TEST-NET-3, reserved for documentation, so it can never route.
             return f"203.0.113.{ordinal % 254 + 1}"
         if entity_type == "WINDOWS_USER_PATH":
-            tail = value.split("\\Users\\", 1)[-1]
-            _, _, rest = tail.partition("\\")
-            suffix = f"\\{rest}" if rest else ""
-            return f"C:\\Users\\user-{ordinal:02d}{suffix}"
+            # Either separator, and whichever one the original used is the one
+            # the pseudonym uses, so a forward-slash path stays recognisable as
+            # the thing it replaced. Splitting on backslash alone used to drop
+            # the whole tail of a forward-slash path: no leak, but the part of
+            # the path that carries the triage value ("AppData/Local/...")
+            # disappeared along with the account name.
+            m = _USERS_SEGMENT.search(value)
+            sep = m.group(1) if m else "\\"
+            tail = value[m.end():] if m else value
+            _account, found_sep, rest = _split_first_path_segment(tail)
+            suffix = f"{found_sep}{rest}" if found_sep else ""
+            return f"C:{sep}Users{sep}user-{ordinal:02d}{suffix}"
         if entity_type == "HOSTNAME_FQDN":
             return f"node-{ordinal:02d}.tenant.example"
+        if entity_type == "DOMAIN_LOGON":
+            domain, _, _user = value.partition("\\")
+            d = self.ordinal_for("_LOGON_DOMAIN", domain.lower())
+            return f"DOMAIN{d:02d}\\user-{ordinal:02d}"
+        if entity_type == "WINDOWS_SID":
+            parts = value.split("-")
+            # Domain form S-1-5-21-a-b-c(-rid): the subauthority triple is the
+            # directory and goes; the RID is kept, because RID 500 meaning
+            # "the built-in Administrator" is triage signal and a bare RID
+            # without its domain identifies nobody. The Azure AD form
+            # S-1-12-1-a-b-c-d is the user's objectId split into four dwords,
+            # so every dword goes: keeping even one leaks a quarter of it.
+            if value.startswith("S-1-5-21-") and len(parts) == 8:
+                return f"S-1-5-21-0-0-{ordinal}-{parts[7]}"
+            prefix = "-".join(parts[:4])
+            return f"{prefix}-0-0-0-{ordinal}" if len(parts) > 7 else f"{prefix}-0-0-{ordinal}"
+        if entity_type == "CERT_THUMBPRINT":
+            return f"{ordinal:040x}"
+        if entity_type == "TENANT_DOMAIN":
+            # Shares the _TENANT_DOMAIN ordinal space with UPN domains and
+            # site URLs, so contoso.onmicrosoft.com, contoso.sharepoint.com
+            # and anna@contoso.com all point at the same tenant pseudonym and
+            # cross-line correlation survives.
+            # Under .example, not .com: tenant-01.onmicrosoft.com could be a
+            # real tenant, and a pseudonym must never collide with a real
+            # value. Same reasoning as the SITE_URL shape above.
+            t = self.ordinal_for("_TENANT_DOMAIN", value.split(".")[0])
+            tail = ".mail.onmicrosoft.example" if ".mail." in value else ".onmicrosoft.example"
+            return f"tenant-{t:02d}{tail}"
+        if entity_type == "CUSTOMER_DOMAIN":
+            # The TLD is kept so triage can still read "a .org host" / "a .de
+            # host"; everything registrable goes. "example" sits between the
+            # tenant label and the TLD so the pseudonym cannot collide with a
+            # real domain. The org label shares the _TENANT_DOMAIN ordinal
+            # space, so backup.fabrikamedu.org correlates with
+            # anna@fabrikamedu.org and fabrikamedu.onmicrosoft.com.
+            labels = value.lower().strip(".").split(".")
+            if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL_SUFFIX:
+                suffix, org, subs = ".".join(labels[-2:]), labels[-3], labels[:-3]
+            else:
+                suffix, org, subs = labels[-1], labels[-2], labels[:-2]
+            t = self.ordinal_for("_TENANT_DOMAIN", org)
+            base = f"tenant-{t:02d}.example.{suffix}"
+            return f"host-{ordinal:02d}.{base}" if subs else base
+        if entity_type == "ONEDRIVE_ACCOUNT":
+            # Its own ordinal, not the owner's UPN entry: the underscore
+            # flattening is not invertible, and a guessed join would silently
+            # merge two different users.
+            return f"user-{ordinal:02d}"
+        if entity_type == "AZURE_KEY_VAULT":
+            # Vault name and secret name get separate ordinals so two secrets
+            # from one vault stay visibly co-located. Under .example so the
+            # pseudonym can never be a real vault host.
+            host = value.split("//", 1)[-1].split("/", 1)[0]
+            v = self.ordinal_for("_KEY_VAULT", host.split(".")[0].lower())
+            base = f"https://vault-{v:02d}.vault.azure.example"
+            if "/" in value.split("//", 1)[-1]:
+                kind = "secrets" if "/secrets/" in value else "keys" if "/keys/" in value \
+                    else "certificates" if "/certificates/" in value else "objects"
+                return f"{base}/{kind}/secret-{ordinal:02d}"
+            return base if value.startswith("http") else f"vault-{v:02d}.vault.azure.example"
+        if entity_type == "EXCHANGE_ITEM_ID":
+            return f"<ExchangeId-{ordinal:02d}>"
+        if entity_type == "PHONE_NUMBER":
+            # 555-01xx is reserved for fiction, so the pseudonym can never be
+            # a real subscriber's number.
+            return f"+1-555-01{ordinal % 100:02d}"
         if entity_type in {"POD_ID", "WORKER_POD_ID"}:
             return f"pod-{ordinal:02d}"
         return f"<{prefix}-{ordinal:02d}>"

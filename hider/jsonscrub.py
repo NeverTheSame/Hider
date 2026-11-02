@@ -272,18 +272,14 @@ def _trim_name(s: pipeline.Span, line: str) -> pipeline.Span | None:
     return replace(s, start=start, end=end)
 
 
-#: Shared hosts of the platforms a case talks about. They identify a vendor,
-#: not the customer, and keeping them keeps the text readable.
-#: Your own vendor's hosts come from hider.local.json, never from the repo.
-_VENDOR_SUFFIXES = ("microsoft.com", "microsoftonline.com", "office.com", "office365.com",
-                    "windows.net", "azure.com",
-                    *localcfg.settings().get("vendor_suffixes", []))
-_VENDOR_HOSTS = {"www", "graph", "login", "outlook", "management", "portal", "api",
-                 "docs", "learn", "support", "admin",
-                 *localcfg.settings().get("vendor_hosts", [])}
-_FILE_EXT = {"log", "txt", "json", "xml", "dll", "exe", "zip", "csv", "config", "html",
-             "htm", "pdf", "png", "jpg", "gz", "db", "md", "ps", "cs", "js", "py", "sh",
-             "ts", "rs", "go", "rb", "yml", "yaml", "ini", "bak", "tmp", "evtx", "etl"}
+#: Vendor hosts and file-extension fencing now live in hider.vendors and
+#: hider.recognizers.FILE_EXT, shared with the plain-log path, so the
+#: "customer or vendor" judgement cannot drift between the two. Site-specific
+#: additions still come from hider.local.json via that module.
+from . import recognizers as _recognizers
+from . import vendors as _vendors
+
+_FILE_EXT = _recognizers.FILE_EXT
 _FQDN = re.compile(r"(?<![\w@.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){2,}"
                    r"[A-Za-z]{2,24}(?![\w-])")
 
@@ -298,8 +294,7 @@ def _fqdn_spans(line: str) -> list[pipeline.Span]:
             continue
         if any(lb != lb.lower() and lb != lb.upper() for lb in labels):
             continue  # Vendor.Product.Proxy is a namespace, not a host
-        low = host.lower()
-        if low.endswith(_VENDOR_SUFFIXES) and labels[0].lower() in _VENDOR_HOSTS:
+        if _vendors.is_vendor_host(host):
             continue
         out.append(pipeline.Span(m.start(), m.end(), "HOSTNAME_FQDN", 0.9, "jsonhost"))
     return out

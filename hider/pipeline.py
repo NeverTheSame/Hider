@@ -100,6 +100,48 @@ class RegexTier:
 # ---------------------------------------------------------------------------
 
 
+#: Characters that continue a dotted identifier chain. A space ends it, which
+#: is what keeps "Wood.Partners Ltd" a two-label chain.
+_CHAIN_CHARS = "._"
+
+
+def in_dotted_chain(text: str, start: int, end: int, min_labels: int = 3) -> bool:
+    """True when ``text[start:end]`` sits inside a dotted chain of >= 3 labels.
+
+    The namespace test, and the reason it is structural rather than a
+    vocabulary: ``System.Net.Http.HttpRequestException`` and
+    ``Newtonsoft.Json.Serialization.DefaultContractResolver`` are namespaces
+    because of their shape, not because "System" or "Newtonsoft" is on a list
+    that somebody has to keep current. Organisation names in prose are written
+    with at most one dot (``Wood.Partners``, ``Tailspin.Industries``), so a
+    three-label floor separates the two families without consulting any
+    vocabulary at all.
+
+    Measured, both directions, on the probe in the commit message: this
+    removes 187 of 187 false spans on the clean corpus and costs nothing on
+    the dotted organisations that tier 2 catches today.
+
+    Two declared misses come with it, each with an adversarial case:
+
+    * a **two-label** namespace tail (``Newtonsoft.JsonSerializationException``)
+      is below the floor and is still vaulted;
+    * a three-label organisation (``Wood.Partners.Group``) is above it and is
+      suppressed.
+    """
+    i = start
+    while i > 0 and (text[i - 1].isalnum() or text[i - 1] in _CHAIN_CHARS):
+        i -= 1
+    j = end
+    while j < len(text) and (text[j].isalnum() or text[j] in _CHAIN_CHARS):
+        j += 1
+    labels = [lb for lb in text[i:j].split(".") if lb]
+    if len(labels) < min_labels:
+        return False
+    # A leading non-alphanumeric label is not how namespaces are written; the
+    # conservative answer there is to leave the span in place.
+    return all(lb[0].isalnum() for lb in labels)
+
+
 class ManagedNerTier:
     """A locally trained classifier over the free-text residue. Phase 2.
 
@@ -132,6 +174,21 @@ class ManagedNerTier:
             if not segment.strip():
                 continue
             for s0, e0, etype, score in classifier.predict_spans(self._clf, segment):
+                # A token straight after a backslash is a path or principal
+                # segment (BUILTIN\Administrators, SOFTWARE\Contoso), never a
+                # name in prose. Without this, "Administrators" was
+                # pseudonymised into the vault as an organisation. Named
+                # suppression, tested as intent in test_recognizers.py.
+                if start + s0 > 0 and text[start + s0 - 1] == "\\":
+                    continue
+                # A label inside a dotted chain of three or more parts is a
+                # namespace, not an organisation. Before this, every bundle
+                # vaulted its exception type names: 187 false spans over 145
+                # of 1,000 clean lines, with the value written to the vault
+                # under ORG_NAME. Offsets are absolute here on purpose - the
+                # chain can run past the residue segment it was found in.
+                if in_dotted_chain(text, start + s0, start + e0):
+                    continue
                 spans.append(Span(start + s0, start + e0, etype, float(score),
                                    self.name, detector="trained-classifier"))
         return spans

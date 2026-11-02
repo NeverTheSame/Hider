@@ -101,7 +101,14 @@ def test_sharepoint_paths_tenant_hosts_and_terms():
         {"message": "GET /sites/acmeUSA-01-X/_api/web for Acme_Prod.onmicrosoft.com by AC team"},
         terms=["AC"])
     msg = res.output["message"]
-    assert "acmeUSA" not in msg and "onmicrosoft" not in msg and " AC " not in msg
+    # The tenant name is the secret and must be gone. The vendor half of the
+    # host may survive in pseudonym form: tier 1's TENANT_DOMAIN rule now wins
+    # this host and replaces it shape-preservingly (tenant-NN.onmicrosoft.example),
+    # which keeps "which SaaS is this" readable and leaks nothing - the vendor
+    # suffix is identical for every tenant on earth. "onmicrosoft.com" itself
+    # must still be gone, so a pseudonym can never collide with a real host.
+    assert "acmeUSA" not in msg and "Acme_Prod" not in msg and " AC " not in msg
+    assert "onmicrosoft.com" not in msg
     assert "/sites/<" in msg and "/_api/web" in msg
 
 

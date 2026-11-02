@@ -127,26 +127,31 @@ Three invariants hold everywhere, enforced by tests rather than by convention:
 ## Measured
 
 From `python -m hider eval` (tier 2 = `classifier`, the default; tier 3 not
-active — see below) on a 5,029 line, 695,840 character synthetic bundle with
-6,681 planted values across 18 entity types:
+active — see below) on a 5,059 line, 705,247 character synthetic bundle with
+6,716 planted values across 18 entity types:
 
 | | |
 |---|---|
-| Recall on shaped identifier types | 99.90% |
-| Same corpus, stock Presidio patterns only | 17.64% |
-| Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 100.00% |
-| Recall across all types | 99.91% |
+| Recall on shaped identifier types | 99.92% |
+| Same corpus, stock Presidio patterns only | 17.54% |
+| Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 99.65% |
+| Recall across all types | 99.90% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
-| Adversarial surprises across 21 hostile placements | 0 |
-| Characters cleared before any paid or model tier is consulted | 40.3% |
+| Seeded values still findable verbatim in the output | 0 unexplained, 4 known gap |
+| Adversarial surprises across 48 hostile placements | 0 |
+| Characters cleared before any paid or model tier is consulted | 39.8% |
 | Units degraded during the run | 0 |
-| Tier 1 throughput | ~136 microseconds per line, single threaded |
-| Tier 2 (classifier) throughput | ~0.5 milliseconds per line over the residue only |
+| Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 31 recognizers |
+| Tier 2 (classifier) throughput | ~0.6 milliseconds per line over the residue only |
 
-Swapping in `--tier2 spacy` on the same corpus: 86.82% free-text recall, ~3.9ms
-per line over the residue. On this corpus the from-scratch classifier is both
-faster (roughly 8x) and higher-recall (100% vs 86.8%) than the pretrained
+Swapping in `--tier2 spacy`: 86.82% free-text recall, ~3.9ms per line over the
+residue. **That pair of numbers is stale and is not reproducible from this
+commit** — it was measured before the dotted-organisation and namespace cases
+entered the corpus, and `--tier2 spacy` needs a model this environment does not
+have installed, so it could not be re-run alongside the figures above. Treat it
+as the last known reading rather than a current one; re-measure both backends
+together before quoting either. On the corpus that produced it the from-scratch
+classifier was both faster (roughly 8x) and higher-recall than the pretrained
 general-purpose model, which is not the result to expect going in and is
 exactly why both are reported rather than one asserted: a classifier trained
 tightly on the shape of *this* log format's free text (short operator notes,
@@ -170,9 +175,12 @@ The gates differ by tier, on purpose. Tier 1 is deterministic, so its gate is
 zero unexplained survivors: a miss is a defect and fails the eval. Tier 2 is a
 model, so its gate is a recall floor (0.75) that it must clear with its misses
 listed one by one; a tier 2 miss is a measurement, reported next to the tier 1
-number instead of blended into it. Passing 100% (or 86.8% for the spaCy
-backend) against a 0.75 floor is a statement with headroom, not a rounding
-exercise. The 100% deserves suspicion and here is what is behind it: the
+number instead of blended into it. Passing 99.65% (or a since-stale 86.8% for
+the spaCy backend) against a 0.75 floor is a statement with headroom, not a
+rounding exercise. The two misses behind that 99.65% are both the dotted-
+organisation gap described under Limitations, and they are deliberately left
+in. Before those cases entered the corpus the figure was 100%, and that 100%
+deserved suspicion; here is what was behind it: the
 previous grammar scored 92.1%, and every one of its misses was the same
 shape, a two-letter all-caps legal suffix ("Fabrikam AG") that a grammar with
 only title-case suffixes had never produced, so the model cut the
@@ -180,9 +188,11 @@ organisation in half. Widening the grammar to abbreviated suffixes, one- and
 two-word heads, single-entity sentences, and log-shaped negatives closed all
 of them without adding the eval corpus's own suffixes to the training set
 (`test_training_grammar_keeps_the_eval_suffixes_out`). The eval corpus seeds
-free text from three templates, so 100% says those three shapes are now
-inside the grammar, not that the model is finished; the spaCy figure is the
-same corpus scored by a model that never saw this grammar.
+free text from a small set of templates, so the figure says those shapes are
+inside the grammar, not that the model is finished — the dotted-organisation
+case was added precisely because it is a shape the grammar has never produced,
+and it duly fails. The spaCy figure was the same corpus scored by a model that
+never saw this grammar, and it predates the current corpus.
 
 ### Tier 3, measured against the injection-adjacent cases
 
@@ -252,10 +262,11 @@ defects in off-the-shelf behaviour:
   common ways a user shows up in a service log.
 
 Both fixes are covered by regression tests. Tier 2's zero false-redaction rate
-on clean lines cost four named suppression rules (acronyms, unit suffixes,
-CamelCase keys, spans glued across log structure), each found by the same
-measurement rather than by inspection and each with its own test in
-`test_ner.py`.
+on clean lines cost six named suppression rules (acronyms, unit suffixes,
+CamelCase keys, spans glued across log structure, tokens straight after a
+backslash, and labels inside a dotted chain of three or more parts), each found
+by the same measurement rather than by inspection and each with its own test in
+`test_ner.py` or `test_recognizers.py`.
 
 ### Utility, measured: does the answer survive the redaction?
 
@@ -473,7 +484,7 @@ adversarial case, each with its own test.
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 16 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/adversarial.py` | 43 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
 | `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |
@@ -543,9 +554,10 @@ recall will never be exactly 100%.
   shaped-type recall figure should be read as an upper bound.
 - **Independence is procedural, not organisational.** One person wrote both
   sides of the contract.
-- **Tier 2 recall is a model's recall, whichever backend runs.** 100%
-  (classifier) on this corpus or 86.8% (spaCy) on free-text names; whatever
-  passes through is listed in the metrics as individual survivors. The floor gate
+- **Tier 2 recall is a model's recall, whichever backend runs.** 99.65%
+  (classifier) on this corpus, or a stale, not-currently-reproducible 86.8%
+  (spaCy); whatever passes through is listed in the metrics as individual
+  survivors. The floor gate
   catches regressions; it cannot make either backend perfect. A managed cloud
   NER service remains a documented, unbuilt contract behind the same
   interface for operators who out-scale both.
@@ -616,15 +628,170 @@ recall will never be exactly 100%.
   dollars are those tokens at the published rate; a model whose rate is not in
   `llm_backend.PRICES_USD_PER_M` is reported as unpriced rather than guessed.
   The managed-NER comparison in `eval` is still an assumed per-character rate.
-- **One known one-line gap is deliberately left unfixed** so it stays visible
-  in the numbers: Windows profile paths written with forward slashes. It is in
-  the adversarial table with an owner. The other, zero-padded IPv4 octets, is
-  now covered by a recognizer that fires only on the padded shape; stock
+- **The two tier 1 gaps that were left visible in the numbers are now closed.**
+  Windows profile paths written with forward slashes are matched by a
+  separator character class, including paths that mix separators, which is
+  what string concatenation across layers produces. Zero-padded IPv4 octets
+  are covered by a recognizer that fires only on the padded shape; stock
   Presidio matched the quad and then discarded it because Python's `ipaddress`
-  rejects leading zeros. The committed tier 3 injection cassette predates that
-  fix: the padded-IP line's residue changed, so replaying it reports one
-  degraded unit until it is re-recorded. The injection figure itself is
-  unaffected, since those cases are separate segments.
+  rejects leading zeros. UNC home paths stay backslash-only on purpose:
+  `//host/users/...` is indistinguishable from the tail of an ordinary URL, so
+  widening it would swallow every `graph.microsoft.com/users/<upn>` call as a
+  filesystem path.
+- **A vaulted credential is worse than a missed one, and five kinds were
+  being vaulted.** A pseudonymising tier that claims a credential leaves the
+  secret in the text under a label *and* writes it to `vault.json` under a
+  reversible mapping, so the leak persists after the request is over. Found
+  by running invented values through `hider redact`: a password in URL
+  userinfo was read as an email address and pseudonymised (with the username
+  left in the clear), an AWS secret access key and both cookie and set-cookie
+  values were claimed by tier 2 as organisation names, PEM private key body
+  lines likewise, and `Authorization: Basic` passed through untouched. All
+  are now destroyed by tier 1 rules (`url_userinfo`, `http_credential_header`,
+  `CookieHeaderRecognizer`, `AwsSecretKeyRecognizer`,
+  `PrivateKeyBlockRecognizer`), and `pipeline.resolve` already prefers a
+  secret span over an overlapping identifier span, which is what makes the
+  userinfo fix beat the address rule. Two deliberate over-destructions come
+  with it, both measured at zero false redaction on the clean corpus: *every*
+  cookie value goes, not just session-looking ones, because cookie names are
+  not a reliable signal; and a line consisting of nothing but a 40+ character
+  base64 run goes, which also catches public certificate bodies. Cookie names,
+  cookie attributes and the PEM `BEGIN`/`END` markers are kept on purpose, so
+  the line still shows what was removed.
+- **Windows and Microsoft identifiers are pseudonymised, with the well-known
+  constants fenced off.** `DOMAIN\user` logons, domain and Azure AD SIDs,
+  certificate thumbprints, `*.onmicrosoft.com` tenant domains in plain log
+  text (jsonscrub already caught them in JSON), Microsoft support trackingIDs
+  and formatted phone numbers all identify a customer, so they go to the vault
+  under shape-preserving pseudonyms rather than being destroyed. Each sits one
+  step from something that must survive, and the fences are explicit and
+  tested: the SID rule requires the `-21-` / `-12-1-` domain subauthorities so
+  well-known SIDs (`S-1-5-18`, `S-1-5-32-544`) cannot match; the logon rule
+  denylists well-known authorities so `NT AUTHORITY\SYSTEM` and
+  `BUILTIN\Administrators` survive verbatim; the thumbprint rule is gated on a
+  naming word because bare 40-hex is every git commit hash; the trackingID
+  rule is gated on its label like the case-number rule. Phone matching uses
+  the `phonenumbers` library behind a hard gate - digits plus `+ - ( )` and
+  spaces only, never a pure digit run - because unfenced it redacted byte
+  counts, the eight-digit case shape, and the head of every bracketed log
+  timestamp (measured: 96 of 1,000 clean lines, rejected). The declared
+  misses: unformatted (`call 4255550147`) and dot-separated phone spellings.
+  A domain SID's pseudonym keeps the RID (RID 500 *means* built-in
+  Administrator; a bare RID without its domain identifies nobody); an Azure AD
+  SID's pseudonym keeps nothing, because its dwords are the user's objectId.
+  Tenant-domain pseudonyms share the tenant ordinal with UPN domains and site
+  URLs, so `contoso.onmicrosoft.com` and `anna@contoso.com` stay correlated,
+  and they end in `.onmicrosoft.example` so a pseudonym can never collide with
+  a real tenant. One tier 2 precision rule came out of the same probe: a token
+  straight after a backslash is a path or principal segment, never a name in
+  prose - before it, `BUILTIN\Administrators` had "Administrators" vaulted as
+  an organisation.
+- **URLs, paths and Azure resource names are pseudonymised; vendor hosts stay
+  readable.** Document URLs with unencoded spaces are covered by a
+  space-tolerant tail fenced twice (it must contain a path separator and end
+  in a document extension, so prose after a URL is never swallowed; a
+  space-separated file name in the *final* segment still leaks its tail -
+  pinned by a test as the declared remainder). The identity segment of a
+  hostless OneDrive `/personal/<upn-with-underscores>/` path gets its own user
+  ordinal (the underscore flattening is not invertible, so it cannot share the
+  owner's UPN vault entry). Key vault URLs map to
+  `vault-NN.vault.azure.example/secrets/secret-NN`, vault and secret ordinals
+  kept separate so co-location stays visible. Exchange item and folder ids
+  (`AAMkAD…`) become `<ExchangeId-NN>`; an id alone on a wrapped line is
+  claimed by the bare-base64-line credential rule instead and destroyed -
+  correlation lost, nothing leaked, declared in the adversarial case. Shared
+  vendor endpoints (`graph.microsoft.com`, `login.microsoftonline.com`,
+  `outlook.office365.com`) survive verbatim, tested as intent. Customer
+  domains outside the internal suffix list (`backup.fabrikamedu.org`) are
+  closed: any public-TLD FQDN that is not a known vendor service is claimed as
+  a customer host, in prose as well as in host positions, failing toward
+  redaction. The vendor judgement lives in one place, `hider/vendors.py` - a
+  pair test (vendor suffix AND vendor service label, so `api.slack.com` is the
+  vendor and `contoso.slack.com` is a customer), with the repo carrying a
+  conservative core list and `hider.local.json` extending it per site. The
+  JSON scrubber and the plain-log path both consume it, replacing the two
+  lists they used to keep separately; the unification also made the suffix
+  match label-aligned, closing a `notmicrosoft.com`-style hole. The fences -
+  a public-TLD allowlist, the shared file-extension list, the mixed-case
+  namespace rule, and a lookahead that refuses to match inside a longer
+  dotted chain like `System.Net.Sockets` - are pinned by tests, and the same
+  lookalikes are seeded into the generated clean corpus so the 0.0%
+  false-redaction figure measures them on every run. Declared misses: domains
+  on TLDs outside the allowlist, TitleCase-spelled domains, and domains whose
+  TLD collides with a source-file extension (`.py`, `.md`, `.rs`), where
+  file names outnumber real hosts in a log bundle by orders of magnitude.
+  Pseudonyms keep the TLD (`host-01.tenant-01.example.org`) and share the
+  tenant ordinal with UPN domains and onmicrosoft tenants, so one customer's
+  hosts, mailboxes and tenant domains stay one correlated entity.
+- **Tier 1 throughput has regressed roughly 9x and the old figure was stale.**
+  The table above used to claim ~136 microseconds per line; re-measured on
+  this commit it is **~1.2 milliseconds per line** across 31 recognizers,
+  single threaded. The cause is simply volume — every recognizer added for
+  vendor credentials, Windows and Microsoft identifiers, URLs, Azure resources
+  and customer domains runs over every line, and `phonenumbers` is the most
+  expensive of them. It is still comfortably inside the batch path's budget
+  and inside a single request's, but the gateway serialises redaction under
+  one lock, so a bundle of a few thousand lines now costs seconds rather than
+  fractions of one. Worth profiling (ordering cheap patterns first, or a
+  single combined scan) before a shared deployment rather than a workstation
+  pilot.
+- **Dotted names: namespaces out, organisations only half in.** Tier 2 labels
+  high-entropy capitalised tokens as organisations, and a .NET namespace is
+  made of them, so every bundle used to write its exception type names into
+  the vault under `ORG_NAME` — measured at **187 false spans across 145 of
+  1,000 clean lines** once the namespaces were seeded into the clean corpus.
+  `pipeline.in_dotted_chain` now suppresses a tier 2 span sitting inside a
+  dotted chain of three or more labels. The floor is structural rather than a
+  vocabulary of namespace roots, because a vocabulary rots and a shape does
+  not, and it is three rather than two so that one-dot organisation names stay
+  catchable. Measured cost of the rule: 187 of 187 false spans removed, and
+  nothing lost on the dotted organisations tier 2 catches today. Two declared
+  misses sit on either side of the floor, each with an adversarial case and a
+  test that pins it:
+  - **below the floor**, a two-label namespace tail
+    (`Newtonsoft.JsonSerializationException`) is still claimed and still
+    vaulted. It is deliberately *not* in the clean corpus, since measuring a
+    declared miss as a failure only produces a red test nobody can act on. The
+    fix belongs in the classifier's training grammar, which should learn that
+    a CamelCase `*Exception` token is not a company.
+  - **above the floor**, a three-label organisation (`Wood.Partners.Group`) is
+    suppressed.
+- **The dotted-organisation head leak is an open tier 2 gap, tracked as
+  separate work.** Across five invented dotted organisations, *none* is caught
+  whole: `Wood.Partners` scores 0.375 against the pipeline's 0.4 floor and is
+  missed outright, while `Tailspin.Industries` is caught only from the dot
+  onward, `Acme.Holdings` only as `.Holdings` and `Fabrikam.Group` only as
+  `Fabrikam` — so one half leaks and the other is vaulted under a name that is
+  not the organisation. This is the whole of the 99.65% free-text recall above:
+  both misses are this gap, left in the corpus rather than papered over.
+  Suppression cannot fix it in either direction, since a tier may only add or
+  remove spans and never widen one; the fix is a span-widening pass over
+  dotted chains or training-grammar work in `classifier.py`. The three-label
+  floor stops deliberately short of this line so the gap stays measurable.
+- **Vendor credential prefixes are detected but not generated.** GitHub PATs
+  (`ghp_`, `github_pat_`), AWS access key ids (`AKIA`, `ASIA` and the other
+  resource-type prefixes), Google API keys (`AIza`), Slack tokens (`xox*`) and
+  Entra client secrets are destroyed by `recognizers.vendor_credential`, which
+  reports them as `API_KEY` because the handling class is identical and a
+  detector has no reason to tell a GitHub PAT from a Slack token. They are
+  measured by the `vendor-*` adversarial cases and by `test_recognizers.py`,
+  **not** by the headline recall figure, because they are not in the generated
+  corpus. That is a deliberate trade: the generator draws every unit from one
+  RNG stream, so adding them to a template reshuffles the whole bundle, shifts
+  the utility excerpt and invalidates the committed utility cassette, which
+  cannot be re-recorded without a live key. Putting them in the recall corpus
+  is a follow-up that has to be done together with a re-record.
+  The AWS key-id rule matches case-insensitively, the opposite call from the
+  pod-id rule: destroying a token that merely looked like a key id costs a
+  line of triage detail, while missing one puts a live credential in a
+  provider's request log.
+- **The committed tier 3 injection cassette is stale.** It predates both the
+  zero-padded IPv4 fix (which changed that line's residue) and the seven
+  adversarial lines added for the vendor, path and credential cases, which are
+  segments it has never seen. Replaying it now reports 31 degraded units rather than 1,
+  and `eval` fails closed on them, as it should. The injection figure itself
+  is unaffected, since those cases are separate segments. Re-record before
+  quoting any tier 3 number from it.
 
 ## Roadmap
 

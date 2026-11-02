@@ -189,6 +189,38 @@ def _api_key(rng: random.Random) -> str:
     return f"{rng.choice(['sk', 'ak', 'vk'])}-{_b64(rng, 40)}"
 
 
+#: Vendor credential formations, from each vendor's published token format.
+#: These are part of the API_KEY contract rather than a type of their own: the
+#: handling class is identical (every one of them authenticates on its own, so
+#: every one is destroyed) and a detector has no reason to tell them apart.
+#:
+#: They are not in ``_api_key`` and so not in the generated corpus. That is a
+#: measurement constraint, not a judgement: the generator draws every unit from
+#: one RNG stream, so widening a value generator reshuffles the whole bundle
+#: and invalidates the committed utility cassette, which cannot be re-recorded
+#: without a live key. These shapes are measured instead by the hand-authored
+#: ``vendor-*`` cases in ``adversarial.py`` and by ``test_recognizers.py``.
+#:
+#: Deliberately absent: the AWS *secret* access key and the Azure storage
+#: account key. Both are bare 40- and 88-character base64 runs with no prefix,
+#: so a shape rule for them is a false-positive generator. They are caught
+#: where they actually appear - inside a connection string - by
+#: ``recognizers.connection_string``.
+VENDOR_KEY_FORMATS: tuple[tuple[str, str], ...] = (
+    ("GitHub personal access token",
+     "ghp_ (user), gho_ (OAuth), ghu_/ghs_ (app), ghr_ (refresh), then 36 base62"),
+    ("GitHub fine-grained PAT", "github_pat_ + 22 base62 + _ + 59 base62"),
+    ("AWS access key id",
+     "a four-letter resource-type prefix (AKIA long-term, ASIA temporary, AROA "
+     "role, AIDA user, AGPA group, ANPA/ANVA/AIPA/ABIA/ACCA others) + 16 alnum"),
+    ("Google API key", "AIza + 35 base64url characters"),
+    ("Slack token",
+     "xoxb/xoxp/xoxa/xoxr/xoxs/xoxe + numeric workspace and app segments + secret"),
+    ("Azure Entra client secret",
+     "a short head, a tilde, then a 30+ character secret body"),
+)
+
+
 # ---------------------------------------------------------------------------
 # The specification
 # ---------------------------------------------------------------------------
@@ -210,19 +242,35 @@ SPECS: tuple[EntitySpec, ...] = (
         name="TENANT_ID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="cloud identity provider tenant identifier, public format",
         description="Tenant id of the customer directory. Same shape as any other GUID on the wire.",
-        generate=_guid, detected_as=_GUID_LABELS | {"TENANT_ID"}, label_prefix="Tenant",
+        generate=_guid,
+        # WINDOWS_SID: a domain SID's subauthority triple identifies the
+        # customer directory the way a tenant id does (the on-prem analogue),
+        # so a SID caught under its own label is a correctly typed catch here.
+        detected_as=_GUID_LABELS | {"TENANT_ID", "WINDOWS_SID"}, label_prefix="Tenant",
     ),
     EntitySpec(
         name="OBJECT_GUID", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="per-object identifiers in SaaS APIs, mailboxes and document collections",
         description="Identifier of one backed-up object.",
-        generate=_guid, detected_as=_GUID_LABELS, label_prefix="Mailbox",
+        generate=_guid,
+        # CERT_THUMBPRINT names exactly one object (a customer certificate),
+        # which is why this spec hosts its adversarial occurrences.
+        detected_as=_GUID_LABELS | {"CERT_THUMBPRINT", "EXCHANGE_ITEM_ID"},
+        label_prefix="Mailbox",
     ),
     EntitySpec(
         name="UPN_EMAIL", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="RFC 5322 addr-spec, cloud user principal names",
         description="User principal name or mailbox address. Directly identifies a person.",
-        generate=_upn, detected_as=frozenset({"EMAIL_ADDRESS", "UPN_EMAIL"}),
+        generate=_upn,
+        # DOMAIN_LOGON and PHONE_NUMBER are not email shapes; they are here
+        # because this spec is the contract for "directly identifies a person"
+        # and it hosts the adversarial occurrences for both (a new spec type
+        # requires a template line, and any template change invalidates the
+        # committed utility cassette). A logon or phone caught under its own
+        # label is a correctly typed catch of a person identifier.
+        detected_as=frozenset({"EMAIL_ADDRESS", "UPN_EMAIL", "DOMAIN_LOGON",
+                               "PHONE_NUMBER", "ONEDRIVE_ACCOUNT"}),
         label_prefix="User",
     ),
     EntitySpec(
@@ -242,7 +290,12 @@ SPECS: tuple[EntitySpec, ...] = (
         name="SITE_URL", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="public URL format of SaaS collaboration hosts, where the subdomain is the customer tenant",
         description="Collaboration site URL. Leaks both the customer tenant name and the business purpose of the site.",
-        generate=_site_url, detected_as=frozenset({"SITE_URL", "URL"}),
+        generate=_site_url,
+        # TENANT_DOMAIN covers *.onmicrosoft.com, a tenant-named host exactly
+        # like the subdomains of TENANT_SITE_HOSTS. It is not added to that
+        # constant because the generator reads it, and widening generation
+        # invalidates the committed utility cassette.
+        detected_as=frozenset({"SITE_URL", "URL", "TENANT_DOMAIN", "AZURE_KEY_VAULT"}),
         label_prefix="Site",
     ),
     EntitySpec(
@@ -268,7 +321,10 @@ SPECS: tuple[EntitySpec, ...] = (
         name="HOSTNAME_FQDN", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="internal DNS naming in on-prem deployments",
         description="Internal hostname. Reveals customer naming conventions.",
-        generate=_fqdn, detected_as=frozenset({"HOSTNAME_FQDN"}), label_prefix="Node",
+        generate=_fqdn,
+        # CUSTOMER_DOMAIN is the public-TLD sibling of this spec: a host on
+        # the customer's own domain outside the internal suffix list.
+        detected_as=frozenset({"HOSTNAME_FQDN", "CUSTOMER_DOMAIN"}), label_prefix="Node",
     ),
     EntitySpec(
         name="SUPPORT_CASE_NUMBER", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
@@ -299,8 +355,10 @@ SPECS: tuple[EntitySpec, ...] = (
     ),
     EntitySpec(
         name="API_KEY", handling=DESTROY, expected_tier=TIER_SHAPED,
-        source="common provider key prefixes",
-        description="API or client key.",
+        source="common provider key prefixes, plus the published vendor token "
+               "formats in VENDOR_KEY_FORMATS",
+        description="API or client key, including vendor-issued tokens that carry "
+                    "their own issuer prefix (GitHub, AWS, Google, Slack, Entra).",
         generate=_api_key, detected_as=frozenset({"API_KEY"}), label_prefix="Key",
     ),
     # ---- free text: tier 1 is EXPECTED to miss these ----

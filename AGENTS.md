@@ -111,8 +111,92 @@ default and needs neither. The test suite never touches the network.
 Listed with owners in the README's Limitations section and in
 `adversarial.CASES`. The ones most likely to matter:
 
-- One tier 1 gap is deliberately left open so it stays visible in the
-  numbers: forward-slash Windows profile paths.
+- Forward-slash Windows profile paths used to be the one deliberately open
+  tier 1 gap. It is closed: the separator in
+  `recognizers.windows_user_path` is a character class, and mixed separators
+  within one path match too. The UNC pattern stays backslash-only on purpose,
+  because `//host/users/...` is indistinguishable from the tail of an ordinary
+  URL and widening it would swallow every Graph call as a filesystem path.
+- Vendor credential prefixes (GitHub, AWS, Google, Slack, Entra) are covered
+  by `recognizers.vendor_credential`, which reports `API_KEY`. They are
+  **not** in the generated corpus, so they do not move the headline recall
+  figure; they are measured by the `vendor-*` cases in `adversarial.CASES`
+  and by `test_recognizers.py`. The reason is a measurement constraint worth
+  knowing before you touch `templates/` or any value generator: the generator
+  draws every unit from one RNG stream, so *any* template or generator change
+  reshuffles the whole bundle, which shifts the utility excerpt and
+  invalidates `cassettes/utility-haiku-4-5-run1.jsonl`. Re-recording that
+  needs a live key. Budget for it before adding an entity type, since
+  `test_every_spec_type_is_exercised_by_the_templates` requires a new spec
+  type to appear in a template.
+- **A credential that reaches tier 2 gets vaulted, which is worse than a
+  miss.** Tier 2 labels high-entropy runs as `ORGANIZATION`, so anything
+  credential-shaped that tier 1 does not claim is pseudonymised into
+  `vault.json` under a reversible mapping instead of being destroyed. Five
+  shapes were doing this and are now owned by tier 1: URL userinfo
+  (`url_userinfo`), `Authorization: Basic` and friends
+  (`http_credential_header`), cookie and set-cookie values
+  (`CookieHeaderRecognizer`), the AWS secret access key
+  (`AwsSecretKeyRecognizer`) and PEM key bodies
+  (`PrivateKeyBlockRecognizer`). When you add any credential shape, assert
+  the *pipeline* property, not just the recognizer: run `Pipeline.redact` and
+  check the value is absent from both the output and `vault.entries`. A
+  recognizer-level test passes while the vault still fills up.
+- Windows/Microsoft identifiers (`DOMAIN\user`, domain and Azure AD SIDs,
+  cert thumbprints, `*.onmicrosoft.com`, support trackingIDs, formatted
+  phones) are pseudonymised by tier 1. Their adversarial occurrences borrow
+  the closest existing spec type (UPN_EMAIL, TENANT_ID, OBJECT_GUID,
+  SITE_URL, SUPPORT_CASE_NUMBER) and each borrowed spec's `detected_as`
+  lists the new detector label - the same cassette constraint as above is why
+  they are not spec types of their own. The fences (well-known SIDs and
+  principals, commit hashes, versions, byte counts, timestamps all survive)
+  are tested as intent in `test_recognizers.py`; phone matching in
+  particular is hard-gated to digits plus `+ - ( )` and spaces because the
+  raw `phonenumbers` matcher redacted 96 of 1,000 clean lines (timestamps).
+  Declared misses: unformatted and dot-separated phone spellings.
+- URLs, paths and Azure resources: space-tolerant document URLs (fenced on a
+  path separator plus a document extension), OneDrive `/personal/` identity
+  segments, key vault URLs and Exchange item ids are pseudonymised by tier 1
+  (`tenant_site_url`, `onedrive_personal_account`, `azure_key_vault`,
+  `exchange_item_id`). Vendor hosts (`graph.microsoft.com`,
+  `login.microsoftonline.com`) stay readable. Customer domains in the open
+  namespace are claimed by `recognizers.CustomerDomainRecognizer`: any
+  public-TLD FQDN that is not a vendor service, in prose too, failing toward
+  redaction. The one vendor list is `hider/vendors.py` (pair test: vendor
+  suffix AND vendor service label), extended per site via `hider.local.json`;
+  jsonscrub and the recognizers both consume it, as does the shared
+  `recognizers.FILE_EXT`. If you add a vendor host, add it there and nowhere
+  else. Lookalikes (namespaces, file names, missing-space typos, vendor
+  hosts) are seeded in the clean corpus, so an over-match shows up as a
+  nonzero false-redaction figure on the next eval. Declared misses: TLDs
+  outside `_PUBLIC_TLDS`, TitleCase-spelled domains, TLDs shadowed by
+  source-file extensions (.py, .md, .rs).
+- **Dotted names.** `pipeline.in_dotted_chain` suppresses a tier 2 span inside
+  a dotted chain of three or more labels, because tier 2 reads .NET namespace
+  parts as organisations and vaults them (187 false spans over 145 of 1,000
+  clean lines before the rule). The floor is structural, not a vocabulary of
+  namespace roots, and it is three rather than two so one-dot organisation
+  names stay catchable. Two declared misses straddle it, each with an
+  adversarial case and a pinning test: a two-label namespace tail
+  (`Newtonsoft.JsonSerializationException`) is still vaulted, and a
+  three-label organisation (`Wood.Partners.Group`) is suppressed. The
+  two-label case is deliberately NOT in the clean corpus — measuring a
+  declared miss as a failure just yields a red test nobody can act on.
+- **OPEN tier 2 gap: the dotted-organisation head leak.** No dotted
+  organisation is caught whole. `Wood.Partners` is below the 0.4 score floor
+  and missed; `Tailspin.Industries` is caught only from the dot onward, so the
+  head leaks and the tail is vaulted under a name that is not the
+  organisation. This is the entire difference between 99.65% and 100%
+  free-text recall. Suppression cannot fix it — a tier may add or remove
+  spans, never widen one — so the fix is a span-widening pass over dotted
+  chains or training-grammar work in `classifier.py`. Do not close it by
+  lowering the three-label floor; that trades a false positive for a real miss.
+- Two deliberate over-destructions live in those rules, both at zero measured
+  false redaction: every cookie value is destroyed (names and attributes
+  survive) because cookie names are not a reliable signal, and any line that
+  is nothing but a 40+ character base64 run is destroyed, which also catches
+  public certificate bodies. Both are tested as intent, not discovered as
+  behaviour.
 - Tier 2 recall is a model's recall. The classifier's training grammar is
   generated and small; a mention shaped unlike anything in it is a realistic
   miss, and the misses are listed one by one in `metrics.json`.
