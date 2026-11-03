@@ -231,6 +231,93 @@ def _cmd_utility(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _cmd_es_eval(args: argparse.Namespace) -> int:
+    from . import elastic, eseval
+
+    cfg = elastic.load(args.config) if args.config else elastic.load(elastic.EXAMPLE)
+    report = eseval.run_eval(cfg, seed=args.seed, docs=args.docs, queries=args.queries,
+                             tier2=args.tier2)
+    print(eseval.format_report(report))
+    eseval.OUT.mkdir(parents=True, exist_ok=True)
+    path = eseval.OUT / "es-eval.json"
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\nwrote {path}")
+    return 0 if report["passed"] else 1
+
+
+def _es_config(path: str | None):
+    from . import elastic
+
+    if path:
+        return elastic.load(path)
+    cfg = elastic.active()
+    if cfg is None:
+        raise SystemExit("no elastic site map: set HIDER_ELASTIC or 'elastic' in hider.local.json, "
+                         "or pass --config (or --stub to use the example map)")
+    return cfg
+
+
+def _cmd_es_smoke(args: argparse.Namespace) -> int:
+    """One scrubbed query, end to end, printing decisions only."""
+    import tempfile
+
+    from . import elastic, esbridge, eseval
+
+    stub = None
+    try:
+        if args.stub:
+            fx = eseval.generate(docs=200)
+            cfg0 = elastic.load(elastic.EXAMPLE)
+            stub = eseval.StubKibana(eseval.StubEngine(fx, cfg0.indices),
+                                     signed_in=not args.expired).start()
+            raw = json.loads(elastic.EXAMPLE.read_text())
+            raw["clusters"] = {"stub": {"kibana": stub.url}}
+            raw["profile_dir"] = args.profile_dir or tempfile.mkdtemp(prefix="hider-es-profile-")
+            cfg = elastic.parse(raw, source="stub")
+            cluster = "stub"
+        else:
+            cfg = _es_config(args.config)
+            cluster = args.cluster
+            if not cluster:
+                raise SystemExit(f"--cluster is required; configured: {[c.name for c in cfg.clusters]}")
+        if args.no_browser:
+            if not args.stub:
+                raise SystemExit("--no-browser only works with --stub: a real cluster's session "
+                                 "stays in the browser")
+            transport = esbridge.UrllibTransport()
+        else:
+            transport = esbridge.BrowserTransport(args.profile_dir or cfg.profile_dir)
+        scrubber = elastic.EsScrubber(cfg, tier2=args.tier2)
+        for term in args.term:
+            print(f"seeded    {scrubber.seed(term)}  (the real value stays here)", file=sys.stderr)
+        bridge = esbridge.Bridge(cfg, scrubber, esbridge.KibanaSession(transport),
+                                 log_path=esbridge.Path(args.log) if args.log else None)
+        q = esbridge.smoke_query(cfg, args.index, args.phrase, size=args.size)
+        print(f"query     {json.dumps(q)}", file=sys.stderr)
+        try:
+            return esbridge.smoke(bridge, cluster, q, show=args.show)
+        finally:
+            transport.close()
+    finally:
+        if stub is not None:
+            stub.stop()
+
+
+def _cmd_es_login(args: argparse.Namespace) -> int:
+    from . import esbridge
+
+    cfg = _es_config(args.config)
+    cluster = cfg.cluster(args.cluster)
+    if cluster is None:
+        raise SystemExit(f"unknown cluster; configured: {[c.name for c in cfg.clusters]}")
+    transport = esbridge.BrowserTransport(args.profile_dir or cfg.profile_dir)
+    print(f"opening {cluster.kibana} in the bridge's own Chrome profile; sign in there, "
+          "the window closes by itself once Kibana loads", file=sys.stderr)
+    ok = transport.login(cluster, timeout=args.timeout)
+    print("signed in" if ok else "timed out before Kibana loaded", file=sys.stderr)
+    return 0 if ok else 1
+
+
 def _cmd_feedback(args: argparse.Namespace) -> int:
     from . import feedback
 
@@ -469,6 +556,44 @@ def main(argv: list[str] | None = None) -> int:
     ut.add_argument("--excerpt-lines", type=int, default=40)
     ut.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
     ut.set_defaults(fn=_cmd_utility)
+
+    ee = sub.add_parser("es-eval", help="measure the Elasticsearch core offline: synthetic "
+                                        "documents, stub Kibana, leak and refusal numbers")
+    ee.add_argument("--config", help="a site map (default: templates/elastic.example.json)")
+    ee.add_argument("--docs", type=int, default=600)
+    ee.add_argument("--queries", type=int, default=120)
+    ee.add_argument("--seed", type=int, default=20261103)
+    ee.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
+    ee.set_defaults(fn=_cmd_es_eval)
+
+    sm = sub.add_parser("es-smoke", help="one scrubbed query through the live bridge "
+                                         "(or a local stub Kibana with --stub); prints decisions only")
+    sm.add_argument("--cluster", help="configured cluster name")
+    sm.add_argument("--config", help="site map file (default: HIDER_ELASTIC / hider.local.json)")
+    sm.add_argument("--stub", action="store_true",
+                    help="start a synthetic Kibana on loopback and run against it")
+    sm.add_argument("--expired", action="store_true",
+                    help="with --stub: the stub serves the SSO login page (expect a refusal)")
+    sm.add_argument("--no-browser", action="store_true",
+                    help="with --stub: plain HTTP instead of Chrome")
+    sm.add_argument("--profile-dir", help="override the dedicated browser profile directory")
+    sm.add_argument("--index", help="index pattern to query (default: the first configured)")
+    sm.add_argument("--phrase", help="a phrase for the first text field")
+    sm.add_argument("--size", type=int, default=3)
+    sm.add_argument("--term", action="append", default=[],
+                    help="seed the case with a customer name (stays local; repeatable)")
+    sm.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
+    sm.add_argument("--show", action="store_true", help="print the scrubbed page")
+    sm.add_argument("--log", help="append a decision-log row to this JSONL file")
+    sm.set_defaults(fn=_cmd_es_smoke)
+
+    lg = sub.add_parser("es-login", help="headed window on a cluster's Kibana to (re)sign in "
+                                         "the bridge's dedicated profile")
+    lg.add_argument("--cluster", required=True)
+    lg.add_argument("--config")
+    lg.add_argument("--profile-dir")
+    lg.add_argument("--timeout", type=float, default=600.0)
+    lg.set_defaults(fn=_cmd_es_login)
 
     fb = sub.add_parser("feedback", help="list redaction feedback reported from the web UI")
     fb.add_argument("--path", help="feedback JSONL (default out/feedback.jsonl)")

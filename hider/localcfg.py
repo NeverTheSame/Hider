@@ -7,7 +7,12 @@ JSON scrubber may leave readable. Looked up at ``HIDER_LOCAL`` or
 URL and those hosts are masked like any other, which only over-redacts.
 
     {"portal_url": "https://portal.example.com/{region}/backup/jobs",
-     "vendor_suffixes": ["example.com"], "vendor_hosts": ["helpcenter"]}
+     "vendor_suffixes": ["example.com"], "vendor_hosts": ["helpcenter"],
+     "elastic": "/path/outside/the/repo/elastic.json"}
+
+``elastic`` is the live-Elasticsearch site map (``hider/elastic.py``): the
+object itself, or a path to a file holding it. Index and field names describe
+the estate, which is why they are here and not in ``templates/``.
 
 A malformed file is a startup error, never a silent skip.
 """
@@ -21,7 +26,8 @@ from pathlib import Path
 
 ENV = "HIDER_LOCAL"
 DEFAULT = Path(__file__).resolve().parent.parent / "hider.local.json"
-_KEYS = {"portal_url": str, "vendor_suffixes": list, "vendor_hosts": list}
+_KEYS = {"portal_url": str, "vendor_suffixes": list, "vendor_hosts": list,
+         "elastic": (dict, str)}
 
 
 @lru_cache(maxsize=1)
@@ -39,7 +45,8 @@ def settings() -> dict:
         raise RuntimeError(f"{path}: top level must be an object")
     for key, typ in _KEYS.items():
         if key in raw and not isinstance(raw[key], typ):
-            raise RuntimeError(f"{path}: {key} must be a {typ.__name__}")
+            names = " or ".join(t.__name__ for t in (typ if isinstance(typ, tuple) else (typ,)))
+            raise RuntimeError(f"{path}: {key} must be a {names}")
     for key in ("vendor_suffixes", "vendor_hosts"):
         if not all(isinstance(v, str) and v for v in raw.get(key, [])):
             raise RuntimeError(f"{path}: {key} must list non-empty strings")

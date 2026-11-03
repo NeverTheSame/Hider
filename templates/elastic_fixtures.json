@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Synthetic Elasticsearch documents for hider/eseval.py. Every value is",
+    "generated; the field names match templates/elastic.example.json and are",
+    "invented. Placeholders in braces: sensitive ones are drawn from the",
+    "document's own tenant and server so field and message correlate, and each",
+    "is recorded as ground truth. {N} {MS} {HTTP} {PCT} {BYTES} are noise.",
+    "clean_messages carry no customer value and seed the lookalikes (namespaces,",
+    "versions, byte counts, vendor hosts) that an over-eager tier would redact."
+  ],
+  "messages": {
+    "logs-app-*": [
+      "Backup job {JOB_NAME} for tenant {TENANT_NAME} ({TENANT_ID}) completed with {N} warnings in {MS} ms",
+      "Site {SITE_URL} returned HTTP {HTTP} after {N} retries; session {SESSION_ID}",
+      "Throttled by SharePoint for {TENANT_NAME}: Retry-After {N}s, object {OBJECT_ID}",
+      "User {UPN} has no license for OneDrive; skipping {N} items",
+      "Worker {SERVER} picked up job {JOB_ID} for {TENANT_FULL_NAME}",
+      "Resource {RESOURCE} on {SERVER}: {PCT}% of quota used, {BYTES} bytes written",
+      "Object {OBJECT_ID} ({TENANT_NAME}) failed: access denied for {UPN}",
+      "Job {JOB_NAME} ({JOB_ID}) scheduled on {SERVER}, {N} sites enqueued",
+      "Health check from {HOST_IP} ok; agent {SERVER} build {N}.{N}.{N}",
+      "Tenant {TENANT_ID} has {N} sites; crawl of {SITE_URL} took {MS} ms"
+    ],
+    "logs-worker-*": [
+      "Downloading {ONEDRIVE_URI} ({BYTES} bytes) via {SERVER}",
+      "Item {ONEDRIVE_URI} skipped: HTTP {HTTP}, retry {N}",
+      "Enumerated {N} items under {SITE_URL}/Shared Documents in {MS} ms",
+      "Worker {SERVER} finished batch {SESSION_ID} for {TENANT_NAME}: {N} items, {PCT}% changed",
+      "Checksum mismatch for {ONEDRIVE_URI}; re-queued on {SERVER}",
+      "Rate limit for {TENANT_NAME} reached on {SERVER}; backing off {N}s"
+    ],
+    "traces-apm-*": [
+      "GET /api/tenants/{TENANT_ID}/sites {HTTP} in {MS} ms for {UPN}",
+      "POST /api/jobs/{JOB_ID}/run {HTTP} ({SERVER})",
+      "Graph call for {UPN} throttled, {N} retries, {MS} ms"
+    ]
+  },
+  "clean_messages": [
+    "Scheduler tick: {N} jobs due, {N} running, {N} queued",
+    "Microsoft.SharePoint.Client.ServerException: The server returned HTTP {HTTP}; retrying in {N}s",
+    "Connection pool stats: {N} idle, {N} active, {N} pending (max {N})",
+    "Upgraded engine from 8.{N}.{N} to 8.{N}.{N}; schema migration took {MS} ms",
+    "Graph endpoint https://graph.microsoft.com/v1.0/sites responded in {MS} ms",
+    "GC pause {MS} ms, heap {BYTES} bytes after collection",
+    "Newtonsoft.Json.JsonSerializationException: Unexpected token at position {N}",
+    "Retry policy exhausted after {N} attempts; last status {HTTP}",
+    "Token cache refreshed; {N} entries, next refresh in {N} minutes",
+    "Queue depth {N}, consumer lag {MS} ms, {PCT}% of capacity",
+    "Worker heartbeat ok; uptime {N}h, {N} jobs completed since start",
+    "System.Net.Http.HttpRequestException: The request was canceled due to the configured HttpClient.Timeout of {N} seconds"
+  ],
+  "transaction_names": [
+    "GET /api/tenants/{TENANT_ID}/sites",
+    "POST /api/jobs/{JOB_ID}/run",
+    "GET /api/health",
+    "GET /api/users/{UPN}/drive"
+  ],
+  "job_names": [
+    "Daily Policy", "Weekly Full", "Hourly Delta", "Finance Archive", "Legal Hold Sync",
+    "Monthly Compliance", "Teams Nightly", "HR Mailboxes"
+  ],
+  "resource_names": [
+    "ProjectPhoenix", "FinanceVault", "LegalHold2026", "BoardPapers", "MarketingAssets"
+  ],
+  "log_file_paths": [
+    "/var/log/backup/{SERVER}/engine.log",
+    "/var/log/backup/{SERVER}/worker-{N}.log",
+    "C:\\ProgramData\\BackupAgent\\Logs\\{SERVER}\\agent.log"
+  ],
+  "datasets": ["app.engine", "app.scheduler", "app.gateway", "worker.items", "apm.transaction"],
+  "log_levels": ["info", "info", "info", "warn", "error"],
+  "outcomes": ["success", "success", "failure", "unknown"],
+  "job_statuses": ["Success", "Warning", "Failed", "Running"]
+}

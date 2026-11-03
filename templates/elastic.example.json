@@ -1,0 +1,76 @@
+{
+  "_comment": [
+    "Example site map for live Elasticsearch research (hider/elastic.py).",
+    "Every name here is invented. Copy this to a file outside the repository,",
+    "replace the index patterns and field names with your own, and point",
+    "HIDER_ELASTIC at it, or put the object under \"elastic\" in hider.local.json.",
+    "Index and field names describe the estate; they never belong in the repo.",
+    "Kinds: keep (passed through, freely queryable), identifier (replaced by a",
+    "stable typed label; queried by label only), text (tiers 1+2 plus the sweep;",
+    "match_phrase only). A field that is not listed is dropped and unqueryable.",
+    "An identifier may carry a 'shape' regex with named groups and a 'label'",
+    "format using those groups plus {n}, so a server keeps its region:",
+    "ctr-amer-042 -> ctr-amer-s01. The label must not itself match the shape.",
+    "clusters maps a short name (what Claude sees) to a Kibana origin; the",
+    "bridge signs in through its own dedicated Chrome profile at profile_dir,",
+    "created by the bridge, never your everyday browser profile.",
+    "A malformed file is a startup error, never a silent skip."
+  ],
+  "time_field": "@timestamp",
+  "clusters": {
+    "amer": {"kibana": "https://kibana-amer.example.net"},
+    "emea": {"kibana": "https://kibana-emea.example.net"},
+    "apj":  {"kibana": "https://kibana-apj.example.net"},
+    "aus":  {"kibana": "https://kibana-aus.example.net"}
+  },
+  "profile_dir": "~/.hider/es-browser-profile",
+  "indices": ["logs-app-*", "logs-worker-*", "traces-apm-*"],
+  "max_hits": 100,
+  "max_buckets": 50,
+  "max_text_chars": 20000,
+  "fields": {
+    "@timestamp": "keep",
+    "data_stream.*": "keep",
+    "ecs.version": "keep",
+    "event.*": "keep",
+    "log.level": "keep",
+    "log.logger": "keep",
+    "service.name": "keep",
+    "service.version": "keep",
+    "http.response.status_code": "keep",
+    "job.status": "keep",
+    "job.counters.*": "keep",
+    "transaction.duration.us": "keep",
+    "transaction.result": "keep",
+
+    "message": "text",
+    "job.status_message": "text",
+    "log.file.path": "text",
+    "transaction.name": "text",
+
+    "agent.name": {
+      "kind": "identifier", "type": "SERVER_NAME",
+      "shape": "(?P<role>[a-z]{2,5})-(?P<region>amer|emea|apj|aus)-(?P<num>\\d{3})",
+      "label": "{role}-{region}-s{n:02d}"
+    },
+    "host.name": {
+      "kind": "identifier", "type": "SERVER_NAME",
+      "shape": "(?P<role>[a-z]{2,5})-(?P<region>amer|emea|apj|aus)-(?P<num>\\d{3})",
+      "label": "{role}-{region}-s{n:02d}"
+    },
+    "host.ip": {"kind": "identifier", "type": "IPV4"},
+    "host.mac": {"kind": "identifier", "type": "MAC_ADDRESS"},
+    "cloud.account.id": {"kind": "identifier", "type": "CLOUD_ACCOUNT"},
+    "cloud.instance.name": {"kind": "identifier", "type": "INSTANCE_NAME"},
+    "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+    "labels.tenant_full_name": {"kind": "identifier", "type": "ORG_NAME"},
+    "labels.tenant_id": {"kind": "identifier", "type": "TENANT_ID"},
+    "labels.resource_name": {"kind": "identifier", "type": "RESOURCE_NAME"},
+    "labels.principal_name": {"kind": "identifier", "type": "UPN_EMAIL"},
+    "job.id": {"kind": "identifier", "type": "GUID"},
+    "job.session_id": {"kind": "identifier", "type": "SESSION_GUID"},
+    "job_object_id": {"kind": "identifier", "type": "GUID"},
+    "job_name": {"kind": "identifier", "type": "JOB_NAME"},
+    "tenant.users_in_tenant": {"kind": "identifier", "type": "TENANT_SIZE"}
+  }
+}

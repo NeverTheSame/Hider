@@ -64,6 +64,7 @@ design conversation, not a code change.
 | Eval metrics or gates | `hider/evaluate.py` (recall, precision, adversarial, injection), `hider/utility.py` (answer accuracy raw vs redacted) |
 | JSON exports and the web UI | `hider/jsonscrub.py`, `hider/webserver.py` (single-file page, stdlib server), `hider/research.py` (Claude Code bridge) |
 | Site-specific patterns | Never in the repo. `templates/profile.example.json` and `HIDER_PROFILE`; see `hider/profiles.py` |
+| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esbridge.py` (the Kibana session: dedicated Chrome profile via Playwright, async-search protocol, every malformed reply a refusal, decision log). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
 
 ## Running things
 
@@ -77,6 +78,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
     --cassette cassettes/utility-haiku-4-5-run1.jsonl    # replay, no key needed
 .venv/bin/python -m hider proxy --upstream https://api.openai.com
 .venv/bin/python -m hider serve                  # web UI on 127.0.0.1:8790
+.venv/bin/python -m hider es-eval                # Elasticsearch core: leaks, refusals, oracle cases, no cluster
+.venv/bin/python -m hider es-smoke --stub        # one query through Chrome against a synthetic Kibana
 ```
 
 Live calls need `pip install -r requirements-llm.txt`, a key in the
@@ -103,8 +106,9 @@ default and needs neither. The test suite never touches the network.
   `metrics.json` and `utility.json`. A README number quoted next to a prompt
   version is the number for that prompt only.
 - **Dependencies.** Core: presidio, scikit-learn. Optional extras: `ner`
-  (spaCy), `llm` (openai, anthropic). Nothing in the core path may import an
-  optional extra at module load.
+  (spaCy), `llm` (openai, anthropic), `es` (playwright, for the live Kibana
+  session only). Nothing in the core path may import an optional extra at
+  module load.
 
 ## Known gaps worth knowing before you start
 
@@ -204,6 +208,19 @@ Listed with owners in the README's Limitations section and in
 - The utility number is one model, one 40-line excerpt, fifteen questions.
 - The gateway serialises redaction; fine for a workstation, the first thing
   to change for a shared deployment.
+- **Elasticsearch: the declared text-query channel.** `esquery` lets a
+  phrase on a `text` field carry plain words, so a guessed word can be
+  confirmed by a hit count. Accepted by decision: every text query is
+  logged with its labels and counted by `es-eval`. Identifier fields take
+  labels only; each forbidden shape (wildcard, prefix, range, sort, terms
+  include, scripts, raw DSL, literals, wrong-type labels) is an
+  `esquery.ORACLE_CASES` entry and must be refused with its declared code.
+  Add the case before the rule, as with `adversarial.CASES`. Only
+  `esbridge` opens a connection, and only through the browser profile it
+  created itself (`prepare_profile_dir` refuses any other); the SSO cookie
+  never leaves Chrome. An expired Kibana session is a 200 login page, not a
+  401, so every reply goes through `KibanaSession.parse_reply` first. The
+  MCP server is not built yet.
 
 ## Where to take questions and findings
 

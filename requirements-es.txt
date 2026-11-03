@@ -1,0 +1,6 @@
+# The live Elasticsearch bridge (hider/esbridge.py): drives the installed
+# Chrome on a dedicated profile so the Kibana SSO cookie never leaves the
+# browser. The offline core (elastic, esquery, eseval) and the test suite
+# run without this; tests that need it skip when it is absent.
+# Uses the installed Google Chrome (channel="chrome"), so no browser download.
+playwright>=1.45

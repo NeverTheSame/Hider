@@ -558,6 +558,11 @@ class JsonScrubber:
             return raw  # a bare integer is a count, not a number to dial
         if re.fullmatch(r"[\d.]+", raw.strip()):
             return raw  # 12.3456789, 10.0.17763.1234: decimals and versions
+        if re.search(r"\d{8,}", raw) and not raw.strip().startswith("+"):
+            # "Report-02 (4190469244 bytes)": a byte count next to a stray
+            # digit pair. A formatted phone number never carries eight
+            # digits in a row; an unformatted one is a declared miss.
+            return raw
         return self._label("PHONE", raw.strip())
 
     def _rewrite(self, node: Any, inherited: str | None, sweep: bool) -> Any:
