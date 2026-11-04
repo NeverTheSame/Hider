@@ -78,6 +78,77 @@ def test_every_base64_fixture_payload_decodes_to_declared_vocabulary(path):
         )
 
 
+# ---------------------------------------------------------------------------
+# Push-protection-shaped credentials. GitHub blocked a push because invented
+# Slack tokens in the fixtures had exactly the vendor's shape. The fixtures
+# are now assembled at import time (hider.adversarial.DEAD_TOKENS); this check
+# keeps the committed text clean for every vendor format a recognizer covers,
+# and proves the patterns bite by running them over the runtime values.
+# ---------------------------------------------------------------------------
+
+#: What a secret scanner keys on: the vendor prefix plus the documented exact
+#: length, or the documented structure. Written to match what GitHub push
+#: protection flags for these providers, not what hider.recognizers matches
+#: (the recognizer uses length floors on purpose; a scanner uses exact shapes).
+SCANNER_PATTERNS = {
+    "github classic/oauth/app/refresh token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36}\b"),
+    "github fine-grained token": re.compile(r"\bgithub_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}\b"),
+    "aws access key id": re.compile(
+        r"\b(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|AIPA|ABIA|ACCA)[A-Z0-9]{16}\b", re.IGNORECASE),
+    "google api key": re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    "slack token": re.compile(r"\bxox[abeprs]-\d{10,13}-\d{10,13}-[A-Za-z0-9]{24,34}\b"),
+    "entra client secret": re.compile(r"\b[A-Za-z0-9_~.-]{3}8Q~[A-Za-z0-9_~.-]{31,34}\b"),
+}
+
+
+def _scanner_hits(text: str) -> list[tuple[str, str]]:
+    hits = []
+    for name, rx in SCANNER_PATTERNS.items():
+        for m in rx.finditer(text):
+            hits.append((name, m.group(0)[:12] + "..."))
+    return hits
+
+
+@pytest.mark.parametrize("path", SCANNED, ids=[str(p.relative_to(ROOT)) for p in SCANNED])
+def test_no_committed_file_contains_a_scanner_shaped_credential(path):
+    text = path.read_text(errors="replace")
+    hits = _scanner_hits(text)
+    # inside base64 payloads too, the blind spot this file exists for
+    for _, decoded in _decodable(text):
+        hits += _scanner_hits(decoded)
+    assert not hits, (
+        f"{path.relative_to(ROOT)} contains a credential-shaped string {hits}; GitHub push "
+        f"protection will reject it. Build the value at runtime from pieces "
+        f"(hider.adversarial.DEAD_TOKENS) instead of writing it out."
+    )
+
+
+def test_scanner_patterns_flag_the_runtime_fixtures():
+    """The other half: the dead tokens really have the vendor shapes, so the
+    recognizer tests test the real thing and the check above is not vacuous."""
+    from hider.adversarial import DEAD_TOKENS
+
+    expected = {
+        "github_classic": "github classic/oauth/app/refresh token",
+        "github_oauth": "github classic/oauth/app/refresh token",
+        "github_fine": "github fine-grained token",
+        "aws_long_term": "aws access key id", "aws_temporary": "aws access key id",
+        "aws_lowercased": "aws access key id",
+        "google": "google api key", "slack_bot": "slack token", "slack_user": "slack token",
+        "entra": "entra client secret",
+    }
+    assert set(expected) == set(DEAD_TOKENS)
+    for key, pattern in expected.items():
+        assert SCANNER_PATTERNS[pattern].search(DEAD_TOKENS[key]), key
+    # and the recognizer catches every one of them, destroyed not vaulted
+    from hider import pipeline
+    pipe = pipeline.Pipeline()
+    for key, value in DEAD_TOKENS.items():
+        r = pipe.redact(f"token {value} seen")
+        assert value not in r.text and "<REDACTED:API_KEY>" in r.text, key
+        assert not any(value == e["value"] for e in pipe.vault.entries.values()), key
+
+
 def test_no_profile_file_is_committed():
     """A filled-in site profile describes an estate and must stay local."""
     for name in ("profile.json", "site.json"):

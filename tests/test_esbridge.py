@@ -7,6 +7,7 @@ present; everything else uses the plain-HTTP transport the stub accepts.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 
@@ -293,6 +294,110 @@ def test_smoke_prints_decisions_only(stub, tmp_path, capsys, fixture):
     assert esbridge.smoke(b, "stub", q) == 2
     assert "REFUSED" in capsys.readouterr().out
     stub.sign_in()
+
+
+def test_smoke_query_time_window_defaults_to_the_last_hour_and_is_overridable():
+    assert esbridge.smoke_query(CFG0)["time_range"] == {"gte": "now-1h", "lte": "now"}
+    q = esbridge.smoke_query(CFG0, since="now-7d/d", until="now-1d")
+    assert q["time_range"] == {"gte": "now-7d/d", "lte": "now-1d"} and "aggs" not in q
+
+
+_SERVER_LABEL = re.compile(r"^[a-z]{2,5}-(?:amer|emea|apj|aus)-s\d{2}$")
+
+
+def test_smoke_count_by_server_per_interval_prints_counts_not_keys(stub, tmp_path, capsys, fixture):
+    """Matching lines per server per hour: keys are region-keeping labels,
+    the summary line carries counts only, and keys appear only with show."""
+    b = _bridge(stub, tmp_path)
+    q = esbridge.smoke_query(b.config, size=0, since="now-6h", count_by="agent.name",
+                             interval="1h", buckets=5)
+    assert esbridge.smoke(b, "stub", q) == 0
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1 and "since=now-6h until=now" in out
+    m = re.search(r"buckets=5 bucket_docs=\[([\d, ]+)\] other_docs=(\d+) time_buckets=(\d+)", out)
+    assert m, out
+    counts = [int(c) for c in m.group(1).split(",")]
+    o = b.outcomes[-1]
+    assert sum(counts) + int(m.group(2)) == o.hits_total
+    # no key of any kind on the summary line: no label, no real name, no time
+    assert not re.search(r"-s\d{2}\b|<[A-Z]", out)
+    assert "2026-" not in out
+    for v in fixture.truth:
+        if len(v) > 4:
+            assert v not in out
+    rows = o.output["aggregations"][esbridge.COUNT_AGG]["buckets"]
+    assert len(rows) == 5 and all(_SERVER_LABEL.match(r["key"]) for r in rows)
+    assert sum(len(r[esbridge.TIME_AGG]["buckets"]) for r in rows) == int(m.group(3))
+    for r in rows:
+        assert sum(t["doc_count"] for t in r[esbridge.TIME_AGG]["buckets"]) == r["doc_count"]
+    assert eseval._leaks(o.output, fixture.truth) == []
+    # the decision log has the shape, not the keys
+    row = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
+    assert row["aggs"][0]["field"] == "agent.name"
+    assert row["aggs"][0]["aggs"][0]["type"] == "date_histogram"
+    assert not any(r["key"] in json.dumps(row) for r in rows)
+
+    assert esbridge.smoke(b, "stub", q, show=True) == 0
+    shown = capsys.readouterr().out
+    assert all(r["key"] in shown for r in rows)
+
+
+def test_smoke_count_by_identifier_keys_come_back_as_labels(stub, tmp_path, capsys, fixture):
+    b = _bridge(stub, tmp_path)
+    q = esbridge.smoke_query(b.config, size=0, since="now-6h", count_by="labels.tenant_name")
+    assert esbridge.smoke(b, "stub", q, show=True) == 0
+    rows = b.outcomes[-1].output["aggregations"][esbridge.COUNT_AGG]["buckets"]
+    assert rows and all(re.fullmatch(r"<Org-\d+>", r["key"]) for r in rows)
+    out = capsys.readouterr().out
+    for v in fixture.truth:
+        if len(v) > 4:
+            assert v not in out
+
+
+def test_smoke_interval_alone_is_a_histogram_of_matching_lines(stub, tmp_path, capsys):
+    b = _bridge(stub, tmp_path)
+    q = esbridge.smoke_query(b.config, size=0, since="now-6h", interval="1h")
+    assert esbridge.smoke(b, "stub", q) == 0
+    out = capsys.readouterr().out
+    m = re.search(r"time_buckets=(\d+) bucket_docs=\[([\d, ]+)\]", out)
+    assert m and "buckets=" not in out.replace("time_buckets=", "")
+    assert sum(int(c) for c in m.group(2).split(",")) == b.outcomes[-1].hits_total
+
+
+@pytest.mark.parametrize("kw,code", [
+    ({"count_by": "user.password"}, "unknown_field"),
+    ({"count_by": "labels.*"}, "unknown_field"),
+    ({"count_by": "message"}, "field_not_queryable"),
+    ({"count_by": "agent.name", "interval": "2w"}, "bad_agg"),
+    ({"count_by": "agent.name", "interval": "1h; drop"}, "bad_agg"),
+    ({"interval": "fortnight"}, "bad_agg"),
+    ({"count_by": "agent.name", "buckets": 500}, "size_cap"),
+    ({"since": "yesterday"}, "bad_value"),
+    ({"until": "Contoso"}, "bad_value"),
+])
+def test_smoke_bad_aggregation_or_time_is_a_refusal(stub, tmp_path, capsys, kw, code):
+    b = _bridge(stub, tmp_path)
+    n = len(stub.engine.requests)
+    q = esbridge.smoke_query(b.config, size=0, **kw)
+    assert esbridge.smoke(b, "stub", q) == 2
+    out = capsys.readouterr().out
+    assert out.startswith("REFUSED ") and f"code={code}" in out
+    assert len(stub.engine.requests) == n  # refused before anything left
+    row = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
+    assert row["refused"] == code
+
+
+def test_es_smoke_cli_wires_the_new_flags(capsys):
+    from hider import cli
+
+    rc = cli.main(["es-smoke", "--stub", "--no-browser", "--tier2", "none", "--since", "now-6h",
+                   "--count-by", "agent.name", "--interval", "1d"])
+    captured = capsys.readouterr()
+    assert rc == 0 and '"size": 0' in captured.err
+    assert re.search(r"shown=0 .* buckets=\d+ bucket_docs=", captured.out)
+    rc = cli.main(["es-smoke", "--stub", "--no-browser", "--tier2", "none",
+                   "--count-by", "not.in.map"])
+    assert rc == 2 and "code=unknown_field" in capsys.readouterr().out
 
 
 # -- the browser transport, when it can run --------------------------------------------

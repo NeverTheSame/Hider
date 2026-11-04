@@ -361,6 +361,23 @@ The last line is the one against a real cluster. It prints one `OK` or
 to print the scrubbed page (labels only) once the counts look right. The
 real site map comes from `HIDER_ELASTIC` or `hider.local.json`.
 
+The window defaults to the last hour; `--since` and `--until` take the
+grammar's times (`now-7d`, `now-1d/d`, ISO). `--count-by FIELD` adds a
+terms aggregation and `--interval 1d` splits it by a date histogram on the
+time field (alone, `--interval` is a histogram of the matching lines):
+
+```sh
+python -m hider es-smoke --stub --no-browser --since now-6h --count-by agent.name --interval 1h
+python -m hider es-smoke --cluster emea --phrase "<a phrase>" --since now-7d --count-by agent.name --interval 1d
+```
+
+The `OK` line then carries bucket counts and per-bucket doc counts, never a
+key; `--show` prints the keys, which are labels on identifier fields
+(`ctr-amer-s01`, region kept by the field's shape). These values go
+through `esquery` unchanged, so a field outside the site map, a text field,
+an interval outside the grammar, a `--buckets` over `max_buckets` or a
+time that is not date math gives a `REFUSED` line with the grammar's code.
+
 Known limits of this layer, by design for now: Playwright's sync API is
 single-threaded, so calls are serialised under one lock (parallel tabs
 need the async API); the probe adds one round trip per call; shard

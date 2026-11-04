@@ -69,8 +69,8 @@
     "labels.principal_name": {"kind": "identifier", "type": "UPN_EMAIL"},
     "job.id": {"kind": "identifier", "type": "GUID"},
     "job.session_id": {"kind": "identifier", "type": "SESSION_GUID"},
-    "job_object_id": {"kind": "identifier", "type": "GUID"},
-    "job_name": {"kind": "identifier", "type": "JOB_NAME"},
+    "job.object_id": {"kind": "identifier", "type": "GUID"},
+    "job.name": {"kind": "identifier", "type": "JOB_NAME"},
     "tenant.users_in_tenant": {"kind": "identifier", "type": "TENANT_SIZE"}
   }
 }

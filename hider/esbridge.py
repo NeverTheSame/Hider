@@ -505,15 +505,60 @@ def _describe(query: dict, compiled: esquery.Compiled) -> dict:
 # ---------------------------------------------------------------------------
 
 
+#: Aggregation names the smoke query uses; fixed so the summary can find them.
+COUNT_AGG = "count_by"
+TIME_AGG = "per_interval"
+
+
 def smoke_query(config: elastic.ElasticConfig, index: str | None = None,
-                phrase: str | None = None, size: int = 3) -> dict:
+                phrase: str | None = None, size: int = 3, *, since: str = "now-1h",
+                until: str = "now", count_by: str | None = None, interval: str | None = None,
+                buckets: int = 10) -> dict:
+    """The grammar request for one smoke run.
+
+    Nothing is validated here on purpose: times, fields, intervals and sizes
+    go to ``esquery`` as given, so a bad one is the grammar's refusal (and a
+    decision-log row), never a CLI-side special case.
+    """
     q: dict[str, Any] = {"index": index or config.indices[0],
-                         "time_range": {"gte": "now-1h", "lte": "now"}, "size": size}
+                         "time_range": {"gte": since, "lte": until}, "size": size}
     if phrase:
         text_field = next((r.pattern for r in config.fields if r.kind == "text"), None)
         if text_field:
             q["filters"] = [{"field": text_field, "op": "phrase", "value": phrase}]
+    hist = ({TIME_AGG: {"type": "date_histogram", "field": config.time_field,
+                        "interval": interval}} if interval is not None else {})
+    if count_by is not None:
+        terms: dict[str, Any] = {"type": "terms", "field": count_by, "size": buckets}
+        if hist:
+            terms["aggs"] = hist
+        q["aggs"] = {COUNT_AGG: terms}
+    elif hist:
+        q["aggs"] = hist
     return q
+
+
+def _bucket_summary(output: dict) -> str:
+    """Bucket counts for the summary line. Never a key: identifier keys are
+    labels, but even labels and time keys only print with ``--show``."""
+    aggs = output.get("aggregations") or {}
+    parts = []
+    terms = aggs.get(COUNT_AGG)
+    if isinstance(terms, dict):
+        rows = terms.get("buckets") or []
+        parts += [f"buckets={len(rows)}",
+                  f"bucket_docs={[b.get('doc_count') for b in rows]}",
+                  f"other_docs={terms.get('sum_other_doc_count', 0)}"]
+        nested = [b[TIME_AGG].get("buckets") or [] for b in rows
+                  if isinstance(b.get(TIME_AGG), dict)]
+        if nested:
+            parts.append(f"time_buckets={sum(len(n) for n in nested)}")
+    hist = aggs.get(TIME_AGG)
+    if isinstance(hist, dict):
+        rows = hist.get("buckets") or []
+        parts += [f"time_buckets={len(rows)}",
+                  f"bucket_docs={[b.get('doc_count') for b in rows]}"]
+    return " ".join(parts)
 
 
 def smoke(bridge: Bridge, cluster: str, query: dict, *, show: bool = False) -> int:
@@ -525,9 +570,13 @@ def smoke(bridge: Bridge, cluster: str, query: dict, *, show: bool = False) -> i
         print(f"REFUSED  cluster={cluster} code={e.code}: {e.message}")
         return 2
     s = bridge.scrubber
-    print(f"OK       cluster={cluster} index={query['index']} hits_total={o.hits_total} "
+    tr = query.get("time_range") or {}
+    buckets = _bucket_summary(o.output or {})
+    print(f"OK       cluster={cluster} index={query['index']} "
+          f"since={tr.get('gte')} until={tr.get('lte')} hits_total={o.hits_total} "
           f"shown={o.hits_shown} labels_issued={len(s.mapping)} "
-          f"dropped_field_paths={len(s.dropped)} seconds={o.seconds}")
+          f"dropped_field_paths={len(s.dropped)} seconds={o.seconds}"
+          + (f" {buckets}" if buckets else ""))
     if s.dropped:
         print(f"         unlisted fields dropped: {sorted(s.dropped)}")
     if show:

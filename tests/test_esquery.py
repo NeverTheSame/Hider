@@ -66,7 +66,7 @@ def test_labels_resolve_to_real_values_on_the_way_out_and_the_log_keeps_labels()
             {"field": "message", "op": "phrase", "value": "Throttled for <Org-01> on ctr-amer-s01"},
             {"field": "log.level", "op": "eq", "value": "error"},
             {"field": "job.counters.errors", "op": "range", "value": {"gte": 1}},
-            {"field": "job_name", "op": "exists"},
+            {"field": "job.name", "op": "exists"},
         ],
         "size": 20, "from": 20,
         "sort": [{"field": "@timestamp", "order": "asc"}],
@@ -79,7 +79,7 @@ def test_labels_resolve_to_real_values_on_the_way_out_and_the_log_keeps_labels()
     assert {"terms": {"agent.name": ["ctr-amer-042"]}} in filters
     assert {"term": {"labels.tenant_id": "3f2a9c4e-1b7d-4e8a-9c2f-6d5b4a3e2f10"}} in filters
     assert {"match_phrase": {"message": "Throttled for Contoso Holdings on ctr-amer-042"}} in filters
-    assert {"exists": {"field": "job_name"}} in filters
+    assert {"exists": {"field": "job.name"}} in filters
     assert body["sort"] == [{"@timestamp": {"order": "asc"}}]
     assert body["size"] == 20 and body["from"] == 20 and body["track_total_hits"] is True
     assert body["_source"]["includes"] == CFG.source_includes()

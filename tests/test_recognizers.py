@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from hider import recognizers as R
+from hider.adversarial import DEAD_TOKENS as T
 
 REGS = R.all_recognizers()
 
@@ -77,39 +78,30 @@ CASES = [
 
 
 # ---------------------------------------------------------------------------
-# Vendor credentials. Every literal below is shape-valid and value-dead: the
-# bodies spell out that they are examples, so the suite exercises the rule
-# without committing anything that could authenticate anywhere.
+# Vendor credentials. Every value is shape-valid and value-dead, and built at
+# import time (hider.adversarial.DEAD_TOKENS) so no committed file contains a
+# string a secret scanner would flag; tests/test_hygiene.py enforces that.
 # ---------------------------------------------------------------------------
 
 VENDOR_CASES = [
     ("github classic PAT",
-     "[Connector] github auth failed for ghp_EXAMPLEONLYnotarealtoken000000000000 at 401",
-     "ghp_EXAMPLEONLYnotarealtoken000000000000"),
+     f"[Connector] github auth failed for {T['github_classic']} at 401", T["github_classic"]),
     ("github OAuth token",
-     "[Connector] refreshing gho_EXAMPLEONLYnotarealtoken000000000000 now",
-     "gho_EXAMPLEONLYnotarealtoken000000000000"),
+     f"[Connector] refreshing {T['github_oauth']} now", T["github_oauth"]),
     ("github fine-grained PAT",
-     "[Connector] token=github_pat_11AAAAAAA0EXAMPLEONLY0_notarealtokennotarealtoken000000 expired",
-     "github_pat_11AAAAAAA0EXAMPLEONLY0_notarealtokennotarealtoken000000"),
+     f"[Connector] token={T['github_fine']} expired", T["github_fine"]),
     ("aws long-term access key id",
-     "[S3] InvalidAccessKeyId for AKIAEXAMPLEKEYID0000 on upload",
-     "AKIAEXAMPLEKEYID0000"),
+     f"[S3] InvalidAccessKeyId for {T['aws_long_term']} on upload", T["aws_long_term"]),
     ("aws temporary access key id",
-     "[S3] assumed role issued ASIAEXAMPLEKEYID0001 valid 1h",
-     "ASIAEXAMPLEKEYID0001"),
+     f"[S3] assumed role issued {T['aws_temporary']} valid 1h", T["aws_temporary"]),
     ("google api key",
-     '[Config] {"gcp":"AIzaSyEXAMPLE_ONLY_not_a_real_key_0000"}',
-     "AIzaSyEXAMPLE_ONLY_not_a_real_key_0000"),
+     f'[Config] {{"gcp":"{T["google"]}"}}', T["google"]),
     ("slack bot token",
-     '[Config] {"slack":"xox' 'b-000000000000-0000000000000-ExampleOnlyNotARealToken"}',
-     "xox" "b-000000000000-0000000000000-ExampleOnlyNotARealToken"),
+     f'[Config] {{"slack":"{T["slack_bot"]}"}}', T["slack_bot"]),
     ("slack user token",
-     "[Connector] xox" "p-000000000000-0000000000000-ExampleOnlyNotARealToken revoked",
-     "xox" "p-000000000000-0000000000000-ExampleOnlyNotARealToken"),
+     f"[Connector] {T['slack_user']} revoked", T["slack_user"]),
     ("entra client secret",
-     "[Auth] client secret Ab18Q~cDeEXAMPLEONLYnotarealsecret00000 expires in 7 days",
-     "Ab18Q~cDeEXAMPLEONLYnotarealsecret00000"),
+     f"[Auth] client secret {T['entra']} expires in 7 days", T["entra"]),
 ]
 
 
@@ -155,7 +147,7 @@ def test_lower_cased_aws_key_id_is_still_caught():
     looked like one costs a line of triage detail; missing one leaks a live
     AWS credential, so this rule errs toward destroying.
     """
-    assert "API_KEY" in types_in("[S3] using profile key akiaexamplekeyid0002")
+    assert "API_KEY" in types_in(f"[S3] using profile key {T['aws_lowercased']}")
 
 
 @pytest.mark.parametrize("line", [

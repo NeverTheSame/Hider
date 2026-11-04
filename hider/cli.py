@@ -292,7 +292,10 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
             print(f"seeded    {scrubber.seed(term)}  (the real value stays here)", file=sys.stderr)
         bridge = esbridge.Bridge(cfg, scrubber, esbridge.KibanaSession(transport),
                                  log_path=esbridge.Path(args.log) if args.log else None)
-        q = esbridge.smoke_query(cfg, args.index, args.phrase, size=args.size)
+        size = args.size if args.size is not None else (0 if args.count_by or args.interval else 3)
+        q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
+                                 until=args.until, count_by=args.count_by,
+                                 interval=args.interval, buckets=args.buckets)
         print(f"query     {json.dumps(q)}", file=sys.stderr)
         try:
             return esbridge.smoke(bridge, cluster, q, show=args.show)
@@ -579,7 +582,17 @@ def main(argv: list[str] | None = None) -> int:
     sm.add_argument("--profile-dir", help="override the dedicated browser profile directory")
     sm.add_argument("--index", help="index pattern to query (default: the first configured)")
     sm.add_argument("--phrase", help="a phrase for the first text field")
-    sm.add_argument("--size", type=int, default=3)
+    sm.add_argument("--size", type=int, default=None,
+                    help="hits on the page (default 3, or 0 with --count-by/--interval)")
+    sm.add_argument("--since", default="now-1h",
+                    help="Kibana-style start: now-7d, now-1d/d, or an ISO timestamp (default now-1h)")
+    sm.add_argument("--until", default="now", help="Kibana-style end (default now)")
+    sm.add_argument("--count-by", metavar="FIELD",
+                    help="terms aggregation on a site-map field; identifier keys come back as labels")
+    sm.add_argument("--interval", metavar="IV",
+                    help="split counts by a date histogram on the time field: 1h, 1d, ...")
+    sm.add_argument("--buckets", type=int, default=10,
+                    help="with --count-by: how many terms buckets (capped by max_buckets)")
     sm.add_argument("--term", action="append", default=[],
                     help="seed the case with a customer name (stays local; repeatable)")
     sm.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")

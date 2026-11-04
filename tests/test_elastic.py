@@ -43,10 +43,9 @@ APP_DOC = {
     "labels": {"tenant_name": "Fabrikam Industries", "tenant_full_name": "Fabrikam Industries GmbH",
                "tenant_id": "0f9e8d7c-6b5a-4433-9221-0a1b2c3d4e5f", "resource_name": "LegalHold2026"},
     "job": {"id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "status": "Failed",
+            "object_id": "7c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f", "name": "Legal Hold Sync",
             "status_message": "Access denied for lena.moreau@fabrikam.com",
             "counters": {"items": 120, "bytes": 4096, "errors": 3}},
-    "job_object_id": "7c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f",
-    "job_name": "Legal Hold Sync",
     "tenant": {"users_in_tenant": 48213},
     "process": {"command_line": "engine.exe --tenant Fabrikam Industries"},
 }
@@ -139,7 +138,7 @@ def test_no_planted_value_survives_and_labels_are_consistent():
     org = src["labels"]["tenant_name"]
     assert org.startswith("<Org-") and org in src["message"]
     # the same GUID under two fields and in the text: one label
-    assert src["job_object_id"] in src["message"]
+    assert src["job"]["object_id"] in src["message"]
     # identifiers that are numbers become labels, counters stay numbers
     assert src["tenant"]["users_in_tenant"].startswith("<Tenant_Size-")
     assert src["job"]["counters"] == {"items": 120, "bytes": 4096, "errors": 3}

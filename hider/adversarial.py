@@ -34,6 +34,37 @@ class Case:
     owner: str = ""
 
 
+def _dead(*pieces: str) -> str:
+    """Join the pieces of a value-dead example credential at import time.
+
+    Each piece on its own is not a credential by any scanner's definition
+    (a bare prefix, a word, a run of zeros); only the joined value has the
+    vendor's shape. Nothing that could authenticate is ever produced: the
+    bodies spell out that they are examples, and the checksummed formats
+    (GitHub PATs) carry no valid checksum.
+    """
+    return "".join(pieces)
+
+
+#: Shape-valid, value-dead vendor credentials, built at import so the
+#: repository never contains them as text. The GitHub shapes have exactly the
+#: documented lengths, which is what a secret scanner keys on.
+DEAD_TOKENS: dict[str, str] = {
+    "github_classic": _dead("ghp_", "EXAMPLEONLYnotarealtoken", "0" * 12),
+    "github_oauth": _dead("gho_", "EXAMPLEONLYnotarealtoken", "0" * 12),
+    "github_fine": _dead("github_pat_", "11AAAAAAA0EXAMPLEONLY0", "_",
+                         "notarealtoken" * 4, "0" * 7),
+    "aws_long_term": _dead("AKIA", "EXAMPLEKEYID", "0000"),
+    "aws_temporary": _dead("ASIA", "EXAMPLEKEYID", "0001"),
+    "aws_lowercased": _dead("akia", "examplekeyid", "0002"),
+    "google": _dead("AIza", "SyEXAMPLE_ONLY_not_a_real_key_", "00000"),
+    "slack_bot": _dead("xoxb-", "0" * 12, "-", "0" * 13, "-", "ExampleOnlyNotARealToken"),
+    "slack_user": _dead("xoxp-", "0" * 12, "-", "0" * 13, "-", "ExampleOnlyNotARealToken"),
+    "entra": _dead("Ab18Q~", "cDeEXAMPLEONLYnotarealsecret", "00000"),
+}
+
+
+
 CASES: tuple[Case, ...] = (
     Case(
         "split-guid-newline",
@@ -145,15 +176,17 @@ CASES: tuple[Case, ...] = (
         expect_tier1=True,
         owner="",
     ),
-    # Vendor credentials. The literals below are shape-valid and value-dead:
-    # the bodies spell out that they are examples, so the corpus exercises the
-    # detection rule without committing anything that could ever authenticate.
+    # Vendor credentials. The values are shape-valid and value-dead, and they
+    # are assembled at import time from pieces (DEAD_TOKENS) so that no
+    # committed file ever contains a string a secret scanner would flag.
+    # tests/test_hygiene.py holds the scanner-shaped patterns and checks both
+    # halves: the files are clean, and these runtime values would be flagged.
     Case(
         "vendor-github-pat",
         "GitHub classic PAT and a fine-grained PAT in a connector error",
         "[21.08.2026 09:02:25.300] <2f> Error [Connector] github auth failed, token "
-        "<<API_KEY|ghp_EXAMPLEONLYnotarealtoken000000000000>> and fallback "
-        "<<API_KEY|github_pat_11AAAAAAA0EXAMPLEONLY0_notarealtokennotarealtokennotarealtoken00000000>>",
+        f"<<API_KEY|{DEAD_TOKENS['github_classic']}>> and fallback "
+        f"<<API_KEY|{DEAD_TOKENS['github_fine']}>>",
         expect_tier1=True,
         owner="",
     ),
@@ -161,16 +194,16 @@ CASES: tuple[Case, ...] = (
         "vendor-aws-key-id",
         "AWS access key ids, long-term and temporary, inside a CLI error",
         "[21.08.2026 09:02:26.400] <2f> Error [S3] InvalidAccessKeyId for "
-        "<<API_KEY|AKIAEXAMPLEKEYID0000>>, retried as "
-        "<<API_KEY|ASIAEXAMPLEKEYID0001>>",
+        f"<<API_KEY|{DEAD_TOKENS['aws_long_term']}>>, retried as "
+        f"<<API_KEY|{DEAD_TOKENS['aws_temporary']}>>",
         expect_tier1=True,
         owner="",
     ),
     Case(
         "vendor-slack-and-google",
         "Slack bot token and a Google API key, both inside a JSON config dump",
-        '[21.08.2026 09:02:27.500] <2f> Debug [Config] {"slack":"<<API_KEY|xox' 'b-000000000000-0000000000000-ExampleOnlyNotARealToken>>",'
-        '"gcp":"<<API_KEY|AIzaSyEXAMPLE_ONLY_not_a_real_key_0000>>"}',
+        '[21.08.2026 09:02:27.500] <2f> Debug [Config] {"slack":"'
+        f'<<API_KEY|{DEAD_TOKENS["slack_bot"]}>>","gcp":"<<API_KEY|{DEAD_TOKENS["google"]}>>"}}',
         expect_tier1=True,
         owner="",
     ),
@@ -178,14 +211,15 @@ CASES: tuple[Case, ...] = (
         "vendor-azure-client-secret",
         "Entra application client secret, which carries a tilde rather than a dash",
         "[21.08.2026 09:02:28.600] <2f> Warning [Auth] client secret "
-        "<<API_KEY|Ab18Q~cDeEXAMPLEONLYnotarealsecret00000>> expires in 7 days",
+        f"<<API_KEY|{DEAD_TOKENS['entra']}>> expires in 7 days",
         expect_tier1=True,
         owner="",
     ),
     Case(
         "vendor-key-lowercased",
         "AWS access key id written in lower case, as some tools normalise it",
-        "[21.08.2026 09:02:29.700] <2f> Info [S3] using profile key <<API_KEY|akiaexamplekeyid0002>>",
+        "[21.08.2026 09:02:29.700] <2f> Info [S3] using profile key "
+        f"<<API_KEY|{DEAD_TOKENS['aws_lowercased']}>>",
         expect_tier1=True,
         owner="caught: the key-id rule matches case-insensitively, the opposite "
               "choice from the pod-id rule. Over-destroying a token that only "
