@@ -374,6 +374,14 @@ def test_smoke_interval_alone_is_a_histogram_of_matching_lines(stub, tmp_path, c
     ({"count_by": "agent.name", "buckets": 500}, "size_cap"),
     ({"since": "yesterday"}, "bad_value"),
     ({"until": "Contoso"}, "bad_value"),
+    # the bucket cap, known before sending: these never reach Kibana
+    ({"since": "now-7d", "count_by": "agent.name", "interval": "1h"}, "size_cap"),
+    ({"since": "now-50h", "interval": "1h"}, "size_cap"),
+    ({"since": "now-1d/d", "until": "now/d", "interval": "10m"}, "size_cap"),
+    ({"since": "2026-08-18", "until": "2026-08-20", "interval": "1h"}, "size_cap"),
+    ({"since": "2026-08-01", "interval": "1h"}, "size_cap"),
+    ({"since": "2026-02-30", "interval": "1d"}, "bad_value"),
+    ({"interval": "0h"}, "bad_agg"),
 ])
 def test_smoke_bad_aggregation_or_time_is_a_refusal(stub, tmp_path, capsys, kw, code):
     b = _bridge(stub, tmp_path)
@@ -385,6 +393,37 @@ def test_smoke_bad_aggregation_or_time_is_a_refusal(stub, tmp_path, capsys, kw, 
     assert len(stub.engine.requests) == n  # refused before anything left
     row = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
     assert row["refused"] == code
+
+
+@pytest.mark.parametrize("kw,most", [
+    ({"since": "now-49h", "interval": "1h"}, 50),                          # the cap exactly
+    ({"since": "now-49h", "count_by": "agent.name", "interval": "1h"}, 50),
+    ({"since": "now-1d/d", "until": "now/d", "interval": "1h"}, 48),
+    ({"since": "2026-08-19", "until": "2026-08-20", "interval": "1h"}, 48),
+    ({"since": "2026-08-13T12:00:00Z", "until": "2026-08-20T12:00:00Z", "interval": "4h"}, 43),
+])
+def test_smoke_histogram_within_the_cap_reaches_kibana(stub, tmp_path, capsys, kw, most):
+    b = _bridge(stub, tmp_path)
+    n = len(stub.engine.requests)
+    q = esbridge.smoke_query(b.config, size=0, **kw)
+    assert esbridge.smoke(b, "stub", q) == 0, capsys.readouterr().out
+    assert len(stub.engine.requests) == n + 1
+    aggs = b.outcomes[-1].output["aggregations"]
+    lists = ([r[esbridge.TIME_AGG]["buckets"] for r in aggs[esbridge.COUNT_AGG]["buckets"]]
+             if esbridge.COUNT_AGG in aggs else [aggs[esbridge.TIME_AGG]["buckets"]])
+    assert all(len(rows) <= most for rows in lists)
+
+
+def test_smoke_refused_histogram_says_how_many_buckets_and_what_fits(stub, tmp_path, capsys):
+    b = _bridge(stub, tmp_path)
+    n = len(stub.engine.requests)
+    q = esbridge.smoke_query(b.config, size=0, since="now-7d", count_by="agent.name",
+                             interval="1h")
+    assert esbridge.smoke(b, "stub", q) == 2
+    out = capsys.readouterr().out
+    assert "code=size_cap" in out and "gives 169 buckets, the cap is 50" in out
+    assert "4h fits (43 buckets)" in out and "window of at most 2d 1h" in out
+    assert len(stub.engine.requests) == n and b.session.transport is not None
 
 
 def test_es_smoke_cli_wires_the_new_flags(capsys):

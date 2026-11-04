@@ -311,7 +311,7 @@ template reshuffles the generator and invalidates it.
 | Session scrubber for async-search responses: hits, `_source` and `fields` by path, bucket keys, `top_hits`, `filters`, metrics; drop-by-default; degraded and leak refusals; error bodies to a class | `elastic.EsScrubber.scrub_response` | `test_elastic.py`, `es-eval` |
 | Case vault and seeding (`seed`), save/restore under `out/es/` | `EsScrubber.seed`, `save_session`, `load_session` | `test_elastic.py` |
 | Closed grammar, compiler, outbound gate, label resolution | `esquery.py` (`compile_query`) | `tests/test_esquery.py` |
-| Adversarial query cases, 35, each with its refusal code | `esquery.ORACLE_CASES` | parametrised test plus `es-eval` |
+| Adversarial query cases, 37, each with its refusal code | `esquery.ORACLE_CASES` | parametrised test plus `es-eval` |
 | Synthetic documents in the three index shapes, with ground truth | `eseval.generate`, `templates/elastic_fixtures.json` | `tests/test_eseval.py` |
 | Stub Elasticsearch engine for the grammar; stub Kibana speaking the async protocol with required headers and a cookie | `eseval.StubEngine`, `eseval.StubKibana` | `test_eseval.py` |
 | The numbers: leak rate, refusals, clean-traffic refusals, round trip, oracle, coverage, text queries, latency | `eseval.run_eval`, `python -m hider es-eval` | writes `out/es-eval.json` |
@@ -377,6 +377,20 @@ key; `--show` prints the keys, which are labels on identifier fields
 through `esquery` unchanged, so a field outside the site map, a text field,
 an interval outside the grammar, a `--buckets` over `max_buckets` or a
 time that is not date math gives a `REFUSED` line with the grammar's code.
+
+A histogram that would return more than `max_buckets` buckets is refused
+by the grammar before anything is sent (`size_cap`, naming the count and an
+interval that fits). `esquery` resolves both `time_range` bounds the way
+Elasticsearch does (UTC, calendar months, `gt`/`lte` rounding up, a bare
+date on `lte` meaning its last millisecond) and counts the buckets between
+them exactly. When one side is `now` and the other an ISO date, the `now`
+side uses this machine's clock widened by five minutes, so the count stays
+an upper bound. When both sides are `now`, one clock reading serves both,
+as Kibana uses one. A histogram whose window cannot be computed is refused
+as `unbounded_histogram`: a `time_range` missing its start or its end, or a
+histogram on a field other than the time field. The scrubber's bucket cap
+stays as the backstop, for example when Kibana's clock sits across a bucket
+edge from this one.
 
 Known limits of this layer, by design for now: Playwright's sync API is
 single-threaded, so calls are serialised under one lock (parallel tabs

@@ -56,7 +56,7 @@ def test_engine_answers_the_grammar(engine, fixture):
     s = elastic.EsScrubber(CFG, tier2="none")
     lab = s.seed(fixture.tenants[0].name)
     c = esquery.compile_query({
-        "index": "logs-app-*", "size": 5, "time_range": {"gte": "now-6h"},
+        "index": "logs-app-*", "size": 5, "time_range": {"gte": "now-6h", "lte": "now"},
         "filters": [{"field": "labels.tenant_name", "op": "eq", "value": lab}],
         "aggs": {"by_srv": {"type": "terms", "field": "agent.name", "size": 3,
                             "aggs": {"last": {"type": "top_hits", "size": 1}}},

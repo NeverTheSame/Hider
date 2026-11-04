@@ -31,8 +31,12 @@ On the way out, two substitutions and one gate:
 
 from __future__ import annotations
 
+import calendar
+import math
 import re
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import elastic, jsonscrub, pipeline
@@ -61,6 +65,148 @@ _LABEL_WORD = re.compile(r"<[A-Za-z][A-Za-z_]*-\d+>")
 
 _GUID_FAMILY = {"GUID", "SESSION_GUID", "TENANT_ID", "OBJECT_GUID", "DOC_ID"}
 
+# -- the histogram pre-flight ------------------------------------------------
+#
+# A date_histogram's bucket count follows from the window and the interval,
+# both known before the query is sent, so a histogram that would overrun
+# ``max_buckets`` is refused here instead of being run and then withheld by
+# the scrubber (which keeps its own cap as the backstop). Both bounds are
+# resolved the way Elasticsearch resolves them and the buckets between them
+# counted exactly. That count is the most the reply can hold: Elasticsearch
+# fills empty buckets only between the first and last matching document, so
+# sparse data gives fewer. Everything is UTC because the compiled range sets
+# no time_zone, and fixed intervals are aligned to the epoch.
+#
+# ``now`` is Kibana's clock, which this machine can only approximate:
+#
+# * no bound on ``now``: exact, no clock involved;
+# * one side on ``now`` and the other an ISO date: that side is resolved at
+#   this clock plus or minus CLOCK_SKEW_S, whichever widens the window, so
+#   the count is a true upper bound;
+# * both sides on ``now``: one clock reading for both, as Kibana uses one.
+#   The anchor cancels (now-7d..now at 1h is 169 buckets at any hour); a
+#   window that is not whole intervals can gain one bucket if Kibana's clock
+#   sits across a bucket edge from this one, and the scrubber catches that.
+
+#: Widening applied to the ``now`` side of a mixed ISO/``now`` window.
+CLOCK_SKEW_S = 300.0
+_DAY = 86400
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MATH = re.compile(r"^now(?:([+-])(\d{1,4})([smhdwMy]))?(?:/([smhdwMy]))?$")
+_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?"
+                  r"(Z|[+-]\d{2}:?\d{2})?)?$")
+_FIXED_UNIT_S = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": _DAY}
+_CALENDAR_S = {"minute": 60, "hour": 3600, "day": _DAY, "1w": 7 * _DAY, "week": 7 * _DAY,
+               "1M": 28 * _DAY, "month": 28 * _DAY, "1q": 90 * _DAY, "quarter": 90 * _DAY,
+               "1y": 365 * _DAY, "year": 365 * _DAY}
+#: what a refusal suggests instead, smallest first; every one is grammar-valid
+_SUGGESTED_INTERVALS = ("1m", "5m", "10m", "15m", "30m", "1h", "2h", "3h", "4h", "6h", "12h",
+                        "1d", "1w", "month", "quarter", "year")
+
+
+def _utc(t: float) -> datetime:
+    return _EPOCH + timedelta(seconds=t)
+
+
+def _secs(d: datetime) -> float:
+    return (d - _EPOCH).total_seconds()
+
+
+def _shift(d: datetime, n: int, unit: str) -> datetime:
+    """Date-math ``+n unit``; months and years clamp the day like Java's plusMonths."""
+    if unit in "smhdw":
+        return d + timedelta(seconds=n * {"s": 1, "m": 60, "h": 3600, "d": _DAY, "w": 7 * _DAY}[unit])
+    months = d.year * 12 + d.month - 1 + (n * 12 if unit == "y" else n)
+    y, m = divmod(months, 12)
+    return d.replace(year=y, month=m + 1, day=min(d.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def _floor(d: datetime, unit: str) -> datetime:
+    d = d.replace(microsecond=0)
+    if unit == "s":
+        return d
+    d = d.replace(second=0)
+    if unit == "m":
+        return d
+    d = d.replace(minute=0)
+    if unit == "h":
+        return d
+    d = d.replace(hour=0)
+    if unit == "w":
+        return d - timedelta(days=d.weekday())  # weeks start on Monday
+    if unit == "M":
+        return d.replace(day=1)
+    if unit == "y":
+        return d.replace(month=1, day=1)
+    return d
+
+
+def _resolve(v: str, *, round_up: bool, now: float) -> float:
+    """The instant Elasticsearch reads a range bound as, in epoch seconds.
+
+    ``gt`` and ``lte`` round up (``now/d`` is the last millisecond of today,
+    a bare date the last millisecond of that day), ``gte`` and ``lt`` round
+    down. Raises ValueError or OverflowError for a date that cannot exist.
+    """
+    m = _MATH.match(v)
+    if m:
+        d = _utc(now)
+        if m.group(1):
+            d = _shift(d, int(m.group(2)) * (1 if m.group(1) == "+" else -1), m.group(3))
+        if not m.group(4):
+            return _secs(d)
+        lo = _floor(d, m.group(4))
+        return _secs(_shift(lo, 1, m.group(4))) - 0.001 if round_up else _secs(lo)
+    m = _ISO.match(v)
+    if m is None:
+        raise ValueError(v)
+    y, mo, d, hh, mi, ss, frac, zone = m.groups()
+    t = _secs(datetime(int(y), int(mo), int(d), int(hh or 0), int(mi or 0), int(ss or 0),
+                       tzinfo=timezone.utc))
+    t += float("0." + frac) if frac else 0.0
+    if zone and zone != "Z":
+        offset = int(zone[1:3]) * 3600 + int(zone[-2:]) * 60
+        t -= offset if zone[0] == "+" else -offset
+    unit = _DAY if hh is None else 60 if ss is None else 1 if frac is None else 0
+    return t + unit - 0.001 if round_up and unit else t
+
+
+def _interval_seconds(interval: str) -> float:
+    """The shortest bucket an interval makes."""
+    if interval in _CALENDAR_S:
+        return float(_CALENDAR_S[interval])
+    m = re.fullmatch(r"(\d+)(ms|s|m|h|d)", interval)
+    return int(m.group(1)) * _FIXED_UNIT_S[m.group(2)]
+
+
+def _bucket_index(t: float, interval: str) -> int:
+    d = _utc(t)
+    if interval in ("1M", "month"):
+        return d.year * 12 + d.month - 1
+    if interval in ("1q", "quarter"):
+        return d.year * 4 + (d.month - 1) // 3
+    if interval in ("1y", "year"):
+        return d.year
+    if interval in ("1w", "week"):
+        return math.floor((t - 4 * _DAY) / (7 * _DAY))  # 1970-01-05 was a Monday
+    return math.floor(t / _interval_seconds(interval))
+
+
+def _bucket_count(start: float, end: float, interval: str) -> int:
+    return 0 if end < start else _bucket_index(end, interval) - _bucket_index(start, interval) + 1
+
+
+def _fmt_span(seconds: float) -> str:
+    s = int(round(seconds / 60.0)) * 60
+    if s <= 0:
+        return f"{max(seconds, 0):g}s"
+    parts = []
+    for unit, size in (("d", _DAY), ("h", 3600), ("m", 60)):
+        if s >= size:
+            parts.append(f"{s // size}{unit}")
+            s %= size
+    return " ".join(parts[:2])
+
 
 @dataclass
 class Compiled:
@@ -74,9 +220,14 @@ class Compiled:
 
 
 class _Compiler:
-    def __init__(self, config: elastic.ElasticConfig, session: elastic.EsScrubber) -> None:
+    def __init__(self, config: elastic.ElasticConfig, session: elastic.EsScrubber, *,
+                 now: float | None = None) -> None:
         self.cfg = config
         self.session = session
+        self.now = time.time() if now is None else now
+        #: (widest window in seconds, whether our clock was needed), or None
+        #: when time_range lacks a start or an end
+        self.window: tuple[float, bool] | None = None
         self.text_queries: list[str] = []
         self.labels_used: list[str] = []
         self._tier1 = pipeline.RegexTier()
@@ -267,7 +418,55 @@ class _Compiler:
             if not isinstance(v, str) or not _TIME.match(v):
                 raise self.refuse("bad_value", f"time_range.{k}: not a timestamp or date math")
             bounds[k] = v
+        on_now = {k: v.startswith("now") for k, v in bounds.items()}
+        mixed = len(set(on_now.values())) > 1
+        starts, ends = [], []
+        for k, v in bounds.items():
+            is_start = k in ("gte", "gt")
+            at = self.now + (0.0 if not (mixed and on_now[k]) else
+                             -CLOCK_SKEW_S if is_start else CLOCK_SKEW_S)
+            try:
+                t = _resolve(v, round_up=k in ("gt", "lte"), now=at)
+            except (ValueError, OverflowError):
+                raise self.refuse("bad_value", f"time_range.{k}: not a calendar date") from None
+            (starts if is_start else ends).append(t)
+        if starts and ends:
+            # every bound applies, so the window is the tightest pair
+            self.window = (max(starts), min(ends), mixed)
         return {"range": {self.cfg.time_field: bounds}}
+
+    def check_histogram(self, fname: str, interval: str, *, what: str) -> None:
+        """Refuse a histogram whose bucket count can overrun the cap, before
+        it is sent. One that cannot be bounded is refused too: it is exactly
+        the query that would run on the cluster and then be withheld."""
+        step = _interval_seconds(interval)
+        if step <= 0:
+            raise self.refuse("bad_agg", f"{what}: interval must be longer than zero")
+        tf = self.cfg.time_field
+        if fname != tf:
+            raise self.refuse("unbounded_histogram", f"{what}: time_range bounds {tf} only, so "
+                                                     f"a histogram on {fname} has no bucket limit; "
+                                                     f"histogram {tf} instead")
+        if self.window is None:
+            raise self.refuse("unbounded_histogram", f"{what}: a histogram needs time_range with a "
+                                                     "start (gte/gt) and an end (lte/lt); without "
+                                                     "both its bucket count cannot be checked "
+                                                     "before the query runs")
+        start, end, clock = self.window
+        cap = self.cfg.max_buckets
+        n = _bucket_count(start, end, interval)
+        if n <= cap:
+            return
+        fits = next(((iv, k) for iv in _SUGGESTED_INTERVALS
+                     for k in [_bucket_count(start, end, iv)] if k <= cap), None)
+        hint = (f"{fits[0]} fits ({fits[1]} buckets)" if fits
+                else "no interval in the grammar fits")
+        # a window of (cap - 1) intervals fits at any alignment
+        raise self.refuse("size_cap", (
+            f"{what}: {interval} over a window of {_fmt_span(end - start)} gives {n} buckets, "
+            f"the cap is {cap}; {hint}, or keep {interval} with a window of at most "
+            f"{_fmt_span((cap - 1) * step)}"
+            + (" (window measured against this machine's clock)" if clock else "")))
 
     # -- sort, aggs --------------------------------------------------------
 
@@ -364,6 +563,7 @@ class _Compiler:
             interval = spec.get("interval", "1h")
             if not isinstance(interval, str) or not _INTERVAL.match(interval):
                 raise self.refuse("bad_agg", f"{what}: interval like 5m, 1h, 1d, week")
+            self.check_histogram(fname, interval, what=what)
             key = "calendar_interval" if interval in {"1w", "1M", "1q", "1y", "minute", "hour",
                                                         "day", "week", "month", "quarter",
                                                         "year"} else "fixed_interval"
@@ -437,9 +637,14 @@ def _types_compatible(field_type: str, label_type: str) -> bool:
     return field_type in _GUID_FAMILY and label_type in _GUID_FAMILY
 
 
-def compile_query(q: Any, config: elastic.ElasticConfig, session: elastic.EsScrubber) -> Compiled:
-    """Grammar in, async-search body out, or :class:`elastic.Refused`."""
-    return _Compiler(config, session).compile(q)
+def compile_query(q: Any, config: elastic.ElasticConfig, session: elastic.EsScrubber, *,
+                  now: float | None = None) -> Compiled:
+    """Grammar in, async-search body out, or :class:`elastic.Refused`.
+
+    ``now`` (epoch seconds, default this machine's clock) is used only to
+    bound a histogram window that mixes an ISO date with ``now``.
+    """
+    return _Compiler(config, session, now=now).compile(q)
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +771,16 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
                {"index": _IDX, "size": 0, "aggs": {"f": {"type": "filters", "filters": {
                    "a": [{"field": _TENANT, "op": "eq", "value": "Fabrikam"}]}}}},
                "literal_identifier"),
+    OracleCase("histogram-over-cap", "a histogram wider than the bucket cap would run on the "
+               "cluster and only then be withheld; refused before it is sent",
+               {"index": _IDX, "size": 0, "time_range": {"gte": "now-7d", "lte": "now"},
+                "aggs": {"h": {"type": "date_histogram", "field": "@timestamp", "interval": "1h"}}},
+               "size_cap"),
+    OracleCase("histogram-without-window", "a histogram with no end to its window has no bucket "
+               "limit that can be checked before it runs",
+               {"index": _IDX, "size": 0, "time_range": {"gte": "now-7d"},
+                "aggs": {"h": {"type": "date_histogram", "field": "@timestamp", "interval": "1d"}}},
+               "unbounded_histogram"),
     OracleCase("time-range-not-a-time", "a time bound that is not a timestamp (injection vector)",
                {"index": _IDX, "time_range": {"gte": "Contoso"}}, "bad_value"),
     OracleCase("tenant-id-literal", "a GUID literal on the tenant id field",

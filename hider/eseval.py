@@ -339,7 +339,9 @@ def _unflatten(flat: dict[str, Any]) -> dict:
     return out
 
 
-def _parse_time(v: Any) -> datetime | None:
+def _parse_time(v: Any, *, round_up: bool = False) -> datetime | None:
+    """A stored or bound time. As Elasticsearch: a time without a zone is UTC,
+    and a bare date read with ``round_up`` (gt, lte) is its last millisecond."""
     if isinstance(v, (int, float)):
         return datetime.fromtimestamp(v / 1000, tz=timezone.utc)
     if not isinstance(v, str):
@@ -353,9 +355,14 @@ def _parse_time(v: Any) -> datetime | None:
             t = t + timedelta(**{unit: n}) if unit else t + timedelta(days=30 * n)
         return t
     try:
-        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        t = datetime.fromisoformat(v.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    if round_up and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        t += timedelta(days=1, milliseconds=-1)
+    return t
 
 
 def _term_eq(stored: Any, literal: Any) -> bool:
@@ -409,7 +416,7 @@ class StubEngine:
                 return False
             x = _cmp_value(f, flat[f])
             for op, b in bounds.items():
-                b = _cmp_value(f, b)
+                b = _parse_time(b, round_up=op in ("gt", "lte")) if f == "@timestamp" else b
                 if x is None or b is None:
                     return False
                 if op == "gte" and not x >= b or op == "gt" and not x > b \

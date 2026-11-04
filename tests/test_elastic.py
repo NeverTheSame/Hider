@@ -295,6 +295,24 @@ def test_bucket_and_hit_caps_are_enforced():
     assert e.value.code == "size_cap"
 
 
+def test_bucket_cap_backstop_holds_for_what_the_grammar_pre_flight_cannot_predict():
+    """esquery refuses a histogram that would overrun max_buckets before it is
+    sent; this cap stays for a reply that has more anyway (a clock across a
+    bucket edge from ours, an upstream that ignores the request)."""
+    hist = elastic.Plan("logs-app-*", {"t": elastic.AggPlan("date_histogram", "@timestamp",
+                                                            CFG.rule("@timestamp"))})
+
+    def buckets(n):
+        return {"t": {"buckets": [{"key": 1_787_227_200_000 + i * 3_600_000, "doc_count": 1}
+                                  for i in range(n)]}}
+
+    assert len(_session().scrub_response(_envelope([], buckets(CFG.max_buckets)), hist)
+               .output["aggregations"]["t"]["buckets"]) == CFG.max_buckets
+    with pytest.raises(elastic.Refused) as e:
+        _session().scrub_response(_envelope([], buckets(CFG.max_buckets + 1)), hist)
+    assert e.value.code == "size_cap"
+
+
 def test_seed_and_resolve_label_and_session_round_trip(tmp_path):
     s = _session()
     lab = s.seed("Fabrikam Industries")
