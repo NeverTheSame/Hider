@@ -267,6 +267,9 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
     from . import elastic, esbridge
 
     size = args.size if args.size is not None else (0 if args.count_by or args.interval else 3)
+    args.eq_pairs = _eq_pairs(args.eq)
+    if args.phrase_field and not args.phrase:
+        raise SystemExit("--phrase-field names the field --phrase searches; give a --phrase")
     if args.stub:
         return _es_smoke_stub(args, size)
     if args.no_browser or args.expired:
@@ -275,20 +278,46 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
     cluster = args.cluster
     if not cluster:
         raise SystemExit(f"--cluster is required; configured: {[c.name for c in cfg.clusters]}")
-    q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
-                             until=args.until, count_by=args.count_by,
-                             interval=args.interval, buckets=args.buckets)
-    print(f"query     {json.dumps(q)}", file=sys.stderr)
+    q = _smoke_query(esbridge, cfg, args, size)
     client = esbridge.BrokerClient(esbridge.broker_socket(args.profile_dir or cfg.profile_dir),
                                    timeout=cfg.poll_timeout_s + 120)
-    try:
-        report = client.call("run", cluster=cluster, query=q, terms=args.term, tier2=args.tier2,
-                             log=str(Path(args.log).resolve()) if args.log else None)["report"]
-    except elastic.Refused as e:
-        report = {"refused": {"code": e.code, "message": e.message}}
-    for label in report.get("seeded", []):
+    seeded: list[str] = []
+
+    def run(query: dict) -> dict:
+        try:
+            report = client.call("run", cluster=cluster, query=query, terms=args.term,
+                                 tier2=args.tier2,
+                                 log=str(Path(args.log).resolve()) if args.log else None)["report"]
+        except elastic.Refused as e:
+            return {"refused": {"code": e.code, "message": e.message}}
+        seeded[:] = report.get("seeded", [])
+        return report
+
+    report = esbridge.run_smoke(run, q)
+    for label in seeded:
         print(f"seeded    {label}  (the real value stays in the bridge)", file=sys.stderr)
     return esbridge.print_smoke(cluster, q, report, show=args.show)
+
+
+def _eq_pairs(raw: list[str]) -> list[tuple[str, str]]:
+    """FIELD=VALUE, split at the first '='. The value goes to the grammar as
+    written: an identifier field takes a label this case has issued."""
+    pairs = []
+    for item in raw:
+        field, sep, value = item.partition("=")
+        if not sep or not field.strip():
+            raise SystemExit(f"--eq takes FIELD=VALUE, got {item!r}")
+        pairs.append((field.strip(), value))
+    return pairs
+
+
+def _smoke_query(esbridge, cfg, args: argparse.Namespace, size: int) -> dict:
+    q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
+                             until=args.until, count_by=args.count_by,
+                             interval=args.interval, buckets=args.buckets,
+                             phrase_field=args.phrase_field, eq=args.eq_pairs)
+    print(f"query     {json.dumps(q)}", file=sys.stderr)
+    return q
 
 
 def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
@@ -317,16 +346,19 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
             if not args.no_browser and not args.expired:
                 transport.login(cfg.cluster("stub"), timeout=30)
             scrubber = elastic.EsScrubber(cfg, tier2=args.tier2)
-            for term in args.term:
-                print(f"seeded    {scrubber.seed(term)}  (the real value stays here)", file=sys.stderr)
+            try:
+                labels = esbridge.seed_terms(cfg, scrubber, args.term)
+            except elastic.Refused as e:
+                print(f"REFUSED  cluster=stub code={e.code}: {e.message}")
+                return 2
+            for label in labels:
+                print(f"seeded    {label}  (the real value stays here)", file=sys.stderr)
             bridge = esbridge.Bridge(cfg, scrubber,
                                      esbridge.KibanaSession(transport, poll_timeout=cfg.poll_timeout_s),
                                      log_path=Path(args.log) if args.log else None)
-            q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
-                                     until=args.until, count_by=args.count_by,
-                                     interval=args.interval, buckets=args.buckets)
-            print(f"query     {json.dumps(q)}", file=sys.stderr)
-            return esbridge.smoke(bridge, "stub", q, show=args.show)
+            q = _smoke_query(esbridge, cfg, args, size)
+            report = esbridge.run_smoke(lambda query: esbridge.run_case(bridge, "stub", query), q)
+            return esbridge.print_smoke("stub", q, report, show=args.show)
         finally:
             transport.close()
     finally:
@@ -669,7 +701,15 @@ def main(argv: list[str] | None = None) -> int:
     sm.add_argument("--profile-dir", help="override the dedicated browser profile directory "
                                           "(locates the running bridge)")
     sm.add_argument("--index", help="index pattern to query (default: the first configured)")
-    sm.add_argument("--phrase", help="a phrase for the first text field")
+    sm.add_argument("--phrase", action="append", default=[],
+                    help="a phrase on the phrase field; repeat to AND several "
+                         "(--phrase 'returned HTTP' --phrase 429)")
+    sm.add_argument("--phrase-field", metavar="FIELD",
+                    help="the text field --phrase searches (default: the first text field in "
+                         "the site map); named in the summary")
+    sm.add_argument("--eq", action="append", default=[], metavar="FIELD=VALUE",
+                    help="an exact filter, repeatable, ANDed; identifier fields take a label "
+                         "this run has issued (see --term TYPE=VALUE)")
     sm.add_argument("--size", type=int, default=None,
                     help="hits on the page (default 3, or 0 with --count-by/--interval)")
     sm.add_argument("--since", default="now-1h",
@@ -682,7 +722,8 @@ def main(argv: list[str] | None = None) -> int:
     sm.add_argument("--buckets", type=int, default=10,
                     help="with --count-by: how many terms buckets (capped by max_buckets)")
     sm.add_argument("--term", action="append", default=[],
-                    help="seed the case with a customer name (stays local; repeatable)")
+                    help="seed the case with a customer name, or TYPE=VALUE for another "
+                         "identifier type (SERVER_NAME=...); stays local; repeatable")
     sm.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
     sm.add_argument("--show", action="store_true", help="print the scrubbed page")
     sm.add_argument("--log", help="append a decision-log row to this JSONL file")

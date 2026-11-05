@@ -315,7 +315,8 @@ def test_smoke_count_by_server_per_interval_prints_counts_not_keys(stub, tmp_pat
     assert esbridge.smoke(b, "stub", q) == 0
     out = capsys.readouterr().out
     assert out.count("\n") == 1 and "since=now-6h until=now" in out
-    m = re.search(r"buckets=5 bucket_docs=\[([\d, ]+)\] other_docs=(\d+) time_buckets=(\d+)", out)
+    m = re.search(r"buckets=5 bucket_docs=\[([\d, ]+)\] other_docs=(\d+) count_error_bound=0 "
+                  r"docs_with_field=\d+ time_buckets=(\d+)", out)
     assert m, out
     counts = [int(c) for c in m.group(1).split(",")]
     o = b.outcomes[-1]
@@ -438,6 +439,227 @@ def test_es_smoke_cli_wires_the_new_flags(capsys):
     rc = cli.main(["es-smoke", "--stub", "--no-browser", "--tier2", "none",
                    "--count-by", "not.in.map"])
     assert rc == 2 and "code=unknown_field" in capsys.readouterr().out
+
+
+# -- phrases, exact filters, the zero-hit check, approximate terms -----------------------
+
+
+def _expected(fixture, index, pred):
+    """Ground truth from the fixture: the stub's window is its whole 6h spread."""
+    return sum(1 for d in fixture.docs if d.index == index and pred(eseval.flatten(d.source)))
+
+
+def _words(text):
+    return eseval._TOKEN.findall(text.lower())
+
+
+def _has_phrase(text, phrase):
+    have, want = _words(text or ""), _words(phrase)
+    return any(have[i:i + len(want)] == want for i in range(len(have) - len(want) + 1))
+
+
+def _smoke(b, capsys, **kw):
+    q = esbridge.smoke_query(b.config, since="now-6h", **kw)
+    report = esbridge.run_smoke(lambda query: esbridge.run_case(b, "stub", query), q)
+    rc = esbridge.print_smoke("stub", q, report)
+    return rc, capsys.readouterr().out, report
+
+
+def test_smoke_query_builds_anded_filters_on_the_named_phrase_field():
+    q = esbridge.smoke_query(CFG0, phrase=["returned HTTP", "429"], phrase_field="job.status_message",
+                             eq=[("data_stream.dataset", "app.engine"), ("agent.name", "ctr-amer-s01")])
+    assert q["filters"] == [
+        {"field": "data_stream.dataset", "op": "eq", "value": "app.engine"},
+        {"field": "agent.name", "op": "eq", "value": "ctr-amer-s01"},
+        {"field": "job.status_message", "op": "phrase", "value": "returned HTTP"},
+        {"field": "job.status_message", "op": "phrase", "value": "429"},
+    ]
+    # the default is still the first text rule, and now it is said out loud
+    assert esbridge.default_phrase_field(CFG0) == "message"
+    assert esbridge.smoke_query(CFG0, phrase="x")["filters"][0]["field"] == "message"
+    # a site map with no text rule: the phrase is refused, not dropped
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["fields"] = {k: v for k, v in raw["fields"].items() if v != "text"}
+    no_text = elastic.parse(raw)
+    q = esbridge.smoke_query(no_text, phrase="x")
+    with pytest.raises(elastic.Refused) as e:
+        from hider import esquery
+        esquery.compile_query(q, no_text, elastic.EsScrubber(no_text, tier2="none"))
+    assert e.value.code == "unknown_field"
+
+
+def test_repeated_phrases_are_anded_and_the_summary_names_the_field(stub, tmp_path, capsys, fixture):
+    b = _bridge(stub, tmp_path)
+    one = _expected(fixture, "logs-app-*", lambda f: _has_phrase(f.get("message"), "returned HTTP"))
+    both = _expected(fixture, "logs-app-*", lambda f: _has_phrase(f.get("message"), "returned HTTP")
+                     and _has_phrase(f.get("message"), "429"))
+    assert 0 < both < one  # the pair is a real narrowing in the fixture
+    rc, out, report = _smoke(b, capsys, phrase="returned HTTP")
+    assert rc == 0 and report["hits_total"] == one and "phrase_field=message phrases=1" in out
+    rc, out, report = _smoke(b, capsys, phrase=["returned HTTP", "429"])
+    assert rc == 0 and report["hits_total"] == both and "phrase_field=message phrases=2" in out
+    # the phrases themselves never reach the summary, and each is logged as written
+    assert "returned HTTP" not in out and "429" not in out.replace("phrases=2", "")
+    row = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
+    assert row["text_queries"] == ["returned HTTP", "429"]
+
+
+def test_a_phrase_on_a_field_with_no_documents_is_empty_not_zero(stub, tmp_path, capsys, fixture):
+    b = _bridge(stub, tmp_path)
+    window = _expected(fixture, "logs-app-*", lambda f: True)
+    rc, out, report = _smoke(b, capsys, phrase="returned HTTP", phrase_field="transaction.name")
+    assert rc == 3 and out.startswith("EMPTY ")
+    assert "phrase_field=transaction.name" in out and "phrase_field_docs=0/" in out
+    assert f"transaction.name holds no documents among the {window}" in out
+    assert "pick another --phrase-field" in out
+    # the check is a second query, logged like any other
+    rows = (tmp_path / "decisions.jsonl").read_text().splitlines()
+    assert json.loads(rows[-1])["aggs"][0]["type"] == "filters"
+
+
+def test_a_phrase_that_matches_nothing_on_a_live_field_is_a_real_zero(stub, tmp_path, capsys, fixture):
+    b = _bridge(stub, tmp_path)
+    window = _expected(fixture, "logs-app-*", lambda f: "message" in f)
+    rc, out, _ = _smoke(b, capsys, phrase="zebra quokka nebula")
+    assert rc == 0 and out.startswith("OK ") and "hits_total=0" in out
+    assert f"phrase_field_docs={window}/{window}" in out
+
+
+def test_an_empty_window_is_empty_not_zero(stub, tmp_path, capsys):
+    b = _bridge(stub, tmp_path)
+    q = esbridge.smoke_query(b.config, phrase="returned HTTP", since="now-1m", until="now-1m")
+    report = esbridge.run_smoke(lambda query: esbridge.run_case(b, "stub", query), q)
+    assert esbridge.print_smoke("stub", q, report) == 3
+    assert "no document in this index and window at all" in capsys.readouterr().out
+
+
+def test_eq_on_a_keep_field_narrows_and_on_a_missing_field_is_empty(stub, tmp_path, capsys, fixture):
+    b = _bridge(stub, tmp_path)
+    dataset = next(eseval.flatten(d.source)["data_stream.dataset"] for d in fixture.docs
+                   if d.index == "logs-app-*")
+    want = _expected(fixture, "logs-app-*", lambda f: f.get("data_stream.dataset") == dataset)
+    rc, out, report = _smoke(b, capsys, eq=[("data_stream.dataset", dataset)])
+    assert rc == 0 and report["hits_total"] == want and dataset not in out
+    # a value nobody has: a real zero, the field is there
+    rc, out, _ = _smoke(b, capsys, eq=[("data_stream.dataset", "nope.nope")])
+    assert rc == 0 and out.startswith("OK ") and "fields_checked=1" in out
+    # a listed field this index never fills (a label named differently here)
+    rc, out, _ = _smoke(b, capsys, eq=[("job.status", "Failed"), ("transaction.result", "ok")])
+    assert rc == 3 and "transaction.result holds no documents among" in out
+    # two values nobody has, one of them on an empty field: still found
+    rc, out, _ = _smoke(b, capsys, eq=[("data_stream.dataset", "nope"), ("transaction.result", "ok")])
+    assert rc == 3 and "transaction.result holds no documents in this index and window" in out
+    assert "data_stream.dataset holds" not in out
+
+
+def test_eq_on_an_identifier_takes_a_label_this_run_issued(stub, tmp_path, capsys, fixture):
+    server = next(eseval.flatten(d.source)["agent.name"] for d in fixture.docs
+                  if d.index == "logs-app-*")
+    want = _expected(fixture, "logs-app-*", lambda f: f.get("agent.name") == server)
+    b = _bridge(stub, tmp_path)
+    # the literal is refused, whoever typed it
+    rc, out, _ = _smoke(b, capsys, eq=[("agent.name", server)])
+    assert rc == 2 and "code=literal_identifier" in out and server not in out
+    # a typed seed gives the label, the same one every run
+    labels = esbridge.seed_terms(b.config, b.scrubber, [f"SERVER_NAME={server}"])
+    again = esbridge.seed_terms(b.config, elastic.EsScrubber(b.config, tier2="none"),
+                                [f"SERVER_NAME={server}"])
+    assert labels == again and re.fullmatch(r"[a-z]{2,5}-(amer|emea|apj|aus)-s\d{2}", labels[0])
+    rc, out, report = _smoke(b, capsys, eq=[("agent.name", labels[0])])
+    assert rc == 0 and report["hits_total"] == want and server not in out
+    # a label of the wrong type, and one never issued
+    org = b.scrubber.seed("Contoso Holdings")
+    rc, out, _ = _smoke(b, capsys, eq=[("agent.name", org)])
+    assert rc == 2 and "code=label_type_mismatch" in out
+    rc, out, _ = _smoke(b, capsys, eq=[("agent.name", "ctr-amer-s77")])
+    assert rc == 2 and "code=unknown_label" in out
+
+
+def test_a_typed_seed_needs_a_site_map_type(tmp_path):
+    cfg = _config("https://kibana-stub.example.net", tmp_path)
+    with pytest.raises(elastic.Refused) as e:
+        esbridge.seed_terms(cfg, elastic.EsScrubber(cfg, tier2="none"), ["PASSWORD=hunter2"])
+    assert e.value.code == "bad_request" and "hunter2" not in e.value.message
+
+
+@pytest.fixture
+def knob_stub(fixture, request):
+    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices, **request.param),
+                           cookie="sid=synthetic").start()
+    yield kb
+    kb.stop()
+
+
+@pytest.mark.parametrize("knob_stub", [{}], indirect=True)
+def test_terms_counts_that_add_up_print_the_error_bound_and_no_note(knob_stub, tmp_path, capsys):
+    b = _bridge(knob_stub, tmp_path)
+    rc, out, report = _smoke(b, capsys, size=0, count_by="agent.name", buckets=3)
+    assert rc == 0 and "count_error_bound=0" in out
+    assert f"docs_with_field={report['hits_total']}" in out and "NOTE" not in out
+
+
+@pytest.mark.parametrize("knob_stub", [{"missing": {"agent.name": 4}}], indirect=True)
+def test_terms_counts_short_of_hits_total_say_why(knob_stub, tmp_path, capsys):
+    b = _bridge(knob_stub, tmp_path)
+    rc, out, report = _smoke(b, capsys, size=0, count_by="agent.name", buckets=3)
+    total = report["hits_total"]
+    present = re.search(r"docs_with_field=(\d+)", out)
+    assert rc == 0 and present and int(present.group(1)) < total
+    assert f"NOTE     {total - int(present.group(1))} of {total} matching documents have no " \
+           "agent.name and are in no bucket" in out
+
+
+@pytest.mark.parametrize("knob_stub", [{"terms_error": 3}], indirect=True)
+def test_terms_counts_from_many_shards_print_the_bound(knob_stub, tmp_path, capsys):
+    b = _bridge(knob_stub, tmp_path)
+    rc, out, report = _smoke(b, capsys, size=0, count_by="agent.name", buckets=3)
+    assert rc == 0 and "count_error_bound=3" in out
+    assert "NOTE     each bucket count may be low by up to 3" in out
+    # the total still reconciles, as in Elasticsearch: no "does not add up" note
+    assert "does not add up" not in out
+
+
+@pytest.mark.parametrize("aggs,hits_total,needle", [
+    # a multi-valued field: more bucket entries than documents
+    ({"count_by": {"buckets": [{"key": "a", "doc_count": 6}, {"key": "b", "doc_count": 6}],
+                   "sum_other_doc_count": 0, "doc_count_error_upper_bound": 0},
+      "count_by_field": {"buckets": {"present": {"doc_count": 10}}}}, 10,
+     "buckets + other_docs = 12, more than the 10 documents with agent.name"),
+    # neither the total nor the documents with the field
+    ({"count_by": {"buckets": [{"key": "a", "doc_count": 4}], "sum_other_doc_count": 1,
+                   "doc_count_error_upper_bound": 2},
+      "count_by_field": {"buckets": {"present": {"doc_count": 9}}}}, 10,
+     "buckets + other_docs = 5 does not add up to hits_total=10 or to the 9 documents"),
+    ({"count_by": {"buckets": [{"key": "a", "doc_count": 4}], "sum_other_doc_count": 0,
+                   "doc_count_error_upper_bound": -1},
+      "count_by_field": {"buckets": {"present": {"doc_count": 4}}}}, 4,
+     "could not bound the bucket count error"),
+])
+def test_terms_reconciliation_notes(capsys, aggs, hits_total, needle):
+    q = esbridge.smoke_query(CFG0, size=0, count_by="agent.name")
+    report = {"refused": None, "output": {"hits": {}, "aggregations": aggs},
+              "hits_total": hits_total, "hits_shown": 0, "seconds": 0.1, "labels_issued": 0,
+              "dropped": []}
+    assert esbridge.print_smoke("stub", q, report) == 0
+    out = capsys.readouterr().out
+    assert "NOTE" in out and needle in out and "key" not in out
+
+
+def test_es_smoke_cli_repeated_phrases_eq_and_the_empty_exit_code(capsys):
+    from hider import cli
+
+    base = ["es-smoke", "--stub", "--no-browser", "--tier2", "none", "--since", "now-6h"]
+    assert cli.main(base + ["--phrase", "returned HTTP", "--phrase", "429",
+                            "--eq", "log.level=error"]) in (0, 3)
+    captured = capsys.readouterr()
+    q = json.loads(captured.err.split("query     ", 1)[1].splitlines()[0])
+    assert [f["op"] for f in q["filters"]] == ["eq", "phrase", "phrase"]
+    assert cli.main(base + ["--phrase", "x", "--phrase-field", "transaction.name"]) == 3
+    assert "EMPTY" in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="FIELD=VALUE"):
+        cli.main(base + ["--eq", "log.level"])
+    with pytest.raises(SystemExit, match="give a --phrase"):
+        cli.main(base + ["--phrase-field", "message"])
 
 
 # -- the session lifecycle: one login, many runs ----------------------------------------
@@ -748,6 +970,34 @@ def test_es_login_then_many_es_smoke_runs_through_the_cli(served, site_map, caps
     rc = cli.main(["es-smoke", "--config", site_map, "--cluster", "stub", "--tier2", "none"])
     res = capsys.readouterr()
     assert rc == 2 and "REFUSED" in res.out and "code=session_expired" in res.out
+
+
+def test_es_smoke_through_the_bridge_checks_empty_fields_and_takes_typed_seeds(
+        served, site_map, capsys, fixture):
+    from hider import cli
+
+    assert cli.main(["es-login", "--config", site_map, "--cluster", "stub", "--timeout", "5"]) == 0
+    capsys.readouterr()
+    base = ["es-smoke", "--config", site_map, "--cluster", "stub", "--tier2", "none",
+            "--since", "now-6h"]
+    # the zero-hit check is a second run in the bridge
+    assert cli.main(base + ["--phrase", "returned HTTP", "--phrase-field", "transaction.name"]) == 3
+    out = capsys.readouterr().out
+    assert out.startswith("EMPTY ") and "transaction.name holds no documents" in out
+    # a typed seed in the bridge gives the label an identifier filter needs
+    server = next(eseval.flatten(d.source)["agent.name"] for d in fixture.docs
+                  if d.index == "logs-app-*")
+    cfg = served.cfg
+    label = esbridge.seed_terms(cfg, elastic.EsScrubber(cfg, tier2="none"),
+                                [f"SERVER_NAME={server}"])[0]
+    assert cli.main(base + ["--term", f"SERVER_NAME={server}", "--eq", f"agent.name={label}",
+                            "--phrase", "returned HTTP", "--phrase", "429"]) in (0, 3)
+    res = capsys.readouterr()
+    assert res.out.startswith(("OK ", "EMPTY ")) and server not in res.out
+    assert f"seeded    {label}" in res.err
+    assert cli.main(base + ["--term", "PASSWORD=hunter2"]) == 2
+    res = capsys.readouterr()
+    assert "code=bad_request" in res.out and "hunter2" not in res.out
 
 
 def test_es_login_timeout_masks_the_url_too(sso, short_dir, capsys):

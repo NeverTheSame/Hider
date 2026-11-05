@@ -387,6 +387,23 @@ through `esquery` unchanged, so a field outside the site map, a text field,
 an interval outside the grammar, a `--buckets` over `max_buckets` or a
 time that is not date math gives a `REFUSED` line with the grammar's code.
 
+`--phrase` is repeatable and every filter is ANDed: `--phrase "returned
+HTTP" --phrase 429`. It searches the first text field in the site map
+unless `--phrase-field` names another, and the summary names the field
+(`phrase_field=message phrases=2`). `--eq FIELD=VALUE` is repeatable; an
+identifier field takes a label this run has issued, so seed it first with
+`--term TYPE=VALUE` (`--term SERVER_NAME=<the server>`), which gives the
+same label on every run with the same terms. A zero-hit filtered query is
+followed by one check query: per filtered field, how many documents the
+other filters leave and how many of those have the field. A field with
+nothing to search makes the run `EMPTY` with exit code 3, naming the
+field; a zero over a field that holds documents stays `OK`. With
+`--count-by`, the summary adds `count_error_bound`
+(`doc_count_error_upper_bound`) and `docs_with_field`, and a `NOTE` when
+bucket counts plus `other_docs` do not equal `hits_total`, saying whether
+documents lack the field, hold several values, or the counts are
+approximate.
+
 A histogram that would return more than `max_buckets` buckets is refused
 by the grammar before anything is sent (`size_cap`, naming the count and an
 interval that fits). `esquery` resolves both `time_range` bounds the way

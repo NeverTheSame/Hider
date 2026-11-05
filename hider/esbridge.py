@@ -587,57 +587,144 @@ def _describe(query: dict, compiled: esquery.Compiled) -> dict:
 #: Aggregation names the smoke query uses; fixed so the summary can find them.
 COUNT_AGG = "count_by"
 TIME_AGG = "per_interval"
+#: beside the terms aggregation: how many matching documents have the field
+COUNT_FIELD_AGG = "count_by_field"
+#: the zero-hit check: per filtered field, documents in scope and with the field
+PHRASE_FIELD_AGG = "field_check"
+_TYPED_SEED = re.compile(r"^([A-Z][A-Z0-9_]*)=(.+)$", re.DOTALL)
+
+
+def default_phrase_field(config: elastic.ElasticConfig) -> str | None:
+    """The first text rule in the site map: what --phrase searches unless
+    --phrase-field names another."""
+    return next((r.pattern for r in config.fields if r.kind == "text"), None)
 
 
 def smoke_query(config: elastic.ElasticConfig, index: str | None = None,
-                phrase: str | None = None, size: int = 3, *, since: str = "now-1h",
-                until: str = "now", count_by: str | None = None, interval: str | None = None,
-                buckets: int = 10) -> dict:
+                phrase: str | list[str] | None = None, size: int = 3, *,
+                since: str = "now-1h", until: str = "now", count_by: str | None = None,
+                interval: str | None = None, buckets: int = 10,
+                phrase_field: str | None = None,
+                eq: list[tuple[str, str]] | tuple = ()) -> dict:
     """The grammar request for one smoke run.
 
-    Nothing is validated here on purpose: times, fields, intervals and sizes
-    go to ``esquery`` as given, so a bad one is the grammar's refusal (and a
-    decision-log row), never a CLI-side special case.
+    Nothing is validated here on purpose: times, fields, values, intervals
+    and sizes go to ``esquery`` as given, so a bad one is the grammar's
+    refusal (and a decision-log row), never a CLI-side special case. Every
+    filter is ANDed: each ``eq`` pair, then each phrase on ``phrase_field``.
     """
+    phrases = [phrase] if isinstance(phrase, str) else list(phrase or [])
     q: dict[str, Any] = {"index": index or config.indices[0],
                          "time_range": {"gte": since, "lte": until}, "size": size}
-    if phrase:
-        text_field = next((r.pattern for r in config.fields if r.kind == "text"), None)
-        if text_field:
-            q["filters"] = [{"field": text_field, "op": "phrase", "value": phrase}]
+    filters = [{"field": f, "op": "eq", "value": v} for f, v in eq]
+    if phrases:
+        # no text rule at all: the field is None and the grammar refuses it,
+        # rather than the phrase being dropped and the query widened
+        field = phrase_field or default_phrase_field(config)
+        filters += [{"field": field, "op": "phrase", "value": p} for p in phrases]
+    if filters:
+        q["filters"] = filters
     hist = ({TIME_AGG: {"type": "date_histogram", "field": config.time_field,
                         "interval": interval}} if interval is not None else {})
     if count_by is not None:
         terms: dict[str, Any] = {"type": "terms", "field": count_by, "size": buckets}
         if hist:
             terms["aggs"] = hist
-        q["aggs"] = {COUNT_AGG: terms}
+        q["aggs"] = {COUNT_AGG: terms,
+                     COUNT_FIELD_AGG: {"type": "filters", "filters": {
+                         "present": [{"field": count_by, "op": "exists"}]}}}
     elif hist:
         q["aggs"] = hist
     return q
 
 
-def _bucket_summary(output: dict) -> str:
-    """Bucket counts for the summary line. Never a key: identifier keys are
-    labels, but even labels and time keys only print with ``--show``."""
-    aggs = output.get("aggregations") or {}
-    parts = []
-    terms = aggs.get(COUNT_AGG)
-    if isinstance(terms, dict):
-        rows = terms.get("buckets") or []
-        parts += [f"buckets={len(rows)}",
-                  f"bucket_docs={[b.get('doc_count') for b in rows]}",
-                  f"other_docs={terms.get('sum_other_doc_count', 0)}"]
-        nested = [b[TIME_AGG].get("buckets") or [] for b in rows
-                  if isinstance(b.get(TIME_AGG), dict)]
-        if nested:
-            parts.append(f"time_buckets={sum(len(n) for n in nested)}")
-    hist = aggs.get(TIME_AGG)
-    if isinstance(hist, dict):
-        rows = hist.get("buckets") or []
-        parts += [f"time_buckets={len(rows)}",
-                  f"bucket_docs={[b.get('doc_count') for b in rows]}"]
-    return " ".join(parts)
+def _phrase_filters(query: dict) -> list[dict]:
+    return [f for f in query.get("filters") or [] if isinstance(f, dict) and f.get("op") == "phrase"]
+
+
+def field_probe(query: dict) -> tuple[dict, list[str]] | None:
+    """The check behind a zero-hit filtered query, as one grammar query.
+
+    For each filtered field F, ``filters`` buckets over the same index and
+    window: ``s<i>``, the documents the *other* filters leave; ``f<i>``,
+    those of them that have F at all; and ``w<i>``, the documents in the
+    window that have F, for when the other filters leave nothing to look
+    in. F's own phrases and values are never in F's buckets, so the answer
+    is about the field, not about the guess. Returns the probe and the
+    field order.
+    """
+    filters = [f for f in query.get("filters") or [] if isinstance(f, dict)]
+    fields = list(dict.fromkeys(f.get("field") for f in filters))
+    if not fields:
+        return None
+    buckets: dict[str, list] = {}
+    for i, name in enumerate(fields):
+        others = [f for f in filters if f.get("field") != name]
+        exists = {"field": name, "op": "exists"}
+        if others:
+            buckets[f"s{i}"] = others
+            buckets[f"w{i}"] = [exists]
+        buckets[f"f{i}"] = others + [exists]
+    probe: dict[str, Any] = {"index": query["index"], "size": 0,
+                             "aggs": {PHRASE_FIELD_AGG: {"type": "filters", "filters": buckets}}}
+    if "time_range" in query:
+        probe["time_range"] = query["time_range"]
+    return probe, fields
+
+
+def run_smoke(run, query: dict) -> dict:
+    """One smoke run through ``run`` (query -> report), plus the zero-hit check.
+
+    Zero hits on a filtered query is ambiguous: nothing matches, or a field
+    it filtered holds nothing here (the wrong text field for this index, a
+    label field named differently on this cluster). The check tells them
+    apart with one more query, reported under ``field_probe``;
+    ``print_smoke`` turns "nothing to search" into EMPTY and exit code 3.
+    """
+    report = run(query)
+    built = field_probe(query)
+    if report.get("refused") or built is None or report.get("hits_total") != 0:
+        return report
+    probe, fields = built
+    checked = run(probe)
+    if checked.get("refused"):
+        report["field_probe"] = {"refused": checked["refused"]}
+        return report
+    got = (((checked.get("output") or {}).get("aggregations") or {})
+           .get(PHRASE_FIELD_AGG, {}).get("buckets", {}))
+    window = checked.get("hits_total")
+    report["field_probe"] = {"docs_in_window": window, "fields": [
+        {"field": name,
+         "in_scope": got.get(f"s{i}", {}).get("doc_count") if f"s{i}" in got else window,
+         "with_field": got.get(f"f{i}", {}).get("doc_count"),
+         "in_window": got.get(f"w{i}", {}).get("doc_count") if f"w{i}" in got
+         else got.get(f"f{i}", {}).get("doc_count")}
+        for i, name in enumerate(fields)]}
+    return report
+
+
+def seed_terms(config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
+               terms: list[str]) -> list[str]:
+    """Seed the case with values the human typed locally; returns their labels.
+
+    ``Contoso Holdings`` seeds an organisation. ``SERVER_NAME=ctr-amer-042``
+    seeds a value of that identifier type, so a label for it exists in this
+    case and ``--eq agent.name=<that label>`` can filter by it (identifier
+    fields take labels only, and each run is a fresh case). The same terms
+    in the same order give the same labels on every run.
+    """
+    types = {"ORG_NAME"} | {r.type for r in config.fields if r.kind == "identifier"}
+    labels = []
+    for t in terms:
+        m = _TYPED_SEED.match(t)
+        if m is None:
+            labels.append(scrubber.seed(t))
+            continue
+        if m.group(1) not in types:
+            raise elastic.Refused("bad_request", f"a typed term needs an identifier type from the "
+                                                 f"site map: {sorted(types)}")
+        labels.append(scrubber.seed(m.group(2), m.group(1)))
+    return labels
 
 
 def run_case(bridge: Bridge, cluster: str, query: dict) -> dict:
@@ -654,25 +741,115 @@ def run_case(bridge: Bridge, cluster: str, query: dict) -> dict:
             "labels_issued": len(s.mapping), "dropped": sorted(s.dropped)}
 
 
+def _bucket_summary(query: dict, output: dict, hits_total: Any) -> tuple[str, list[str]]:
+    """Bucket counts for the summary line, and notes when they do not add up.
+    Never a key: identifier keys are labels, but even labels and time keys
+    only print with ``--show``."""
+    aggs = output.get("aggregations") or {}
+    parts: list[str] = []
+    notes: list[str] = []
+    terms = aggs.get(COUNT_AGG)
+    if isinstance(terms, dict):
+        field = ((query.get("aggs") or {}).get(COUNT_AGG) or {}).get("field")
+        rows = terms.get("buckets") or []
+        counts = [b.get("doc_count") or 0 for b in rows]
+        other = terms.get("sum_other_doc_count") or 0
+        err = terms.get("doc_count_error_upper_bound")
+        present = (((aggs.get(COUNT_FIELD_AGG) or {}).get("buckets") or {})
+                   .get("present") or {}).get("doc_count")
+        parts += [f"buckets={len(rows)}", f"bucket_docs={counts}", f"other_docs={other}"]
+        if err is not None:
+            parts.append(f"count_error_bound={err}")
+        if present is not None:
+            parts.append(f"docs_with_field={present}")
+        nested = [b[TIME_AGG].get("buckets") or [] for b in rows
+                  if isinstance(b.get(TIME_AGG), dict)]
+        if nested:
+            parts.append(f"time_buckets={sum(len(n) for n in nested)}")
+        added = sum(counts) + other
+        if isinstance(hits_total, int) and added != hits_total:
+            if present is not None and added == present:
+                notes.append(f"{hits_total - present} of {hits_total} matching documents have no "
+                             f"{field} and are in no bucket")
+            elif present is not None and added > present:
+                notes.append(f"buckets + other_docs = {added}, more than the {present} documents "
+                             f"with {field}: some hold several values and count once per value")
+            else:
+                notes.append(f"buckets + other_docs = {added} does not add up to hits_total="
+                             f"{hits_total}" + (f" or to the {present} documents with {field}"
+                                                if present is not None else "")
+                             + ": treat the bucket counts as approximate")
+        if isinstance(err, int) and err > 0:
+            notes.append(f"each bucket count may be low by up to {err} "
+                         "(doc_count_error_upper_bound: shards return only their top terms)")
+        elif err == -1:
+            notes.append("the shards could not bound the bucket count error "
+                         "(doc_count_error_upper_bound=-1)")
+    hist = aggs.get(TIME_AGG)
+    if isinstance(hist, dict):
+        rows = hist.get("buckets") or []
+        parts += [f"time_buckets={len(rows)}",
+                  f"bucket_docs={[b.get('doc_count') for b in rows]}"]
+    return " ".join(parts), notes
+
+
+def _probe_findings(probe: dict) -> list[str]:
+    """Why a zero is empty, one line per reason; [] when the zero is real."""
+    if probe.get("refused"):
+        return [f"0 hits, and the check that the filtered fields hold documents was refused "
+                f"({probe['refused']['code']}): the 0 means unknown"]
+    if not probe.get("docs_in_window"):
+        return ["no document in this index and window at all: 0 hits says nothing"]
+    out = []
+    for f in probe["fields"]:
+        hint = "; check the field name for this cluster" + (
+            " or pick another --phrase-field" if f.get("phrase") else "")
+        if f["in_scope"] and not f["with_field"]:
+            out.append(f"{f['field']} holds no documents among the {f['in_scope']} the other "
+                       f"filters leave: its filter cannot match anything here{hint}")
+        elif not f["in_scope"] and not f["in_window"]:
+            out.append(f"{f['field']} holds no documents in this index and window at all: its "
+                       f"filter cannot match anything here{hint}")
+    return out
+
+
 def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) -> int:
-    """Decisions only. Exit code 0 on a clean page, 2 on a refusal."""
+    """Decisions only. Exit code 0 on a clean page, 2 on a refusal, 3 when a
+    filtered query had nothing to search (EMPTY: zero hits that mean nothing)."""
     refused = report.get("refused")
     if refused:
         print(f"REFUSED  cluster={cluster} code={refused['code']}: {refused['message']}")
         return 2
     tr = query.get("time_range") or {}
     output = report.get("output") or {}
-    buckets = _bucket_summary(output)
-    print(f"OK       cluster={cluster} index={query['index']} "
-          f"since={tr.get('gte')} until={tr.get('lte')} hits_total={report['hits_total']} "
-          f"shown={report['hits_shown']} labels_issued={report['labels_issued']} "
-          f"dropped_field_paths={len(report['dropped'])} seconds={report['seconds']}"
-          + (f" {buckets}" if buckets else ""))
+    phrases = _phrase_filters(query)
+    probe = report.get("field_probe")
+    if probe and not probe.get("refused") and phrases:
+        for f in probe["fields"]:
+            f["phrase"] = f["field"] == phrases[0]["field"]
+    findings = _probe_findings(probe) if probe is not None else []
+    buckets, notes = _bucket_summary(query, output, report.get("hits_total"))
+    line = (f"{'EMPTY' if findings else 'OK':<9}cluster={cluster} index={query['index']} "
+            f"since={tr.get('gte')} until={tr.get('lte')} hits_total={report['hits_total']} "
+            f"shown={report['hits_shown']} labels_issued={report['labels_issued']} "
+            f"dropped_field_paths={len(report['dropped'])} seconds={report['seconds']}")
+    if phrases:
+        line += f" phrase_field={phrases[0]['field']} phrases={len(phrases)}"
+    if probe is not None and not probe.get("refused"):
+        if phrases:
+            pf = next(f for f in probe["fields"] if f["field"] == phrases[0]["field"])
+            line += f" phrase_field_docs={pf['with_field']}/{pf['in_scope']}"
+        line += f" fields_checked={len(probe['fields'])}"
+    print(line + (f" {buckets}" if buckets else ""))
+    for finding in findings:
+        print(f"         {finding}")
+    for note in notes:
+        print(f"NOTE     {note}")
     if report["dropped"]:
         print(f"         unlisted fields dropped: {report['dropped']}")
     if show:
         print(json.dumps(output, indent=1))
-    return 0
+    return 3 if findings else 0
 
 
 def smoke(bridge: Bridge, cluster: str, query: dict, *, show: bool = False) -> int:
@@ -813,7 +990,7 @@ class Broker:
         if log is not None and not (isinstance(log, str) and os.path.isabs(log)):
             raise elastic.Refused("bad_request", "log is an absolute path")
         scrubber = elastic.EsScrubber(self.config, tier2=tier2)
-        seeded = [scrubber.seed(t) for t in terms]
+        seeded = seed_terms(self.config, scrubber, terms)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
                                 poll_timeout=self.config.poll_timeout_s)
         bridge = Bridge(self.config, scrubber, session, log_path=log)

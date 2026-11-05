@@ -396,9 +396,19 @@ def backing_index(pattern: str) -> str:
 class StubEngine:
     """Evaluates compiled bodies against the fixture, Elasticsearch-shaped replies."""
 
-    def __init__(self, fixture: Fixture, indices: Iterable[str] = ()) -> None:
+    def __init__(self, fixture: Fixture, indices: Iterable[str] = (), *,
+                 missing: dict[str, int] | None = None, terms_error: int = 0) -> None:
         self.fixture = fixture
         self.indices = set(indices) or {d.index for d in fixture.docs}
+        #: field -> n: every nth document lacks the field, as real documents
+        #: do (every fixture document carries every field otherwise)
+        self.missing = dict(missing or {})
+        #: what a terms aggregation looks like over many shards: each shard
+        #: returns only its top terms, so the top bucket is undercounted by
+        #: this much, the difference lands in sum_other_doc_count (the total
+        #: stays exact, as it does in Elasticsearch), and
+        #: doc_count_error_upper_bound says so
+        self.terms_error = terms_error
         self.requests: list[dict] = []
         self.lock = threading.Lock()
 
@@ -483,11 +493,16 @@ class StubEngine:
                         counts.setdefault(v, []).append(r)
                 ordered = sorted(counts.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
                 shown = ordered[: a.get("size", 10)]
+                bucket_rows = [{"key": k, "doc_count": len(v), **self._aggs(v, sub, index)}
+                               for k, v in shown]
+                lost = min(self.terms_error, bucket_rows[0]["doc_count"] - 1) if bucket_rows else 0
+                if lost > 0:
+                    bucket_rows[0]["doc_count"] -= lost
                 out[name] = {
-                    "doc_count_error_upper_bound": 0,
-                    "sum_other_doc_count": sum(len(v) for _, v in ordered[a.get("size", 10):]),
-                    "buckets": [{"key": k, "doc_count": len(v), **self._aggs(v, sub, index)}
-                                for k, v in shown],
+                    "doc_count_error_upper_bound": self.terms_error,
+                    "sum_other_doc_count": sum(len(v) for _, v in ordered[a.get("size", 10):])
+                    + max(lost, 0),
+                    "buckets": bucket_rows,
                 }
             elif atype == "date_histogram":
                 iv = a.get("fixed_interval") or a.get("calendar_interval") or "1h"
@@ -549,6 +564,10 @@ class StubEngine:
         if index not in self.indices:
             raise KeyError(index)
         rows = [(i, flatten(d.source)) for i, d in enumerate(self._select(index))]
+        for f, nth in self.missing.items():
+            for i, flat in rows:
+                if i % nth == 0:
+                    flat.pop(f, None)
         rows = [r for r in rows if self._match(r[1], body.get("query", {"match_all": {}}))]
         total = len(rows)
         aggs = self._aggs(rows, body.get("aggs", {}), index) if body.get("aggs") else None
