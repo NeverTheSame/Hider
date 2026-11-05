@@ -117,8 +117,13 @@ def test_stub_kibana_speaks_the_async_search_protocol(engine):
         s = elastic.EsScrubber(CFG, tier2="none")
         c = esquery.compile_query({"index": "logs-worker-*", "size": 3}, CFG, s)
         url = kb.url + "/internal/search/ese"
-        # headers and the session cookie are required, as on the real endpoint
-        assert _post(url, c.body)[0] == 401
+        # no session: behind SSO that is the login page with a 200, never a 401
+        req = urllib.request.Request(url, data=json.dumps(c.body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", **KBN})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200 and "/login" in r.geturl()
+            assert r.headers["Content-Type"].startswith("text/html")
+        # headers are required, as on the real endpoint
         assert _post(url, c.body, {"Cookie": "sid=synthetic"})[0] == 400
         assert _post(url, c.body, {"Cookie": "sid=synthetic", "kbn-xsrf": "true"})[0] == 400
         hdr = {"Cookie": "sid=synthetic", **KBN}

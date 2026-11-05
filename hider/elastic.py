@@ -81,6 +81,18 @@ _FORMAT_FIELD = re.compile(r"\{(\w+)")
 DEFAULT_MAX_HITS = 100
 DEFAULT_MAX_BUCKETS = 50
 DEFAULT_MAX_TEXT_CHARS = 20_000
+#: How long one async search may run before it is withheld as incomplete.
+#: The ceiling is there because the bridge is serialised: a search that is
+#: still polling blocks every other call, so ten minutes is the most one
+#: query may hold it. A wider window or a filter is the answer past that.
+DEFAULT_POLL_TIMEOUT_S = 120
+MAX_POLL_TIMEOUT_S = 600
+#: Elasticsearch names a data stream's backing indices
+#: ``.ds-<stream>-<yyyy.MM.dd>-<generation>``, and a hit names the backing
+#: index, never the stream the query targeted. The suffix is fixed, so the
+#: stream name is recovered exactly; the greedy group is safe because the
+#: anchor is the end of the name.
+_BACKING_INDEX = re.compile(r"^\.ds-(?P<stream>.+)-\d{4}\.\d{2}\.\d{2}-\d{6,}$")
 
 
 class ConfigError(RuntimeError):
@@ -153,6 +165,7 @@ class ElasticConfig:
     #: browser profile. Both optional for the offline core.
     clusters: tuple[Cluster, ...] = ()
     profile_dir: str = ""
+    poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S
 
     def cluster(self, name: str) -> Cluster | None:
         for c in self.clusters:
@@ -176,8 +189,21 @@ class ElasticConfig:
         return tuple(r for r in self.fields if r.shape is not None)
 
     def index_allowed(self, name: str) -> bool:
-        """An index name a hit came from must match one allowlisted pattern."""
-        return any(fnmatch.fnmatchcase(name, pat) for pat in self.indices)
+        """An index name a hit came from must match one allowlisted pattern.
+
+        A data stream's backing index is admitted when its *stream* matches:
+        ``.ds-logs-app-default-2026.08.20-000001`` under ``logs-app-*``. That
+        admits nothing the pattern did not already reach (querying the
+        pattern is what returned the backing index), and nothing else that
+        starts with ``.ds-``: the name must have the backing-index suffix and
+        the stream in front of it must match. A failure-store index
+        (``.fs-``) or a downsampled one is not the stream and stays refused.
+        """
+        if any(fnmatch.fnmatchcase(name, pat) for pat in self.indices):
+            return True
+        m = _BACKING_INDEX.match(name)
+        return m is not None and any(fnmatch.fnmatchcase(m.group("stream"), pat)
+                                     for pat in self.indices)
 
     def summary(self) -> dict:
         """What Claude may be told: names and kinds, nothing else."""
@@ -282,7 +308,7 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"{source}: top level must be an object")
     allowed = {"_comment", "indices", "fields", "time_field", "max_hits", "max_buckets",
-               "max_text_chars", "clusters", "profile_dir"}
+               "max_text_chars", "clusters", "profile_dir", "poll_timeout_s"}
     unknown = set(raw) - allowed
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
@@ -308,8 +334,13 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
     profile_dir = raw.get("profile_dir", "")
     if not isinstance(profile_dir, str):
         raise ConfigError(f"{source}: profile_dir must be a path string")
+    poll = raw.get("poll_timeout_s", DEFAULT_POLL_TIMEOUT_S)
+    if isinstance(poll, bool) or not isinstance(poll, (int, float)) \
+            or not 1 <= poll <= MAX_POLL_TIMEOUT_S:
+        raise ConfigError(f"{source}: poll_timeout_s must be a number of seconds, "
+                          f"1..{MAX_POLL_TIMEOUT_S}")
     cfg = ElasticConfig(tuple(indices), rules, time_field, source=source, clusters=clusters,
-                        profile_dir=profile_dir, **caps)
+                        profile_dir=profile_dir, poll_timeout_s=float(poll), **caps)
     tf = cfg.rule(time_field)
     if tf is None or tf.kind != "keep":
         raise ConfigError(f"{source}: time_field {time_field!r} must be listed as keep")

@@ -14,6 +14,9 @@
     "clusters maps a short name (what Claude sees) to a Kibana origin; the",
     "bridge signs in through its own dedicated Chrome profile at profile_dir,",
     "created by the bridge, never your everyday browser profile.",
+    "poll_timeout_s is how long one async search may run (1..600, default 120).",
+    "Hits from a data stream name its backing index (.ds-<stream>-<date>-<gen>);",
+    "list the stream pattern (logs-app-*), never the .ds- names.",
     "A malformed file is a startup error, never a silent skip."
   ],
   "time_field": "@timestamp",
@@ -28,6 +31,7 @@
   "max_hits": 100,
   "max_buckets": 50,
   "max_text_chars": 20000,
+  "poll_timeout_s": 120,
   "fields": {
     "@timestamp": "keep",
     "data_stream.*": "keep",

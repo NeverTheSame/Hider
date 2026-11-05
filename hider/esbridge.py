@@ -1,18 +1,25 @@
-"""The live session layer: a dedicated browser owns the Kibana SSO session.
+"""The live session layer: one long-lived browser owns the Kibana SSO session.
 
-    python -m hider es-smoke --stub                 # whole path against a local stub Kibana
-    python -m hider es-smoke --cluster emea         # one scrubbed query against a real cluster
-    python -m hider es-login --cluster emea         # headed window to (re)sign in
+    python -m hider es-login --cluster emea         # start the bridge, sign the cluster in
+    python -m hider es-smoke --cluster emea         # one scrubbed query through the bridge
+    python -m hider es-logout                       # stop the bridge; the session ends
+    python -m hider es-smoke --stub                 # whole path in one process, synthetic Kibana
 
 Design (``docs/es-bridge-design.md``): there are no API keys. Each Kibana
 sits behind corporate SSO and the session lives in a browser cookie jar.
 The cookie never leaves the browser: the bridge launches the installed
-Chrome on a *dedicated* profile that is only ever signed in to Kibana, keeps
-a tab on the Kibana origin, and runs every request as an in-page ``fetch``
-from that tab. Playwright drives Chrome over a pipe, so no debugging port
-is open. The bridge process itself holds no credential.
+Chrome with an off-the-record context, keeps a tab on the Kibana origin,
+and runs every request as an in-page ``fetch`` from that tab. Playwright
+drives Chrome over a pipe, so no debugging port is open. The bridge
+process itself holds no credential.
 
-Three things this module promises, each tested against ``eseval.StubKibana``:
+Kibana's session cookie has no expiry, so it lasts exactly as long as the
+browser holding it. ``Broker`` is the process that keeps that browser
+alive between commands: ``es-login`` starts it and signs in (headed: the
+IdP never completes headless), each ``es-smoke`` sends it one grammar query
+over a private socket and gets a scrubbed page back.
+
+Four things this module promises, each tested against ``eseval.StubKibana``:
 
 * **Only well-formed, complete async-search responses reach the scrubber.**
   A login page (Kibana serves it with a 200 after an expired SSO session,
@@ -24,13 +31,17 @@ Three things this module promises, each tested against ``eseval.StubKibana``:
   compiles, this module posts the body verbatim, ``EsScrubber`` reads the
   reply. Labels are resolved on the way out and minted on the way back
   inside those two modules; nothing here sees a value in the clear except
-  the raw reply in transit, which is never logged.
-* **The browser profile is the bridge's own.** It is created by the bridge
-  with a marker file, refused if it points at an existing profile without
-  the marker, and refused if it is a stock Chrome profile directory. The
-  analyst's everyday browser is never locked by this process.
+  the raw reply in transit, which is never logged and never leaves the
+  broker.
+* **No cookie reaches disk.** Nothing here reads, exports or stores one,
+  and the off-the-record context keeps Chrome from writing it either.
+* **The bridge's directory is its own.** It is created by the bridge with a
+  marker file, refused if it points at an existing directory without the
+  marker, and refused if it is a stock Chrome profile directory. It holds
+  the broker's socket (0600 in a 0700 directory) and nothing of Chrome's.
 
-No MCP yet: :class:`Bridge.run` is the function a tool will call.
+No MCP yet: :class:`Bridge.run` is the function a tool will call, and the
+broker is the process it will run in.
 """
 
 from __future__ import annotations
@@ -38,6 +49,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -150,11 +164,20 @@ async ({url, method, headers, body}) => {
 
 
 class BrowserTransport:
-    """Chrome on the bridge's own profile, driven by Playwright over a pipe.
+    """The installed Chrome, driven by Playwright over a pipe, signed in
+    inside an off-the-record context.
 
     One browser, one tab per cluster, every request an in-page ``fetch``
     from that tab. Playwright's sync API is single-threaded, so calls are
     serialised under one lock; parallel tabs are a later phase.
+
+    Off the record because a persistent profile writes cookies to disk:
+    Chrome flushes even session cookies (Kibana's ``sid``) to the profile's
+    cookie database within about 30 seconds, encrypted under the fixed key
+    Playwright's ``--use-mock-keychain`` gives it. An off-the-record context
+    keeps every cookie, the IdP's included, in memory, and they all go when
+    the browser does. The price: nothing is remembered between browsers, so
+    the first sign-in of each browser is the full IdP flow.
 
     Playwright is an optional extra (``requirements-es.txt``) and is
     imported here, never at module load.
@@ -167,10 +190,22 @@ class BrowserTransport:
         self.channel = channel
         self._lock = threading.Lock()
         self._pw = None
+        self._browser = None
         self._ctx = None
+        self._closing = False
         self._tabs: dict[str, Any] = {}
+        self._gone = False
+
+    def start(self) -> None:
+        """Launch Chrome now rather than on the first request, so a missing
+        extra or a locked profile fails at startup."""
+        with self._lock:
+            self._start()
 
     def _start(self) -> None:
+        if self._gone:
+            raise elastic.Refused("session_expired", "the bridge's browser was closed; "
+                                                     "run es-login")
         if self._ctx is not None:
             return
         try:
@@ -181,11 +216,26 @@ class BrowserTransport:
         self._pw = sync_playwright().start()
         # Playwright talks to Chromium over a pipe by default: no
         # --remote-debugging-port, nothing for another local process to attach to.
-        self._ctx = self._pw.chromium.launch_persistent_context(
-            str(self.profile_dir), channel=self.channel, headless=self.headless,
-            accept_downloads=False, ignore_default_args=["--enable-automation"],
+        # launch() puts Chrome on a throwaway user-data-dir that Playwright
+        # deletes at close; new_context() is off the record on top of it.
+        self._browser = self._pw.chromium.launch(
+            channel=self.channel, headless=self.headless,
+            ignore_default_args=["--enable-automation"],
             args=["--no-first-run", "--no-default-browser-check", "--disable-sync"],
         )
+        self._browser.on("disconnected", lambda *_: self._went_away())
+        self._ctx = self._browser.new_context(accept_downloads=False)
+
+    def _went_away(self) -> None:
+        if not self._closing:
+            self._gone = True
+
+    def _new_tab(self, cluster: elastic.Cluster):
+        page = self._ctx.new_page()
+        # the analyst closing the window ends the session, as es-logout does
+        page.on("close", lambda *_: self._went_away())
+        self._tabs[cluster.name] = page
+        return page
 
     def _tab(self, cluster: elastic.Cluster):
         """The tab parked on the cluster's Kibana, navigated there if needed.
@@ -197,8 +247,7 @@ class BrowserTransport:
         self._start()
         page = self._tabs.get(cluster.name)
         if page is None or page.is_closed():
-            page = self._ctx.new_page()
-            self._tabs[cluster.name] = page
+            page = self._new_tab(cluster)
         if _url_host(page.url) != cluster.host or _is_login_url(page.url):
             page.goto(cluster.kibana + APP_PATH, wait_until="domcontentloaded", timeout=30_000)
         if _url_host(page.url) != cluster.host or _is_login_url(page.url):
@@ -211,6 +260,8 @@ class BrowserTransport:
         with self._lock:
             page = self._tab(cluster)
             try:
+                if self._gone:
+                    raise RuntimeError("browser closed")
                 r = page.evaluate(_FETCH_JS, {
                     "url": cluster.kibana + path, "method": method, "headers": HEADERS,
                     "body": json.dumps(body) if body is not None else None,
@@ -221,37 +272,65 @@ class BrowserTransport:
                          bool(r["redirected"]))
 
     def login(self, cluster: elastic.Cluster, *, timeout: float = LOGIN_TIMEOUT_S) -> bool:
-        """Open a headed window on the cluster and wait for the analyst to
-        sign in. Returns True once the tab sits on the Kibana host off the
-        login page. The identity provider is driven by the human only."""
+        """Park the cluster's tab on Kibana and wait until it is signed in.
+
+        Returns True once the tab sits on the Kibana host off the login
+        page. The identity provider is driven by the human (or completes by
+        itself when the IdP remembers them); this only navigates and waits.
+
+        The browser stays open afterwards, and that is the whole point:
+        Kibana's session cookie has no expiry, so Chrome holds it in memory
+        only and it dies with the browser. A login is only worth anything to
+        the process that keeps this browser running (``Broker``). Run it
+        headed: headless SSO does not complete against a real IdP.
+        """
         with self._lock:
-            self.close()
-            self.headless = False
-            try:
-                self._start()
-                page = self._ctx.new_page()
-                page.goto(cluster.kibana + APP_PATH, wait_until="domcontentloaded", timeout=60_000)
-                deadline = time.time() + timeout
-                while time.time() < deadline:
-                    if _url_host(page.url) == cluster.host and not _is_login_url(page.url):
-                        page.wait_for_timeout(1500)  # let Kibana set its cookies
-                        return True
-                    page.wait_for_timeout(500)
-                return False
-            finally:
-                self.close()
-                self.headless = True
+            self._start()
+            page = self._tabs.get(cluster.name)
+            if page is None or page.is_closed():
+                page = self._new_tab(cluster)
+            page.goto(cluster.kibana + APP_PATH, wait_until="domcontentloaded", timeout=60_000)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if _url_host(page.url) == cluster.host and not _is_login_url(page.url):
+                    page.wait_for_timeout(1500)  # let Kibana set its cookies
+                    self._minimise(page)
+                    return True
+                page.wait_for_timeout(500)
+            return False
+
+    @property
+    def closed(self) -> bool:
+        """True once Chrome has gone away under us (the analyst closed the
+        window): the session went with it."""
+        return self._gone
+
+    @staticmethod
+    def _minimise(page) -> None:
+        """Out of the way after sign-in; best effort, the window must stay
+        open because closing it ends the session."""
+        try:
+            cdp = page.context.new_cdp_session(page)
+            win = cdp.send("Browser.getWindowForTarget")["windowId"]
+            cdp.send("Browser.setWindowBounds", {"windowId": win,
+                                                 "bounds": {"windowState": "minimized"}})
+        except Exception:
+            pass
 
     def close(self) -> None:
+        self._closing = True
         try:
-            if self._ctx is not None:
-                self._ctx.close()
+            if self._browser is not None:
+                self._browser.close()
         finally:
+            self._browser = None
             self._ctx = None
             self._tabs.clear()
             if self._pw is not None:
                 self._pw.stop()
                 self._pw = None
+            self._closing = False
+            self._gone = False  # a deliberate close: the next call starts a fresh browser
 
 
 def prepare_profile_dir(path: str | Path) -> Path:
@@ -277,8 +356,8 @@ def prepare_profile_dir(path: str | Path) -> Path:
                                       "pick an empty directory")
     else:
         p.mkdir(parents=True, mode=0o700)
-    (p / PROFILE_MARKER).write_text("Dedicated Chrome profile for hider es-bridge. Signed in to "
-                                    "Kibana only. Never open it with another tool.\n")
+    (p / PROFILE_MARKER).write_text("The hider es-bridge's own directory: its control socket "
+                                    "lives here. Chrome keeps no cookie or session here.\n")
     try:
         os.chmod(p, 0o700)
     except OSError:
@@ -561,24 +640,291 @@ def _bucket_summary(output: dict) -> str:
     return " ".join(parts)
 
 
-def smoke(bridge: Bridge, cluster: str, query: dict, *, show: bool = False) -> int:
-    """Run one query end to end and print decisions only. Exit code 0 on a
-    clean page, 2 on a refusal."""
+def run_case(bridge: Bridge, cluster: str, query: dict) -> dict:
+    """One query through a bridge, as the JSON report ``print_smoke`` reads.
+    The same report comes back from the broker, so a run prints the same
+    whether it happened in this process or in the long-lived one."""
     try:
         o = bridge.run(cluster, query)
     except elastic.Refused as e:
-        print(f"REFUSED  cluster={cluster} code={e.code}: {e.message}")
-        return 2
+        return {"refused": {"code": e.code, "message": e.message}}
     s = bridge.scrubber
+    return {"refused": None, "output": o.output, "hits_total": o.hits_total,
+            "hits_shown": o.hits_shown, "seconds": o.seconds,
+            "labels_issued": len(s.mapping), "dropped": sorted(s.dropped)}
+
+
+def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) -> int:
+    """Decisions only. Exit code 0 on a clean page, 2 on a refusal."""
+    refused = report.get("refused")
+    if refused:
+        print(f"REFUSED  cluster={cluster} code={refused['code']}: {refused['message']}")
+        return 2
     tr = query.get("time_range") or {}
-    buckets = _bucket_summary(o.output or {})
+    output = report.get("output") or {}
+    buckets = _bucket_summary(output)
     print(f"OK       cluster={cluster} index={query['index']} "
-          f"since={tr.get('gte')} until={tr.get('lte')} hits_total={o.hits_total} "
-          f"shown={o.hits_shown} labels_issued={len(s.mapping)} "
-          f"dropped_field_paths={len(s.dropped)} seconds={o.seconds}"
+          f"since={tr.get('gte')} until={tr.get('lte')} hits_total={report['hits_total']} "
+          f"shown={report['hits_shown']} labels_issued={report['labels_issued']} "
+          f"dropped_field_paths={len(report['dropped'])} seconds={report['seconds']}"
           + (f" {buckets}" if buckets else ""))
-    if s.dropped:
-        print(f"         unlisted fields dropped: {sorted(s.dropped)}")
+    if report["dropped"]:
+        print(f"         unlisted fields dropped: {report['dropped']}")
     if show:
-        print(json.dumps(o.output, indent=1))
+        print(json.dumps(output, indent=1))
     return 0
+
+
+def smoke(bridge: Bridge, cluster: str, query: dict, *, show: bool = False) -> int:
+    """Run one query end to end in this process and print decisions only."""
+    return print_smoke(cluster, query, run_case(bridge, cluster, query), show=show)
+
+
+# ---------------------------------------------------------------------------
+# The broker: one long-lived browser, so one sign-in serves many runs
+# ---------------------------------------------------------------------------
+#
+# Kibana's session cookie carries no expiry. Chrome keeps such a cookie in
+# memory only and drops it when the browser exits, so a sign-in lasts
+# exactly as long as the Chrome process that made it. The broker is the
+# process that keeps that Chrome alive: ``es-login`` starts it (headed,
+# because headless SSO never completes against the real IdP) and asks it
+# to sign in; every ``es-smoke`` asks it to run one query; ``es-logout``,
+# closing the Chrome window, or BROKER_IDLE_S without a request ends it, and
+# the session with it.
+#
+# The socket speaks the bridge's interface, not the transport's: a grammar
+# query in, a scrubbed page or a refusal out. Compiling, the Kibana round
+# trip and scrubbing all happen in here, so a raw reply never crosses the
+# socket and a local process that finds it can get what Claude can get and
+# nothing more. It lives in the bridge's own profile directory (0700) and
+# is itself 0600. Nothing in this module reads, exports or stores a cookie.
+
+BROKER_SOCKET = "hider-bridge.sock"
+BROKER_SCHEMA = "hider.es-broker.v1"
+BROKER_IDLE_S = 8 * 3600
+BROKER_START_S = 60.0
+_MAX_REQUEST = 1 << 20
+_MAX_REPLY = 64 << 20
+_SUN_PATH_MAX = 103  # macOS: 104 bytes including the terminating NUL
+_TIER2 = ("classifier", "spacy", "none")
+_MAX_TERMS = 20
+
+
+def broker_socket(profile_dir: str | Path) -> Path:
+    """Where the broker for a profile listens. Not created here."""
+    if not str(profile_dir).strip():
+        raise elastic.ConfigError("profile_dir is required for the live bridge")
+    p = Path(profile_dir).expanduser().resolve() / BROKER_SOCKET
+    if len(os.fsencode(str(p))) > _SUN_PATH_MAX:
+        raise elastic.ConfigError(f"profile_dir is too deep for a local socket (at most "
+                                  f"{_SUN_PATH_MAX - len(BROKER_SOCKET) - 1} bytes); pick a "
+                                  "shorter path")
+    return p
+
+
+def _send(conn: socket.socket, msg: dict) -> None:
+    conn.sendall(json.dumps(msg).encode() + b"\n")
+
+
+def _recv(conn: socket.socket, limit: int) -> Any:
+    buf = bytearray()
+    while not buf.endswith(b"\n"):
+        chunk = conn.recv(1 << 16)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            raise ValueError("message too large")
+    if not buf.endswith(b"\n"):
+        raise ValueError("truncated message")
+    return json.loads(buf)
+
+
+def _fail(code: str, message: str) -> dict:
+    return {"ok": False, "code": code, "message": message}
+
+
+class Broker:
+    """The long-lived owner of the bridge's browser. Single-threaded on
+    purpose: Playwright's sync API belongs to the thread that started it,
+    and the bridge is serialised anyway."""
+
+    def __init__(self, config: elastic.ElasticConfig, transport_factory, *,
+                 idle_timeout: float = BROKER_IDLE_S,
+                 poll_interval: float = POLL_INTERVAL_S) -> None:
+        self.config = config
+        self._factory = transport_factory
+        self.transport = None
+        self.idle_timeout = idle_timeout
+        self.poll_interval = poll_interval
+        self.stopping = False
+        self.last_used = time.monotonic()
+
+    def open(self) -> None:
+        """Start the browser before listening, so a broken setup fails at
+        startup instead of on the first login."""
+        if self.transport is None:
+            self.transport = self._factory()
+            start = getattr(self.transport, "start", None)
+            if start is not None:
+                start()
+
+    def handle(self, req: Any) -> dict:
+        """One request, one reply; never raises."""
+        self.last_used = time.monotonic()
+        if not isinstance(req, dict) or req.get("schema") != BROKER_SCHEMA:
+            return _fail("bad_request", "not a bridge request")
+        op = req.get("op")
+        try:
+            if op == "ping":
+                return {"ok": True, "clusters": [c.name for c in self.config.clusters]}
+            if op == "stop":
+                self.stopping = True
+                return {"ok": True}
+            name = req.get("cluster")
+            cluster = self.config.cluster(name) if isinstance(name, str) else None
+            if cluster is None:
+                return _fail("bad_cluster", "cluster must be one of the configured names")
+            self.open()
+            if op == "login":
+                timeout = req.get("timeout", LOGIN_TIMEOUT_S)
+                if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+                        or not 1 <= timeout <= 3600:
+                    return _fail("bad_request", "timeout is 1..3600 seconds")
+                return {"ok": True, "signed_in": bool(self.transport.login(cluster, timeout=timeout))}
+            if op == "run":
+                return {"ok": True, "report": self._run(cluster, req)}
+            return _fail("bad_request", "unknown op")
+        except elastic.Refused as e:
+            return _fail(e.code, e.message)
+        except Exception:  # fail closed, and keep whatever it was out of the reply
+            return _fail("bridge_error", "the bridge failed on this request; nothing was returned")
+
+    def _run(self, cluster: elastic.Cluster, req: dict) -> dict:
+        terms = req.get("terms", [])
+        tier2 = req.get("tier2", "classifier")
+        log = req.get("log")
+        if not isinstance(terms, list) or len(terms) > _MAX_TERMS or not all(
+                isinstance(t, str) and 0 < len(t) <= 128 for t in terms):
+            raise elastic.Refused("bad_request", f"terms is a list of up to {_MAX_TERMS} strings")
+        if tier2 not in _TIER2:
+            raise elastic.Refused("bad_request", f"tier2 is one of {list(_TIER2)}")
+        if log is not None and not (isinstance(log, str) and os.path.isabs(log)):
+            raise elastic.Refused("bad_request", "log is an absolute path")
+        scrubber = elastic.EsScrubber(self.config, tier2=tier2)
+        seeded = [scrubber.seed(t) for t in terms]
+        session = KibanaSession(self.transport, poll_interval=self.poll_interval,
+                                poll_timeout=self.config.poll_timeout_s)
+        bridge = Bridge(self.config, scrubber, session, log_path=log)
+        report = run_case(bridge, cluster.name, req.get("query"))
+        report["seeded"] = seeded
+        return report
+
+    def serve(self, socket_path: str | Path) -> None:
+        """Listen until stopped, idle, or the browser goes away."""
+        path = Path(socket_path)
+        if path.exists() or path.is_symlink():
+            if broker_running(path):
+                raise elastic.ConfigError("a bridge is already running for this profile")
+            path.unlink()
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o177)
+        try:
+            srv.bind(str(path))
+        finally:
+            os.umask(old)
+        os.chmod(path, 0o600)
+        srv.listen(8)
+        srv.settimeout(1.0)
+        try:
+            while not self.stopping:
+                if time.monotonic() - self.last_used > self.idle_timeout:
+                    break
+                if self.transport is not None and getattr(self.transport, "closed", False):
+                    break
+                try:
+                    conn, _ = srv.accept()
+                except (socket.timeout, TimeoutError):
+                    continue
+                with conn:
+                    conn.settimeout(30.0)
+                    try:
+                        reply = self.handle(_recv(conn, _MAX_REQUEST))
+                    except (ValueError, OSError):
+                        reply = _fail("bad_request", "malformed request")
+                    try:
+                        _send(conn, reply)
+                    except OSError:
+                        pass
+        finally:
+            srv.close()
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            if self.transport is not None:
+                self.transport.close()
+
+
+class BrokerClient:
+    """What es-smoke, es-login and es-logout use to reach the broker. No
+    broker is a refusal (``session_expired``): nothing else holds a session."""
+
+    def __init__(self, socket_path: str | Path, *, timeout: float) -> None:
+        self.path = Path(socket_path)
+        self.timeout = timeout
+
+    def call(self, op: str, **fields: Any) -> dict:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conn.settimeout(self.timeout)
+        try:
+            try:
+                conn.connect(str(self.path))
+            except (FileNotFoundError, ConnectionRefusedError):
+                raise elastic.Refused("session_expired", "no bridge is running for this "
+                                                         "profile; run es-login") from None
+            _send(conn, {"schema": BROKER_SCHEMA, "op": op, **fields})
+            reply = _recv(conn, _MAX_REPLY)
+        except (socket.timeout, TimeoutError):
+            raise elastic.Refused("unreachable", "the bridge did not answer in time") from None
+        except (OSError, ValueError):
+            raise elastic.Refused("unreachable", "the bridge did not answer") from None
+        finally:
+            conn.close()
+        if not isinstance(reply, dict):
+            raise elastic.Refused("malformed", "the bridge answered with something else")
+        if not reply.get("ok"):
+            raise elastic.Refused(str(reply.get("code") or "bridge_error"),
+                                  str(reply.get("message") or "the bridge refused"))
+        return reply
+
+
+def broker_running(socket_path: str | Path) -> bool:
+    try:
+        BrokerClient(socket_path, timeout=5.0).call("ping")
+        return True
+    except elastic.Refused:
+        return False
+
+
+def spawn_broker(socket_path: Path, argv: list[str], *, wait: float = BROKER_START_S) -> None:
+    """Start ``python -m hider es-broker`` detached and wait until it answers.
+
+    Its output goes nowhere: a broker that dies at startup is reported here
+    with the command to run it in the foreground, which shows why.
+    """
+    root = Path(__file__).resolve().parent.parent
+    proc = subprocess.Popen([sys.executable, "-m", "hider", "es-broker", *argv], cwd=root,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("the bridge exited while starting; run `python -m hider "
+                               "es-broker` in the foreground to see why")
+        if broker_running(socket_path):
+            return
+        time.sleep(0.25)
+    proc.terminate()
+    raise RuntimeError("the bridge did not start in time")

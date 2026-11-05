@@ -258,67 +258,154 @@ def _es_config(path: str | None):
 
 
 def _cmd_es_smoke(args: argparse.Namespace) -> int:
-    """One scrubbed query, end to end, printing decisions only."""
+    """One scrubbed query, end to end, printing decisions only.
+
+    Against a real cluster the query goes to the running bridge (es-login
+    starts it), which holds the only Kibana session there is. With --stub
+    everything runs in this process against a synthetic Kibana.
+    """
+    from . import elastic, esbridge
+
+    size = args.size if args.size is not None else (0 if args.count_by or args.interval else 3)
+    if args.stub:
+        return _es_smoke_stub(args, size)
+    if args.no_browser or args.expired:
+        raise SystemExit("--no-browser and --expired only work with --stub")
+    cfg = _es_config(args.config)
+    cluster = args.cluster
+    if not cluster:
+        raise SystemExit(f"--cluster is required; configured: {[c.name for c in cfg.clusters]}")
+    q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
+                             until=args.until, count_by=args.count_by,
+                             interval=args.interval, buckets=args.buckets)
+    print(f"query     {json.dumps(q)}", file=sys.stderr)
+    client = esbridge.BrokerClient(esbridge.broker_socket(args.profile_dir or cfg.profile_dir),
+                                   timeout=cfg.poll_timeout_s + 120)
+    try:
+        report = client.call("run", cluster=cluster, query=q, terms=args.term, tier2=args.tier2,
+                             log=str(Path(args.log).resolve()) if args.log else None)["report"]
+    except elastic.Refused as e:
+        report = {"refused": {"code": e.code, "message": e.message}}
+    for label in report.get("seeded", []):
+        print(f"seeded    {label}  (the real value stays in the bridge)", file=sys.stderr)
+    return esbridge.print_smoke(cluster, q, report, show=args.show)
+
+
+def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
+    """The whole path in one process against a synthetic Kibana. The browser
+    signs in through the stub's SSO and runs the query in the same lifetime,
+    because its session cookie dies when it closes, as a real one does."""
     import tempfile
 
     from . import elastic, esbridge, eseval
 
-    stub = None
+    fx = eseval.generate(docs=200)
+    cfg0 = elastic.load(elastic.EXAMPLE)
+    # headless sign-in is allowed here only: the real IdP refuses it
+    stub = eseval.StubKibana(eseval.StubEngine(fx, cfg0.indices), cookie="sid=synthetic-stub",
+                             signed_in=not args.expired, sso_headless=True).start()
     try:
-        if args.stub:
-            fx = eseval.generate(docs=200)
-            cfg0 = elastic.load(elastic.EXAMPLE)
-            stub = eseval.StubKibana(eseval.StubEngine(fx, cfg0.indices),
-                                     signed_in=not args.expired).start()
-            raw = json.loads(elastic.EXAMPLE.read_text())
-            raw["clusters"] = {"stub": {"kibana": stub.url}}
-            raw["profile_dir"] = args.profile_dir or tempfile.mkdtemp(prefix="hider-es-profile-")
-            cfg = elastic.parse(raw, source="stub")
-            cluster = "stub"
-        else:
-            cfg = _es_config(args.config)
-            cluster = args.cluster
-            if not cluster:
-                raise SystemExit(f"--cluster is required; configured: {[c.name for c in cfg.clusters]}")
+        raw = json.loads(elastic.EXAMPLE.read_text())
+        raw["clusters"] = {"stub": {"kibana": stub.url}}
+        raw["profile_dir"] = args.profile_dir or tempfile.mkdtemp(prefix="hider-es-profile-")
+        cfg = elastic.parse(raw, source="stub")
         if args.no_browser:
-            if not args.stub:
-                raise SystemExit("--no-browser only works with --stub: a real cluster's session "
-                                 "stays in the browser")
-            transport = esbridge.UrllibTransport()
+            transport = esbridge.UrllibTransport(stub.cookie)
         else:
-            transport = esbridge.BrowserTransport(args.profile_dir or cfg.profile_dir)
-        scrubber = elastic.EsScrubber(cfg, tier2=args.tier2)
-        for term in args.term:
-            print(f"seeded    {scrubber.seed(term)}  (the real value stays here)", file=sys.stderr)
-        bridge = esbridge.Bridge(cfg, scrubber, esbridge.KibanaSession(transport),
-                                 log_path=esbridge.Path(args.log) if args.log else None)
-        size = args.size if args.size is not None else (0 if args.count_by or args.interval else 3)
-        q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
-                                 until=args.until, count_by=args.count_by,
-                                 interval=args.interval, buckets=args.buckets)
-        print(f"query     {json.dumps(q)}", file=sys.stderr)
+            transport = esbridge.BrowserTransport(cfg.profile_dir)
         try:
-            return esbridge.smoke(bridge, cluster, q, show=args.show)
+            if not args.no_browser and not args.expired:
+                transport.login(cfg.cluster("stub"), timeout=30)
+            scrubber = elastic.EsScrubber(cfg, tier2=args.tier2)
+            for term in args.term:
+                print(f"seeded    {scrubber.seed(term)}  (the real value stays here)", file=sys.stderr)
+            bridge = esbridge.Bridge(cfg, scrubber,
+                                     esbridge.KibanaSession(transport, poll_timeout=cfg.poll_timeout_s),
+                                     log_path=Path(args.log) if args.log else None)
+            q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
+                                     until=args.until, count_by=args.count_by,
+                                     interval=args.interval, buckets=args.buckets)
+            print(f"query     {json.dumps(q)}", file=sys.stderr)
+            return esbridge.smoke(bridge, "stub", q, show=args.show)
         finally:
             transport.close()
     finally:
-        if stub is not None:
-            stub.stop()
+        stub.stop()
+
+
+def _broker_argv(args: argparse.Namespace) -> list[str]:
+    argv = []
+    if args.config:
+        argv += ["--config", str(Path(args.config).expanduser().resolve())]
+    if args.profile_dir:
+        argv += ["--profile-dir", str(Path(args.profile_dir).expanduser().resolve())]
+    return argv
 
 
 def _cmd_es_login(args: argparse.Namespace) -> int:
-    from . import esbridge
+    """Sign a cluster in, in the bridge's long-lived Chrome. Starts the
+    bridge if it is not running. Prints cluster names, never Kibana URLs."""
+    from . import elastic, esbridge
 
     cfg = _es_config(args.config)
     cluster = cfg.cluster(args.cluster)
     if cluster is None:
         raise SystemExit(f"unknown cluster; configured: {[c.name for c in cfg.clusters]}")
-    transport = esbridge.BrowserTransport(args.profile_dir or cfg.profile_dir)
-    print(f"opening {cluster.kibana} in the bridge's own Chrome profile; sign in there, "
-          "the window closes by itself once Kibana loads", file=sys.stderr)
-    ok = transport.login(cluster, timeout=args.timeout)
-    print("signed in" if ok else "timed out before Kibana loaded", file=sys.stderr)
-    return 0 if ok else 1
+    sock = esbridge.broker_socket(args.profile_dir or cfg.profile_dir)
+    if not esbridge.broker_running(sock):
+        print("starting the bridge's own Chrome (it stays open: the Kibana session lives "
+              "in it and ends with it)", file=sys.stderr)
+        try:
+            esbridge.spawn_broker(sock, _broker_argv(args))
+        except RuntimeError as e:
+            raise SystemExit(str(e)) from None
+    print(f"signing in cluster {cluster.name} in the bridge's Chrome window; it minimises "
+          "itself once Kibana loads", file=sys.stderr)
+    try:
+        reply = esbridge.BrokerClient(sock, timeout=args.timeout + 60).call(
+            "login", cluster=cluster.name, timeout=args.timeout)
+    except elastic.Refused as e:
+        print(f"REFUSED  cluster={cluster.name} code={e.code}: {e.message}")
+        return 2
+    if reply["signed_in"]:
+        print(f"signed in: cluster {cluster.name}; the session lasts while the bridge runs "
+              "(es-logout, closing its window, or 8 hours idle ends it)")
+        return 0
+    print(f"timed out: cluster {cluster.name} did not reach Kibana; run es-login again")
+    return 1
+
+
+def _cmd_es_logout(args: argparse.Namespace) -> int:
+    from . import elastic, esbridge
+
+    cfg = _es_config(args.config)
+    sock = esbridge.broker_socket(args.profile_dir or cfg.profile_dir)
+    try:
+        esbridge.BrokerClient(sock, timeout=30).call("stop")
+    except elastic.Refused:
+        print("no bridge was running")
+        return 0
+    print("bridge stopped; every Kibana session ended with its browser")
+    return 0
+
+
+def _cmd_es_broker(args: argparse.Namespace) -> int:
+    """The long-lived bridge, in the foreground. es-login starts it detached."""
+    from . import esbridge
+
+    cfg = _es_config(args.config)
+    profile = esbridge.prepare_profile_dir(args.profile_dir or cfg.profile_dir)
+    sock = esbridge.broker_socket(profile)
+    broker = esbridge.Broker(cfg, lambda: esbridge.BrowserTransport(profile, headless=False),
+                             idle_timeout=args.idle_hours * 3600)
+    broker.open()
+    print(f"bridge listening for {[c.name for c in cfg.clusters]}; es-logout stops it",
+          file=sys.stderr)
+    try:
+        broker.serve(sock)
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def _cmd_feedback(args: argparse.Namespace) -> int:
@@ -579,7 +666,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="with --stub: the stub serves the SSO login page (expect a refusal)")
     sm.add_argument("--no-browser", action="store_true",
                     help="with --stub: plain HTTP instead of Chrome")
-    sm.add_argument("--profile-dir", help="override the dedicated browser profile directory")
+    sm.add_argument("--profile-dir", help="override the dedicated browser profile directory "
+                                          "(locates the running bridge)")
     sm.add_argument("--index", help="index pattern to query (default: the first configured)")
     sm.add_argument("--phrase", help="a phrase for the first text field")
     sm.add_argument("--size", type=int, default=None,
@@ -600,13 +688,27 @@ def main(argv: list[str] | None = None) -> int:
     sm.add_argument("--log", help="append a decision-log row to this JSONL file")
     sm.set_defaults(fn=_cmd_es_smoke)
 
-    lg = sub.add_parser("es-login", help="headed window on a cluster's Kibana to (re)sign in "
-                                         "the bridge's dedicated profile")
+    lg = sub.add_parser("es-login", help="sign a cluster in, in the bridge's long-lived Chrome "
+                                         "(starts the bridge if needed)")
     lg.add_argument("--cluster", required=True)
     lg.add_argument("--config")
     lg.add_argument("--profile-dir")
     lg.add_argument("--timeout", type=float, default=600.0)
     lg.set_defaults(fn=_cmd_es_login)
+
+    lo = sub.add_parser("es-logout", help="stop the bridge; its Chrome and every Kibana session "
+                                          "in it end")
+    lo.add_argument("--config")
+    lo.add_argument("--profile-dir")
+    lo.set_defaults(fn=_cmd_es_logout)
+
+    br = sub.add_parser("es-broker", help="run the long-lived bridge in the foreground "
+                                          "(es-login starts it detached)")
+    br.add_argument("--config")
+    br.add_argument("--profile-dir")
+    br.add_argument("--idle-hours", type=float, default=8.0,
+                    help="stop after this long without a request (default 8, a working day)")
+    br.set_defaults(fn=_cmd_es_broker)
 
     fb = sub.add_parser("feedback", help="list redaction feedback reported from the web UI")
     fb.add_argument("--path", help="feedback JSONL (default out/feedback.jsonl)")

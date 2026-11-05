@@ -91,6 +91,10 @@ def test_example_config_loads_and_classifies():
     ({"indices": []}, "indices"),
     ({"time_field": "message"}, "must be listed as keep"),
     ({"max_hits": 0}, "positive integer"),
+    ({"poll_timeout_s": 0}, "poll_timeout_s"),
+    ({"poll_timeout_s": 601}, "1..600"),
+    ({"poll_timeout_s": "120"}, "poll_timeout_s"),
+    ({"poll_timeout_s": True}, "poll_timeout_s"),
     ({"extra": 1}, "unknown keys"),
 ])
 def test_malformed_config_is_a_startup_error(patch, needle):
@@ -164,6 +168,49 @@ def test_meta_fields_doc_id_is_labelled_and_index_checked():
     with pytest.raises(elastic.Refused) as e:
         s.scrub_response(_envelope([_hit(APP_DOC, index=".security-7")]), PLAN)
     assert e.value.code == "bad_index"
+
+
+@pytest.mark.parametrize("name,allowed", [
+    # a data stream's backing index is admitted when the stream matches
+    (".ds-logs-app-default-2026.08.20-000001", True),
+    (".ds-logs-worker-eu-2026.01.31-000042", True),
+    (".ds-traces-apm-default-2026.08.20-1000000", True),  # generations grow past six digits
+    (".ds-logs-app-2026-x-2026.08.20-000003", True),       # a stream name with a date-ish part
+    ("logs-app-2026.08.20", True),                         # an ordinary index, as before
+    # and nothing else that starts with .ds- or looks like one
+    (".ds-logs-billing-default-2026.08.20-000001", False),  # stream not allowlisted
+    (".ds-logs-app-2026.08.20-000001", False),     # stream logs-app is not logs-app-*
+    (".ds-logs-app-default", False),               # no backing suffix
+    (".ds-logs-app-default-2026.08.20-01", False), # generation is six digits or more
+    (".ds-logs-app-default-20260820-000001", False),
+    (".fs-logs-app-default-2026.08.20-000001", False),  # failure store: not the stream
+    ("downsample-1h-.ds-logs-app-default-2026.08.20-000001", False),
+    (".ds-.kibana_security_session-2026.08.20-000001", False),
+    ("logs-app", False),
+])
+def test_data_stream_backing_indices_are_checked_by_their_stream(name, allowed):
+    assert CFG.index_allowed(name) is allowed
+
+
+def test_a_page_from_a_data_stream_is_scrubbed_and_a_foreign_stream_is_refused():
+    s = _session()
+    out = s.scrub_response(_envelope([_hit(APP_DOC, index=".ds-logs-app-default-2026.08.20-000001")]),
+                           PLAN).output
+    assert out["hits"]["hits"][0]["_index"] == ".ds-logs-app-default-2026.08.20-000001"
+    with pytest.raises(elastic.Refused) as e:
+        s.scrub_response(_envelope([_hit(APP_DOC, index=".ds-audit-default-2026.08.20-000001")]),
+                         PLAN)
+    assert e.value.code == "bad_index"
+
+
+def test_poll_timeout_defaults_and_bounds():
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw.pop("poll_timeout_s", None)
+    assert elastic.parse(raw).poll_timeout_s == elastic.DEFAULT_POLL_TIMEOUT_S == 120
+    raw["poll_timeout_s"] = elastic.MAX_POLL_TIMEOUT_S
+    assert elastic.parse(raw).poll_timeout_s == 600
+    raw["poll_timeout_s"] = 1.5
+    assert elastic.parse(raw).poll_timeout_s == 1.5
 
 
 def test_hit_decorations_are_dropped():

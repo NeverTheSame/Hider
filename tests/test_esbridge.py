@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -439,6 +440,338 @@ def test_es_smoke_cli_wires_the_new_flags(capsys):
     assert rc == 2 and "code=unknown_field" in capsys.readouterr().out
 
 
+# -- the session lifecycle: one login, many runs ----------------------------------------
+#
+# Kibana's session cookie has no expiry, so it lives exactly as long as the
+# browser that holds it. The stub issues it that way and its IdP completes
+# only for a headed top-level navigation; SimBrowser keeps Chrome's cookie
+# rules. Before the broker, es-login signed in and closed its browser, and
+# every es-smoke started a new one: the replay below shows the stub now
+# refuses that, as the real cluster did.
+
+
+@pytest.fixture
+def sso(fixture):
+    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices)).start()
+    yield kb
+    kb.stop()
+
+
+@pytest.fixture
+def short_dir():
+    """A socket path must fit in 104 bytes; pytest's tmp_path on macOS does not."""
+    import tempfile
+    d = tempfile.mkdtemp(prefix="hb-", dir="/tmp")
+    yield Path(d)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def _sso_config(url: str, profile: Path, **extra) -> elastic.ElasticConfig:
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": url}}
+    raw["profile_dir"] = str(profile)
+    raw.update(extra)
+    return elastic.parse(raw, source="test")
+
+
+def _probe(browser, cluster) -> None:
+    esbridge.KibanaSession(browser).probe(cluster)
+
+
+def test_stub_session_cookie_dies_with_the_browser(sso):
+    cluster = elastic.Cluster("stub", sso.url)
+    profile: list = []
+    first = eseval.SimBrowser(profile)
+    assert first.login(cluster) and sso.logins == 1
+    _probe(first, cluster)
+    assert [c.name for c in first.cookies if c.discard] == ["sid"]  # a session cookie
+    first.close()
+    assert profile == []  # nothing about the session reached the profile
+    second = eseval.SimBrowser(profile)
+    with pytest.raises(elastic.Refused) as e:
+        _probe(second, cluster)
+    assert e.value.code == "session_expired"
+
+
+def test_headless_sso_never_completes_and_a_fetch_never_signs_in(sso):
+    cluster = elastic.Cluster("stub", sso.url)
+    assert eseval.SimBrowser([], headless=True).login(cluster, timeout=0.3) is False
+    with pytest.raises(elastic.Refused) as e:
+        _probe(eseval.SimBrowser([]), cluster)  # headed, but a fetch is not a navigation
+    assert e.value.code == "session_expired"
+    assert sso.logins == 0
+
+
+def test_the_lifecycle_before_the_broker_fails_against_the_stub(sso, tmp_path):
+    """es-login in one browser, es-smoke in the next: refused every time."""
+    cfg = _sso_config(sso.url, tmp_path / "p")
+    profile: list = []
+    login = eseval.SimBrowser(profile)
+    assert login.login(cfg.cluster("stub"))
+    login.close()  # what es-login's finally did
+    for _ in range(2):
+        b = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"),
+                            esbridge.KibanaSession(eseval.SimBrowser(profile), sleep=lambda s: None))
+        with pytest.raises(elastic.Refused) as e:
+            b.run("stub", {"index": "logs-app-*", "size": 1})
+        assert e.value.code == "session_expired"
+
+
+class _ServedBroker:
+    def __init__(self, cfg, sock, factory):
+        self.broker = esbridge.Broker(cfg, factory, poll_interval=0.01)
+        self.sock = sock
+        self.thread = threading.Thread(target=self.broker.serve, args=(sock,), daemon=True)
+        self.thread.start()
+        for _ in range(200):
+            if esbridge.broker_running(sock):
+                break
+            threading.Event().wait(0.02)
+
+    def client(self, timeout=30.0):
+        return esbridge.BrokerClient(self.sock, timeout=timeout)
+
+    def stop(self):
+        if self.thread.is_alive():
+            try:
+                self.client().call("stop")
+            except elastic.Refused:
+                pass
+            self.thread.join(10)
+
+
+@pytest.fixture
+def served(sso, short_dir):
+    cfg = _sso_config(sso.url, short_dir / "profile")
+    esbridge.prepare_profile_dir(cfg.profile_dir)
+    profile: list = []
+    browsers: list = []
+
+    def factory():
+        browsers.append(eseval.SimBrowser(profile))  # headed, as es-broker launches it
+        return browsers[-1]
+
+    sb = _ServedBroker(cfg, esbridge.broker_socket(cfg.profile_dir), factory)
+    sb.cfg, sb.profile, sb.browsers, sb.sso = cfg, profile, browsers, sso
+    yield sb
+    sb.stop()
+
+
+def test_one_login_lasts_across_many_smoke_runs(served, fixture):
+    c = served.client()
+    assert c.call("login", cluster="stub", timeout=5)["signed_in"] is True
+    for i in range(3):  # three es-smoke processes, one client each
+        report = served.client().call("run", cluster="stub", tier2="none",
+                                      query={"index": "logs-app-*", "size": 2})["report"]
+        assert report["refused"] is None and report["hits_shown"] == 2
+        assert eseval._leaks(report["output"], fixture.truth) == []
+        # data-stream backing indices are admitted, as on the real cluster
+        assert all(h["_index"].startswith(".ds-logs-app-") for h in report["output"]["hits"]["hits"])
+    assert served.sso.logins == 1 and len(served.browsers) == 1
+    # Kibana ends the session: refused, not retried; es-login signs in again
+    served.sso.expire()
+    report = c.call("run", cluster="stub", tier2="none", query={"index": "logs-app-*", "size": 1})["report"]
+    assert report["refused"]["code"] == "session_expired"
+    assert c.call("login", cluster="stub", timeout=5)["signed_in"] is True
+    assert c.call("run", cluster="stub", tier2="none",
+                  query={"index": "logs-app-*", "size": 1})["report"]["refused"] is None
+    # stopping the bridge closes its browser, and the session goes with it
+    served.stop()
+    assert not served.sock.exists() and served.profile == []
+    with pytest.raises(elastic.Refused) as e:
+        served.client().call("run", cluster="stub", query={"index": "logs-app-*"})
+    assert e.value.code == "session_expired" and "es-login" in e.value.message
+
+
+def test_a_new_bridge_starts_signed_out(served):
+    assert served.client().call("login", cluster="stub", timeout=5)["signed_in"]
+    served.stop()
+    again = _ServedBroker(served.cfg, served.sock, lambda: eseval.SimBrowser(served.profile))
+    try:
+        report = again.client().call("run", cluster="stub", tier2="none",
+                                     query={"index": "logs-app-*", "size": 1})["report"]
+        assert report["refused"]["code"] == "session_expired"
+    finally:
+        again.stop()
+
+
+def test_a_headless_bridge_cannot_sign_in(sso, short_dir):
+    cfg = _sso_config(sso.url, short_dir / "profile")
+    esbridge.prepare_profile_dir(cfg.profile_dir)
+    sb = _ServedBroker(cfg, esbridge.broker_socket(cfg.profile_dir),
+                       lambda: eseval.SimBrowser([], headless=True))
+    try:
+        assert sb.client().call("login", cluster="stub", timeout=1)["signed_in"] is False
+        assert sso.logins == 0
+    finally:
+        sb.stop()
+
+
+def test_bridge_stops_when_its_browser_goes_away(served):
+    assert served.client().call("login", cluster="stub", timeout=5)["signed_in"]
+    served.browsers[0].closed = True  # the analyst closed the Chrome window
+    served.thread.join(5)
+    assert not served.thread.is_alive() and not served.sock.exists()
+
+
+def test_bridge_socket_is_private_and_a_live_one_is_not_taken_over(served):
+    import stat
+    assert stat.S_IMODE(served.sock.stat().st_mode) == 0o600
+    with pytest.raises(elastic.ConfigError, match="already running"):
+        esbridge.Broker(served.cfg, lambda: None).serve(served.sock)
+    assert esbridge.broker_running(served.sock)
+
+
+def test_a_stale_socket_is_replaced(sso, short_dir):
+    import socket as _socket
+    cfg = _sso_config(sso.url, short_dir / "profile")
+    esbridge.prepare_profile_dir(cfg.profile_dir)
+    sock = esbridge.broker_socket(cfg.profile_dir)
+    dead = _socket.socket(_socket.AF_UNIX)
+    dead.bind(str(sock))
+    dead.close()  # a socket file nobody listens on: a crashed bridge
+    assert sock.exists() and not esbridge.broker_running(sock)
+    sb = _ServedBroker(cfg, sock, lambda: eseval.SimBrowser([]))
+    try:
+        assert esbridge.broker_running(sock)
+    finally:
+        sb.stop()
+
+
+class _Exploding:
+    def start(self):
+        pass
+
+    def request(self, *a, **k):
+        raise KeyError("Contoso Holdings at https://kibana-emea.example.net")
+
+    def login(self, *a, **k):
+        raise RuntimeError("https://kibana-emea.example.net/login")
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("req,code", [
+    ("not a dict", "bad_request"),
+    ({"op": "ping"}, "bad_request"),                                    # no schema
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "shell"}, "bad_cluster"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "shell", "cluster": "stub"}, "bad_request"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "run", "cluster": "elsewhere"}, "bad_cluster"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "run", "cluster": "stub", "terms": "x"}, "bad_request"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "run", "cluster": "stub", "tier2": "gpt"}, "bad_request"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "run", "cluster": "stub", "log": "rel.jsonl"},
+     "bad_request"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "login", "cluster": "stub", "timeout": 0}, "bad_request"),
+    ({"schema": esbridge.BROKER_SCHEMA, "op": "login", "cluster": "stub"}, "bridge_error"),
+])
+def test_broker_fails_closed_and_says_nothing_it_should_not(tmp_path, req, code):
+    cfg = _sso_config("https://kibana-stub.example.net", tmp_path / "p")
+    reply = esbridge.Broker(cfg, _Exploding).handle(req)
+    assert reply["ok"] is False and reply["code"] == code
+    assert "example.net" not in reply["message"] and "Contoso" not in reply["message"]
+
+
+def test_broker_run_with_a_failing_transport_is_a_refusal_not_a_page(tmp_path):
+    cfg = _sso_config("https://kibana-stub.example.net", tmp_path / "p")
+    reply = esbridge.Broker(cfg, _Exploding).handle(
+        {"schema": esbridge.BROKER_SCHEMA, "op": "run", "cluster": "stub", "tier2": "none",
+         "query": {"index": "logs-app-*", "size": 1}})
+    assert reply["ok"] is False and reply["code"] == "bridge_error"
+    assert "example.net" not in reply["message"] and "Contoso" not in reply["message"]
+
+
+def test_bridge_code_never_reads_exports_or_stores_a_cookie():
+    """The session stays in Chrome: no Playwright call that lifts cookies out
+    of the browser or writes them anywhere is in the bridge."""
+    import re as _re
+    src = Path(esbridge.__file__).read_text()
+    for call in ("storage_state", ".cookies(", "add_cookies", "clear_cookies", "Network.getCookies",
+                 "Storage.getCookies", "document.cookie"):
+        assert call not in src, call
+    assert not _re.search(r"Set-Cookie|cookiejar", src)
+
+
+def test_poll_timeout_comes_from_the_site_map(fixture, short_dir):
+    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices), slow=True).start()
+    try:
+        cfg = _sso_config(kb.url, short_dir / "profile", poll_timeout_s=1)
+        assert cfg.poll_timeout_s == 1.0
+        esbridge.prepare_profile_dir(cfg.profile_dir)
+        sb = _ServedBroker(cfg, esbridge.broker_socket(cfg.profile_dir), lambda: eseval.SimBrowser([]))
+        try:
+            assert sb.client().call("login", cluster="stub", timeout=5)["signed_in"]
+            report = sb.client().call("run", cluster="stub", tier2="none",
+                                      query={"index": "logs-app-*", "size": 1})["report"]
+            assert report["refused"]["code"] == "incomplete"
+            assert kb.deleted  # the server-side search was released
+        finally:
+            sb.stop()
+    finally:
+        kb.stop()
+
+
+# -- the CLI against a running bridge ------------------------------------------------------
+
+
+@pytest.fixture
+def site_map(served, short_dir):
+    path = short_dir / "elastic.json"
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": served.sso.url}}
+    raw["profile_dir"] = served.cfg.profile_dir
+    path.write_text(json.dumps(raw))
+    return str(path)
+
+
+def test_es_login_then_many_es_smoke_runs_through_the_cli(served, site_map, capsys, fixture):
+    from hider import cli
+
+    assert cli.main(["es-login", "--config", site_map, "--cluster", "stub", "--timeout", "5"]) == 0
+    out = capsys.readouterr()
+    # the Kibana URL is masked like everything else: cluster names only
+    for stream in (out.out, out.err):
+        assert served.sso.url not in stream and "127.0.0.1" not in stream and "http" not in stream
+    assert "signed in: cluster stub" in out.out
+    for _ in range(3):
+        rc = cli.main(["es-smoke", "--config", site_map, "--cluster", "stub", "--tier2", "none",
+                       "--since", "now-6h", "--count-by", "agent.name", "--interval", "1h"])
+        res = capsys.readouterr()
+        assert rc == 0 and res.out.startswith("OK ") and "buckets=" in res.out
+        for v in fixture.truth:
+            if len(v) > 4:
+                assert v not in res.out
+    assert served.sso.logins == 1
+    assert cli.main(["es-logout", "--config", site_map]) == 0
+    assert "bridge stopped" in capsys.readouterr().out
+    served.thread.join(10)
+    rc = cli.main(["es-smoke", "--config", site_map, "--cluster", "stub", "--tier2", "none"])
+    res = capsys.readouterr()
+    assert rc == 2 and "REFUSED" in res.out and "code=session_expired" in res.out
+
+
+def test_es_login_timeout_masks_the_url_too(sso, short_dir, capsys):
+    from hider import cli
+
+    cfg = _sso_config(sso.url, short_dir / "profile")
+    esbridge.prepare_profile_dir(cfg.profile_dir)
+    sb = _ServedBroker(cfg, esbridge.broker_socket(cfg.profile_dir),
+                       lambda: eseval.SimBrowser([], headless=True))
+    path = short_dir / "elastic.json"
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": sso.url}}
+    raw["profile_dir"] = cfg.profile_dir
+    path.write_text(json.dumps(raw))
+    try:
+        assert cli.main(["es-login", "--config", str(path), "--cluster", "stub",
+                         "--timeout", "1"]) == 1
+        out = capsys.readouterr()
+        assert "timed out: cluster stub" in out.out
+        assert "127.0.0.1" not in out.out + out.err and "http" not in out.out + out.err
+    finally:
+        sb.stop()
+
+
 # -- the browser transport, when it can run --------------------------------------------
 
 
@@ -452,29 +785,100 @@ def _browser_available() -> bool:
         shutil.which("google-chrome") or shutil.which("google-chrome-stable"))
 
 
+def _kibana_cookie_rows(profile: Path, host: str) -> list[tuple]:
+    """Cookie rows Chrome wrote to the profile's cookie store for ``host``."""
+    import sqlite3
+    import tempfile
+    rows = []
+    for db in profile.rglob("Cookies"):
+        with tempfile.TemporaryDirectory() as d:
+            copy = Path(d) / "c.db"
+            shutil.copy(db, copy)  # Chrome holds a lock on the original
+            con = sqlite3.connect(copy)
+            try:
+                rows += con.execute("SELECT host_key, name, is_persistent FROM cookies "
+                                    "WHERE host_key LIKE ?", (f"%{host}%",)).fetchall()
+            except sqlite3.DatabaseError:
+                pass
+            finally:
+                con.close()
+    return rows
+
+
 @pytest.mark.skipif(not _browser_available(), reason="playwright and Chrome are needed")
-def test_browser_transport_runs_the_whole_path_and_sees_the_login_page(fixture, tmp_path):
-    # no cookie requirement: the browser's jar is empty and that is the point;
-    # the stub decides signed-in state server side
-    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices)).start()
-    transport = esbridge.BrowserTransport(tmp_path / "profile")
+def test_browser_login_keeps_the_session_and_it_dies_with_the_browser(fixture, short_dir):
+    """Real Chrome, real session cookie: the sign-in serves every request
+    while this browser lives, and the next browser starts signed out. Before
+    the fix, login() closed the browser and the first run here was refused."""
+    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices), sso_headless=True).start()
+    profile = short_dir / "profile"
+    transport = esbridge.BrowserTransport(profile)
     try:
-        cfg = _config(kb.url, tmp_path)
-        scrubber = elastic.EsScrubber(cfg, tier2="none")
-        b = esbridge.Bridge(cfg, scrubber, esbridge.KibanaSession(transport, poll_interval=0.1))
-        o = b.run("stub", {"index": "logs-worker-*", "size": 3})
-        assert o.refused is None and o.hits_shown == 3
-        assert eseval._leaks(o.output, fixture.truth) == []
-        # the request came from the Kibana tab with the required headers
-        posts = [(p, h) for m, p, h in kb.calls if m == "POST"]
-        assert posts and posts[0][0] == esbridge.SEARCH_PATH
-        assert (tmp_path / "profile" / esbridge.PROFILE_MARKER).exists()
+        cfg = _sso_config(kb.url, profile)
+        cluster = cfg.cluster("stub")
+
+        def bridge(t):
+            return esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"),
+                                   esbridge.KibanaSession(t, poll_interval=0.1))
+
+        assert transport.login(cluster, timeout=20)
+        for _ in range(2):
+            o = bridge(transport).run("stub", {"index": "logs-worker-*", "size": 3})
+            assert o.refused is None and o.hits_shown == 3
+            assert all(h["_index"].startswith(".ds-") for h in o.output["hits"]["hits"])
+            assert eseval._leaks(o.output, fixture.truth) == []
+        assert kb.logins == 1
+        posts = [p for m, p, _ in kb.calls if m == "POST"]
+        assert posts and posts[0] == esbridge.SEARCH_PATH
+        # Kibana ends the session: refused, and a login in the same browser recovers
         kb.expire()
         with pytest.raises(elastic.Refused) as e:
-            b.run("stub", {"index": "logs-worker-*", "size": 1})
+            bridge(transport).run("stub", {"index": "logs-worker-*", "size": 1})
         assert e.value.code == "session_expired"
-        kb.sign_in()
-        assert b.run("stub", {"index": "logs-worker-*", "size": 1}).refused is None
+        assert transport.login(cluster, timeout=20)
+        assert bridge(transport).run("stub", {"index": "logs-worker-*", "size": 1}).refused is None
+        transport.close()
+        # nothing reached the bridge's directory, and the next browser is signed
+        # out (the stub's IdP now behaves like the real one for headless, so it
+        # cannot quietly sign the new browser back in)
+        assert _kibana_cookie_rows(profile, "127.0.0.1") == []
+        assert not list(profile.rglob("Cookies"))
+        kb.sso_headless = False
+        transport = esbridge.BrowserTransport(profile)
+        with pytest.raises(elastic.Refused) as e:
+            bridge(transport).run("stub", {"index": "logs-worker-*", "size": 1})
+        assert e.value.code == "session_expired" and kb.logins == 2
     finally:
         transport.close()
+        kb.stop()
+
+
+@pytest.mark.skipif(not _browser_available(), reason="playwright and Chrome are needed")
+def test_browser_headless_sso_never_completes(fixture, short_dir):
+    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices)).start()
+    transport = esbridge.BrowserTransport(short_dir / "profile", headless=True)
+    try:
+        assert transport.login(elastic.Cluster("stub", kb.url), timeout=3) is False
+        assert kb.logins == 0
+    finally:
+        transport.close()
+        kb.stop()
+
+
+@pytest.mark.skipif(not _browser_available(), reason="playwright and Chrome are needed")
+def test_broker_with_real_chrome_serves_many_runs_from_one_login(fixture, short_dir):
+    kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices), sso_headless=True).start()
+    cfg = _sso_config(kb.url, short_dir / "profile")
+    profile = esbridge.prepare_profile_dir(cfg.profile_dir)
+    sb = _ServedBroker(cfg, esbridge.broker_socket(profile),
+                       lambda: esbridge.BrowserTransport(profile, headless=True))
+    try:
+        assert sb.client(60).call("login", cluster="stub", timeout=20)["signed_in"]
+        for _ in range(3):
+            r = sb.client(60).call("run", cluster="stub", tier2="none",
+                                   query={"index": "logs-app-*", "size": 2})["report"]
+            assert r["refused"] is None and r["hits_shown"] == 2
+        assert kb.logins == 1
+    finally:
+        sb.stop()
         kb.stop()

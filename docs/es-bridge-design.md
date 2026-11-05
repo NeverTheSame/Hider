@@ -14,7 +14,7 @@ es-smoke`, `es-login`). No MCP server yet. Companion to `pilot-plan.md`.
 | Minimum word length on phrase queries | No. `match_phrase` on `message` is the main tool. Guess confirmation by hit count is accepted: every text query is logged with its labels, counted in the eval (`text_queries`) and declared. |
 | Server names | Keep role and region: `ctr-amer-042` becomes `ctr-amer-s01`, through a `shape` regex and `label` format on the identifier field. |
 | Index and field names | Site-specific, in `hider.local.json` under `elastic` (object or path), or `HIDER_ELASTIC`. The repo ships `templates/elastic.example.json` with invented names only. |
-| Auth | No API keys. The bridge drives the installed Chrome through Playwright on its **own dedicated profile**, signed in to Kibana only, one profile for all four clusters. Queries are in-page `fetch` calls from a tab parked on each Kibana origin, so the SSO cookie never leaves the browser. The analyst's everyday profile is never opened by the bridge. |
+| Auth | No API keys. The bridge drives the installed Chrome through Playwright in an **off-the-record context**, signed in to Kibana only, one browser for all four clusters, kept alive by a long-lived broker process because Kibana's session cookie dies with the browser. Queries are in-page `fetch` calls from a tab parked on each Kibana origin, so the SSO cookie never leaves the browser, and off the record it never reaches disk (a persistent profile flushes even session cookies to its cookie database). The analyst's everyday profile is never opened by the bridge. |
 | Kibana | 9.4 on all clusters. Required headers: `kbn-xsrf`, `x-elastic-internal-origin: Kibana`, `Content-Type` and `Accept: application/json`. Poll every 1.5 s, 2 minute timeout, `DELETE` the search when done. |
 | Expired session | Kibana does not 401. It redirects, sometimes via the identity provider, to a `/login` page served with 200. Any such reply is `session_expired`; a visible window (`es-login`) is how the human signs back in, silently when Entra remembers the device. |
 
@@ -332,18 +332,22 @@ unformatted one is already a declared miss. Eval before and after: unchanged.
 
 | Piece | What it does | Tested by |
 |---|---|---|
-| `BrowserTransport` | Playwright, `launch_persistent_context` on `profile_dir`, `channel="chrome"`, pipe transport (no debug port). One tab per cluster parked on `/app/home`; every request is an in-page `fetch` with the four headers. A tab that lands off the Kibana host or on `/login` is `session_expired`. `login()` reopens the same profile headed and waits for the human. | `test_browser_transport_runs_the_whole_path_and_sees_the_login_page` (skips without Playwright and Chrome) |
-| `prepare_profile_dir` | Creates the dedicated profile with a marker file, mode 700. Refuses a stock Chrome profile root and any existing non-empty directory without the marker. | `test_profile_dir_is_dedicated` |
+| `BrowserTransport` | Playwright, `launch()` plus an off-the-record `new_context()`, `channel="chrome"`, pipe transport (no debug port). One tab per cluster parked on `/app/home`; every request is an in-page `fetch` with the four headers. A tab that lands off the Kibana host or on `/login` is `session_expired`. `login()` navigates the tab and waits; it keeps the browser open, because the session cookie dies with it. | `test_browser_login_keeps_the_session_and_it_dies_with_the_browser`, `test_browser_headless_sso_never_completes` (skip without Playwright and Chrome) |
+| `Broker`, `BrokerClient` | The long-lived process that owns the browser. `es-login` starts it detached and asks it to sign in; `es-smoke` sends a grammar query over a Unix socket (0600, in the bridge's 0700 directory) and gets the scrubbed report back. Compile, Kibana and scrub all run inside it, so no raw reply crosses the socket. Stops on `es-logout`, on the analyst closing its window, or after 8 hours idle; any exception is a `bridge_error` refusal with no detail. No broker is `session_expired`. | `test_one_login_lasts_across_many_smoke_runs`, the CLI test, the fail-closed tests |
+| `prepare_profile_dir` | Creates the bridge's own directory with a marker file, mode 700; it holds the broker socket. Refuses a stock Chrome profile root and any existing non-empty directory without the marker. | `test_profile_dir_is_dedicated` |
 | `UrllibTransport` | Plain HTTP with a cookie, for the stub only. The CLI refuses to use it against a configured cluster. | the rest of `test_esbridge.py` |
 | `KibanaSession.parse_reply` | The gate every reply passes: off-host redirect, `/login`, HTML that mentions login, other HTML, non-JSON, non-object, 401/403 each have a code; the body never enters the refusal message. | parametrised test, ten shapes |
 | `KibanaSession.search` | Submit, poll on `isRunning`, timeout to `incomplete`, `DELETE` in `finally`. Error bodies pass through to the scrubber, which classes them. | `test_search_submits_polls_and_releases`, `test_poll_timeout_is_incomplete_and_the_search_is_deleted`, the mid-flight expiry test |
 | `Bridge.run` | cluster lookup, compile, probe (`/internal/security/me`, body discarded), search, scrub, one lock, decision-log row. The function the MCP tool will call. | the bridge tests, including six concurrent calls |
 | Decision log | `hider.es-bridge.v1`: cluster, index, size, time range, filter fields and ops, agg shape, labels used, text phrases as written, hit counts, refusal code, seconds. | `..._the_log_holds_no_values` checks every planted value against the log |
-| Stub Kibana additions | `signed_in=False` serves a 302 to `/login` and a 200 HTML login page, `slow=True` never finishes, `DELETE` is recorded, `/app/home` and `/internal/security/me` exist. | `eseval.StubKibana` |
+| Stub Kibana additions | Sessions are `sid` cookies with no expiry, issued by an IdP at `/login` that completes only for a headed top-level navigation (never headless, never a `fetch`); without one, a 302 to `/login` and a 200 HTML login page. Hits name data-stream backing indices (`.ds-logs-app-default-2026.08.20-000001`). `slow=True` never finishes, `DELETE` is recorded. `eseval.SimBrowser` keeps Chrome's cookie lifetime rules for tests that cannot run Chrome. | `eseval.StubKibana`, the lifecycle tests |
 
 Site configuration gained two keys, both in the example with invented
 values: `clusters` (name to Kibana origin; plain `http` only on loopback)
-and `profile_dir`.
+and `profile_dir` (the bridge's own directory). `poll_timeout_s` (default
+120, at most 600) caps how long one async search may poll; the ceiling is
+there because the bridge is serialised and a polling search blocks every
+other call.
 
 Smoke commands, in the order to run them:
 
@@ -352,11 +356,16 @@ Smoke commands, in the order to run them:
 python -m hider es-smoke --stub --no-browser         # grammar + scrubber + protocol, no Chrome
 python -m hider es-smoke --stub                      # the same through real Chrome on a throwaway profile
 python -m hider es-smoke --stub --expired            # the stub serves the SSO login page: expect REFUSED session_expired
-python -m hider es-login --cluster emea              # once per cluster: headed window, sign in, closes itself
+python -m hider es-login --cluster emea              # starts the bridge; headed window, sign in, it minimises
 python -m hider es-smoke --cluster emea --term "<the customer>" --phrase "<a phrase>" --log out/es/smoke.jsonl
+python -m hider es-logout                            # stops the bridge; every session ends with its browser
 ```
 
-The last line is the one against a real cluster. It prints one `OK` or
+`es-login` once per cluster per bridge; every `es-smoke` after that runs
+in the bridge. The first sign-in of each bridge is the full IdP flow,
+because the off-the-record context remembers nothing; re-signing in after
+Kibana expires a session, inside the same bridge, is the quick one. The
+`es-smoke` line is the one against a real cluster. It prints one `OK` or
 `REFUSED` line with counts and a refusal code, never a page; add `--show`
 to print the scrubbed page (labels only) once the counts look right. The
 real site map comes from `HIDER_ELASTIC` or `hider.local.json`.

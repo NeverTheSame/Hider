@@ -38,7 +38,11 @@ import random
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
+from http.cookiejar import Cookie, CookieJar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -383,6 +387,12 @@ def _cmp_value(field_name: str, v: Any):
     return v
 
 
+def backing_index(pattern: str) -> str:
+    """The backing index a hit from ``pattern`` names, as Elasticsearch
+    names a data stream's write index."""
+    return f".ds-{pattern.replace('*', 'default')}-2026.08.20-000001"
+
+
 class StubEngine:
     """Evaluates compiled bodies against the fixture, Elasticsearch-shaped replies."""
 
@@ -446,7 +456,9 @@ class StubEngine:
         return _unflatten(keep)
 
     def _hit(self, index: str, i: int, flat: dict, includes: list[str] | None) -> dict:
-        return {"_index": index.replace("*", "2026.08.20"), "_id": f"{index[:4]}{i:08d}",
+        # Real hits name the data stream's backing index, never the pattern
+        # or the stream: logs-app-* -> .ds-logs-app-default-2026.08.20-000001
+        return {"_index": backing_index(index), "_id": f"{index[:4]}{i:08d}",
                 "_score": None, "_source": self._project(flat, includes)}
 
     def _sorted(self, rows: list[tuple[int, dict]], sort: list[dict]) -> list[tuple[int, dict]]:
@@ -579,19 +591,31 @@ class StubKibana:
     """
 
     def __init__(self, engine: StubEngine, *, cookie: str | None = None,
-                 signed_in: bool = True, slow: bool = False) -> None:
+                 signed_in: bool = True, slow: bool = False,
+                 sso_headless: bool = False) -> None:
         self.engine = engine
+        #: Sessions are cookies, as Kibana's are: ``sid=<value>`` with no
+        #: expiry, so a browser holds it in memory and loses it on exit.
+        #: Every request without a live one gets a 302 to /login and a 200
+        #: HTML login page, never a 401. ``cookie`` is a session issued up
+        #: front (for the plain-HTTP transport); ``signed_in`` says whether
+        #: it starts live. A browser gets its own from the SSO flow below.
         self.cookie = cookie
-        #: False: the session has expired. Like Kibana behind SSO, every
-        #: request then gets a 302 to /login and a 200 HTML login page, never
-        #: a 401. ``expire()`` and ``sign_in()`` flip it mid-test.
-        self.signed_in = signed_in
+        self.sessions: set[str] = {cookie} if cookie and signed_in else set()
+        #: The IdP: GET /login completes for a top-level navigation in a
+        #: headed browser and issues a session. Never for a fetch (Chrome
+        #: sends Sec-Fetch-Mode: cors; the IdP's auto-post needs a page),
+        #: and never for a headless browser (HeadlessChrome in the user
+        #: agent), as the real one never did; True lets a headless test
+        #: browser sign in.
+        self.sso_headless = sso_headless
         #: True: the search never finishes (isRunning stays true), to drive
         #: the poll timeout.
         self.slow = slow
         self.pending: dict[str, dict] = {}
         self.deleted: list[str] = []
         self.calls: list[tuple[str, str, dict]] = []
+        self.logins = 0
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -624,21 +648,40 @@ class StubKibana:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _has_session(self) -> bool:
+                jar = {c.strip() for c in (self.headers.get("Cookie") or "").split(";")}
+                return bool(jar & stub.sessions)
+
+            def _sso(self) -> None:
+                """The login page and the IdP behind it, in one step."""
+                nxt = re.search(r"[?&]next=([^&]+)", self.path)
+                target = urllib.parse.unquote(nxt.group(1)) if nxt else "/app/home"
+                if not target.startswith("/") or target.startswith("//"):
+                    target = "/app/home"
+                if self._has_session():
+                    return self._html(302, "", {"Location": target})
+                headless = "HeadlessChrome" in (self.headers.get("User-Agent") or "")
+                navigation = self.headers.get("Sec-Fetch-Mode") == "navigate"
+                if not navigation or (headless and not stub.sso_headless):
+                    return self._html(200, LOGIN_PAGE)
+                sid = f"sid={uuid.uuid4().hex}"
+                stub.sessions.add(sid)
+                stub.logins += 1
+                self._html(302, "", {"Location": target,
+                                     "Set-Cookie": f"{sid}; Path=/; HttpOnly; SameSite=Lax"})
+
             def _session_ok(self) -> bool:
-                """Expired SSO: redirect to the login page, which is a 200."""
-                if stub.signed_in:
-                    return True
+                """No live session: redirect to the login page, which is a 200."""
                 if self.path.startswith("/login"):
-                    self._html(200, LOGIN_PAGE)
-                else:
-                    self._html(302, "", {"Location": f"/login?next={self.path}"})
+                    self._sso()
+                    return False
+                if self._has_session():
+                    return True
+                self._html(302, "", {"Location": "/login?next=" + urllib.parse.quote(self.path)})
                 return False
 
             def _authorised(self) -> bool:
                 if not self._session_ok():
-                    return False
-                if stub.cookie is not None and stub.cookie not in (self.headers.get("Cookie") or ""):
-                    self._reply(401, kibana_error(401, "Unauthorized"))
                     return False
                 if not self.headers.get("kbn-xsrf"):
                     self._reply(400, kibana_error(400, "Request must contain a kbn-xsrf header."))
@@ -731,10 +774,89 @@ class StubKibana:
         self.server.server_close()
 
     def expire(self) -> None:
-        self.signed_in = False
+        """Kibana ends every session server side (idle timeout, logout)."""
+        self.sessions.clear()
 
     def sign_in(self) -> None:
-        self.signed_in = True
+        """The up-front session is live again (plain-HTTP tests only; a
+        browser signs in through /login)."""
+        if self.cookie:
+            self.sessions.add(self.cookie)
+
+
+class SimBrowser:
+    """Chrome's cookie rules, for tests that cannot run Chrome.
+
+    A session cookie (no Expires, no Max-Age: Kibana's ``sid``) lives in the
+    browser's memory and is gone when the browser closes; only persistent
+    cookies reach ``profile``, which stands in for the profile on disk and
+    outlives the browser. Headless mode says so in the user agent, as
+    Chrome does, which is what the IdP keys on. Implements the transport
+    interface the bridge uses, plus ``login``, ``start`` and ``closed``.
+    """
+
+    UA = "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) {}/131.0 Safari/537.36"
+
+    def __init__(self, profile: list[Cookie], *, headless: bool = False) -> None:
+        self.profile = profile
+        self.headless = headless
+        self.closed = False
+        self._jar: CookieJar | None = None
+        self._opener = None
+
+    def start(self) -> None:
+        if self._jar is None:
+            self._jar = CookieJar()
+            for c in self.profile:
+                self._jar.set_cookie(c)
+            self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._jar))
+
+    @property
+    def cookies(self) -> list[Cookie]:
+        return list(self._jar) if self._jar is not None else []
+
+    def request(self, cluster: elastic.Cluster, method: str, path: str,
+                body: dict | None = None, *, navigate: bool = False):
+        """An in-page fetch, or with ``navigate`` a top-level page load."""
+        from . import esbridge
+
+        self.start()
+        url = cluster.kibana + path
+        headers = dict(esbridge.HEADERS)
+        headers["User-Agent"] = self.UA.format("HeadlessChrome" if self.headless else "Chrome")
+        headers["Sec-Fetch-Mode"] = "navigate" if navigate else "cors"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with self._opener.open(req, timeout=10) as r:
+                return esbridge.Reply(r.status, r.geturl(), r.headers.get("Content-Type", ""),
+                                      r.read().decode("utf-8", "replace"), r.geturl() != url)
+        except urllib.error.HTTPError as e:
+            return esbridge.Reply(e.code, e.geturl() or url, e.headers.get("Content-Type", ""),
+                                  e.read().decode("utf-8", "replace"), (e.geturl() or url) != url)
+        except (urllib.error.URLError, OSError) as e:
+            raise elastic.Refused("unreachable", "kibana unreachable") from e
+
+    def login(self, cluster: elastic.Cluster, *, timeout: float = 5.0) -> bool:
+        """Navigate to Kibana and wait to land on it signed in."""
+        from . import esbridge
+
+        deadline = time.monotonic() + timeout
+        while True:
+            r = self.request(cluster, "GET", esbridge.APP_PATH, navigate=True)
+            if esbridge._url_host(r.url) == cluster.host and not esbridge._is_login_url(r.url):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+
+    def close(self) -> None:
+        """The browser exits: persistent cookies are written to the
+        profile, session cookies die."""
+        if self._jar is not None:
+            self.profile[:] = [c for c in self._jar if not c.discard]
+        self._jar = None
+        self._opener = None
 
 
 #: What an expired SSO session looks like from the client: a 200 with HTML.

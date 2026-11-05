@@ -64,7 +64,7 @@ design conversation, not a code change.
 | Eval metrics or gates | `hider/evaluate.py` (recall, precision, adversarial, injection), `hider/utility.py` (answer accuracy raw vs redacted) |
 | JSON exports and the web UI | `hider/jsonscrub.py`, `hider/webserver.py` (single-file page, stdlib server), `hider/research.py` (Claude Code bridge) |
 | Site-specific patterns | Never in the repo. `templates/profile.example.json` and `HIDER_PROFILE`; see `hider/profiles.py` |
-| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esbridge.py` (the Kibana session: dedicated Chrome profile via Playwright, async-search protocol, every malformed reply a refusal, decision log). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
+| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
 
 ## Running things
 
@@ -80,6 +80,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hider serve                  # web UI on 127.0.0.1:8790
 .venv/bin/python -m hider es-eval                # Elasticsearch core: leaks, refusals, oracle cases, no cluster
 .venv/bin/python -m hider es-smoke --stub        # one query through Chrome against a synthetic Kibana
+.venv/bin/python -m hider es-login --cluster emea # start the bridge and sign in (headed, once per bridge)
+.venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
 ```
 
 Live calls need `pip install -r requirements-llm.txt`, a key in the
@@ -216,11 +218,18 @@ Listed with owners in the README's Limitations section and in
   include, scripts, raw DSL, literals, wrong-type labels) is an
   `esquery.ORACLE_CASES` entry and must be refused with its declared code.
   Add the case before the rule, as with `adversarial.CASES`. Only
-  `esbridge` opens a connection, and only through the browser profile it
-  created itself (`prepare_profile_dir` refuses any other); the SSO cookie
-  never leaves Chrome. An expired Kibana session is a 200 login page, not a
-  401, so every reply goes through `KibanaSession.parse_reply` first. The
-  MCP server is not built yet.
+  `esbridge` opens a connection, and only from the broker's browser. The
+  SSO cookie never leaves Chrome and never reaches disk: Kibana's `sid` is
+  a session cookie that dies with the browser, so one long-lived broker
+  (`es-login` starts it, `es-smoke` talks to it over a 0600 socket) holds
+  the sign-in, and its Chrome context is off the record because a
+  persistent profile flushes even session cookies to its cookie database.
+  The stub enforces the same rules (cookie sessions, an IdP that refuses
+  headless and fetches) and names hits by data-stream backing index
+  (`.ds-<stream>-<date>-<gen>`), which `index_allowed` checks by stream. An
+  expired Kibana session is a 200 login page, not a 401, so every reply
+  goes through `KibanaSession.parse_reply` first. The MCP server is not
+  built yet.
 
 ## Where to take questions and findings
 
