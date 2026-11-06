@@ -26,6 +26,7 @@ Three rules hold in both:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol, Sequence
@@ -142,6 +143,51 @@ def in_dotted_chain(text: str, start: int, end: int, min_labels: int = 3) -> boo
     return all(lb[0].isalnum() for lb in labels)
 
 
+#: Words every log uses as a level, severity or outcome. They are never a
+#: name, but tier 2 read them as one: "Info Lena" as one person, "Debug" as a
+#: person on its own, "Critical Contoso Holdings" as one organisation. That
+#: destroyed the word in message text, and once it was a known value the ES
+#: sweep replaced it everywhere, log.level included. Kept to words that are
+#: not plausible names; "Grace" or "Dawn" would never go here.
+LOG_VOCABULARY = frozenset({
+    "trace", "debug", "verbose", "info", "information", "informational", "notice",
+    "warn", "warning", "error", "err", "fatal", "critical", "crit", "severe", "alert",
+    "emergency", "emerg", "success", "succeeded", "successful", "failed", "failure",
+    "retry", "retrying", "timeout", "started", "completed", "skipped", "cancelled",
+    "canceled", "aborted", "pending", "running",
+})
+_WORD = re.compile(r"[A-Za-z]+")
+
+
+def is_log_word(word: str) -> bool:
+    return word.casefold() in LOG_VOCABULARY
+
+
+def trim_log_vocabulary(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """A tier 2 span with log vocabulary taken off both ends, or None when
+    nothing else is left. Only ever narrows a tier 2 span; a tier 1 span is
+    never touched, so monotonicity holds."""
+    words = [(m.start(), m.end()) for m in _WORD.finditer(text, start, end)]
+    while words and is_log_word(text[words[0][0]:words[0][1]]):
+        words.pop(0)
+    while words and is_log_word(text[words[-1][0]:words[-1][1]]):
+        words.pop()
+    if not words:
+        return None
+    # keep any non-word characters the model put inside the span, but not a
+    # vocabulary word's leftovers at the edges
+    return words[0][0], words[-1][1]
+
+
+def normalise_log_vocabulary(segment: str) -> str:
+    """The segment with log vocabulary lower-cased, for the model only. Same
+    length, so offsets map back one to one. A capitalised "Warning" before a
+    name looks like a first name to a per-token classifier; lower-cased it
+    does not, and the real name beside it is read whole again."""
+    return _WORD.sub(lambda m: m.group(0).lower() if is_log_word(m.group(0)) else m.group(0),
+                     segment)
+
+
 class ManagedNerTier:
     """A locally trained classifier over the free-text residue. Phase 2.
 
@@ -173,7 +219,7 @@ class ManagedNerTier:
             segment = text[start:end]
             if not segment.strip():
                 continue
-            for s0, e0, etype, score in classifier.predict_spans(self._clf, segment):
+            for s0, e0, etype, score in self._predict(segment):
                 # A token straight after a backslash is a path or principal
                 # segment (BUILTIN\Administrators, SOFTWARE\Contoso), never a
                 # name in prose. Without this, "Administrators" was
@@ -192,6 +238,32 @@ class ManagedNerTier:
                 spans.append(Span(start + s0, start + e0, etype, float(score),
                                    self.name, detector="trained-classifier"))
         return spans
+
+    def _predict(self, segment: str) -> list[tuple[int, int, str, float]]:
+        """Spans for one segment, never containing log vocabulary.
+
+        Two readings when the segment has a vocabulary word: as written, and
+        with the vocabulary lower-cased. The second stops a level word from
+        breaking the name beside it ("user Lena Moreau Warning" left "Lena"
+        in the clear); the first keeps what tier 2 found before ("Info Lena"
+        trims to "Lena", which a lone first name otherwise is not caught as).
+        Both are trimmed of vocabulary and the union kept: each span is still
+        tier 2's own claim, narrowed, so this only ever adds redaction
+        relative to dropping the words. Measured on the adversarial grid in
+        test_recognizers.py: 54 of 160 words lost and 36 names leaked before,
+        none lost and 4 leaked after, those 4 leaking before too.
+        """
+        readings = [segment]
+        normalised = normalise_log_vocabulary(segment)
+        if normalised != segment:
+            readings.append(normalised)
+        found: dict[tuple[int, int], tuple[int, int, str, float]] = {}
+        for reading in readings:
+            for s0, e0, etype, score in classifier.predict_spans(self._clf, reading):
+                kept = trim_log_vocabulary(segment, s0, e0)
+                if kept is not None and kept not in found:
+                    found[kept] = (kept[0], kept[1], etype, score)
+        return sorted(found.values())
 
 
 # ---------------------------------------------------------------------------

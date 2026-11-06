@@ -406,3 +406,62 @@ def test_with_tier2_the_fixture_pages_come_out_clean():
         out = s.scrub_response({"rawResponse": raw}, elastic.Plan(index)).output
         assert eseval._leaks(out, fx.truth) == []
     assert s.degraded == 0
+
+
+# -- generic log vocabulary through the scrubber, sweep included --------------
+
+_LOG_WORDS = ["Warning", "Info", "Error", "Debug", "Warn", "Critical", "Completed", "Failed",
+              "Retry", "INFO", "ERROR"]
+_SHAPES = [("{w} Lena Moreau signed in", "Lena Moreau"), ("user Lena Moreau {w}", "Lena Moreau"),
+           ("Lena Moreau {w} on sync", "Lena Moreau"), ("{w} Contoso Holdings throttled",
+                                                         "Contoso Holdings")]
+
+
+@pytest.fixture(scope="module")
+def tier2_scrubber_factory():
+    return lambda: elastic.EsScrubber(CFG, tier2="classifier")
+
+
+@pytest.mark.parametrize("shape,name", _SHAPES)
+def test_log_vocabulary_survives_in_keep_fields_and_message_text(tier2_scrubber_factory, shape, name):
+    """The word is in log.level and job.status (keep) and in the message; the
+    name beside it is labelled. Before the tier 2 vocabulary rule the word
+    became a known value and the sweep replaced it in the keep fields."""
+    failures = []
+    for w in _LOG_WORDS:
+        s = tier2_scrubber_factory()
+        doc = {"@timestamp": "2026-08-20T10:00:00Z", "log": {"level": w},
+               "job": {"status": w}, "message": shape.format(w=w)}
+        out = s.scrub_response(_envelope([_hit(doc)]), PLAN).output["hits"]["hits"][0]["_source"]
+        if out["log"]["level"] != w or out["job"]["status"] != w:
+            failures.append(f"{w}: keep fields became {out['log']['level']!r}/{out['job']['status']!r}")
+        if not any(t.strip(":,") == w for t in out["message"].split()):
+            failures.append(f"{w}: message lost it: {out['message']!r}")
+        if any(part in out["message"] for part in name.split()):
+            failures.append(f"{w}: name leaked: {out['message']!r}")
+        if any(pipeline_word(v) for v in s.mapping.values()):
+            failures.append(f"{w}: a log word was mapped: {sorted(s.mapping.values())}")
+    assert not failures, failures
+
+
+def pipeline_word(value: str) -> bool:
+    from hider import pipeline
+    return all(pipeline.is_log_word(t) for t in value.split())
+
+
+@pytest.mark.parametrize("patch,why", [
+    ({"isRunning": True}, "still running"),
+    ({"isPartial": True}, "partial results"),
+    ({"timed_out": True}, "timed out"),
+])
+def test_incomplete_refusals_say_how_to_narrow(patch, why):
+    env = _envelope([_hit(APP_DOC)])
+    if "timed_out" in patch:
+        env["rawResponse"]["timed_out"] = True
+    else:
+        env.update(patch)
+    with pytest.raises(elastic.Refused) as e:
+        _session().scrub_response(env, PLAN)
+    assert e.value.code == "incomplete" and why in e.value.message
+    assert "shorter time window" in e.value.message and "phrase" in e.value.message
+    assert "index pattern" in e.value.message

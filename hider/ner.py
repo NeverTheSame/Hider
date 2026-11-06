@@ -42,7 +42,7 @@ import re
 import threading
 from typing import Protocol, Sequence
 
-from .pipeline import Span
+from .pipeline import Span, trim_log_vocabulary
 
 #: Raw NER labels this tier maps to spec entity types. The keys are spaCy's
 #: labels; Presidio's NLP engine already normalises ORG to ORGANIZATION when
@@ -197,8 +197,12 @@ class LocalNerTier:
             if not segment.strip():
                 continue
             for s, e, label in self._analyse(segment):
+                # log vocabulary is never part of a name (pipeline.LOG_VOCABULARY)
+                kept = trim_log_vocabulary(segment, s, e)
+                if kept is None:
+                    continue
                 out.append(
-                    Span(start + s, start + e, label, SPAN_SCORE, self.name,
+                    Span(start + kept[0], start + kept[1], label, SPAN_SCORE, self.name,
                          detector=f"spacy:{label}")
                 )
         return out

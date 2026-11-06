@@ -85,6 +85,12 @@ DEFAULT_MAX_TEXT_CHARS = 20_000
 #: The ceiling is there because the bridge is serialised: a search that is
 #: still polling blocks every other call, so ten minutes is the most one
 #: query may hold it. A wider window or a filter is the answer past that.
+#: Distinct phrases one query may carry, in its filters and in every
+#: aggregation at any depth. A ``filters`` aggregation returns a separate
+#: hit count per bucket, so without a cap one query confirms a whole list of
+#: guessed words. The ceiling keeps a site from configuring that back in.
+DEFAULT_MAX_PHRASES = 8
+MAX_PHRASES_CEILING = 16
 DEFAULT_POLL_TIMEOUT_S = 120
 MAX_POLL_TIMEOUT_S = 600
 #: Elasticsearch names a data stream's backing indices
@@ -92,6 +98,10 @@ MAX_POLL_TIMEOUT_S = 600
 #: index, never the stream the query targeted. The suffix is fixed, so the
 #: stream name is recovered exactly; the greedy group is safe because the
 #: anchor is the end of the name.
+#: Appended to every ``incomplete`` refusal: the search was too wide to finish
+#: whole, and these are the levers the grammar has.
+INCOMPLETE_HINT = ("narrow the query: a shorter time window, a more specific phrase or an "
+                   "exact filter, or one index pattern instead of a wide one")
 _BACKING_INDEX = re.compile(r"^\.ds-(?P<stream>.+)-\d{4}\.\d{2}\.\d{2}-\d{6,}$")
 
 
@@ -166,6 +176,7 @@ class ElasticConfig:
     clusters: tuple[Cluster, ...] = ()
     profile_dir: str = ""
     poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S
+    max_phrases: int = DEFAULT_MAX_PHRASES
 
     def cluster(self, name: str) -> Cluster | None:
         for c in self.clusters:
@@ -180,6 +191,14 @@ class ElasticConfig:
             if r.matches(path) and (best is None or r.specificity > best.specificity):
                 best = r
         return best
+
+    def closest_field(self, name: str) -> str | None:
+        """The site-map field most like ``name``, for a refusal hint. Field
+        names are what ``summary`` already tells Claude, so naming one here
+        discloses nothing new."""
+        import difflib
+        hit = difflib.get_close_matches(name, [r.pattern for r in self.fields], n=1, cutoff=0.6)
+        return hit[0] if hit else None
 
     def source_includes(self) -> list[str]:
         return [r.pattern for r in self.fields]
@@ -213,6 +232,7 @@ class ElasticConfig:
             "fields": {r.pattern: r.kind for r in sorted(self.fields, key=lambda r: r.pattern)},
             "max_hits": self.max_hits,
             "max_buckets": self.max_buckets,
+            "max_phrases": self.max_phrases,
             "clusters": [c.name for c in self.clusters],
         }
 
@@ -308,7 +328,8 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"{source}: top level must be an object")
     allowed = {"_comment", "indices", "fields", "time_field", "max_hits", "max_buckets",
-               "max_text_chars", "clusters", "profile_dir", "poll_timeout_s"}
+               "max_text_chars", "clusters", "profile_dir", "poll_timeout_s",
+               "max_phrases"}
     unknown = set(raw) - allowed
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
@@ -339,8 +360,14 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
             or not 1 <= poll <= MAX_POLL_TIMEOUT_S:
         raise ConfigError(f"{source}: poll_timeout_s must be a number of seconds, "
                           f"1..{MAX_POLL_TIMEOUT_S}")
+    phrases = raw.get("max_phrases", DEFAULT_MAX_PHRASES)
+    if isinstance(phrases, bool) or not isinstance(phrases, int) \
+            or not 0 <= phrases <= MAX_PHRASES_CEILING:
+        raise ConfigError(f"{source}: max_phrases must be an integer, 0..{MAX_PHRASES_CEILING} "
+                          "(0 turns text queries off)")
     cfg = ElasticConfig(tuple(indices), rules, time_field, source=source, clusters=clusters,
-                        profile_dir=profile_dir, poll_timeout_s=float(poll), **caps)
+                        profile_dir=profile_dir, poll_timeout_s=float(poll),
+                        max_phrases=phrases, **caps)
     tf = cfg.rule(time_field)
     if tf is None or tf.kind != "keep":
         raise ConfigError(f"{source}: time_field {time_field!r} must be listed as keep")
@@ -590,14 +617,15 @@ class EsScrubber(jsonscrub.JsonScrubber):
         if klass is not None:
             raise self._refuse("upstream_error", f"upstream error: {klass}")
         if raw.get("isRunning") is True:
-            raise self._refuse("incomplete", "response withheld: search still running")
+            raise self._refuse("incomplete", f"response withheld: search still running; {INCOMPLETE_HINT}")
         if raw.get("isPartial") is True:
-            raise self._refuse("incomplete", "response withheld: partial results")
+            raise self._refuse("incomplete", "response withheld: partial results (shards failed or "
+                                             f"timed out); {INCOMPLETE_HINT}")
         body = raw.get("rawResponse", raw)
         if not isinstance(body, dict) or "hits" not in body:
             raise self._refuse("malformed", "response withheld: no hits section")
         if body.get("timed_out") is True:
-            raise self._refuse("incomplete", "response withheld: search timed out")
+            raise self._refuse("incomplete", f"response withheld: search timed out; {INCOMPLETE_HINT}")
         degraded_before = self.degraded
         dropped_before = sum(self.dropped.values())
 

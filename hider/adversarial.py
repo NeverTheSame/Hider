@@ -462,6 +462,37 @@ CASES: tuple[Case, ...] = (
         expect_tier1=True,
         owner="the identifiers are tier 1; the name and company are the tier 2 case and scored separately",
     ),
+    # Generic log vocabulary beside a name. Tier 2 used to read a level or
+    # status word as part of a name ("Info Lena" as one person) or as a name
+    # on its own ("Debug" as <Person-01>); the word then became a known value
+    # and the ES sweep replaced it in log.level. The names here must still be
+    # caught; the words must survive, which adversarial scoring cannot see,
+    # so tests/test_recognizers.py and tests/test_elastic.py assert that half.
+    Case(
+        "log-level-word-before-a-name",
+        "A level word straight before a person's name, which tier 2 took into the name",
+        "[21.08.2026 09:02:48.100] <2f> Info [Auth] Warning <<PERSON_NAME|Diego Ferreira>> signed in twice, Debug trace on",
+        expect_tier1=False,
+        owner="tier 2 owns the name. The level words are pipeline.LOG_VOCABULARY and "
+              "must never be inside a tier 2 span; the survival half is tested as "
+              "intent in test_recognizers.py.",
+    ),
+    Case(
+        "log-level-word-after-a-name",
+        "A level word straight after a person's name, which tier 2 labelled as a person of its own",
+        "[21.08.2026 09:02:48.200] <2f> Info [Auth] user <<PERSON_NAME|Lena Moreau>> Info, session refreshed",
+        expect_tier1=False,
+        owner="tier 2 owns the name; survival of the level word is tested as intent "
+              "in test_recognizers.py.",
+    ),
+    Case(
+        "status-word-before-an-organisation",
+        "A severity word straight before an organisation, which tier 2 took into the organisation",
+        "[21.08.2026 09:02:48.300] <2f> Error [Throttle] Critical <<ORG_NAME|Woodgrove Partners>> throttled, Completed with Error",
+        expect_tier1=False,
+        owner="tier 2 owns the organisation; survival of the severity words is tested "
+              "as intent in test_recognizers.py.",
+    ),
 )
 
 

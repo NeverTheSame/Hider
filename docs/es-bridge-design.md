@@ -311,7 +311,7 @@ template reshuffles the generator and invalidates it.
 | Session scrubber for async-search responses: hits, `_source` and `fields` by path, bucket keys, `top_hits`, `filters`, metrics; drop-by-default; degraded and leak refusals; error bodies to a class | `elastic.EsScrubber.scrub_response` | `test_elastic.py`, `es-eval` |
 | Case vault and seeding (`seed`), save/restore under `out/es/` | `EsScrubber.seed`, `save_session`, `load_session` | `test_elastic.py` |
 | Closed grammar, compiler, outbound gate, label resolution | `esquery.py` (`compile_query`) | `tests/test_esquery.py` |
-| Adversarial query cases, 37, each with its refusal code | `esquery.ORACLE_CASES` | parametrised test plus `es-eval` |
+| Adversarial query cases, 38, each with its refusal code | `esquery.ORACLE_CASES` | parametrised test plus `es-eval` |
 | Synthetic documents in the three index shapes, with ground truth | `eseval.generate`, `templates/elastic_fixtures.json` | `tests/test_eseval.py` |
 | Stub Elasticsearch engine for the grammar; stub Kibana speaking the async protocol with required headers and a cookie | `eseval.StubEngine`, `eseval.StubKibana` | `test_eseval.py` |
 | The numbers: leak rate, refusals, clean-traffic refusals, round trip, oracle, coverage, text queries, latency | `eseval.run_eval`, `python -m hider es-eval` | writes `out/es-eval.json` |
@@ -347,7 +347,13 @@ values: `clusters` (name to Kibana origin; plain `http` only on loopback)
 and `profile_dir` (the bridge's own directory). `poll_timeout_s` (default
 120, at most 600) caps how long one async search may poll; the ceiling is
 there because the bridge is serialised and a polling search blocks every
-other call.
+other call. `max_phrases` (default 8, at most 16, 0 turns text queries off)
+caps the distinct phrases in one query, filters and aggregations at any
+depth together; over it is `size_cap` with the count and the cap, never
+the phrases. A phrase repeated across buckets, or differing only in case
+or spacing, counts once. The zero-hit check reuses only the query's own
+filters, so it never goes over the cap of a query that was allowed, and
+it splits its buckets across queries when `max_buckets` needs it.
 
 Smoke commands, in the order to run them:
 

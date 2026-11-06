@@ -191,6 +191,8 @@ def test_poll_timeout_is_incomplete_and_the_search_is_deleted(fixture, tmp_path)
         with pytest.raises(elastic.Refused) as e:
             b.run("stub", {"index": "logs-app-*", "size": 1})
         assert e.value.code == "incomplete"
+        assert "did not finish in 0s" in e.value.message
+        assert "shorter time window" in e.value.message and "index pattern" in e.value.message
         assert len(kb.deleted) == 1
     finally:
         kb.stop()
@@ -460,7 +462,8 @@ def _has_phrase(text, phrase):
 
 def _smoke(b, capsys, **kw):
     q = esbridge.smoke_query(b.config, since="now-6h", **kw)
-    report = esbridge.run_smoke(lambda query: esbridge.run_case(b, "stub", query), q)
+    report = esbridge.run_smoke(lambda query: esbridge.run_case(b, "stub", query), q,
+                                max_buckets=b.config.max_buckets)
     rc = esbridge.print_smoke("stub", q, report)
     return rc, capsys.readouterr().out, report
 
@@ -643,6 +646,104 @@ def test_terms_reconciliation_notes(capsys, aggs, hits_total, needle):
     assert esbridge.print_smoke("stub", q, report) == 0
     out = capsys.readouterr().out
     assert "NOTE" in out and needle in out and "key" not in out
+
+
+_CAP_WORDS = ("harbor", "violet", "granite", "meadow", "copper", "lantern", "orchid", "summit",
+              "willow")
+
+
+def _event_fields(n):
+    return [(f"event.f{i:02d}", "x") for i in range(n)]
+
+
+@pytest.mark.parametrize("max_buckets,eq,phrase_field", [
+    (50, [("data_stream.dataset", "app.engine")], "message"),
+    (50, [("data_stream.dataset", "app.engine"), ("log.level", "error")], "transaction.name"),
+    (50, _event_fields(20), "message"),        # 3 buckets a field: past max_buckets, split
+    (2, _event_fields(3), "message"),          # a cap smaller than one field's buckets
+    (1, [("log.level", "error")], "message"),
+])
+def test_the_zero_hit_check_is_never_refused_for_a_query_that_was_allowed(
+        tmp_path, max_buckets, eq, phrase_field):
+    from hider import esquery
+
+    cfg = elastic.parse({**json.loads(elastic.EXAMPLE.read_text()), "max_buckets": max_buckets})
+    for n in range(cfg.max_phrases + 2):
+        q = esbridge.smoke_query(cfg, phrase=list(_CAP_WORDS[:n]), phrase_field=phrase_field,
+                                 eq=eq, since="now-6h")
+        s = elastic.EsScrubber(cfg, tier2="none")
+        try:
+            esquery.compile_query(q, cfg, s)
+        except elastic.Refused as e:
+            assert n > cfg.max_phrases and e.code == "size_cap"
+            continue
+        probes, fields = esbridge.field_probe(q, max_buckets=cfg.max_buckets)
+        for probe in probes:
+            esquery.compile_query(probe, cfg, s)  # raises if the check would be refused
+        names = [k for p in probes for k in p["aggs"][esbridge.PHRASE_FIELD_AGG]["filters"]]
+        assert len(names) == len(set(names)) and all(
+            len(p["aggs"][esbridge.PHRASE_FIELD_AGG]["filters"]) <= max_buckets for p in probes)
+
+
+def test_a_query_at_the_phrase_cap_gets_its_zero_hit_check(stub, tmp_path, capsys, fixture):
+    b = _bridge(stub, tmp_path)
+    dataset = next(eseval.flatten(d.source)["data_stream.dataset"] for d in fixture.docs
+                   if d.index == "logs-app-*")
+    rc, out, report = _smoke(b, capsys, phrase=list(_CAP_WORDS[:8]), phrase_field="transaction.name",
+                             eq=[("data_stream.dataset", dataset), ("log.level", "error")])
+    assert "refused" not in report["field_probe"], report["field_probe"]
+    assert rc == 3 and "transaction.name holds no documents" in out
+    # many filtered fields: the check is split, and still not refused
+    rc, out, report = _smoke(b, capsys, phrase=list(_CAP_WORDS[:8]),
+                             eq=[("data_stream.dataset", dataset)] + _event_fields(17))
+    assert "refused" not in report["field_probe"] and report["field_probe"]["queries"] == 2
+    assert rc == 3 and "event.f00 holds no documents" in out
+
+
+def test_one_phrase_over_the_cap_is_refused_before_kibana(stub, tmp_path, capsys):
+    b = _bridge(stub, tmp_path)
+    n = len(stub.engine.requests)
+    rc, out, _ = _smoke(b, capsys, phrase=list(_CAP_WORDS[:9]))
+    assert rc == 2 and "code=size_cap" in out
+    assert "the query has 9 distinct phrases" in out and "the cap is 8 per query" in out
+    assert not any(w in out for w in _CAP_WORDS)
+    assert len(stub.engine.requests) == n
+    row = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
+    assert row["refused"] == "size_cap" and "text_queries" not in row
+
+
+@pytest.mark.parametrize("no_browser", [True, False])
+def test_es_smoke_stub_expired_is_refused_with_and_without_a_browser(monkeypatch, capsys, no_browser):
+    """--expired exits 2 in the browser too. The browser here is SimBrowser
+    parking its tab the way BrowserTransport does (a navigation through
+    /login first), which is what signed the expired run back in before."""
+    from hider import cli
+
+    monkeypatch.setattr(esbridge, "BrowserTransport",
+                        lambda profile_dir: eseval.SimBrowser([], headless=True, parks=True))
+    argv = ["es-smoke", "--stub", "--tier2", "none", "--expired"]
+    if no_browser:
+        argv.append("--no-browser")
+    assert cli.main(argv) == 2
+    out = capsys.readouterr().out
+    assert out.startswith("REFUSED ") and "code=session_expired" in out
+
+
+def test_a_parked_headless_browser_is_signed_in_only_while_the_stub_idp_is_open(fixture):
+    cluster_of = lambda kb: elastic.Cluster("stub", kb.url)
+    for sso, expect in ((True, None), (False, "session_expired")):
+        kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices), signed_in=False,
+                               sso_headless=True, sso=sso).start()
+        try:
+            browser = eseval.SimBrowser([], headless=True, parks=True)
+            try:
+                esbridge.KibanaSession(browser).probe(cluster_of(kb))
+                got = None
+            except elastic.Refused as e:
+                got = e.code
+            assert got == expect and kb.logins == (1 if sso else 0)
+        finally:
+            kb.stop()
 
 
 def test_es_smoke_cli_repeated_phrases_eq_and_the_empty_exit_code(capsys):

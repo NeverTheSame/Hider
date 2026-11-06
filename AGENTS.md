@@ -188,6 +188,22 @@ Listed with owners in the README's Limitations section and in
   three-label organisation (`Wood.Partners.Group`) is suppressed. The
   two-label case is deliberately NOT in the clean corpus — measuring a
   declared miss as a failure just yields a red test nobody can act on.
+- **Log vocabulary is never part of a tier 2 span.** Tier 2 read level and
+  status words as names: "Info Lena" as one person, "Debug" as a person on
+  its own, "Critical Contoso Holdings" as one organisation. That destroyed
+  the word in message text and, once it was a known value, the ES sweep
+  replaced it in `log.level` too. `pipeline.LOG_VOCABULARY` lists the words
+  (levels, severities, outcomes; no plausible names). Tier 2 reads a segment
+  that has one twice, as written and with the words lower-cased, trims the
+  words off both readings' spans and keeps the union: a narrowed tier 2
+  span, never a widened one, and never a tier 1 span touched. The sweep
+  over keep fields is unchanged, on purpose: it is the safety net for a
+  misclassified field. On the 160-line grid in `test_recognizers.py`, 54
+  words lost and 36 names leaked before, none and 4 after, those 4 leaking
+  before too: a lone upper-case-level first name (`WARN Lena`), pinned as a
+  declared miss, since tier 2 misses a lone first name beside any word. The
+  spaCy tier gets the trim, not the second reading. A real name spelled like
+  a vocabulary word (`Trace`) is a declared miss of this rule.
 - **OPEN tier 2 gap: the dotted-organisation head leak.** No dotted
   organisation is caught whole. `Wood.Partners` is below the 0.4 score floor
   and missed; `Tailspin.Industries` is caught only from the dot onward, so the
@@ -213,7 +229,25 @@ Listed with owners in the README's Limitations section and in
 - **Elasticsearch: the declared text-query channel.** `esquery` lets a
   phrase on a `text` field carry plain words, so a guessed word can be
   confirmed by a hit count. Accepted by decision: every text query is
-  logged with its labels and counted by `es-eval`. Identifier fields take
+  logged with its labels and counted by `es-eval`. The width of the
+  channel per query is capped: at most `max_phrases` distinct phrases
+  (site map, default 8, ceiling 16, 0 turns text queries off), counted
+  across the filters and every aggregation at any depth, so one `filters`
+  aggregation can no longer return a separate count for a whole word list
+  (`phrase-flooded-filters-agg` is the oracle case). Distinct means per
+  field, ignoring case and spacing: a phrase reused across buckets is one
+  guess, which is also why the zero-hit check, built only from a query's
+  own filters, always fits the cap of the query it checks. What the cap
+  does **not** close: guesses across queries (`max_phrases` per query, queries
+  unlimited, no per-case budget; the log and `es-eval` count them, nothing
+  stops them); combinations of the allowed phrases (a `filters`
+  aggregation can still count up to `max_buckets` co-occurrences of its
+  allowed phrases, so it bounds the vocabulary per query, not the number of
+  counts); literals on `keep` fields, which are uncapped because a keep
+  field is declared non-sensitive (a sensitive value under `keep` is a
+  site-map error); and punctuation variants of one phrase, which count
+  separately (safe direction). OR across phrases is not built
+  (`any_of` waits for a decision). Identifier fields take
   labels only; each forbidden shape (wildcard, prefix, range, sort, terms
   include, scripts, raw DSL, literals, wrong-type labels) is an
   `esquery.ORACLE_CASES` entry and must be refused with its declared code.

@@ -342,3 +342,107 @@ def test_compile_uses_the_real_clock_when_none_is_given():
     esquery.compile_query(_hist({"gte": recent, "lte": "now"}, "1d"), CFG, _session())
     with pytest.raises(elastic.Refused):
         esquery.compile_query(_hist({"gte": "2000-01-01", "lte": "now"}, "1d"), CFG, _session())
+
+
+# -- the per-query phrase cap ----------------------------------------------------
+
+_WORDS = ("harbor", "violet", "granite", "meadow", "copper", "lantern", "orchid", "summit",
+          "willow", "ember", "falcon", "juniper", "pebble", "thistle", "saffron", "cobalt", "tundra")
+
+
+def _phrase(word, field="message"):
+    return {"field": field, "op": "phrase", "value": word}
+
+
+def _flood(top, nested, cfg=CFG):
+    """``top`` phrases in the filters, ``nested`` in a filters aggregation two
+    levels down (inside a terms aggregation)."""
+    q = {"index": "logs-app-*", "size": 0, "filters": [_phrase(w) for w in _WORDS[:top]]}
+    if nested:
+        q["aggs"] = {"by_srv": {"type": "terms", "field": "agent.name", "aggs": {
+            "g": {"type": "filters", "filters": {
+                f"w{i}": [_phrase(w)] for i, w in enumerate(_WORDS[top:top + nested])}}}}}
+    return esquery.compile_query(q, cfg, _session())
+
+
+def test_phrase_cap_counts_filters_and_nested_aggregations_together():
+    assert CFG.max_phrases == elastic.DEFAULT_MAX_PHRASES == 8
+    c = _flood(4, 4)
+    assert len(c.text_queries) == 8
+    for top, nested in ((5, 4), (0, 9), (9, 0)):
+        with pytest.raises(elastic.Refused) as e:
+            _flood(top, nested)
+        assert e.value.code == "size_cap"
+        assert "the query has 9 distinct phrases across its filters and aggregations; " \
+               "the cap is 8 per query" in e.value.message
+        assert not any(w in e.value.message for w in _WORDS)
+
+
+def test_phrase_cap_counts_a_repeated_phrase_once_and_each_field_separately():
+    # one phrase in many buckets, and case or spacing variants of it: one guess
+    buckets = {f"b{i}": [_phrase(v), _phrase("ember")]
+               for i, v in enumerate(("harbor", "Harbor", "HARBOR  ", " harbor"))}
+    q = {"index": "logs-app-*", "size": 0, "filters": [_phrase("harbor")],
+         "aggs": {"g": {"type": "filters", "filters": buckets}}}
+    c = esquery.compile_query(q, CFG, _session())
+    assert len(c.text_queries) == 9  # every use still logged
+    # the same word on two text fields is two counts, so two phrases
+    q = {"index": "logs-app-*", "filters": [_phrase(w) for w in _WORDS[:4]]
+         + [_phrase(w, "job.status_message") for w in _WORDS[:5]]}
+    with pytest.raises(elastic.Refused) as e:
+        esquery.compile_query(q, CFG, _session())
+    assert "9 distinct phrases" in e.value.message
+    # the uses count appears only when it differs from the distinct count
+    buckets = {f"b{i}": [_phrase(w)] for i, w in enumerate(_WORDS[:9])}
+    buckets["again"] = [_phrase("harbor")]
+    with pytest.raises(elastic.Refused) as e:
+        esquery.compile_query({"index": "logs-app-*", "size": 0,
+                               "aggs": {"g": {"type": "filters", "filters": buckets}}},
+                              CFG, _session())
+    assert "9 distinct phrases (10 uses)" in e.value.message
+
+
+def _with(**extra):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw.update(extra)
+    return elastic.parse(raw)
+
+
+def test_phrase_cap_is_a_site_map_setting_with_a_ceiling():
+    top = _with(max_phrases=elastic.MAX_PHRASES_CEILING)
+    _flood(8, 8, top)
+    with pytest.raises(elastic.Refused):
+        _flood(9, 8, top)
+    off = _with(max_phrases=0)
+    with pytest.raises(elastic.Refused) as e:
+        _flood(1, 0, off)
+    assert "the cap is 0" in e.value.message
+    esquery.compile_query({"index": "logs-app-*", "filters": [
+        {"field": "log.level", "op": "eq", "value": "error"}]}, off, _session())
+    assert top.summary()["max_phrases"] == 16
+
+
+@pytest.mark.parametrize("value", [17, -1, True, "8", 4.0])
+def test_phrase_cap_outside_its_range_is_a_startup_error(value):
+    with pytest.raises(elastic.ConfigError, match="max_phrases must be an integer, 0..16"):
+        _with(max_phrases=value)
+
+
+# -- refusal hints ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field,closest", [
+    ("agent.nmae", "agent.name"),
+    ("job.status_mesage", "job.status_message"),
+    ("labels.tenant", "labels.tenant_id"),
+    ("labels.*", None),                        # a glob is not usable and too short to match
+    ("user.password", None),                   # nothing close: no guess offered
+])
+def test_unknown_field_names_the_closest_site_map_field(field, closest):
+    with pytest.raises(elastic.Refused) as e:
+        _compile({"index": "logs-app-*", "filters": [{"field": field, "op": "exists"}]})
+    assert e.value.code == "unknown_field"
+    if closest:
+        assert e.value.message.endswith(f"closest site-map field: {closest}")
+    else:
+        assert e.value.message.endswith("see the site map's field list")

@@ -611,7 +611,7 @@ class StubKibana:
 
     def __init__(self, engine: StubEngine, *, cookie: str | None = None,
                  signed_in: bool = True, slow: bool = False,
-                 sso_headless: bool = False) -> None:
+                 sso_headless: bool = False, sso: bool = True) -> None:
         self.engine = engine
         #: Sessions are cookies, as Kibana's are: ``sid=<value>`` with no
         #: expiry, so a browser holds it in memory and loses it on exit.
@@ -628,6 +628,10 @@ class StubKibana:
         #: agent), as the real one never did; True lets a headless test
         #: browser sign in.
         self.sso_headless = sso_headless
+        #: False: the IdP never completes for anyone, as when a session has
+        #: expired and nobody is at the keyboard to sign back in. What
+        #: ``es-smoke --stub --expired`` needs, in Chrome as over plain HTTP.
+        self.sso = sso
         #: True: the search never finishes (isRunning stays true), to drive
         #: the poll timeout.
         self.slow = slow
@@ -681,7 +685,7 @@ class StubKibana:
                     return self._html(302, "", {"Location": target})
                 headless = "HeadlessChrome" in (self.headers.get("User-Agent") or "")
                 navigation = self.headers.get("Sec-Fetch-Mode") == "navigate"
-                if not navigation or (headless and not stub.sso_headless):
+                if not stub.sso or not navigation or (headless and not stub.sso_headless):
                     return self._html(200, LOGIN_PAGE)
                 sid = f"sid={uuid.uuid4().hex}"
                 stub.sessions.add(sid)
@@ -816,9 +820,15 @@ class SimBrowser:
 
     UA = "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) {}/131.0 Safari/537.36"
 
-    def __init__(self, profile: list[Cookie], *, headless: bool = False) -> None:
+    def __init__(self, profile: list[Cookie], *, headless: bool = False,
+                 parks: bool = False) -> None:
         self.profile = profile
         self.headless = headless
+        #: True: like BrowserTransport._tab, the first request to a cluster
+        #: first navigates a tab to Kibana, which goes through /login and the
+        #: IdP when there is no session
+        self.parks = parks
+        self._parked: set[str] = set()
         self.closed = False
         self._jar: CookieJar | None = None
         self._opener = None
@@ -840,6 +850,9 @@ class SimBrowser:
         from . import esbridge
 
         self.start()
+        if self.parks and not navigate and cluster.name not in self._parked:
+            self._parked.add(cluster.name)
+            self.request(cluster, "GET", esbridge.APP_PATH, navigate=True)
         url = cluster.kibana + path
         headers = dict(esbridge.HEADERS)
         headers["User-Agent"] = self.UA.format("HeadlessChrome" if self.headless else "Chrome")

@@ -229,6 +229,8 @@ class _Compiler:
         #: when time_range lacks a start or an end
         self.window: tuple[float, bool] | None = None
         self.text_queries: list[str] = []
+        #: distinct (field, phrase) pairs, for the per-query phrase cap
+        self.phrases: set[tuple[str, str]] = set()
         self.labels_used: list[str] = []
         self._tier1 = pipeline.RegexTier()
         self._label_rx = None
@@ -241,11 +243,17 @@ class _Compiler:
 
     def rule(self, name: Any, *, what: str) -> elastic.FieldRule:
         if not isinstance(name, str) or not elastic._FIELD_RE.match(name) or "*" in name:
-            raise self.refuse("unknown_field", f"{what}: field name is not usable")
+            raise self.refuse("unknown_field", f"{what}: field name is not usable"
+                              + self._closest(name))
         r = self.cfg.rule(name)
         if r is None:
-            raise self.refuse("unknown_field", f"{what}: field is not in the site map")
+            raise self.refuse("unknown_field", f"{what}: field is not in the site map"
+                              + self._closest(name))
         return r
+
+    def _closest(self, name: Any) -> str:
+        hit = self.cfg.closest_field(name[:128]) if isinstance(name, str) else None
+        return f"; closest site-map field: {hit}" if hit else "; see the site map's field list"
 
     def _labels_in(self, text: str) -> list[str]:
         """Every label the session knows that appears in ``text``, longest first."""
@@ -368,6 +376,7 @@ class _Compiler:
                 raise self.refuse("pattern_query", f"{what}: wildcards are not allowed")
             resolved = self._resolve_text(v)
             self.text_queries.append(v)
+            self.phrases.add((name, _phrase_key(v)))
             return {"match_phrase": {name: resolved}}
         if rule.kind == "text":
             raise self.refuse("field_not_queryable", f"{what}: text fields take phrase only")
@@ -434,6 +443,22 @@ class _Compiler:
             # every bound applies, so the window is the tightest pair
             self.window = (max(starts), min(ends), mixed)
         return {"range": {self.cfg.time_field: bounds}}
+
+    def check_phrases(self) -> None:
+        """At most ``max_phrases`` distinct phrases per query, counting the
+        filters and every aggregation at any depth (all of them come through
+        ``one_filter``). Distinct per field: a phrase repeated across buckets
+        is one guess however many counts it appears in, and that is also
+        what keeps the zero-hit check, which reuses a query's own filters,
+        inside the cap of the query it checks. The message has the numbers,
+        never the phrases."""
+        n, cap = len(self.phrases), self.cfg.max_phrases
+        if n > cap:
+            uses = len(self.text_queries)
+            raise self.refuse("size_cap", (
+                f"the query has {n} distinct phrases"
+                + (f" ({uses} uses)" if uses != n else "")
+                + f" across its filters and aggregations; the cap is {cap} per query"))
 
     def check_histogram(self, fname: str, interval: str, *, what: str) -> None:
         """Refuse a histogram whose bucket count can overrun the cap, before
@@ -614,6 +639,7 @@ class _Compiler:
             filters.insert(0, tr)
         sort = self.sort(q.get("sort")) if size else []
         agg_body, agg_plans = self.aggs(q.get("aggs"))
+        self.check_phrases()
         body: dict[str, Any] = {
             "size": size,
             "track_total_hits": True,
@@ -629,6 +655,13 @@ class _Compiler:
         plan = elastic.Plan(index, agg_plans, size)
         return Compiled({"params": {"index": index, "body": body}}, plan,
                         list(self.text_queries), list(self.labels_used))
+
+
+def _phrase_key(v: str) -> str:
+    """Spellings that differ only in case or spacing are one phrase: the text
+    analyzer reads them alike, so the second confirms nothing new. Other
+    variants count separately, which errs toward the cap."""
+    return " ".join(v.casefold().split())
 
 
 def _types_compatible(field_type: str, label_type: str) -> bool:
@@ -781,6 +814,14 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
                {"index": _IDX, "size": 0, "time_range": {"gte": "now-7d"},
                 "aggs": {"h": {"type": "date_histogram", "field": "@timestamp", "interval": "1d"}}},
                "unbounded_histogram"),
+    OracleCase("phrase-flooded-filters-agg", "one filters aggregation with a phrase per bucket "
+               "returns a separate count for each, confirming a whole word list in one query",
+               {"index": _IDX, "size": 0, "aggs": {"guess": {"type": "filters", "filters": {
+                   f"w{i:02d}": [{"field": "message", "op": "phrase", "value": word}]
+                   for i, word in enumerate(("harbor", "violet", "granite", "meadow", "copper",
+                                             "lantern", "orchid", "summit", "willow", "ember",
+                                             "falcon", "juniper"))}}}},
+               "size_cap"),
     OracleCase("time-range-not-a-time", "a time bound that is not a timestamp (injection vector)",
                {"index": _IDX, "time_range": {"gte": "Contoso"}}, "bad_value"),
     OracleCase("tenant-id-literal", "a GUID literal on the tenant id field",

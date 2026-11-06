@@ -293,7 +293,7 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
         seeded[:] = report.get("seeded", [])
         return report
 
-    report = esbridge.run_smoke(run, q)
+    report = esbridge.run_smoke(run, q, max_buckets=cfg.max_buckets)
     for label in seeded:
         print(f"seeded    {label}  (the real value stays in the bridge)", file=sys.stderr)
     return esbridge.print_smoke(cluster, q, report, show=args.show)
@@ -330,9 +330,12 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
 
     fx = eseval.generate(docs=200)
     cfg0 = elastic.load(elastic.EXAMPLE)
-    # headless sign-in is allowed here only: the real IdP refuses it
+    # headless sign-in is allowed here only: the real IdP refuses it. With
+    # --expired the IdP is closed too, or Chrome parking its tab would sign
+    # the run straight back in.
     stub = eseval.StubKibana(eseval.StubEngine(fx, cfg0.indices), cookie="sid=synthetic-stub",
-                             signed_in=not args.expired, sso_headless=True).start()
+                             signed_in=not args.expired, sso_headless=True,
+                             sso=not args.expired).start()
     try:
         raw = json.loads(elastic.EXAMPLE.read_text())
         raw["clusters"] = {"stub": {"kibana": stub.url}}
@@ -357,7 +360,8 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
                                      esbridge.KibanaSession(transport, poll_timeout=cfg.poll_timeout_s),
                                      log_path=Path(args.log) if args.log else None)
             q = _smoke_query(esbridge, cfg, args, size)
-            report = esbridge.run_smoke(lambda query: esbridge.run_case(bridge, "stub", query), q)
+            report = esbridge.run_smoke(lambda query: esbridge.run_case(bridge, "stub", query), q,
+                                        max_buckets=cfg.max_buckets)
             return esbridge.print_smoke("stub", q, report, show=args.show)
         finally:
             transport.close()

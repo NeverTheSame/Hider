@@ -902,3 +902,72 @@ def test_subtyping_never_changes_the_span():
         hits = [r for r in R.analyze(line, REGS) if "GUID" in r.entity_type or "TENANT" in r.entity_type]
         assert [(h.start, h.end) for h in hits] == [(line.index(GUID_A),
                                                      line.index(GUID_A) + len(GUID_A))]
+
+
+# ---------------------------------------------------------------------------
+# Generic log vocabulary beside names: the words survive, the names do not.
+# Tier 2 used to take a level or status word into a name ("Info Lena") or
+# label it as a name on its own ("Debug"), destroying it in message text and,
+# through the ES sweep, in keep fields. The list here is written out on
+# purpose rather than imported, so the test does not just restate the rule.
+# ---------------------------------------------------------------------------
+
+LOG_WORDS = ["Warning", "Info", "Error", "Debug", "Warn", "Trace", "Fatal", "Critical", "Notice",
+             "Verbose", "Information", "Success", "Failed", "Retry", "Timeout", "Completed",
+             "WARN", "ERROR", "INFO", "DEBUG"]
+NAME_SHAPES = [
+    ("{w} Lena Moreau signed in", "Lena Moreau"),
+    ("{w}: Lena Moreau signed in", "Lena Moreau"),
+    ("user Lena Moreau {w}", "Lena Moreau"),
+    ("Lena Moreau {w} on sync", "Lena Moreau"),
+    ("Escalated by Diego Ferreira, {w} raised", "Diego Ferreira"),
+    ("{w} Contoso Holdings throttled", "Contoso Holdings"),
+    ("{w} Woodgrove Partners throttled", "Woodgrove Partners"),
+]
+
+
+@pytest.fixture(scope="module")
+def tier2_pipe():
+    from hider import pipeline
+    return pipeline.Pipeline([pipeline.RegexTier(), pipeline.ManagedNerTier()])
+
+
+@pytest.mark.parametrize("shape,name", NAME_SHAPES)
+def test_log_vocabulary_survives_beside_a_name_and_the_name_is_caught(tier2_pipe, shape, name):
+    failures = []
+    for w in LOG_WORDS:
+        line = shape.format(w=w)
+        out = tier2_pipe.redact(line).text
+        if out.split().count(w) + out.split().count(w + ":") + out.split().count(w + ",") \
+                != line.split().count(w) + line.split().count(w + ":") + line.split().count(w + ","):
+            failures.append(f"{w!r} lost: {out!r}")
+        for part in name.split():
+            if part in out:
+                failures.append(f"{part!r} leaked: {out!r}")
+    assert not failures, failures
+
+
+def test_a_lone_first_name_after_a_log_word_is_a_declared_tier2_miss(tier2_pipe):
+    """A first name on its own is a tier 2 miss whatever precedes it (the
+    control: "today Lena" leaks too), so this shape is pinned rather than
+    required. The words always survive. Before the vocabulary rule, 16 of
+    these 20 were caught only because tier 2 swallowed the word into the
+    name ("Info Lena" as one person); the rule keeps those catches by
+    trimming the word off, and the four upper-case spellings leaked before
+    and still do. If tier 2 learns lone first names, this set shrinks:
+    update it, do not loosen the survival half."""
+    assert "Lena" in tier2_pipe.redact("today Lena").text  # the control
+    leaked = set()
+    for w in LOG_WORDS:
+        out = tier2_pipe.redact(f"{w} Lena").text
+        assert out.split()[0] == w, out
+        if "Lena" in out:
+            leaked.add(w)
+    assert leaked == {"WARN", "ERROR", "INFO", "DEBUG"}
+
+
+@pytest.mark.parametrize("w", LOG_WORDS)
+def test_log_vocabulary_alone_is_never_a_tier2_span(tier2_pipe, w):
+    for line in (f"{w}", f"level {w}", f"{w} {w}", f"[{w}] engine started"):
+        r = tier2_pipe.redact(line)
+        assert not [s for s in r.spans if s.tier == "tier2"], (line, r.text)

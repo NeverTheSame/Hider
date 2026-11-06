@@ -456,8 +456,9 @@ class KibanaSession:
                 if not isinstance(sid, str) or not re.fullmatch(r"[\w=/+.-]{1,512}", sid):
                     raise elastic.Refused("malformed", "response withheld: bad async search id")
                 if time.monotonic() >= deadline:
-                    raise elastic.Refused("incomplete",
-                                          "response withheld: search did not finish in time")
+                    raise elastic.Refused("incomplete", (
+                        f"response withheld: search did not finish in "
+                        f"{self.poll_timeout:g}s; {elastic.INCOMPLETE_HINT}"))
                 self._sleep(self.poll_interval)
                 data = self.parse_reply(
                     cluster, self.transport.request(cluster, "POST", f"{SEARCH_PATH}/{sid}", body))
@@ -642,58 +643,72 @@ def _phrase_filters(query: dict) -> list[dict]:
     return [f for f in query.get("filters") or [] if isinstance(f, dict) and f.get("op") == "phrase"]
 
 
-def field_probe(query: dict) -> tuple[dict, list[str]] | None:
-    """The check behind a zero-hit filtered query, as one grammar query.
+def field_probe(query: dict, *, max_buckets: int = elastic.DEFAULT_MAX_BUCKETS
+                ) -> tuple[list[dict], list[str]] | None:
+    """The check behind a zero-hit filtered query, as grammar queries.
 
     For each filtered field F, ``filters`` buckets over the same index and
     window: ``s<i>``, the documents the *other* filters leave; ``f<i>``,
     those of them that have F at all; and ``w<i>``, the documents in the
     window that have F, for when the other filters leave nothing to look
     in. F's own phrases and values are never in F's buckets, so the answer
-    is about the field, not about the guess. Returns the probe and the
+    is about the field, not about the guess.
+
+    The check must never be refused for a query that was allowed. Every
+    filter in it is one of the query's own, so its distinct phrases are a
+    subset of the query's and fit the same phrase cap; the bucket count
+    grows with the number of fields, so the buckets are split across as
+    many queries as ``max_buckets`` needs. Returns the queries and the
     field order.
     """
     filters = [f for f in query.get("filters") or [] if isinstance(f, dict)]
     fields = list(dict.fromkeys(f.get("field") for f in filters))
     if not fields:
         return None
-    buckets: dict[str, list] = {}
+    buckets: list[tuple[str, list]] = []
     for i, name in enumerate(fields):
         others = [f for f in filters if f.get("field") != name]
         exists = {"field": name, "op": "exists"}
         if others:
-            buckets[f"s{i}"] = others
-            buckets[f"w{i}"] = [exists]
-        buckets[f"f{i}"] = others + [exists]
-    probe: dict[str, Any] = {"index": query["index"], "size": 0,
-                             "aggs": {PHRASE_FIELD_AGG: {"type": "filters", "filters": buckets}}}
-    if "time_range" in query:
-        probe["time_range"] = query["time_range"]
-    return probe, fields
+            buckets += [(f"s{i}", others), (f"w{i}", [exists])]
+        buckets.append((f"f{i}", others + [exists]))
+    step = max(1, max_buckets)
+    probes = []
+    for at in range(0, len(buckets), step):
+        probe: dict[str, Any] = {"index": query["index"], "size": 0, "aggs": {PHRASE_FIELD_AGG: {
+            "type": "filters", "filters": dict(buckets[at:at + step])}}}
+        if "time_range" in query:
+            probe["time_range"] = query["time_range"]
+        probes.append(probe)
+    return probes, fields
 
 
-def run_smoke(run, query: dict) -> dict:
+def run_smoke(run, query: dict, *, max_buckets: int = elastic.DEFAULT_MAX_BUCKETS) -> dict:
     """One smoke run through ``run`` (query -> report), plus the zero-hit check.
 
     Zero hits on a filtered query is ambiguous: nothing matches, or a field
     it filtered holds nothing here (the wrong text field for this index, a
     label field named differently on this cluster). The check tells them
-    apart with one more query, reported under ``field_probe``;
-    ``print_smoke`` turns "nothing to search" into EMPTY and exit code 3.
+    apart with one more query (more when the buckets need splitting),
+    reported under ``field_probe``; ``print_smoke`` turns "nothing to
+    search" into EMPTY and exit code 3.
     """
     report = run(query)
-    built = field_probe(query)
+    built = field_probe(query, max_buckets=max_buckets)
     if report.get("refused") or built is None or report.get("hits_total") != 0:
         return report
-    probe, fields = built
-    checked = run(probe)
-    if checked.get("refused"):
-        report["field_probe"] = {"refused": checked["refused"]}
-        return report
-    got = (((checked.get("output") or {}).get("aggregations") or {})
-           .get(PHRASE_FIELD_AGG, {}).get("buckets", {}))
-    window = checked.get("hits_total")
-    report["field_probe"] = {"docs_in_window": window, "fields": [
+    probes, fields = built
+    got: dict[str, Any] = {}
+    window = None
+    for probe in probes:
+        checked = run(probe)
+        if checked.get("refused"):
+            report["field_probe"] = {"refused": checked["refused"]}
+            return report
+        window = checked.get("hits_total")
+        got.update(((checked.get("output") or {}).get("aggregations") or {})
+                   .get(PHRASE_FIELD_AGG, {}).get("buckets", {}))
+    report["field_probe"] = {"docs_in_window": window, "queries": len(probes), "fields": [
         {"field": name,
          "in_scope": got.get(f"s{i}", {}).get("doc_count") if f"s{i}" in got else window,
          "with_field": got.get(f"f{i}", {}).get("doc_count"),
