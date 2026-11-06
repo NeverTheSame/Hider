@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import (
@@ -444,6 +445,190 @@ def _cmd_es_broker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_es_research(args: argparse.Namespace) -> int:
+    """Claude Code over the live logs, through the bridge's MCP tools only.
+
+    The bridge (es-login) opens the case and mints its token; this process
+    masks the prompt, launches Claude Code restricted to those tools in an
+    empty folder with an allowlisted environment, then closes the case and
+    unmasks the answer locally."""
+    from . import elastic, esbridge
+
+    if args.stub:
+        return _es_research_stub(args)
+    cfg = _es_config(args.config)
+    sock = esbridge.broker_socket(args.profile_dir or cfg.profile_dir)
+    if not esbridge.broker_running(sock):
+        print("REFUSED  code=session_expired: no bridge is running; start it with "
+              "es-login --cluster NAME")
+        return 2
+    return _es_research(args, esbridge.BrokerClient(sock, timeout=60), elastic.SESSIONS, cfg)
+
+
+def _es_research(args: argparse.Namespace, client, sessions_dir: Path, cfg) -> int:
+    import subprocess
+
+    from . import elastic, esmcp, research
+
+    prompt = None
+    if args.prompt is not None:
+        prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    try:
+        opened = client.call("open_case", case=args.case, terms=args.term, tier2=args.tier2)
+    except elastic.Refused as e:
+        print(f"REFUSED  code={e.code}: {e.message}")
+        return 2
+    token, launch = opened["token"], None
+    try:
+        if opened["replaced"]:
+            print("an earlier Claude session on this case was closed; its tools stop working",
+                  file=sys.stderr)
+        for label, etype in opened["seeded"]:
+            print(f"seeded    {label}  ({etype}; the real value stays in the bridge)",
+                  file=sys.stderr)
+        extra: dict[str, str] = {}
+        session_json = sessions_dir / args.case / "session.json"
+        if prompt is not None:
+            mapping = esmcp.load_case_mapping(sessions_dir, args.case)
+            masking = esmcp.load_case_mapping(sessions_dir, args.case, for_masking=True)
+            # What masking cannot replace: an identifier the case does not
+            # hold. Checked on the prompt as typed (values the case holds are
+            # masked below, so they are not findings), before the preview and
+            # whatever --yes says.
+            findings = esmcp.prompt_findings(prompt, mapping, seedable=esmcp.seedable_types(cfg),
+                                             shapes=esmcp.config_shapes(cfg), known=False)
+            if findings:
+                for f in findings:
+                    print(f"REFUSED  code=prompt_identifier: the prompt was not sent; {f}")
+                return 2
+            # words the labels show anyway (the region in ctr-amer-s01) are public
+            prompt, extra, n = research.mask_prompt(prompt, masking, None, "\n".join(mapping))
+            print(f"--- sent to Claude Code ({n} customer value(s) masked) ---\n{prompt}\n---",
+                  file=sys.stderr)
+            if not args.yes and input("send it? [y/N] ").strip().lower() != "y":
+                return 1
+        launch = esmcp.prepare_launch(opened["url"], token, config=cfg, session_json=session_json)
+        argv = esmcp.claude_argv(launch.mcp_config, prompt, model=args.model,
+                                 max_budget_usd=args.max_budget_usd, settings=launch.settings)
+        env = esmcp.claude_env()
+        if prompt is None:
+            print("Claude Code with the hider-es tools only (no shell, no files, no web); "
+                  "every prompt you type is checked first, and one holding a customer value or "
+                  "an identifier is blocked; exit it to close the case", file=sys.stderr)
+            rc = subprocess.run(argv, cwd=launch.workspace, env=env).returncode
+            print(f"unmask its answers with:  python -m hider unmask answer.md --mapping "
+                  f"{sessions_dir / args.case / 'session.json'}", file=sys.stderr)
+            return rc
+        t0 = time.time()
+        proc = subprocess.run(argv, cwd=launch.workspace, env=env, capture_output=True,
+                              text=True, timeout=args.timeout, stdin=subprocess.DEVNULL)
+        try:
+            reply = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            print(f"claude exited {proc.returncode}: {proc.stderr.strip()[:400]}", file=sys.stderr)
+            return 1
+        if not isinstance(reply, dict) or reply.get("is_error") or proc.returncode:
+            result = reply.get("result") if isinstance(reply, dict) else None
+            print(f"claude failed: {str(result or proc.stderr)[:400]}", file=sys.stderr)
+            return 1
+        if reply.get("num_turns") == 0 and str(reply.get("result") or "").startswith(
+                "UserPromptSubmit operation blocked by hook"):
+            # the hook refused what the check above let through; its reply
+            # quotes the prompt, so it is not an answer and is not saved
+            print("REFUSED  code=prompt_identifier: the prompt check in Claude Code blocked the "
+                  "prompt", file=sys.stderr)
+            return 2
+        answer_masked = str(reply.get("result") or "")
+    finally:
+        try:
+            client.call("close_case", token=token)
+        except elastic.Refused:
+            pass
+        if launch is not None:
+            launch.cleanup()
+    # labels minted during the session are in the case file now
+    mapping = {**esmcp.load_case_mapping(sessions_dir, args.case), **extra}
+    answer, replaced, unknown = research.unmask(answer_masked, mapping)
+    answer, shaped = esmcp.unmask_shaped(answer, mapping)
+    replaced += shaped
+    dest = esmcp.research_dir(research.RESEARCH, args.case)
+    (dest / "prompt.sent.txt").write_text(prompt, encoding="utf-8")
+    (dest / "answer.masked.md").write_text(answer_masked, encoding="utf-8")
+    (dest / "answer.md").write_text(answer, encoding="utf-8")
+    print(answer)
+    denials = len(reply.get("permission_denials") or [])
+    print(f"--- {replaced} labels unmasked, {round(time.time() - t0, 1)} s, cost "
+          f"${reply.get('total_cost_usd') or 0:.2f}, {denials} blocked tool calls; saved {dest}",
+          file=sys.stderr)
+    if unknown:
+        print(f"labels not in the case: {', '.join(unknown)}", file=sys.stderr)
+    return 0
+
+
+def _es_research_stub(args: argparse.Namespace) -> int:
+    """es-research against a synthetic Kibana: a broker in this process
+    speaking plain HTTP to the stub, cases in a throwaway directory."""
+    import shutil
+    import tempfile
+    import threading
+
+    from . import elastic, esbridge, eseval
+
+    fx = eseval.generate(docs=300)
+    cfg0 = elastic.load(elastic.EXAMPLE)
+    stub = eseval.StubKibana(eseval.StubEngine(fx, cfg0.indices),
+                             cookie="sid=synthetic-stub").start()
+    # a socket path must fit in 104 bytes; the default temp root on macOS is long
+    base = Path(tempfile.mkdtemp(prefix="hes-", dir="/tmp" if Path("/tmp").is_dir() else None))
+    try:
+        raw = json.loads(elastic.EXAMPLE.read_text())
+        raw["clusters"] = {"stub": {"kibana": stub.url}}
+        raw["profile_dir"] = str(base / "profile")
+        cfg = elastic.parse(raw, source="stub")
+        profile = esbridge.prepare_profile_dir(cfg.profile_dir)
+        sock = esbridge.broker_socket(profile)
+        broker = esbridge.Broker(cfg, lambda: esbridge.UrllibTransport(stub.cookie),
+                                 sessions_dir=base / "cases")
+        thread = threading.Thread(target=broker.serve, args=(sock,), daemon=True)
+        thread.start()
+        for _ in range(200):
+            if esbridge.broker_running(sock):
+                break
+            time.sleep(0.02)
+        if not args.term:
+            print(f"stub: synthetic tenants you can seed with --term: {[t.name for t in fx.tenants[:3]]}",
+                  file=sys.stderr)
+        try:
+            return _es_research(args, esbridge.BrokerClient(sock, timeout=60), base / "cases", cfg)
+        finally:
+            broker.stopping = True
+            thread.join(10)
+    finally:
+        stub.stop()
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _cmd_es_prompt_check(args: argparse.Namespace) -> int:
+    """Claude Code's UserPromptSubmit hook for es-research. Reads the hook's
+    JSON on stdin; exit 0 and no output lets the prompt through, exit 2
+    blocks it and shows stderr to the human (never to the model). Anything
+    unexpected is a block: a hook that fails any other way would let the
+    prompt pass."""
+    try:
+        from . import esmcp
+
+        event = json.loads(sys.stdin.read())
+        findings = esmcp.check_prompt_file(args.check, event.get("prompt"))
+    except Exception:
+        print("hider: the prompt check failed, so the prompt was blocked", file=sys.stderr)
+        return 2
+    if findings:
+        for f in findings:
+            print(f"hider: prompt blocked; {f}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _cmd_feedback(args: argparse.Namespace) -> int:
     from . import feedback
 
@@ -647,6 +832,16 @@ def _cmd_unmask(args: argparse.Namespace) -> int:
     text = sys.stdin.read() if args.path in (None, "-") else Path(args.path).read_text(
         encoding="utf-8")
     out, n, unknown = research.unmask(text, mapping)
+    from . import elastic
+    try:
+        es_case = json.loads(Path(path).read_text(encoding="utf-8")).get("schema") == \
+            elastic.SESSION_SCHEMA
+    except (OSError, ValueError, AttributeError):
+        es_case = False
+    if es_case:  # an es-research case: server labels like ctr-amer-s01 have no brackets
+        from . import esmcp
+        out, shaped = esmcp.unmask_shaped(out, mapping)
+        n += shaped
     sys.stdout.write(out)
     print(f"\n--- {n} label(s) unmasked", file=sys.stderr)
     if unknown:
@@ -754,6 +949,31 @@ def main(argv: list[str] | None = None) -> int:
     br.add_argument("--idle-hours", type=float, default=8.0,
                     help="stop after this long without a request (default 8, a working day)")
     br.set_defaults(fn=_cmd_es_broker)
+
+    rs = sub.add_parser("es-research", help="Claude Code over the live logs through the "
+                                            "bridge's MCP tools only; every value a label")
+    rs.add_argument("--case", required=True,
+                    help="case name; its vault persists under out/es/CASE across sessions")
+    rs.add_argument("--term", action="append", default=[],
+                    help="seed the case: a customer name, or TYPE=VALUE (SERVER_NAME=...); "
+                         "stays local, Claude gets the label; repeatable")
+    rs.add_argument("--prompt", help="ask one question headless ('-' reads stdin); without it "
+                                     "Claude Code opens interactively")
+    rs.add_argument("--yes", action="store_true", help="send the masked prompt without asking")
+    rs.add_argument("--model")
+    rs.add_argument("--max-budget-usd", type=float, help="with --prompt: stop spending at this")
+    rs.add_argument("--timeout", type=int, default=1800, help="with --prompt: seconds")
+    rs.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
+    rs.add_argument("--config")
+    rs.add_argument("--profile-dir")
+    rs.add_argument("--stub", action="store_true",
+                    help="a synthetic Kibana and an in-process bridge; nothing live")
+    rs.set_defaults(fn=_cmd_es_research)
+
+    pc = sub.add_parser("es-prompt-check", help="internal: the prompt check es-research installs "
+                                                "as Claude Code's UserPromptSubmit hook")
+    pc.add_argument("check", help="the launch's prompt-check.json")
+    pc.set_defaults(fn=_cmd_es_prompt_check)
 
     fb = sub.add_parser("feedback", help="list redaction feedback reported from the web UI")
     fb.add_argument("--path", help="feedback JSONL (default out/feedback.jsonl)")

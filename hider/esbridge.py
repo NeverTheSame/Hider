@@ -40,8 +40,10 @@ Four things this module promises, each tested against ``eseval.StubKibana``:
   marker, and refused if it is a stock Chrome profile directory. It holds
   the broker's socket (0600 in a 0700 directory) and nothing of Chrome's.
 
-No MCP yet: :class:`Bridge.run` is the function a tool will call, and the
-broker is the process it will run in.
+The MCP server (``esmcp``) runs inside the broker: ``open_case`` on the
+broker's socket mints a per-case token and starts an HTTP listener on
+127.0.0.1, and every tool call is a :meth:`Bridge.run` on the broker's
+thread, the one that owns the browser.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
 import socket
 import subprocess
 import sys
@@ -513,10 +516,14 @@ class Bridge:
             raise elastic.Refused("bad_cluster", "cluster must be one of the configured names")
         return c
 
-    def run(self, cluster_name: str, query: dict, *, probe: bool = True) -> Outcome:
+    def run(self, cluster_name: str, query: dict, *, probe: bool = True,
+            tool: str | None = None) -> Outcome:
+        """``tool`` is the MCP tool that made the call, for the log."""
         t0 = time.perf_counter()
         row: dict[str, Any] = {"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                "cluster": cluster_name if isinstance(cluster_name, str) else "?"}
+        if tool is not None:
+            row["tool"] = tool
         outcome = Outcome(row["cluster"], None, None, 0.0)
         with self._lock:
             try:
@@ -944,7 +951,10 @@ class Broker:
 
     def __init__(self, config: elastic.ElasticConfig, transport_factory, *,
                  idle_timeout: float = BROKER_IDLE_S,
-                 poll_interval: float = POLL_INTERVAL_S) -> None:
+                 poll_interval: float = POLL_INTERVAL_S,
+                 sessions_dir: str | Path | None = None) -> None:
+        from . import esmcp
+
         self.config = config
         self._factory = transport_factory
         self.transport = None
@@ -952,6 +962,10 @@ class Broker:
         self.poll_interval = poll_interval
         self.stopping = False
         self.last_used = time.monotonic()
+        #: cases open for MCP sessions, by token; the vaults live under here
+        self.cases = esmcp.CaseBook(config, sessions_dir or elastic.SESSIONS)
+        #: the MCP listener, started by the first open_case
+        self.mcp = None
 
     def open(self) -> None:
         """Start the browser before listening, so a broken setup fails at
@@ -974,6 +988,10 @@ class Broker:
             if op == "stop":
                 self.stopping = True
                 return {"ok": True}
+            if op == "open_case":
+                return self._open_case(req)
+            if op == "close_case":
+                return {"ok": True, "closed": self.cases.close(req.get("token"))}
             name = req.get("cluster")
             cluster = self.config.cluster(name) if isinstance(name, str) else None
             if cluster is None:
@@ -993,15 +1011,41 @@ class Broker:
         except Exception:  # fail closed, and keep whatever it was out of the reply
             return _fail("bridge_error", "the bridge failed on this request; nothing was returned")
 
-    def _run(self, cluster: elastic.Cluster, req: dict) -> dict:
+    @staticmethod
+    def _terms_tier2(req: dict) -> tuple[list[str], str]:
         terms = req.get("terms", [])
         tier2 = req.get("tier2", "classifier")
-        log = req.get("log")
         if not isinstance(terms, list) or len(terms) > _MAX_TERMS or not all(
                 isinstance(t, str) and 0 < len(t) <= 128 for t in terms):
             raise elastic.Refused("bad_request", f"terms is a list of up to {_MAX_TERMS} strings")
         if tier2 not in _TIER2:
             raise elastic.Refused("bad_request", f"tier2 is one of {list(_TIER2)}")
+        return terms, tier2
+
+    def _touch(self) -> None:
+        self.last_used = time.monotonic()
+
+    def _open_case(self, req: dict) -> dict:
+        """Open a case for one Claude Code session: load or create its vault,
+        seed the human's terms, mint the token, start the MCP listener.
+
+        The reply carries the token and the labels, never a value: the
+        mapping stays in the case directory for the human's own process."""
+        from . import esmcp
+
+        terms, tier2 = self._terms_tier2(req)
+        self.open()
+        if self.mcp is None:
+            self.mcp = esmcp.McpHttpServer(self.config, self.cases, on_request=self._touch)
+        session = KibanaSession(self.transport, poll_interval=self.poll_interval,
+                                poll_timeout=self.config.poll_timeout_s)
+        token, case, replaced = self.cases.open(req.get("case"), terms, tier2, session)
+        return {"ok": True, "url": self.mcp.url, "token": token, "replaced": replaced,
+                "seeded": [[lab, case.scrubber.types.get(lab, "")] for lab in case.seeded]}
+
+    def _run(self, cluster: elastic.Cluster, req: dict) -> dict:
+        terms, tier2 = self._terms_tier2(req)
+        log = req.get("log")
         if log is not None and not (isinstance(log, str) and os.path.isabs(log)):
             raise elastic.Refused("bad_request", "log is an absolute path")
         scrubber = elastic.EsScrubber(self.config, tier2=tier2)
@@ -1029,34 +1073,56 @@ class Broker:
         os.chmod(path, 0o600)
         srv.listen(8)
         srv.settimeout(1.0)
+        # One thread for both listeners: the private socket (es-login,
+        # es-smoke, es-research) and, once a case is open, the MCP endpoint.
+        # Playwright's sync API belongs to this thread, so every tool call
+        # has to run on it too.
+        sel = selectors.DefaultSelector()
+        sel.register(srv, selectors.EVENT_READ, "control")
+        mcp_registered = False
         try:
             while not self.stopping:
                 if time.monotonic() - self.last_used > self.idle_timeout:
                     break
                 if self.transport is not None and getattr(self.transport, "closed", False):
                     break
-                try:
-                    conn, _ = srv.accept()
-                except (socket.timeout, TimeoutError):
-                    continue
-                with conn:
-                    conn.settimeout(30.0)
+                if self.mcp is not None and not mcp_registered:
+                    sel.register(self.mcp.socket, selectors.EVENT_READ, "mcp")
+                    mcp_registered = True
+                for key, _ in sel.select(timeout=1.0):
+                    if key.data == "mcp":
+                        self.mcp.handle_request()
+                        continue
                     try:
-                        reply = self.handle(_recv(conn, _MAX_REQUEST))
-                    except (ValueError, OSError):
-                        reply = _fail("bad_request", "malformed request")
-                    try:
-                        _send(conn, reply)
-                    except OSError:
-                        pass
+                        conn, _ = srv.accept()
+                    except (socket.timeout, TimeoutError, BlockingIOError):
+                        continue
+                    self._control(conn)
         finally:
+            sel.close()
             srv.close()
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
+            self.cases.close_all()
+            if self.mcp is not None:
+                self.mcp.server_close()
+                self.mcp = None
             if self.transport is not None:
                 self.transport.close()
+
+    def _control(self, conn: socket.socket) -> None:
+        with conn:
+            conn.settimeout(30.0)
+            try:
+                reply = self.handle(_recv(conn, _MAX_REQUEST))
+            except (ValueError, OSError):
+                reply = _fail("bad_request", "malformed request")
+            try:
+                _send(conn, reply)
+            except OSError:
+                pass
 
 
 class BrokerClient:

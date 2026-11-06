@@ -64,7 +64,7 @@ design conversation, not a code change.
 | Eval metrics or gates | `hider/evaluate.py` (recall, precision, adversarial, injection), `hider/utility.py` (answer accuracy raw vs redacted) |
 | JSON exports and the web UI | `hider/jsonscrub.py`, `hider/webserver.py` (single-file page, stdlib server), `hider/research.py` (Claude Code bridge) |
 | Site-specific patterns | Never in the repo. `templates/profile.example.json` and `HIDER_PROFILE`; see `hider/profiles.py` |
-| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
+| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log), `hider/esmcp.py` (the MCP server inside the broker: cases and tokens, the four tools, transport guards, the Claude Code launch). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
 
 ## Running things
 
@@ -81,6 +81,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hider es-eval                # Elasticsearch core: leaks, refusals, oracle cases, no cluster
 .venv/bin/python -m hider es-smoke --stub        # one query through Chrome against a synthetic Kibana
 .venv/bin/python -m hider es-login --cluster emea # start the bridge and sign in (headed, once per bridge)
+.venv/bin/python -m hider es-research --case c1 --term "<customer>"   # Claude Code, bridge tools only
+.venv/bin/python -m hider es-research --stub --case demo --prompt "..."  # the same on a synthetic Kibana
 .venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
 ```
 
@@ -262,8 +264,23 @@ Listed with owners in the README's Limitations section and in
   headless and fetches) and names hits by data-stream backing index
   (`.ds-<stream>-<date>-<gen>`), which `index_allowed` checks by stream. An
   expired Kibana session is a 200 login page, not a 401, so every reply
-  goes through `KibanaSession.parse_reply` first. The MCP server is not
-  built yet.
+  goes through `KibanaSession.parse_reply` first. The MCP server
+  (`esmcp`) runs inside the broker, because the broker's thread owns the
+  browser: per-case bearer token, loopback, `Host` checked, no CORS. Its
+  tools take grammar keys only. Never add a tool that seeds a value,
+  signs in or unmasks: a value-to-label tool would let Claude mint a label
+  for a guess and confirm it with a count. Claude Code is launched with an
+  allowlisted environment (`esmcp.claude_env`); a variable it needs goes
+  on the allowlist, and nothing goes on a denylist. The prompt is gated
+  too (`esmcp.prompt_findings`), headless before launch and interactive
+  as a `UserPromptSubmit` hook whose command ends in `|| exit 2`, so a
+  broken check blocks. `es-eval` runs the fixture through the real MCP
+  endpoint (`mcp_*` gates) and currently **fails `mcp_no_leaks`**: a job
+  name present only in free text on a fresh case's first page survives
+  scrubbing. A scrubber gap, tracked in the design doc; do not reorder the
+  eval's calls to hide it. A case saved before the log-vocabulary trim
+  may hold "Info" as a value: `load_session` keeps such labels for
+  unmasking but not as known values (`elastic.log_vocabulary_only`).
 
 ## Where to take questions and findings
 

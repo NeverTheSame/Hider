@@ -452,7 +452,8 @@ and a loopback-only web UI wraps the whole loop:
    `--restricted` mode with no MCP
    servers and only Read, Grep and Glob, in a temp folder holding nothing but
    the obfuscated file, so it cannot reach the mapping, run commands or
-   browse.
+   browse. (The live Elasticsearch path below is the one that gives Claude
+   Code an MCP server, and nothing else.)
 4. **Unmask.** Labels in the answer go back to real values by dictionary
    lookup, no model. Labels the model rewrote are listed, not guessed.
 
@@ -469,6 +470,96 @@ as a mapping. `python -m hider feedback` lists them. This is the one channel
 through which real-bundle observations reach the synthetic corpus: each entry
 is meant to become a recognizer pattern, a classifier training sentence or an
 adversarial case, each with its own test.
+
+## Live Elasticsearch research: Claude Code through the bridge's MCP tools
+
+The same idea pointed at live logs instead of an export: Claude Code
+investigates a case in Elasticsearch, searching, counting and aggregating
+as it goes, and every customer value it sees is a label. It can still
+narrow a search to the customer it only knows as `<Org-01>`. The design,
+with every risk and measurement, is
+[`docs/es-bridge-design.md`](docs/es-bridge-design.md).
+
+```sh
+pip install -r requirements-es.txt                    # playwright; drives the installed Chrome
+python -m hider es-login --cluster emea               # starts the bridge, you sign in to Kibana once
+python -m hider es-research --case c1 --term "<the customer>"            # interactive Claude Code
+python -m hider es-research --case c1 --prompt "<question>" --model haiku  # one headless question
+python -m hider unmask answer.md --mapping out/es/c1/session.json        # labels back to values
+python -m hider es-logout                             # stops the bridge; the Kibana session ends
+python -m hider es-research --stub --case demo --term "Contoso Group" --prompt "..."  # synthetic, nothing live
+```
+
+The site map (index patterns, fields and their kinds, clusters) lives in
+`hider.local.json` under `elastic` or in `HIDER_ELASTIC`; the repo ships
+only `templates/elastic.example.json` with invented names.
+
+**How it fits together.** `es-login` starts the bridge, a long-lived
+process that owns an off-the-record Chrome signed in to Kibana. The SSO
+cookie never leaves that browser. `es-research` asks the bridge to open a
+*case*: a vault under `out/es/<case>/` (gitignored, 0700), seeded with the
+`--term` values you type, which Claude only ever sees as labels. Opening a
+case mints a per-case token and starts an MCP endpoint (Streamable HTTP) on
+`127.0.0.1` inside the bridge. Claude Code is then launched pointed at that
+endpoint. Labels are stable across calls and sessions of a case, so
+yesterday's `<Org-01>` still filters today. When the session ends the case
+is closed, its token dies, and the answer is unmasked on your machine.
+
+**What Claude Code can do through it.** Four tools and nothing else:
+`es_schema` (indices, fields and their kinds, caps, the labels this case
+knows), `es_search`, `es_count` and `es_aggregate`. Their parameters are the
+closed grammar in `esquery.py`: exact filters on identifier fields by label
+only, phrases on text fields (a phrase may contain labels), ranges, sorts and
+metrics on non-sensitive fields, terms aggregations whose identifier keys
+come back as labels, and histograms with their bucket count checked before
+the query is sent. Every response goes through the scrubber, the leak check
+and the degraded check, and a response that fails any of them is withheld
+whole.
+
+**What it cannot do.** Nothing outside those tools. There is no shell, no
+file access, no web, no other MCP server (`--restricted --strict-mcp-config
+--tools ""`, only the four tools allowed). The working directory is empty,
+and the environment is an allowlist, so `HIDER_*`, an exported cookie or a
+vault key is never there. No raw Query DSL, wildcards, ranges or sorts on
+identifiers, literal identifiers, or labels from another case. There is no
+tool to sign in, seed a value or unmask. A value-to-label tool would let
+Claude mint a label for a guessed name and then confirm the guess with a
+count. Refusals reach it as a code and a rule, never a value. The MCP
+endpoint refuses any request without the case's token, from a non-loopback
+peer, with a foreign `Host` (DNS rebinding) or a foreign `Origin`, and sends
+no CORS headers.
+
+**The prompt is checked too.** Your question is the one thing that reaches
+Claude Code without passing the grammar. Headless, values the case holds are
+masked to their labels. A prompt that still holds anything identifier-shaped
+(an email, a GUID, an IP, a server name, a customer domain, a credential) is
+refused before anything is launched, `--yes` or not. The refusal names the
+type and how to seed it (`--term UPN_EMAIL=<the value>`), never the value.
+Labels pass, including shaped ones like `ctr-amer-s01`. Interactive, the
+same check runs as Claude Code's `UserPromptSubmit` hook on every prompt you
+type. A hook can block but not rewrite, so there a value the case holds is
+refused too, with the label to type instead. A check that fails for any
+reason blocks the prompt.
+
+**Measured.** `python -m hider es-eval` runs the grammar and scrubber
+offline, and then the same synthetic fixture through the MCP server: real
+HTTP to a bridge on a thread, a stub Kibana behind it. On the example map
+(600 documents, tier 2 on) the MCP section reports:
+
+- 38 tool calls, 0 clean-traffic refusals, 12/12 label round trips;
+- every one of the 38 oracle cases refused (33 by the grammar with the
+  declared code, 5 raw-DSL shapes by the tool layer);
+- 13/13 hostile transport requests rejected, 0 of them reaching Kibana;
+- a clean decision log, an isolated launch, and the prompt gate holding.
+
+It also reports **1 leak, and the run fails its `mcp_no_leaks` gate.** A
+planted job name survives in a free-text status message on the first page of
+a fresh case. In that hit the job-name field holds a different job, so the
+value was never harvested as an identifier, and tier 2 does not read it as a
+name. The same query through the offline path leaks the same way. The
+offline section never showed it only because its single session had already
+learnt the name from earlier pages. It is a scrubber gap, open until fixed;
+see Limitations.
 
 ## Layout
 
@@ -494,6 +585,11 @@ adversarial case, each with its own test.
 | `hider/csvmerge.py` | Merges an admin portal's "Download logs" CSV parts into one JSON document. |
 | `hider/research.py` | The Claude Code bridge: prompt masking, the restricted headless run, workspaces, unmasking. |
 | `hider/localcfg.py` | Loads the uncommitted `hider.local.json`. |
+| `hider/elastic.py` | The Elasticsearch site map, the case-scoped response scrubber, case vaults. |
+| `hider/esquery.py` | The closed query grammar, its compiler and outbound gate, and the oracle cases it must refuse. |
+| `hider/esbridge.py` | The live session: the bridge process that owns the off-the-record Chrome, the Kibana async-search protocol, the decision log. |
+| `hider/esmcp.py` | The MCP server inside the bridge (cases, tokens, the four tools, transport guards), the prompt gate and the Claude Code launch. |
+| `hider/eseval.py` | Synthetic documents, the stub Kibana, and `es-eval`, offline and through MCP. |
 | `templates/` | Sanitized log line skeletons. Typed placeholders only. |
 
 ## How the numbers avoid being circular
@@ -572,6 +668,23 @@ recall will never be exactly 100%.
   draws (a lowercase brand, an ampersand in the name, a hyphenated surname at
   sentence start) remains a realistic way for it to miss. The eval corpus
   seeds free text from three templates and cannot tell you how often.
+- **Live Elasticsearch research has its own limits.**
+  - *An open leak.* `es-eval`'s MCP section fails its `mcp_no_leaks` gate.
+    A job name that appears only in free text, never in its own field on
+    that page, passes through, because nothing harvested it and tier 2 does
+    not read it as a name.
+  - *Guesses can be confirmed.* A phrase on a text field can confirm a
+    guessed plain word by its hit count. This is declared, logged and
+    capped per query, but not across queries.
+  - *Refusal codes say a little.* A `known_value` refusal tells the model
+    that a word it typed is a value the case already holds.
+  - *Prompt-check limits.* The interactive check is a hook with a 120-second
+    timeout. Whether Claude Code blocks or passes a prompt whose hook timed
+    out is not verified, and should not be relied on. Words of
+    three letters or fewer from inside a held value are not refused, so
+    `.com` hosts stay askable.
+  - *One call at a time.* The bridge serves calls one by one, and a
+    polling search holds the others.
 - **Streaming adds a small delay and trusts the vault's label set.** A delta
   is held back only while the tail of the stream is still the prefix of a
   pseudonym the vault holds, so plain prose is released immediately and the

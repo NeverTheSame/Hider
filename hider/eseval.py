@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 import threading
@@ -907,7 +908,12 @@ APP_PAGE = """<!DOCTYPE html><html lang="en"><head><title>Home - Elastic</title>
 
 def _leaks(output: Any, truth: dict[str, str]) -> list[str]:
     """Planted values that survive in a scrubbed page, by type (never the value)."""
-    blob = json.dumps(output).lower()
+    return _text_leaks(json.dumps(output), truth)
+
+
+def _text_leaks(text: str, truth: dict[str, str]) -> list[str]:
+    """The same check over raw text: what an MCP client received, a log file."""
+    blob = text.lower()
     found = []
     for v, t in truth.items():
         lv = v.lower()
@@ -964,8 +970,331 @@ class Session:
         return out, refused, dt, compiled
 
 
+class _McpClient:
+    """Speaks to the bridge's MCP endpoint over real HTTP and keeps every
+    byte it received, so the leak check sees exactly what Claude Code would."""
+
+    def __init__(self, url: str, token: str | None) -> None:
+        m = re.match(r"http://127\.0\.0\.1:(\d+)(/.*)", url)
+        self.port, self.path, self.token = int(m.group(1)), m.group(2), token
+        self.received: list[str] = []
+        self._id = 0
+
+    def raw(self, method: str = "POST", body: bytes | None = b"{}", *, path: str | None = None,
+            headers: dict | None = None) -> tuple[int, dict, str]:
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+        h.update(headers or {})
+        try:
+            conn.request(method, path or self.path, body=body, headers=h)
+            r = conn.getresponse()
+            data = r.read().decode("utf-8", "replace")
+            status, hdrs = r.status, {k.lower(): v for k, v in r.getheaders()}
+        finally:
+            conn.close()
+        self.received.append(data)
+        return status, hdrs, data
+
+    def rpc(self, method: str, params: dict | None = None) -> dict:
+        self._id += 1
+        msg: dict[str, Any] = {"jsonrpc": "2.0", "id": self._id, "method": method}
+        if params is not None:
+            msg["params"] = params
+        status, _, data = self.raw(body=json.dumps(msg).encode())
+        return json.loads(data) if status == 200 else {"http_status": status}
+
+    def tool(self, name: str, args: dict) -> tuple[Any, str | None]:
+        """(payload, None) for a page, (None, refusal code) for a tool error."""
+        res = self.rpc("tools/call", {"name": name, "arguments": args}).get("result") or {}
+        text = ((res.get("content") or [{}])[0]).get("text", "")
+        if res.get("isError"):
+            m = re.match(r"refused \(([a-z_]+)\)", text)
+            return None, m.group(1) if m else "malformed"
+        try:
+            return json.loads(text), None
+        except json.JSONDecodeError:
+            return None, "malformed"
+
+
+def _oracle_tool(q: Any) -> tuple[str, Any, bool]:
+    """The tool an oracle case goes through, its arguments, and whether the
+    case reaches the grammar (False: its keys are no tool's, so the tool
+    layer refuses it as bad_request before esquery sees it)."""
+    from . import esmcp
+
+    if isinstance(q, dict) and "aggs" in q and q.get("size", 0) == 0:
+        return "es_aggregate", {k: v for k, v in q.items() if k != "size"}, True
+    keys = set(q) if isinstance(q, dict) else set()
+    for tool in ("es_count", "es_search"):
+        if keys <= esmcp._TOOL_KEYS[tool]:
+            return tool, q, True
+    return "es_search", q, False
+
+
+def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 20261103,
+                 tier2: str = "classifier") -> dict:
+    """The same estate through the MCP server, as a Claude Code session sees it.
+
+    A stub Kibana serves the fixture; a broker runs on a thread with the
+    plain-HTTP transport; one case is opened, seeded with the tenant the
+    investigation is about; every request below is real HTTP to the MCP
+    endpoint. Measured: leaks in anything received (pages, refusals, errors),
+    refusals by code, clean-traffic refusals, label round trips, the oracle
+    cases through the tools, transport requests that must be rejected (and
+    must not reach Kibana), the decision log, and what a launch hands Claude
+    Code (environment, argv, working directory, prompt gate).
+    """
+    import dataclasses
+    import shutil
+    import tempfile
+    import threading
+
+    from . import esbridge, esmcp
+
+    truth = fx.truth
+    cookie = "sid=es-eval"
+    kb = StubKibana(StubEngine(fx, config.indices), cookie=cookie).start()
+    # a socket path must fit in 104 bytes; the default temp root on macOS does not
+    base = Path(tempfile.mkdtemp(prefix="hev-", dir="/tmp" if os.path.isdir("/tmp") else None))
+    cfg = dataclasses.replace(config, clusters=(elastic.Cluster("stub", kb.url),),
+                              profile_dir=str(base / "profile"))
+    rng = random.Random(seed + 2)
+    broker = esbridge.Broker(cfg, lambda: esbridge.UrllibTransport(cookie), poll_interval=0.01,
+                             sessions_dir=base / "cases")
+    sock = esbridge.broker_socket(esbridge.prepare_profile_dir(cfg.profile_dir))
+    thread = threading.Thread(target=broker.serve, args=(sock,), daemon=True)
+    thread.start()
+    for _ in range(500):
+        if esbridge.broker_running(sock):
+            break
+        time.sleep(0.02)
+    control = esbridge.BrokerClient(sock, timeout=120)
+    tenant = fx.tenants[0].name
+    calls: list[dict] = []
+    timings: list[float] = []
+    try:
+        # what the human seeds: the tenant the case is about, and the two
+        # labels the oracle cases are written against (esquery: <Org-01>,
+        # ctr-amer-s01, <Tenant-01>)
+        amer = next(sv.name for sv in fx.servers if "-amer-" in sv.name)
+        opened = control.call("open_case", case="es-eval", tier2=tier2, terms=[
+            tenant, f"SERVER_NAME={amer}", f"TENANT_ID={fx.tenants[0].tenant_id}"])
+        case_label = opened["seeded"][0][0]
+        seeded_ok = [lab for lab, _ in opened["seeded"]] == ["<Org-01>", "ctr-amer-s01",
+                                                             "<Tenant-01>"]
+        c = _McpClient(opened["url"], opened["token"])
+
+        def tool(name: str, args: dict, *, clean: bool = False) -> Any:
+            t0 = time.perf_counter()
+            payload, code = c.tool(name, args)
+            timings.append(time.perf_counter() - t0)
+            calls.append({"tool": name, "refused": code, "clean": clean})
+            return payload
+
+        # -- the session: handshake, then an investigation -----------------
+        init = c.rpc("initialize", {"protocolVersion": esmcp.PROTOCOL_VERSIONS[0],
+                                    "capabilities": {}, "clientInfo": {"name": "es-eval"}})
+        listed = c.rpc("tools/list").get("result", {}).get("tools", [])
+        protocol_ok = (init.get("result", {}).get("serverInfo", {}).get("name") == esmcp.SERVER_NAME
+                       and [t.get("name") for t in listed] == list(esmcp.TOOLS))
+        schema = tool("es_schema", {})
+        protocol_ok = (protocol_ok and seeded_ok and bool(schema)
+                       and case_label in schema["case"]["labels"])
+
+        tr = {"gte": "now-6h", "lte": "now"}
+        by_case = [{"field": "labels.tenant_name", "op": "eq", "value": case_label}]
+        round_trip = {"tried": 0, "passed": 0}
+
+        def check(label_count: Any, want: int) -> None:
+            round_trip["tried"] += 1
+            round_trip["passed"] += bool(label_count) and \
+                label_count["hits_total"]["value"] == want
+
+        # the seeded tenant: label out, real value to Kibana, counted against the fixture
+        want = sum(1 for d in fx.docs if d.index == "logs-app-*"
+                   and flatten(d.source).get("labels.tenant_name") == tenant)
+        check(tool("es_count", {"index": "logs-app-*", "filters": by_case}), want)
+        tool("es_search", {"index": "logs-app-*", "time_range": tr, "filters": by_case, "size": 20})
+        for index in ("logs-app-*", "logs-worker-*"):
+            aggs = tool("es_aggregate", {"index": index, "time_range": tr, "aggs": {
+                "srv": {"type": "terms", "field": "agent.name", "size": 10,
+                        "aggs": {"last": {"type": "top_hits", "size": 1}}}}})
+            # a server label learnt from the page, used as the next filter
+            for b in ((aggs or {}).get("aggregations", {}).get("srv", {}).get("buckets") or [])[:4]:
+                check(tool("es_count", {"index": index, "time_range": tr, "filters": [
+                    {"field": "agent.name", "op": "eq", "value": b["key"]}]}), b["doc_count"])
+        tool("es_aggregate", {"index": "logs-app-*", "time_range": tr, "aggs": {
+            "over_time": {"type": "date_histogram", "field": config.time_field, "interval": "1h"},
+            "tenants": {"type": "cardinality", "field": "labels.tenant_id"}}})
+        users = tool("es_aggregate", {"index": "traces-apm-*", "time_range": tr, "aggs": {
+            "users": {"type": "terms", "field": "labels.principal_name", "size": 5}}})
+        for b in ((users or {}).get("aggregations", {}).get("users", {}).get("buckets") or [])[:3]:
+            check(tool("es_count", {"index": "traces-apm-*", "time_range": tr, "filters": [
+                {"field": "labels.principal_name", "op": "eq", "value": b["key"]}]}), b["doc_count"])
+        for phrase in _PLAIN_PHRASES:
+            tool("es_search", {"index": rng.choice(list(config.indices)), "time_range": tr,
+                               "size": rng.choice([5, 20, 50]),
+                               "filters": [{"field": "message", "op": "phrase", "value": phrase}]})
+        tool("es_search", {"index": "logs-app-*", "time_range": tr, "size": 20, "filters": [
+            {"field": "message", "op": "phrase", "value": f"Throttled by SharePoint for {case_label}"}]})
+        for phrase in _CLEAN_PHRASES:
+            tool("es_search", {"index": rng.choice(list(config.indices)), "time_range": tr,
+                               "size": 20,
+                               "filters": [{"field": "message", "op": "phrase", "value": phrase}]},
+                 clean=True)
+        session_calls = len(calls)
+
+        # -- the oracle cases, through the tools ---------------------------
+        oracle = {"cases": len(esquery.ORACLE_CASES), "refused": 0, "by_grammar": 0,
+                  "by_tool_layer": 0, "wrong_code": [], "shown": []}
+        for case in esquery.ORACLE_CASES:
+            name, args, reaches = _oracle_tool(case.query)
+            payload, code = c.tool(name, args)
+            want_code = case.code if reaches else "bad_request"
+            if code is None:
+                oracle["shown"].append(case.name)
+            else:
+                oracle["refused"] += 1
+                oracle["by_grammar" if reaches else "by_tool_layer"] += 1
+                if code != want_code:
+                    oracle["wrong_code"].append({"case": case.name, "expected": want_code,
+                                                 "got": code})
+
+        # -- requests the transport must reject ----------------------------
+        ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode()
+        port = c.port
+        rejections = [
+            ("no token", _McpClient(opened["url"], None), {}, "POST", None, 401),
+            ("wrong token", _McpClient(opened["url"], "x" * 43), {}, "POST", None, 401),
+            ("token as Basic", c, {"Authorization": "Basic " + opened["token"]}, "POST", None, 401),
+            ("foreign Host (DNS rebinding)", c, {"Host": f"evil.example:{port}"}, "POST", None, 403),
+            ("Host without the port", c, {"Host": "127.0.0.1"}, "POST", None, 403),
+            ("foreign Origin", c, {"Origin": "https://evil.example"}, "POST", None, 403),
+            ("CORS preflight", c, {"Origin": "https://evil.example",
+                                   "Access-Control-Request-Method": "POST"}, "OPTIONS", None, 405),
+            ("GET (event stream)", c, {}, "GET", None, 405),
+            ("DELETE", c, {}, "DELETE", None, 405),
+            ("wrong path", c, {}, "POST", "/", 404),
+            ("not JSON", c, {"Content-Type": "text/plain"}, "POST", None, 415),
+            ("declared body over the cap", c, {"Content-Length": str(esmcp._MAX_BODY + 1)},
+             "POST", None, 413),
+        ]
+        kibana_before = len(kb.calls)
+        rejected = {"tried": 0, "rejected": 0, "unexpected": [], "cors_headers": 0}
+
+        def reject(what: str, client: _McpClient, headers: dict, method: str,
+                   path: str | None, want_status: int) -> None:
+            status, hdrs, _ = client.raw(method, ping if method == "POST" else None, path=path,
+                                         headers=headers)
+            rejected["tried"] += 1
+            rejected["rejected"] += status == want_status
+            rejected["cors_headers"] += any(k.startswith("access-control") for k in hdrs)
+            if status != want_status:
+                rejected["unexpected"].append({"request": what, "expected": want_status,
+                                               "got": status})
+            c.received.extend(client.received if client is not c else [])
+
+        for r in rejections:
+            reject(*r)
+        control.call("close_case", token=opened["token"])
+        reject("token of a closed case", c, {}, "POST", None, 401)
+        rejected["reached_kibana"] = len(kb.calls) - kibana_before
+        log_path = base / "cases" / "es-eval" / "decisions.jsonl"
+        log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    finally:
+        broker.stopping = True
+        thread.join(10)
+        kb.stop()
+
+    # -- what a launch hands Claude Code -------------------------------------
+    hostile_env = {"HOME": "/home/analyst", "PATH": "/usr/bin", "ANTHROPIC_API_KEY": "synthetic",
+                   "HIDER_ELASTIC": "/site/elastic.json", "HIDER_VAULT_KEY": "k",
+                   "KIBANA_SID": cookie, "ELASTIC_PASSWORD": "synthetic", "PYTHONPATH": "/repo"}
+    env = esmcp.claude_env(hostile_env)
+    launch = esmcp.prepare_launch("http://127.0.0.1:1/mcp", "t" * 43, config=cfg,
+                                  session_json=base / "cases" / "es-eval" / "session.json")
+    try:
+        argv = esmcp.claude_argv(launch.mcp_config, "why <Org-01>?", settings=launch.settings)
+        launch_checks = {
+            "env_allowlisted": set(env) == {"HOME", "PATH", "ANTHROPIC_API_KEY"},
+            "no_builtin_tools": argv[argv.index("--tools") + 1] == "",
+            "only_bridge_tools": argv[argv.index("--allowedTools") + 1].split(",")
+            == list(esmcp.ALLOWED_TOOLS),
+            "restricted_strict_mcp": "--restricted" in argv and "--strict-mcp-config" in argv,
+            "token_not_on_argv": "t" * 43 not in " ".join(argv),
+            "workspace_empty": not any(launch.workspace.iterdir()),
+            "prompt_hook_installed": "--settings" in argv,
+        }
+    finally:
+        launch.cleanup()
+    mapping = esmcp._read_mapping(base / "cases" / "es-eval" / "session.json")
+    shapes, seedable = esmcp.config_shapes(cfg), esmcp.seedable_types(cfg)
+    server_label = next((k for k in mapping if not k.startswith("<")), "")
+    prompt_cases = {  # synthetic prompt -> must it be refused (by the hook: nothing masks it)
+        f"How busy is {case_label} on {server_label} over now-7d in logs-app-*?": False,
+        f"How busy is {tenant}?": True,
+        f"What failed for {fx.tenants[1].upns[0] if fx.tenants[1].upns else 'x@y.com'}?": True,
+        f"Job {fx.tenants[1].objects[0] if fx.tenants[1].objects else ''} failed, why?": True,
+    }
+    prompt_gate = {"cases": len(prompt_cases), "held": 0}
+    for text, refuse in prompt_cases.items():
+        found = esmcp.prompt_findings(text, mapping, seedable=seedable, shapes=shapes)
+        prompt_gate["held"] += bool(found) == refuse
+    shutil.rmtree(base, ignore_errors=True)
+
+    received = "\n".join(c.received)
+    leaked = _text_leaks(received, truth)
+    refusals: dict[str, int] = {}
+    for row in calls:
+        if row["refused"]:
+            refusals[row["refused"]] = refusals.get(row["refused"], 0) + 1
+    clean = [r for r in calls if r["clean"]]
+    log_rows = [line for line in log_text.splitlines() if line.strip()]
+    return {
+        "protocol_ok": protocol_ok,
+        "tool_calls": session_calls,
+        "pages": sum(1 for r in calls if r["refused"] is None),
+        "refusals": refusals,
+        "clean_calls": len(clean),
+        "clean_refused": sum(1 for r in clean if r["refused"]),
+        "responses_received": len(c.received),
+        "leaks": len(leaked),
+        "leaked_types": sorted(set(leaked)),
+        "label_round_trip": round_trip,
+        "oracle": oracle,
+        "rejected_requests": rejected,
+        "log_rows": len(log_rows),
+        "log_leaks": len(_text_leaks(log_text, truth)),
+        "launch": launch_checks,
+        "prompt_gate": prompt_gate,
+        "latency_s": {"p50": round(_pct(timings, 50), 4), "p95": round(_pct(timings, 95), 4),
+                      "max": round(max(timings), 4) if timings else 0.0},
+    }
+
+
+def mcp_gates(m: dict) -> dict[str, bool]:
+    rj = m["rejected_requests"]
+    return {
+        "mcp_protocol": m["protocol_ok"],
+        "mcp_no_leaks": m["leaks"] == 0,
+        "mcp_oracle_all_refused": m["oracle"]["refused"] == m["oracle"]["cases"]
+        and not m["oracle"]["wrong_code"],
+        "mcp_round_trip_complete": m["label_round_trip"]["tried"] > 0
+        and m["label_round_trip"]["passed"] == m["label_round_trip"]["tried"],
+        "mcp_requests_rejected": rj["rejected"] == rj["tried"] and rj["reached_kibana"] == 0
+        and rj["cors_headers"] == 0,
+        "mcp_log_clean": m["log_rows"] >= m["tool_calls"] - 1 and m["log_leaks"] == 0,
+        "mcp_launch_isolated": all(m["launch"].values()),
+        "mcp_prompt_gate": m["prompt_gate"]["held"] == m["prompt_gate"]["cases"],
+    }
+
+
 def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 20261103, docs: int = 600,
-             queries: int = 120, tier2: str = "classifier") -> dict:
+             queries: int = 120, tier2: str = "classifier", mcp: bool = True) -> dict:
     cfg = config or elastic.load(elastic.EXAMPLE)
     fx = generate(seed=seed, docs=docs)
     truth = fx.truth
@@ -1152,6 +1481,10 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # here; either way never shown
         "unlisted_never_shown": not (set(fx.unlisted_fields) & shown_paths),
     }
+    if mcp:
+        # the same fixture through the MCP server, as Claude Code reaches it
+        report["mcp"] = run_mcp_eval(cfg, fx, seed=seed, tier2=tier2)
+        gates.update(mcp_gates(report["mcp"]))
     report["gates"] = gates
     report["passed"] = all(gates.values())
     return report
@@ -1202,6 +1535,33 @@ def format_report(r: dict) -> str:
         f"field coverage    {r['field_coverage']} ; unlisted seen: {r['unlisted_fields_seen']}",
         f"latency           p50 {r['latency_s']['p50']}s  p95 {r['latency_s']['p95']}s  "
         f"max {r['latency_s']['max']}s (tier2={r['tier2']})",
+    ]
+    m = r.get("mcp")
+    if m:
+        o, rj = m["oracle"], m["rejected_requests"]
+        lines += [
+            "-- through the MCP server (real HTTP to the bridge, stub Kibana) --",
+            f"mcp tool calls    {m['tool_calls']} ({m['pages']} pages, refused: "
+            f"{m['refusals'] or 'none'}); clean traffic {m['clean_refused']}/{m['clean_calls']} "
+            f"refused; protocol {'ok' if m['protocol_ok'] else 'FAILED'}",
+            f"mcp leaks         {m['leaks']} in {m['responses_received']} responses received"
+            + (f" (types: {m['leaked_types']})" if m["leaked_types"] else ""),
+            f"mcp round trip    {m['label_round_trip']['passed']}/{m['label_round_trip']['tried']}",
+            f"mcp oracle        {o['refused']}/{o['cases']} refused ({o['by_grammar']} by the "
+            f"grammar with the declared code, {o['by_tool_layer']} by the tool layer as "
+            f"bad_request)" + (f"; wrong code: {o['wrong_code']}" if o["wrong_code"] else "")
+            + (f"; SHOWN: {o['shown']}" if o["shown"] else ""),
+            f"mcp rejected      {rj['rejected']}/{rj['tried']} transport requests rejected, "
+            f"{rj['reached_kibana']} reached Kibana, {rj['cors_headers']} with CORS headers"
+            + (f"; unexpected: {rj['unexpected']}" if rj["unexpected"] else ""),
+            f"mcp decision log  {m['log_rows']} rows, {m['log_leaks']} with a planted value",
+            f"mcp launch        {m['launch']}",
+            f"mcp prompt gate   {m['prompt_gate']['held']}/{m['prompt_gate']['cases']} prompts "
+            f"decided right",
+            f"mcp latency       p50 {m['latency_s']['p50']}s  p95 {m['latency_s']['p95']}s  "
+            f"max {m['latency_s']['max']}s",
+        ]
+    lines += [
         f"gates             {r['gates']}",
         f"PASSED" if r["passed"] else "FAILED",
     ]

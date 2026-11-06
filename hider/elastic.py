@@ -923,8 +923,31 @@ class EsScrubber(jsonscrub.JsonScrubber):
             raise ConfigError(f"{d}: not a session directory")
         s = cls(config, tier2=tier2, vault=vault)
         for label, value in raw["mapping"].items():
-            s._remember(value, label, raw["types"].get(label, "UNKNOWN"))
+            etype = raw["types"].get(label, "UNKNOWN")
+            if log_vocabulary_only(value):
+                # Saved before tier 2 stopped reading log words as names. Not
+                # a known value any more, or the sweep would label log.level
+                # again; still in the mapping, so answers already written
+                # with its label unmask and a re-save keeps it.
+                s.mapping.setdefault(label, value)
+                s.types.setdefault(label, etype)
+                continue
+            s._remember(value, label, etype)
         return s
+
+
+_ALNUM = re.compile(r"[A-Za-z0-9]")
+
+
+def log_vocabulary_only(value: Any) -> bool:
+    """A value made of ``pipeline.LOG_VOCABULARY`` words and nothing else
+    alphanumeric ("Info", "ERROR", "Warning - Failed"). "Info Systems" and
+    "Error42" are not."""
+    if not isinstance(value, str) or not pipeline._WORD.search(value):
+        return False
+    rest = pipeline._WORD.sub(lambda m: "" if pipeline.is_log_word(m.group(0)) else m.group(0),
+                              value)
+    return not _ALNUM.search(rest)
 
 
 _DROP = object()

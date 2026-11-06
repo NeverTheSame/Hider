@@ -383,6 +383,46 @@ def test_seed_and_resolve_label_and_session_round_trip(tmp_path):
     assert out["hits"]["hits"][0]["_source"]["agent"]["name"] == server_label
 
 
+def _old_case_with_log_words(tmp_path):
+    """A case as code before the log-vocabulary trim saved it: tier 2 had
+    called the bare words "Info" and "ERROR" organisations, so they were
+    vaulted and became known values, next to a real organisation that only
+    contains a log word."""
+    old = _session()
+    words = {"Info": old._label("ORG_NAME", "Info"), "ERROR": old._label("ORG_NAME", "ERROR")}
+    real = old._label("ORG_NAME", "Info Systems")
+    assert old._find_known("Info") and old._find_known("error")  # the old state
+    return old.save_session(tmp_path / "case"), words, real
+
+
+def test_a_saved_case_does_not_bring_back_log_words_as_known_values(tmp_path):
+    from hider import research
+
+    d, words, real = _old_case_with_log_words(tmp_path)
+    s = elastic.EsScrubber.load_session(d, CFG, tier2="none")
+    doc = copy.deepcopy(APP_DOC)
+    doc["log"]["level"] = "Info"
+    doc["event"]["outcome"] = "error"
+    doc["message"] = "Info: nightly job for Info Systems started, no ERROR"
+    out = s.scrub_response(_envelope([_hit(doc)]), PLAN).output["hits"]["hits"][0]["_source"]
+    # the log words are left alone, in keep fields and in message text
+    assert out["log"]["level"] == "Info" and out["event"]["outcome"] == "error"
+    assert out["message"] == f"Info: nightly job for {real} started, no ERROR"
+    # a value that only contains a log word is still a known value
+    assert s._find_known("for Info Systems") and not s._find_known("Info") \
+        and not s._find_known("error")
+    # the query side follows: a phrase with the word is no longer a known value
+    esquery.compile_query({"index": "logs-app-*", "filters": [
+        {"field": "message", "op": "phrase", "value": "Info started"}]}, CFG, s)
+    # the old labels still unmask answers written before, and survive a re-save
+    for value, label in words.items():
+        assert s.mapping[label] == value
+        assert research.unmask(f"see {label}", s.mapping)[0] == f"see {value}"
+    s.save_session(d)
+    again = json.loads((d / "session.json").read_text())["mapping"]
+    assert {again[lab] for lab in words.values()} == set(words)
+
+
 def test_text_longer_than_the_cap_is_truncated_then_scrubbed():
     s = _session()
     cfg = elastic.ElasticConfig(CFG.indices, CFG.fields, max_text_chars=60)

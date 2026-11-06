@@ -161,8 +161,18 @@ def test_eval_passes_its_gates_on_the_example_map():
     assert r["text_queries"] > 0
     assert r["unlisted_fields_seen"] == ["process.command_line", "user.full_name"]
     assert r["field_coverage"]["unlisted"] == 2
+    # the MCP section: real HTTP to a broker on the same fixture
+    m = r["mcp"]
+    assert m["protocol_ok"] and m["tool_calls"] > 20 and m["leaks"] == 0
+    assert m["oracle"]["refused"] == m["oracle"]["cases"] == len(esquery.ORACLE_CASES)
+    assert m["oracle"]["by_tool_layer"] == 5 and not m["oracle"]["wrong_code"]
+    rj = m["rejected_requests"]
+    assert rj["tried"] == rj["rejected"] >= 13 and rj["reached_kibana"] == 0
+    assert m["label_round_trip"]["passed"] == m["label_round_trip"]["tried"] > 0
+    assert all(m["launch"].values()) and m["log_leaks"] == 0
+    assert {g for g in r["gates"] if g.startswith("mcp_")} == set(eseval.mcp_gates(m))
     text = eseval.format_report(r)
-    assert "PASSED" in text
+    assert "PASSED" in text and "mcp rejected" in text
     # the report carries counts and field names, never a planted value
     truth = eseval.generate(docs=300).truth
     blob = json.dumps(r).lower()

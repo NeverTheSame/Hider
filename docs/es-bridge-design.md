@@ -3,7 +3,9 @@
 Status: offline core built and measured (`hider/elastic.py`, `hider/esquery.py`,
 `hider/eseval.py`, `python -m hider es-eval`); session layer built and
 tested against the stub Kibana (`hider/esbridge.py`, `python -m hider
-es-smoke`, `es-login`). No MCP server yet. Companion to `pilot-plan.md`.
+es-smoke`, `es-login`); MCP server built inside the broker and tested
+against the stub and one live Claude Code run on it (`hider/esmcp.py`,
+`python -m hider es-research`). Companion to `pilot-plan.md`.
 
 ## Decisions taken
 
@@ -429,6 +431,85 @@ single-threaded, so calls are serialised under one lock (parallel tabs
 need the async API); the probe adds one round trip per call; shard
 failures in a complete response are not yet a refusal.
 
+## Built: the MCP server (`hider/esmcp.py`)
+
+The architecture section above predates the broker, and three things in it
+changed when the MCP server was built on top of it:
+
+- **Where it runs.** Inside the broker, not a process of its own: the
+  broker owns the Chrome that holds the only Kibana session, and
+  Playwright's sync API belongs to its thread, so every tool call runs
+  there. One `selectors` loop serves both listeners: the private socket
+  (`es-login`, `es-smoke`, `es-research`) and MCP Streamable HTTP on
+  `127.0.0.1`, ephemeral port, JSON replies, no event stream, one request
+  per connection.
+- **What there is to isolate.** No Elastic credential exists any more, so
+  "the argv and env contain no ES variable" becomes: the environment is an
+  allowlist (`esmcp.claude_env`: `HOME`, `PATH`, locale, proxies with
+  loopback forced into `NO_PROXY`, `ANTHROPIC_*`, `CLAUDE_CODE_*`), so
+  `HIDER_ELASTIC`, `HIDER_VAULT_KEY` or an exported cookie are absent by
+  default, and nothing Claude Code can reach can open the broker's socket.
+- **Tool parameters.** The tools carry the grammar as `esquery` has it now,
+  not the signatures in "The query surface": a `cluster`, `phrase` filters
+  instead of `text_query`, `aggs` as the grammar's object, and `from`
+  instead of `cursor` (cursors are still a later phase).
+
+| Piece | What it does | Tested by |
+|---|---|---|
+| Transport guards (risk 11) | Loopback peer; `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (DNS rebinding); a non-loopback `Origin` is refused; no `Access-Control-*` header on any reply; bearer token for an open case, checked before the path; JSON only, declared length capped before the body is read. Nothing about a case is said before the token matches. | `test_requests_without_a_live_token_or_from_a_page_are_refused`, `test_the_listener_is_loopback_only` |
+| Cases | `open_case` on the private socket loads or creates `out/es/<case>/` (0700, files 0600), seeds the human's terms, mints a token. Reopening a case kills the earlier token (one session per case); `close_case` and stopping the bridge kill it too. Saved after every tool call, so labels survive a restart. Two cases, two vaults. | `test_closing_or_reopening_a_case_kills_its_token`, `test_a_case_keeps_its_labels_across_a_bridge_restart`, `test_two_cases_have_two_vaults` |
+| Tools | `es_schema` (site map, caps, the case's labels and types), `es_search`, `es_count`, `es_aggregate`, schemas filled in from the site map. Each passes only its own grammar keys to `Bridge.run`; anything else (`terms`, `log`, raw DSL) is `bad_request`. There is no seeding, login, stop or unmask tool: a tool that turned a value into a label would let a guessed value be minted and then confirmed by a count. | `test_a_session_investigates_with_labels_and_never_sees_a_value`, the parametrised refusal test, `test_protocol_edges` |
+| Refusals | A tool error `refused (<code>): <message>` with the refusal's own message; any other exception is `bridge_error`, fixed text. | `test_a_real_value_typed_by_claude_is_refused_and_not_echoed`, `test_a_failing_transport_is_bridge_error_with_nothing_in_it` |
+| Decision log | The case's `decisions.jsonl`; rows gain `tool`. | `test_the_decision_log_names_the_tool_and_holds_no_values` |
+| Launch (credential isolation row) | `es-research`: `claude --restricted --strict-mcp-config --mcp-config <file> --tools "" --allowedTools mcp__hider-es__…`, cwd an empty temp dir, the token only in a 0600 config file in a separate 0700 dir (never on argv), all removed afterwards. The prompt is masked against the case mapping before it is sent; the answer is unmasked locally, shaped server labels included. | `test_the_environment_is_an_allowlist`, `test_argv_names_only_the_bridge_tools_and_holds_no_secret`, `test_es_research_runs_claude_with_the_tools_only_and_unmasks_locally` (a stand-in `claude` that is itself an MCP client) |
+
+```sh
+python -m hider es-research --stub --case demo --term "Contoso Group" --prompt "..."   # synthetic
+python -m hider es-login --cluster emea
+python -m hider es-research --case <case> --term "<the customer>"                       # interactive
+python -m hider es-research --case <case> --prompt "<question>" --model haiku         # headless
+python -m hider unmask answer.md --mapping out/es/<case>/session.json
+```
+
+Added after the first version:
+
+- **The prompt gate** (`esmcp.prompt_findings`). The prompt is the one input
+  that skips the grammar. Headless, values the case holds are masked, then
+  anything tier 1 or a site shape still calls an identifier is refused
+  (`prompt_identifier`), whatever `--yes` says. The check runs on the
+  prompt with the case's whole values taken out, before term-word masking,
+  because masking `com` inside an address hid the address from tier 1.
+  Interactive, the same check is a `UserPromptSubmit` hook passed with
+  `--settings` (which `--restricted` honours; checked against Claude Code
+  2.1.319: blocked with 0 turns and no cost). Exit code 2 blocks and shows
+  stderr to the human only; the command ends in `|| exit 2`, so a crash
+  blocks too. The hook also refuses values the case holds, naming their
+  labels, because it cannot rewrite the prompt. Labels the case issued and
+  the generic label shapes (reserved namespaces) are taken out first.
+  Tested by the prompt-gate tests in `test_esmcp.py`.
+- **es-eval's MCP section** (`eseval.run_mcp_eval`, gates `mcp_*`). The
+  same fixture through the real endpoint. The case is seeded with the
+  three labels the oracle cases are written against. The 38 oracle cases
+  go through the tools (5 raw-DSL shapes stop at the tool layer as
+  `bad_request`). Then 13 hostile transport requests, which must not reach
+  Kibana, the decision log, the launch and the prompt gate. On the example
+  map it finds **one leak** and fails `mcp_no_leaks`: a job name present only
+  in `job.status_message` on the first page of a fresh case. The direct
+  path leaks it too; the offline section misses it because its session
+  learnt the name earlier. A scrubber gap, open, not fixed here.
+- **Old cases and log words.** `EsScrubber.load_session` no longer makes a
+  value of only `pipeline.LOG_VOCABULARY` words a known value. The label
+  stays in the mapping, so old answers unmask; the vocabulary-only value
+  is also left out of prompt masking.
+
+Known limits of this layer: one call at a time (a polling search holds
+every other call, and `es-login` holds the tools while the human signs
+in); the refusal codes reach the model, so `known_value` confirms that a
+word Claude typed is a value this case has pseudonymised, a narrower
+form of the declared text-query channel; and the zero-hit field check
+`es-smoke` runs is not done for the tools (Claude can ask `es_count` with
+`exists` itself).
+
 ## Superseded: the SSO proposal as written before the decisions
 
 The live side has to make one request shape work on four clusters, each
@@ -528,8 +609,6 @@ Questions before building this part:
 - **Shard failures as refusals.** `_shards.failed > 0` in a complete
   response should be `incomplete`.
 - **Parallel tabs.** Playwright's async API, one tab per in-flight call.
-- **The MCP server.** Loopback, per-session token, `es_schema`, `es_search`,
-  `es_count`, `es_aggregate` over `Bridge.run`; started by the human.
 - **Cursor pagination.** `from` is capped at 1,000 today; opaque bridge-held
   `search_after` cursors if deeper pages are ever needed.
 - **Parallel sessions.** One lock, as the gateway. Fine for one analyst.
