@@ -314,7 +314,13 @@ SPECS: tuple[EntitySpec, ...] = (
         name="WINDOWS_USER_PATH", handling=PSEUDONYMISE, expected_tier=TIER_SHAPED,
         source="Windows profile path layout",
         description="Filesystem path containing an account name.",
-        generate=_win_user_path, detected_as=frozenset({"WINDOWS_USER_PATH"}),
+        generate=_win_user_path,
+        # The customer-path rule's labels borrow this spec: folder and file
+        # names in any rooted path, and the account in /home/<account>. A
+        # spec type of their own would have to appear in a template, which
+        # reshuffles the generator and invalidates the utility cassette.
+        detected_as=frozenset({"WINDOWS_USER_PATH", "PATH_SEGMENT", "FILE_NAME",
+                               "PATH_ACCOUNT"}),
         label_prefix="Path",
     ),
     EntitySpec(

@@ -635,8 +635,10 @@ def test_onedrive_pseudonym_keeps_the_path_structure():
     from hider import pipeline, pseudonym
 
     out = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k")).redact(PERSONAL_PATH)
-    assert "/personal/user-01/Documents/Reviews" in out.text
-    assert "anna" not in out.text
+    # the account is the OneDrive rule's; the customer folder after the
+    # library is the path rule's, a stable label; structure stays
+    assert "/personal/user-01/Documents/<Folder-01>" in out.text
+    assert "anna" not in out.text and "Reviews" not in out.text
 
 
 def test_two_secrets_from_one_vault_stay_colocated():

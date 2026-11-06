@@ -361,8 +361,8 @@ CASES: tuple[Case, ...] = (
         "Hostless OneDrive personal path, whose second segment is the user's UPN with dots and @ flattened to underscores",
         "[21.08.2026 09:02:42.400] <2f> Info [Sync] item /personal/<<UPN_EMAIL|anna_novak_contosocorp_com>>/Documents/Reviews queued",
         expect_tier1=True,
-        owner="the identity segment is claimed; file names deeper in a hostless "
-              "path are out of scope here and documented as such.",
+        owner="the identity segment is claimed by the OneDrive rule; customer folders "
+              "deeper in the path are the customer-path rule's (path-* cases).",
     ),
     Case(
         "azure-key-vault-url",
@@ -493,6 +493,201 @@ CASES: tuple[Case, ...] = (
         owner="tier 2 owns the organisation; survival of the severity words is tested "
               "as intent in test_recognizers.py.",
     ),
+    # Customer file paths in free text. Tier 1 owns them (recognizers.
+    # CustomerPathRecognizer): each customer folder and file name becomes its
+    # own stable label, separators, structural names (hider/paths.py) and the
+    # extension stay readable. Only the customer parts are marked, so a case
+    # is caught only when exactly those are covered. The occurrences borrow
+    # WINDOWS_USER_PATH, whose detected_as lists the new detector labels; a
+    # spec type of its own would have to appear in a template, and any
+    # template change invalidates the utility cassette.
+    Case(
+        "path-spaces-parentheses-sharepoint",
+        "Server-relative library path with spaces, parentheses and a dash inside folder names",
+        "[21.08.2026 09:02:50.100] <2f> Info [Sync] Uploaded /Sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Harbor Ridge Project (HRP)>>"
+        "/<<WINDOWS_USER_PATH|Board Notes - Drafts>>/<<WINDOWS_USER_PATH|Budget>>.docx (412 KB)",
+        expect_tier1=True,
+        owner="was tier 2 guessing at fragments ('Harbor', 'Board Notes') and leaving "
+              "'Project (HRP)' readable; tier 1 now owns the whole path.",
+    ),
+    Case(
+        "path-windows-backslash-spaces",
+        "Drive path with backslashes and spaces in a folder and a file name",
+        r"[21.08.2026 09:02:50.200] <2f> Error [Export] Export failed for C:\Exports\<<WINDOWS_USER_PATH|Airplane Trust>>"
+        r"\<<WINDOWS_USER_PATH|Payroll Review>>.xlsx: access denied",
+        expect_tier1=True,
+        owner="was untouched by every tier.",
+    ),
+    Case(
+        "path-forward-slash-drive",
+        "Drive path written with forward slashes, a parenthesised suffix in the file name",
+        "[21.08.2026 09:02:50.300] <2f> Info [Export] wrote D:/Shares/<<WINDOWS_USER_PATH|Northgate Fund>>"
+        "/<<WINDOWS_USER_PATH|Quarterly Review (Final)>>.pptx in 3 s",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-curly-apostrophe",
+        "Folder and file names with typographic apostrophes, as Office and macOS produce them",
+        "[21.08.2026 09:02:50.400] <2f> Info [Restore] Restored C:\\Exports\\"
+        "<<WINDOWS_USER_PATH|Harbor Partners\u2019 Files>>\\<<WINDOWS_USER_PATH|Members\u2019 List 2026>>.xlsx",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-all-caps-unc",
+        "UNC path with an all-caps server, share, folder and file name and an upper-case extension",
+        r"[21.08.2026 09:02:50.500] <2f> Warn [Share] slow read on \\<<HOSTNAME_FQDN|FS01>>"
+        r"\<<WINDOWS_USER_PATH|FINANCE>>\<<WINDOWS_USER_PATH|HRP BOARD>>\<<WINDOWS_USER_PATH|BUDGET 2026>>.XLSX",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-all-caps-drive",
+        "Drive path whose every segment is upper case",
+        r"[21.08.2026 09:02:50.600] <2f> Info [Scan] indexed E:\<<WINDOWS_USER_PATH|LEDGERS>>"
+        r"\<<WINDOWS_USER_PATH|BRAMBLE HILL>>\<<WINDOWS_USER_PATH|CLOSING>>.PDF",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-mixed-separators-customer",
+        "One customer path with both separators, as string concatenation across layers produces",
+        r"[21.08.2026 09:02:50.700] <2f> Info [Copy] source E:\<<WINDOWS_USER_PATH|Clients>>/"
+        r"<<WINDOWS_USER_PATH|Bramble Hill>>\<<WINDOWS_USER_PATH|Ledger>>.csv",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-quoted-final-folder",
+        "A quoted path ending in a folder whose name has spaces and no extension",
+        "[21.08.2026 09:02:50.800] <2f> Error [Copy] Copy target \"D:\\Shares\\"
+        "<<WINDOWS_USER_PATH|Airplane Trust>>\\<<WINDOWS_USER_PATH|Year End Close>>\" is read-only",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-titlecase-final-folder-in-prose",
+        "An unquoted path ending in a title-case folder with spaces, followed by prose",
+        r"[21.08.2026 09:02:50.900] <2f> Info [Restore] Restore to C:\Exports\<<WINDOWS_USER_PATH|Harbor Ridge Project>>"
+        r" completed in 4 s",
+        expect_tier1=True,
+        owner="the last segment has no extension and no closing separator, so its end is "
+              "read from the words: title-case and all-caps words continue it, a lower-case "
+              "or log-vocabulary word ends it.",
+    ),
+    Case(
+        "path-url-encoded-server-relative",
+        "Server-relative path with percent-encoded spaces",
+        "[21.08.2026 09:02:51.000] <2f> Info [Sync] queued /sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared%20Documents/<<WINDOWS_USER_PATH|Board%20Notes>>/<<WINDOWS_USER_PATH|Budget>>.docx",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-posix-home",
+        "A Linux home path: the account and the customer folders under it",
+        "[21.08.2026 09:02:51.100] <2f> Info [Agent] staged /home/<<WINDOWS_USER_PATH|lena.okafor>>"
+        "/<<WINDOWS_USER_PATH|Bramble Hill>>/<<WINDOWS_USER_PATH|notes>>.txt",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-json-escaped-backslashes",
+        "A Windows path inside a JSON-encoded log line, every backslash doubled",
+        "[21.08.2026 09:02:51.200] <2f> Info [Api] body {\"path\":\"D:\\\\Shares\\\\"
+        "<<WINDOWS_USER_PATH|Northgate Fund>>\\\\<<WINDOWS_USER_PATH|Ledger Q3>>.xlsx\"}",
+        expect_tier1=True,
+    ),
+    Case(
+        "path-library-rooted-relative",
+        "A path with no root that starts at a document library name",
+        "[21.08.2026 09:02:51.300] <2f> Info [Restore] Restored Shared Documents/"
+        "<<WINDOWS_USER_PATH|Harbor Ridge>>/<<WINDOWS_USER_PATH|Budget>>.docx",
+        expect_tier1=True,
+    ),
+    # Declared misses of the path rule, each with its owner.
+    Case(
+        "path-rootless-relative",
+        "A relative path with no root and no library name to anchor its left edge",
+        "[21.08.2026 09:02:51.400] <2f> Info [Restore] Restored item "
+        "<<WINDOWS_USER_PATH|Cobalt Meadow>>/<<WINDOWS_USER_PATH|Grant Ledger>>.docx to the site",
+        expect_tier1=False,
+        owner="accepted tier 1 miss: without a root (drive, UNC, leading slash, ~) or a "
+              "library name there is no telling where the path starts in prose; tier 2 "
+              "sees the residue and may catch the folder.",
+    ),
+    Case(
+        "path-lowercase-final-folder-in-prose",
+        "An unquoted lower-case final folder with a space and no extension, followed by prose",
+        r"[21.08.2026 09:02:51.500] <2f> Info [Copy] Copied to C:\Exports\<<WINDOWS_USER_PATH|larch valley trust>> overnight",
+        expect_tier1=False,
+        owner="accepted tier 1 miss: a lower-case word after the last segment cannot be told "
+              "from prose, so only 'larch' is labelled and 'valley trust' stays readable. "
+              "Quoted paths, a closing separator or an extension close it.",
+    ),
+    Case(
+        "path-customer-folder-under-system-root",
+        "A customer-named folder under a system root",
+        "[21.08.2026 09:02:51.600] <2f> Info [Agent] rotated /var/log/<<WINDOWS_USER_PATH|Owl Creek Holdings>>/agent.log",
+        expect_tier1=False,
+        owner="accepted by design: system roots (/var, /usr, /opt, C:\\Windows, Program "
+              "Files, ProgramData) keep their folders readable so application paths stay "
+              "triageable; only a document file name under one is labelled. Tier 2 sees "
+              "the residue.",
+    ),
+    Case(
+        "path-customer-folder-in-profile-tail",
+        "Customer folders inside a Windows profile path, after the account",
+        r"[21.08.2026 09:02:51.700] <2f> Info [Export] saved C:\Users\<<WINDOWS_USER_PATH|lena.okafor>>"
+        r"\Documents\<<WINDOWS_USER_PATH|Saltmarsh Lane>>\<<WINDOWS_USER_PATH|Tithe Accounts>>.xlsx",
+        expect_tier1=False,
+        owner="windows_user_path owns profile paths and keeps the tail after the account "
+              "readable by design; its pseudonym shape feeds the utility excerpt, so "
+              "relabelling the tail is a utility-cassette re-record. Open tier 1 gap.",
+    ),
+    Case(
+        "path-repository-name-in-source-path",
+        "A customer-named repository folder in a stack-trace source path",
+        r"[21.08.2026 09:02:51.800] <2f> Error [Worker]    at Program.Main() in D:\Repos\<<WINDOWS_USER_PATH|Quarry Point Portal>>"
+        r"\src\Program.cs:line 12",
+        expect_tier1=False,
+        owner="accepted by design: paths to source files (.cs, .py, .java, ...) and program "
+              "binaries (.dll, .exe, .so, ...) stay readable whole, so stack traces and "
+              "install paths keep their triage value.",
+    ),
+    Case(
+        "bare-file-name-in-prose",
+        "A document name with spaces in prose, with no path around it",
+        "[21.08.2026 09:02:51.900] <2f> Info [Upload] uploaded <<WINDOWS_USER_PATH|Fernhill Payroll>>.xlsx to the share",
+        expect_tier1=False,
+        owner="accepted tier 1 miss: a bare file name is not a path; the clean corpus keeps "
+              "names like summary.xlsx readable on purpose. Tier 2 sees the residue.",
+    ),
+)
+
+
+#: Path lookalikes that hold no customer value and must come out unchanged:
+#: system and application paths, source paths in stack traces, API routes,
+#: URLs other rules own, versions, switches and fractions. A fixed list, not
+#: drawn from the generator, so adding to it never moves the generator's RNG
+#: stream (and with it the utility cassette). ``evaluate.run`` scores it as
+#: its own clean unit, beside the 1,000 generated clean lines.
+PATH_LOOKALIKES: tuple[str, ...] = (
+    "[21.08.2026 09:03:00.100] <2f> Info [Agent] loaded /usr/lib/x86_64-linux-gnu/libssl.so.3",
+    "[21.08.2026 09:03:00.200] <2f> Info [Agent] rotated /var/log/backup/engine.log at 02:00",
+    "[21.08.2026 09:03:00.300] <2f> Info [Agent] read C:\\Windows\\System32\\drivers\\etc\\hosts",
+    "[21.08.2026 09:03:00.400] <2f> Info [Svc] started C:\\Program Files\\BackupAgent\\Agent.Service.exe",
+    "[21.08.2026 09:03:00.500] <2f> Info [Svc] logging to C:\\ProgramData\\BackupAgent\\Logs\\Svc.Agent.log",
+    "[21.08.2026 09:03:00.600] <2f> Error [Worker]    at Backup.Proxy.SessionWorker.Run() in "
+    "D:\\a\\1\\s\\src\\Proxy\\SessionWorker.cs:line 214",
+    "[21.08.2026 09:03:00.700] <2f> Error [Py]   File \"/usr/lib/python3.11/site-packages/requests/api.py\", line 59",
+    "[21.08.2026 09:03:00.800] <2f> Info [Api] GET /v1.0/users/{id}/drive/root/children returned 200",
+    "[21.08.2026 09:03:00.900] <2f> Info [Api] POST /api/v2/jobs/start returned 202 in 41 ms",
+    "[21.08.2026 09:03:01.000] <2f> Info [Api] route /jobs/run/status answered 200",
+    "[21.08.2026 09:03:01.100] <2f> Info [Graph] GET https://graph.microsoft.com/v1.0/sites/root/drives",
+    "[21.08.2026 09:03:01.200] <2f> Info [Agent] agent 12.3.1.1139 installed under /opt/agent/12.3.1/bin",
+    "[21.08.2026 09:03:01.300] <2f> Info [Copy] robocopy /MIR /R:3 /W:5 finished, 50 MB/s, 1/2 done",
+    "[21.08.2026 09:03:01.400] <2f> Info [Copy] staged in C:\\Temp\\agent-setup.log and C:\\Temp\\state.json",
+    "[21.08.2026 09:03:01.500] <2f> Info [Svc] loaded D:\\Apps\\BackupAgent\\bin\\Release\\net8.0\\Agent.Core.dll",
+    "[21.08.2026 09:03:01.600] <2f> Info [Note] and/or the 08/20/2026 window, see /? for help",
+    "[21.08.2026 09:03:01.700] <2f> Info [Rotate] archived backup.log and metrics.csv, wrote summary.xlsx",
+    "[21.08.2026 09:03:01.800] <2f> Info [Sync] library Shared Documents has 41 items",
+    "[21.08.2026 09:03:01.900] <2f> Info [Agent] cache under ~/.cache/backup-agent/state.db",
+    "[21.08.2026 09:03:02.000] <2f> Info [Js] at handler (/app/node_modules/express/lib/router/index.js:284:15)",
 )
 
 

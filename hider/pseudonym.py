@@ -181,6 +181,18 @@ class EntityVault:
                     else "certificates" if "/certificates/" in value else "objects"
                 return f"{base}/{kind}/secret-{ordinal:02d}"
             return base if value.startswith("http") else f"vault-{v:02d}.vault.azure.example"
+        if entity_type == "PATH_SEGMENT":
+            # One label per customer folder, so two files in one folder visibly
+            # share it; the separators and structure around it stay as written.
+            return f"<Folder-{ordinal:02d}>"
+        if entity_type == "FILE_NAME":
+            # The stem only: the extension stays outside the span, so
+            # "<File-03>.xlsx" still says what kind of file failed.
+            return f"<File-{ordinal:02d}>"
+        if entity_type == "PATH_ACCOUNT":
+            # The account in /home/<account>; its own ordinal space, like the
+            # OneDrive segment, since nothing ties it to a UPN reliably.
+            return f"user-{ordinal:02d}"
         if entity_type == "EXCHANGE_ITEM_ID":
             return f"<ExchangeId-{ordinal:02d}>"
         if entity_type == "PHONE_NUMBER":

@@ -127,22 +127,32 @@ Three invariants hold everywhere, enforced by tests rather than by convention:
 ## Measured
 
 From `python -m hider eval` (tier 2 = `classifier`, the default; tier 3 not
-active — see below) on a 5,059 line, 705,247 character synthetic bundle with
-6,716 planted values across 18 entity types:
+active — see below) on a 5,101 line, 709,442 character synthetic bundle with
+6,761 planted values across 18 entity types:
 
 | | |
 |---|---|
-| Recall on shaped identifier types | 99.92% |
-| Same corpus, stock Presidio patterns only | 17.54% |
+| Recall on shaped identifier types | 99.81% |
+| Same corpus, stock Presidio patterns only | 17.42% |
 | Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 99.65% |
-| Recall across all types | 99.90% |
+| Recall across all types | 99.79% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Seeded values still findable verbatim in the output | 0 unexplained, 4 known gap |
-| Adversarial surprises across 48 hostile placements | 0 |
-| Characters cleared before any paid or model tier is consulted | 39.8% |
+| Path lookalikes changed (20 fixed system, source, API and version path lines) | 0 by tier 1; 2 with tier 2 on |
+| Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
+| Adversarial surprises across 70 hostile placements | 0 |
+| Characters cleared before any paid or model tier is consulted | 39.7% |
 | Units degraded during the run | 0 |
-| Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 31 recognizers |
+| Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 32 recognizers |
 | Tier 2 (classifier) throughput | ~0.6 milliseconds per line over the residue only |
+
+The shaped-recall figure dropped from 99.92% when the customer-path cases
+entered the hostile set. All of the drop is their seven declared misses
+(`path-*` cases with `expect_tier1=False`). On the generated corpus alone
+the path rule changes no line: same recall, same spans. That is also why the
+generated corpus cannot measure the rule; the 13 `path-*` cases and the
+20 path lookalikes do. The two lookalikes changed with tier 2 on are tier 2
+calling "Files" (in `Program Files`) and a prose "Shared Documents" a
+person. Tier 1 leaves both lines unchanged.
 
 Swapping in `--tier2 spacy`: 86.82% free-text recall, ~3.9ms per line over the
 residue. **That pair of numbers is stale and is not reproducible from this
@@ -575,7 +585,7 @@ see Limitations.
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 43 hand-built hostile placements, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/adversarial.py` | 65 hand-built hostile placements, 20 path lookalikes that must stay readable, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
 | `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |
@@ -585,6 +595,7 @@ see Limitations.
 | `hider/csvmerge.py` | Merges an admin portal's "Download logs" CSV parts into one JSON document. |
 | `hider/research.py` | The Claude Code bridge: prompt masking, the restricted headless run, workspaces, unmasking. |
 | `hider/localcfg.py` | Loads the uncommitted `hider.local.json`. |
+| `hider/paths.py` | The one list of path structure: folder names that are the same at every customer, system roots, source, binary and document extensions, API roots. Extended per site with `path_structure` in `hider.local.json`. |
 | `hider/elastic.py` | The Elasticsearch site map, the case-scoped response scrubber, case vaults. |
 | `hider/esquery.py` | The closed query grammar, its compiler and outbound gate, and the oracle cases it must refuse. |
 | `hider/esbridge.py` | The live session: the bridge process that owns the off-the-record Chrome, the Kibana async-search protocol, the decision log. |
@@ -751,6 +762,41 @@ recall will never be exactly 100%.
   `//host/users/...` is indistinguishable from the tail of an ordinary URL, so
   widening it would swallow every `graph.microsoft.com/users/<upn>` call as a
   filesystem path.
+- **Customer file paths: tier 1 hides each name, not the whole path.**
+  `recognizers.CustomerPathRecognizer` labels every customer folder and file
+  name in a rooted path (drive, UNC, `~/`, leading slash, a library name such
+  as `Shared Documents/`). Each name gets its own stable label:
+  `/Sites/<Folder-01>/Shared Documents/<Folder-02>/<File-01>.docx`.
+  Separators, the extension, version segments and the structural names in
+  `hider/paths.py` stay readable (`path_structure` in `hider.local.json` adds
+  site ones).
+  - *What this default keeps, and what it costs.* An engineer can follow one
+    file through a bundle, see that two files share a folder, and see the
+    path's depth and file type. Those same things are visible to the
+    provider. Names are case-folded, so `FINANCE` and `Finance` share a
+    label. A label is per name, not per path: two different `Budget.docx`
+    files in two folders share `<File-01>`, and their folder labels tell
+    them apart.
+  - *What stays readable on purpose.* Paths to source files and program
+    binaries, whole (a customer-named repository or install folder in one
+    stays readable). Folders under a system root (`/var`, `/usr`, `/opt`,
+    `C:\Windows`, `Program Files`, `ProgramData`) or a hidden folder
+    (`~/.cache/<app>`); only a document name under one is labelled. API
+    routes: a leading-slash path after an HTTP method, under an API root, or
+    lower-case with nothing a document path has. Application file names such
+    as `agent.log` or `state.json`.
+  - *Declared misses, each an adversarial case.* A path with no root
+    (`Harbor Ridge/Budget.docx`). A bare file name in prose. A lower-case
+    last folder with spaces and no extension, followed by prose (only its
+    first word is labelled). Customer folders inside a Windows profile path's
+    tail, which `windows_user_path` keeps readable: changing its pseudonym
+    shape would re-record the utility cassette. Customer folders under a
+    system root, and in source or binary paths.
+  - *Tier 2 still reads the structure.* With the classifier on, it labels
+    the readable `Shared Documents` between two folder labels as a person,
+    and the `Files` of `Program Files` as one. Tier 1 leaves them readable;
+    tier 2 is unchanged. Separately, an `es-research` prompt that names a
+    customer path is now refused by type (`PATH_SEGMENT`, `FILE_NAME`).
 - **A vaulted credential is worse than a missed one, and five kinds were
   being vaulted.** A pseudonymising tier that claims a credential leaves the
   secret in the text under a label *and* writes it to `vault.json` under a

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from . import entities, profiles, vendors
+from . import entities, paths, profiles, vendors
 from presidio_analyzer import (
     LocalRecognizer,
     Pattern,
@@ -586,13 +586,12 @@ def onedrive_personal_account() -> PatternRecognizer:
     underscores, so ``anna.novak@contoso.com`` travels as
     ``/personal/anna_novak_contoso_com/...`` even when the host has been
     stripped from the log line. The segment is the person; the rest of the
-    path stays, which keeps "which folder failed" answerable.
+    path keeps its structure, which keeps "which folder failed" answerable.
 
     The flattening is not invertible (an underscore in the original local part
     is indistinguishable from a flattened dot), so this pseudonym cannot share
-    the owner's UPN vault entry; it gets its own user ordinal. File names
-    deeper in a hostless path are out of scope here and documented in the
-    adversarial case.
+    the owner's UPN vault entry; it gets its own user ordinal. Customer
+    folders and file names deeper in the path are CustomerPathRecognizer's.
     """
     return PatternRecognizer(
         supported_entity="ONEDRIVE_ACCOUNT",
@@ -976,6 +975,267 @@ def windows_user_path() -> PatternRecognizer:
     )
 
 
+#: Extensions the path rule reads as a file's extension (the rest of a dotted
+#: final segment is part of the name).
+_ARTIFACT_EXT = frozenset({
+    "log", "etl", "evtx", "dmp", "json", "jsonl", "xml", "config", "ini", "yml", "yaml",
+    "toml", "lock", "tmp", "dat", "db", "sqlite", "reg", "cab", "pem", "crt", "cer",
+    "pfx", "trace", "out", "err",
+})
+_PATH_EXT = (FILE_EXT | paths.CODE_EXT | paths.BINARY_EXT | paths.DOCUMENT_EXT
+             | _ARTIFACT_EXT | {"gz", "tar", "bz2", "xz", "tgz"})
+_PATH_WORD = r"[^\s\\/\"<>|*?:\x00-\x1f]+"
+_HTTP_METHOD = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+$")
+_QUOTES = {'"': '"', "'": "'", "\u2018": "\u2019", "\u201c": "\u201d", "`": "`"}
+_LOG_WORDS = None
+
+
+class CustomerPathRecognizer(LocalRecognizer):
+    """Customer folder and file names inside file paths in free text.
+
+    Each customer segment gets its own stable label, so one file can be
+    followed through a bundle and two files in one folder visibly share it;
+    separators, structural folder names (:mod:`hider.paths`), version
+    segments and the file extension stay readable:
+
+        /Sites/Finance/Shared Documents/Harbor Ridge Project (HRP)/Budget.docx
+        /Sites/<Folder-01>/Shared Documents/<Folder-02>/<File-01>.docx
+
+    A path starts at a root: a drive (``C:\\`` or ``C:/``), a UNC server
+    (``\\\\server\\share``), ``~/``, a leading slash after whitespace, a quote
+    or a bracket, or a library name (``Shared Documents/``). Folder names may
+    hold spaces when a separator closes them. The last segment may hold
+    spaces when it ends in a known extension, when the path is quoted (it
+    then runs to the closing quote), or as far as the following words are
+    title-case or all-caps; a lower-case or log-vocabulary word ends it.
+
+    What stays readable, each a named fence with a test:
+
+    * a path to a source file or a program binary (stack traces, installs);
+    * a path under a system root (``/usr``, ``/var``, ``C:\\Windows``,
+      ``Program Files``) or through a hidden folder (``~/.cache/<app>``): its
+      folders, though a document name under one is labelled;
+    * a leading-slash path that is an API route: after an HTTP method, under
+      an API root, or with nothing in it that a document path has (an
+      extension, a space, a capital, a library root); and one segment alone
+      (``/MIR``) is a switch, not a path;
+    * Windows profile paths and ``\\\\server\\users\\`` homes, which
+      ``windows_user_path`` owns; URLs, whose host other rules own.
+
+    The labels are new detector labels (``PATH_SEGMENT``, ``FILE_NAME``,
+    ``PATH_ACCOUNT``) borrowed by the ``WINDOWS_USER_PATH`` spec, and the UNC
+    server is ``HOSTNAME_FQDN``.
+    """
+
+    _START = re.compile(
+        r"(?P<drive>(?<![A-Za-z0-9_])[A-Za-z]:(?=[\\/]))"
+        r"|(?P<unc>(?<![\\\w])\\\\(?=[A-Za-z0-9]))"
+        r"|(?P<tilde>(?<![\w~/\\])~(?=[\\/]))"
+        r"|(?P<slash>(?:^|(?<=[\s\"'(\[=,;\u2018\u201c`]))(?=/[^\s/\\]))"
+        r"|(?P<anchor>(?<![\w\\/.%-])(?:" + "|".join(re.escape(a) for a in paths.RELATIVE_ANCHORS)
+        + r")(?=[\\/]))"
+    )
+    _SEP = re.compile(r"[\\/]+")
+    _INTERIOR = re.compile(_PATH_WORD + r"(?: " + _PATH_WORD + r"){0,9}(?=[\\/])")
+    _QUOTED_SEG = re.compile(r"[^\\/\"<>|*?:\x00-\x1f]+?(?=[\\/]|$)")
+    _WORD = re.compile(_PATH_WORD)
+    _SPACED_FILE = re.compile(_PATH_WORD + r"(?: " + _PATH_WORD + r"){1,7}?"
+                              r"\.([A-Za-z0-9]{1,8})(?![A-Za-z0-9])")
+    _HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
+    _IP = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["PATH_SEGMENT", "FILE_NAME", "PATH_ACCOUNT", "HOSTNAME_FQDN"],
+            name="CustomerPathRecognizer",
+            context=["path", "file", "folder", "share", "export", "restore"],
+        )
+
+    def load(self) -> None:
+        return None
+
+    # -- parsing -------------------------------------------------------------
+
+    @staticmethod
+    def _ext(seg: str) -> str:
+        stem, dot, ext = seg.rpartition(".")
+        return ext.lower() if dot and stem and ext.lower() in _PATH_EXT else ""
+
+    @staticmethod
+    def _strip_tail(text: str, a: int, b: int) -> int:
+        """End of a last segment without the sentence punctuation after it."""
+        while b > a and text[b - 1] in ".,;!?\"\u201d":
+            b -= 1
+        for opener, closer in ("()", "[]", "{}"):
+            while b > a and text[b - 1] == closer and \
+                    text[a:b].count(closer) > text[a:b].count(opener):
+                b -= 1
+        return b
+
+    def _continue_title(self, text: str, a: int, b: int, lim: int) -> int:
+        """Extend an unquoted last folder over title-case and all-caps words."""
+        global _LOG_WORDS
+        if _LOG_WORDS is None:
+            from . import pipeline
+            _LOG_WORDS = pipeline.LOG_VOCABULARY
+        if not (text[a].isupper() or text[a].isdigit()):
+            return b
+        end = b
+        pos = b
+        while pos < lim and text[pos] == " ":
+            m = self._WORD.match(text, pos + 1, lim)
+            if not m:
+                break
+            word = m.group(0)
+            core = word.rstrip(".,;!?")
+            if core in {"-", "\u2013", "&"}:
+                pos = m.end()  # joins two capitalised words, only kept if one follows
+                continue
+            letters = core.lstrip("(")
+            if not letters or not (letters[0].isupper() or letters[0].isdigit()) \
+                    or letters.casefold().strip("()") in _LOG_WORDS:
+                break
+            end = m.start() + len(core)
+            if core != word:
+                break  # "Trust," ends the name and the sentence goes on
+            pos = m.end()
+        return end
+
+    def _segments(self, text: str, pos: int, lim: int, quoted: bool) -> list[tuple[int, int, bool]]:
+        """(start, end, is_last) of each segment after the root, separators skipped."""
+        segs: list[tuple[int, int, bool]] = []
+        while pos < lim:
+            sep = self._SEP.match(text, pos, lim)
+            if not sep:
+                break
+            pos = sep.end()
+            if quoted:
+                m = self._QUOTED_SEG.match(text, pos, lim)
+                if not m or not m.group(0).strip():
+                    break
+                a, b = m.start(), m.start() + len(m.group(0).rstrip())
+                last = m.end() >= lim
+                segs.append((a, b, last))
+                pos = m.end()
+                if last:
+                    break
+                continue
+            m = self._INTERIOR.match(text, pos, lim)
+            if m:
+                segs.append((m.start(), m.end(), False))
+                pos = m.end()
+                continue
+            tok = self._WORD.match(text, pos, lim)
+            if not tok:
+                break
+            a = pos
+            b = self._strip_tail(text, a, tok.end())
+            if b <= a:
+                break
+            if not self._ext(text[a:b]):
+                spaced = self._SPACED_FILE.match(text, pos, lim)
+                if spaced and spaced.group(1).lower() in _PATH_EXT:
+                    b = spaced.end()
+                else:
+                    b = self._continue_title(text, a, b, lim)
+            segs.append((a, b, True))
+            break
+        return segs
+
+    # -- deciding ------------------------------------------------------------
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        out: list[RecognizerResult] = []
+        taken = 0
+        for m in self._START.finditer(text):
+            if m.start() < taken:
+                continue  # inside a path already read
+            kind = m.lastgroup
+            start = m.start()
+            q = text[start - 1] if start > 0 else ""
+            lim = len(text)
+            quoted = False
+            if q in _QUOTES:
+                close = text.find(_QUOTES[q], m.end(), min(len(text), m.end() + 400))
+                nl = text.find("\n", m.end(), close if close > 0 else len(text))
+                if close > 0 and nl < 0:
+                    lim, quoted = close, True
+            spans: list[tuple[int, int, str]] = []
+            pos = m.end()
+            if kind == "unc":
+                host = self._HOST.match(text, m.end(), lim)
+                if not host:
+                    continue
+                pos = host.end()
+                if not self._IP.match(host.group(0)):
+                    spans.append((host.start(), host.end(), "HOSTNAME_FQDN"))
+            segs = self._segments(text, pos, lim, quoted)
+            if not segs:
+                continue
+            taken = segs[-1][1]
+            found = self._decide(text, kind, start, segs, spans)
+            for a, b, etype in found:
+                out.append(RecognizerResult(entity_type=etype, start=a, end=b, score=0.7,
+                                            analysis_explanation=None))
+        return [r for r in out if not entities or r.entity_type in entities]
+
+    def _decide(self, text: str, kind: str, start: int, segs: list, spans: list) -> list:
+        names = [text[a:b] for a, b, _ in segs]
+        last_a, last_b, is_last = segs[-1]
+        ext = self._ext(names[-1]) if is_last else ""
+        if ext in paths.CODE_EXT or ext in paths.BINARY_EXT:
+            return []  # a source file or a program: readable whole
+        first = paths.norm(names[0])
+        mode = "customer"
+        account = None
+        if kind == "drive":
+            if first == "users":
+                return []  # windows_user_path owns profile paths
+            if first in paths.WINDOWS_SYSTEM_ROOTS:
+                mode = "system"
+        elif kind == "unc":
+            if first in {"users", "user", "users$"}:
+                return []  # the unc-home pattern owns it
+        elif kind == "slash":
+            if _HTTP_METHOD.search(text[max(0, start - 10):start]) or paths.is_api_root(names[0]):
+                return []
+            if first in paths.POSIX_SYSTEM_ROOTS:
+                mode = "system"
+            elif len(segs) < 2:
+                return []  # /MIR, /s: a switch, not a path
+            elif first in paths.PROFILE_ROOTS:
+                account = 1
+            elif not (ext or first in paths.LIBRARY_ROOTS
+                      or any(" " in n or "%20" in n or paths.is_structural(n) or n[:1].isupper()
+                             for n in names)):
+                return []  # lower-case and nothing a document path has: an API route
+        if any(n.startswith(".") and n.strip(".") for n, (_, _, last) in zip(names, segs)
+               if not last):
+            mode = "system"  # ~/.cache/<app>, /srv/x/.git/...: application state
+        found = list(spans)
+        for i, ((a, b, last), name) in enumerate(zip(segs, names)):
+            if last and ext:
+                stem_end = b - len(ext) - 1
+                stem = text[a:stem_end]
+                if mode == "system" and ext not in paths.DOCUMENT_EXT:
+                    continue
+                if ext in _ARTIFACT_EXT or paths.is_structural(stem) or paths.is_version(stem):
+                    continue  # agent.log, setup.json: application artifacts keep their names
+                found.append((a, stem_end, "FILE_NAME"))
+                continue
+            if mode == "system":
+                continue
+            if account is not None and i == account:
+                found.append((a, b, "PATH_ACCOUNT"))
+                continue
+            if i == 0 and kind == "slash" and first in paths.PROFILE_ROOTS:
+                continue
+            if paths.is_structural(name) or paths.is_version(name):
+                continue
+            found.append((a, b, "PATH_SEGMENT"))
+        return found
+
+
 def hostname_fqdn() -> PatternRecognizer:
     """Internal hostnames. Narrow on purpose: broad FQDN matching over-redacts.
 
@@ -1109,6 +1369,7 @@ def custom() -> list[LocalRecognizer]:
         AwsSecretKeyRecognizer(),
         PrivateKeyBlockRecognizer(),
         windows_user_path(),
+        CustomerPathRecognizer(),
         hostname_fqdn(),
         zero_padded_ipv4(),
         SupportCaseRecognizer(),
@@ -1246,8 +1507,16 @@ def suppress(text: str, results: list[RecognizerResult]) -> list[RecognizerResul
     is kept small, explicit, and covered by its own tests.
     """
     kept: list[RecognizerResult] = []
+    # Inside a path, "BOARD\BUDGET" is two all-caps folders, not a logon: the
+    # logon match would win overlap resolution on length and leave the rest
+    # of the folder name ("HRP" in "\HRP BOARD\") readable.
+    path_spans = [(r.start, r.end) for r in results
+                  if r.entity_type in {"PATH_SEGMENT", "FILE_NAME", "PATH_ACCOUNT"}]
     for r in results:
         value = text[r.start:r.end]
+        if r.entity_type == "DOMAIN_LOGON" and any(
+                r.start < b and a < r.end for a, b in path_spans):
+            continue
         if r.entity_type == "IP_ADDRESS" and ":" not in value:
             if _VERSION_CONTEXT.search(text[max(0, r.start - 40):r.start]):
                 continue

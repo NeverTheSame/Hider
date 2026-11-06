@@ -10,6 +10,9 @@ URL and those hosts are masked like any other, which only over-redacts.
      "vendor_suffixes": ["example.com"], "vendor_hosts": ["helpcenter"],
      "elastic": "/path/outside/the/repo/elastic.json"}
 
+``path_structure`` lists folder names that are structure at this site, not
+customer content, so the path rule leaves them readable (``hider/paths.py``).
+
 ``elastic`` is the live-Elasticsearch site map (``hider/elastic.py``): the
 object itself, or a path to a file holding it. Index and field names describe
 the estate, which is why they are here and not in ``templates/``.
@@ -27,7 +30,7 @@ from pathlib import Path
 ENV = "HIDER_LOCAL"
 DEFAULT = Path(__file__).resolve().parent.parent / "hider.local.json"
 _KEYS = {"portal_url": str, "vendor_suffixes": list, "vendor_hosts": list,
-         "elastic": (dict, str)}
+         "elastic": (dict, str), "path_structure": list}
 
 
 @lru_cache(maxsize=1)
@@ -47,7 +50,7 @@ def settings() -> dict:
         if key in raw and not isinstance(raw[key], typ):
             names = " or ".join(t.__name__ for t in (typ if isinstance(typ, tuple) else (typ,)))
             raise RuntimeError(f"{path}: {key} must be a {names}")
-    for key in ("vendor_suffixes", "vendor_hosts"):
+    for key in ("vendor_suffixes", "vendor_hosts", "path_structure"):
         if not all(isinstance(v, str) and v for v in raw.get(key, [])):
             raise RuntimeError(f"{path}: {key} must list non-empty strings")
     return raw

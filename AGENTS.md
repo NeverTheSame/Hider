@@ -56,6 +56,7 @@ design conversation, not a code change.
 | Task | Start here |
 |---|---|
 | A shaped identifier is missed or over-matched | `hider/recognizers.py`, add a case to `hider/adversarial.py`, test in `tests/test_recognizers.py` |
+| A customer path segment missed or a system path over-matched | `recognizers.CustomerPathRecognizer`; structure, system roots and extensions live only in `hider/paths.py` (site additions: `path_structure` in `hider.local.json`); add a `path-*` case to `hider/adversarial.py` or a line to `PATH_LOOKALIKES`, tests in `tests/test_paths.py` |
 | A new entity type | `hider/entities.py` first (the contract), then the recognizer, then `pseudonym._shape` if it needs a shaped label |
 | Free-text names missed | `hider/classifier.py` (training grammar and features). Keep the train/eval vocabulary disjoint; `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary` guards it |
 | Tier 3 prompt or parsing | `hider/llm_tier.py`. Changing the instruction text changes `PROMPT_VERSION`; committed cassettes stop matching and must be re-recorded |
@@ -179,6 +180,31 @@ Listed with owners in the README's Limitations section and in
   nonzero false-redaction figure on the next eval. Declared misses: TLDs
   outside `_PUBLIC_TLDS`, TitleCase-spelled domains, TLDs shadowed by
   source-file extensions (.py, .md, .rs).
+- **Customer file paths.** `recognizers.CustomerPathRecognizer` labels each
+  customer folder (`<Folder-NN>`) and file stem (`<File-NN>`, extension kept)
+  in a rooted path, plus the account in `/home/<account>` (`user-NN`) and a
+  UNC server (`HOSTNAME_FQDN`). The labels are detector labels borrowed by
+  the `WINDOWS_USER_PATH` spec (`detected_as`), for the cassette reason
+  above. The structural-name list, system roots, API roots and extension
+  classes live in `hider/paths.py` and nowhere else; a site adds structure
+  through `path_structure`, never in the repo. The generated corpus has
+  almost no paths (the rule changes zero generated lines), so the rule is
+  measured by the 13 `path-*` cases and by `adversarial.PATH_LOOKALIKES`, a
+  fixed clean unit outside the RNG stream that `eval` reports as its own
+  line. Keep new lookalikes there, not in `templates/`. A `DOMAIN_LOGON`
+  match inside a path span is suppressed (`BOARD\BUDGET` is two folders).
+  Six declared misses, each a `path-*` or `bare-file-name` case:
+  - rootless relative paths and bare file names;
+  - an unquoted lower-case last folder with spaces;
+  - folders under a system root;
+  - folders in source or binary paths;
+  - customer folders in a Windows profile tail, which `windows_user_path`
+    keeps readable. Relabelling that tail changes its pseudonym shape, which
+    the utility excerpt depends on: a cassette re-record.
+
+  Open: with tier 2 on, the readable `Shared Documents` between folder
+  labels is labelled a person by tier 2. Fixing that is a pipeline rule over
+  tier 2 spans, a design conversation.
 - **Dotted names.** `pipeline.in_dotted_chain` suppresses a tier 2 span inside
   a dotted chain of three or more labels, because tier 2 reads .NET namespace
   parts as organisations and vaults them (187 false spans over 145 of 1,000

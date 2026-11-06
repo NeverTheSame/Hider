@@ -141,6 +141,10 @@ class Report:
     clean_lines: int = 0
     clean_lines_with_redaction: int = 0
     clean_false_spans: int = 0
+    #: adversarial.PATH_LOOKALIKES: fixed path lines that must come out unchanged
+    lookalike_lines: int = 0
+    lookalike_lines_with_redaction: int = 0
+    lookalike_false_spans: int = 0
     unmatched_spans: int = 0
     total_spans: int = 0
     verbatim_survivors: list[dict] = field(default_factory=list)
@@ -279,6 +283,9 @@ class Report:
                 "clean_lines_with_redaction": self.clean_lines_with_redaction,
                 "false_redaction_rate": round(self.false_redaction_rate, 5),
                 "clean_false_spans": self.clean_false_spans,
+                "path_lookalike_lines": self.lookalike_lines,
+                "path_lookalike_lines_with_redaction": self.lookalike_lines_with_redaction,
+                "path_lookalike_false_spans": self.lookalike_false_spans,
                 "unmatched_spans_overall": self.unmatched_spans,
                 "total_spans": self.total_spans,
             },
@@ -511,6 +518,15 @@ def run(
                         free_seeded[case.case_id] += 1
                         free_covered[case.case_id] += int(full)
         redacted[adversarial.UNIT] = out_lines
+        # Path lookalikes: a fixed clean unit, outside the generator's RNG
+        # stream, reported beside the generated clean lines rather than
+        # inside them so that figure stays comparable across runs.
+        for i, line in enumerate(adversarial.PATH_LOOKALIKES):
+            r = pipe.redact(line, unit="Adversarial/path-lookalikes.log", line_no=i)
+            report.lookalike_lines += 1
+            if r.spans:
+                report.lookalike_lines_with_redaction += 1
+                report.lookalike_false_spans += len(r.spans)
         report.injection_canaries = len(adversarial.INJECTION_CANARIES)
         report.cases = [
             CaseResult(
