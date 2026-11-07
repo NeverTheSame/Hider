@@ -704,3 +704,20 @@ def test_the_hook_blocks_when_it_cannot_check(monkeypatch, tmp_path, capsys):
         monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
         assert cli.main(["es-prompt-check", check]) == 2
     assert "the prompt check failed" in capsys.readouterr().err
+
+
+def test_schema_and_instructions_warn_about_keep_field_spellings(bridge):
+    """log.level on a real cluster holds err and Error and INFO side by side;
+    an exact filter on one spelling looks like absence. Claude is told, in
+    both places it reads, to aggregate a keep field's actual values first
+    and then filter with `in` across the spellings it saw."""
+    opened = bridge.open()
+    schema, err = Mcp(opened["url"], opened["token"]).tool("es_schema")
+    assert not err
+    keep = schema["kinds"]["keep"]
+    assert "as logged" in keep and "in" in keep and "spelling" in keep
+    for text in (esmcp.INSTRUCTIONS, keep):
+        assert "aggregate" in text.lower() and "spelling" in text.lower()
+    assert "exact filter" in esmcp.INSTRUCTIONS and "op in" in esmcp.INSTRUCTIONS
+    # and it says what a zero means, so "no errors" is not reported as fact
+    assert "Zero hits" in esmcp.INSTRUCTIONS

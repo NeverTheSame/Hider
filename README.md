@@ -127,32 +127,41 @@ Three invariants hold everywhere, enforced by tests rather than by convention:
 ## Measured
 
 From `python -m hider eval` (tier 2 = `classifier`, the default; tier 3 not
-active — see below) on a 5,101 line, 709,442 character synthetic bundle with
-6,761 planted values across 18 entity types:
+active — see below) on a 5,121 line, 711,858 character synthetic bundle with
+6,790 planted values across 18 entity types:
 
 | | |
 |---|---|
-| Recall on shaped identifier types | 99.81% |
-| Same corpus, stock Presidio patterns only | 17.42% |
+| Recall on shaped identifier types | 99.76% |
+| Same corpus, stock Presidio patterns only | 17.34% |
 | Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 99.65% |
-| Recall across all types | 99.79% |
+| Recall across all types | 99.75% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Path lookalikes changed (20 fixed system, source, API and version path lines) | 0 by tier 1; 2 with tier 2 on |
+| Path lookalikes changed (27 fixed system, source, API and version path lines) | 0 by tier 1; 1 with tier 2 on |
 | Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
-| Adversarial surprises across 70 hostile placements | 0 |
-| Characters cleared before any paid or model tier is consulted | 39.7% |
+| Adversarial surprises across 83 hostile placements | 0 |
+| Characters cleared before any paid or model tier is consulted | 39.6% |
 | Units degraded during the run | 0 |
 | Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 32 recognizers |
 | Tier 2 (classifier) throughput | ~0.6 milliseconds per line over the residue only |
 
 The shaped-recall figure dropped from 99.92% when the customer-path cases
-entered the hostile set. All of the drop is their seven declared misses
-(`path-*` cases with `expect_tier1=False`). On the generated corpus alone
-the path rule changes no line: same recall, same spans. That is also why the
-generated corpus cannot measure the rule; the 13 `path-*` cases and the
-20 path lookalikes do. The two lookalikes changed with tier 2 on are tier 2
-calling "Files" (in `Program Files`) and a prose "Shared Documents" a
-person. Tier 1 leaves both lines unchanged.
+entered the hostile set, and from 99.81% to 99.76% when the file-name cases
+did. All of the drop is their nine declared misses (`path-*` and
+`bare-file-name` cases with `expect_tier1=False`). On the generated corpus
+alone the path rule changes no line: same recall, same spans, byte-identical
+output before and after the file-name change. That is also why the
+generated corpus cannot measure the rule; the 23 caught `path-*` cases and
+the 27 path lookalikes do. One lookalike still changes with tier 2 on: a prose
+"Shared Documents" with no separator around it, which tier 2 calls a person.
+That is the declared boundary of `pipeline.in_structural_path_segment`
+(below): between separators, structural path segments are never part of a
+tier 2 span; in prose, tier 2's reading is deliberately untouched, so the
+over-redaction is kept rather than the rule widened. Tier 1 leaves all 27
+lines unchanged. The six lookalikes added with the file-name change guard
+the reader that now runs on past spaces and colons to an extension; one of
+them (a lower-case API route followed by "details in agent.log") was
+labelled as two folders before that change and is readable now.
 
 Swapping in `--tier2 spacy`: 86.82% free-text recall, ~3.9ms per line over the
 residue. **That pair of numbers is stale and is not reproducible from this
@@ -562,14 +571,14 @@ HTTP to a bridge on a thread, a stub Kibana behind it. On the example map
 - 13/13 hostile transport requests rejected, 0 of them reaching Kibana;
 - a clean decision log, an isolated launch, and the prompt gate holding.
 
-It also reports **1 leak, and the run fails its `mcp_no_leaks` gate.** A
-planted job name survives in a free-text status message on the first page of
-a fresh case. In that hit the job-name field holds a different job, so the
-value was never harvested as an identifier, and tier 2 does not read it as a
-name. The same query through the offline path leaks the same way. The
-offline section never showed it only because its single session had already
-learnt the name from earlier pages. It is a scrubber gap, open until fixed;
-see Limitations.
+- 0 leaks in everything received, and every gate passing.
+
+The leak this section used to report - a planted job name surviving in a
+free-text status message on the first page of a fresh case, because the hit's
+own job-name field held a different job and nothing had harvested the
+referenced one - is closed by the job-reference rule (`Job <name> (...)` in a
+text field is labelled when the site map declares `JOB_NAME` an identifier).
+What that rule costs in readability is stated in Limitations.
 
 ## Layout
 
@@ -585,7 +594,7 @@ see Limitations.
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 65 hand-built hostile placements, 20 path lookalikes that must stay readable, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/adversarial.py` | 83 hand-built hostile placements, 27 path lookalikes that must stay readable, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
 | `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |
@@ -680,10 +689,21 @@ recall will never be exactly 100%.
   sentence start) remains a realistic way for it to miss. The eval corpus
   seeds free text from three templates and cannot tell you how often.
 - **Live Elasticsearch research has its own limits.**
-  - *An open leak.* `es-eval`'s MCP section fails its `mcp_no_leaks` gate.
-    A job name that appears only in free text, never in its own field on
-    that page, passes through, because nothing harvested it and tier 2 does
-    not read it as a name.
+  - *The job-reference rule, and what it costs.* The one measured leak -
+    a job name in free text whose own field sits on some other document, on
+    the first page of a fresh case - is closed: at a site whose map declares
+    `JOB_NAME` an identifier, a title-case run after the word "job" in a
+    text field is labelled (`Job Teams Nightly (...)` becomes
+    `Job <Job_Name-01> (...)`), with the same label the name gets as a
+    field value. The cost: any capitalised run right after "job" is hidden,
+    so a capitalised component name there (`job Scheduler restarted`) gets a
+    label too. Runs that are only log vocabulary (`Job Failed`) are left
+    alone, and `es-eval`'s `mcp_no_leaks` gate now passes.
+  - *Spellings are not normalised.* `log.level` on a real cluster holds
+    `err`, `Error` and `ERROR` side by side; an exact filter on one spelling
+    looks like absence. `es_schema` and the session instructions tell Claude
+    to aggregate a keep field's actual values first and then filter with
+    `in` across the spellings it saw; nothing rewrites the stored values.
   - *Guesses can be confirmed.* A phrase on a text field can confirm a
     guessed plain word by its hit count. This is declared, logged and
     capped per query, but not across queries.
@@ -773,8 +793,11 @@ recall will never be exactly 100%.
   - *What this default keeps, and what it costs.* An engineer can follow one
     file through a bundle, see that two files share a folder, and see the
     path's depth and file type. Those same things are visible to the
-    provider. Names are case-folded, so `FINANCE` and `Finance` share a
-    label. A label is per name, not per path: two different `Budget.docx`
+    provider. Names are compared as `paths.norm` reads them (case-folded,
+    `%20`, doubled and non-breaking spaces as one space), so `FINANCE`,
+    `Finance` and `Board%20Notes` / `Board Notes` share a label, and one
+    file keeps one label across hits, pages and spellings. A label is per
+    name, not per path: two different `Budget.docx`
     files in two folders share `<File-01>`, and their folder labels tell
     them apart.
   - *What stays readable on purpose.* Paths to source files and program
@@ -785,18 +808,50 @@ recall will never be exactly 100%.
     routes: a leading-slash path after an HTTP method, under an API root, or
     lower-case with nothing a document path has. Application file names such
     as `agent.log` or `state.json`.
-  - *Declared misses, each an adversarial case.* A path with no root
+  - *A file name is labelled whole or not at all.* A blind test on real
+    bundles found 14 of 75 paths coming out as `<Folder-03> payroll.xlsb`:
+    a folder label over the first words of a file name, the rest readable.
+    Four readers fell back to the title-case rule: an unknown extension
+    (`.xlsb`, `.xlsl`), a colon (and in a quoted path the whole name stayed
+    readable), a doubled or non-breaking space, and more than eight words.
+    The last segment is now read up to sixteen more words to the first known
+    extension, else the last unknown one, over colons, commas, codes such as
+    `WO-12345`, amounts and space runs. A known extension stays readable
+    (`.xlsb` and the rest of the Office family are now known); an unknown
+    one is hidden with the name (`<File-01>`), because nothing says it is
+    not part of it. Each shape is a `path-file-*` case.
+  - *What that costs.* When unsure the reader errs long: prose between an
+    unquoted folder path and a file named later on the same line, within
+    sixteen words, is hidden with the name (`Restore to C:\Exports\<File-01>.xlsx
+    for the audit`). The same reach closed two older leaks, where a spaced
+    name ending in `.log` stayed readable whole as an application artifact.
+    A one-word artifact name (`agent.log`) still stays readable.
+  - *Declared misses, each an adversarial case.* An unquoted file name of
+    more than sixteen words. An unquoted file name with no extension
+    followed by prose (the same miss as the lower-case last folder below).
+    A folder path ending in prose that later names a source file
+    (`...\Cormorant Quay completed, see Program.cs`): the source-file fence
+    keeps the whole path readable, older than the file-name change, kept
+    because narrowing the fence would label spaced application binaries.
+    A path with no root
     (`Harbor Ridge/Budget.docx`). A bare file name in prose. A lower-case
     last folder with spaces and no extension, followed by prose (only its
     first word is labelled). Customer folders inside a Windows profile path's
     tail, which `windows_user_path` keeps readable: changing its pseudonym
     shape would re-record the utility cassette. Customer folders under a
     system root, and in source or binary paths.
-  - *Tier 2 still reads the structure.* With the classifier on, it labels
-    the readable `Shared Documents` between two folder labels as a person,
-    and the `Files` of `Program Files` as one. Tier 1 leaves them readable;
-    tier 2 is unchanged. Separately, an `es-research` prompt that names a
-    customer path is now refused by type (`PATH_SEGMENT`, `FILE_NAME`).
+  - *Tier 2 and structure.* `pipeline.in_structural_path_segment` drops a
+    tier 2 span that lies inside path segments which are all structural
+    names, bounded by separators on both sides: the `Shared Documents`
+    between two folder labels and the `Files` of `C:\Program Files\` stay
+    readable with the classifier and the spaCy backend both. A name on a
+    non-structural segment in the same path is still tier 2's to label, a
+    structural word in prose (no separators) is still labelled as before,
+    and a final segment with no closing separator is too - the safe
+    direction, over-redacting structure rather than leaking a name. No
+    tier 1 span is touched and the model is unchanged. Separately, an
+    `es-research` prompt that names a customer path is refused by type
+    (`PATH_SEGMENT`, `FILE_NAME`).
 - **A vaulted credential is worse than a missed one, and five kinds were
   being vaulted.** A pseudonymising tier that claims a credential leaves the
   secret in the text under a label *and* writes it to `vault.json` under a

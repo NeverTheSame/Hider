@@ -189,22 +189,42 @@ Listed with owners in the README's Limitations section and in
   classes live in `hider/paths.py` and nowhere else; a site adds structure
   through `path_structure`, never in the repo. The generated corpus has
   almost no paths (the rule changes zero generated lines), so the rule is
-  measured by the 13 `path-*` cases and by `adversarial.PATH_LOOKALIKES`, a
+  measured by the 23 caught `path-*` cases and by `adversarial.PATH_LOOKALIKES`, a
   fixed clean unit outside the RNG stream that `eval` reports as its own
   line. Keep new lookalikes there, not in `templates/`. A `DOMAIN_LOGON`
   match inside a path span is suppressed (`BOARD\BUDGET` is two folders).
-  Six declared misses, each a `path-*` or `bare-file-name` case:
+  **The last segment is a file name, labelled whole or not at all**, never
+  a folder label over its first words (`<Folder-03> payroll.xlsb` was a
+  blind-test finding, 14 of 75 paths). `_file_end` reads up to
+  `_MAX_NAME_WORDS` (16) more words over colons, commas, codes, amounts and
+  space runs (NBSP too) to the first known extension, else the last
+  unknown one (`_unknown_ext`: hidden with the name, `<File-01>`, no
+  extension shown). It errs long on purpose: prose between a folder path
+  and a file named later on the line is hidden with the name, pinned as
+  intent in `test_paths.py`. A one-word artifact name (`agent.log`) stays
+  readable; a spaced one does not. The vault keys path labels on
+  `paths.norm`, so a file keeps one label across hits, pages, case, `%20`
+  and space runs. The `path-file-*` cases are the shapes; add the next one
+  there first.
+  Nine declared misses, each a `path-*` or `bare-file-name` case:
   - rootless relative paths and bare file names;
-  - an unquoted lower-case last folder with spaces;
+  - an unquoted lower-case last folder with spaces, and an unquoted
+    extensionless file name followed by prose (the same miss);
+  - an unquoted file name of more than sixteen words;
+  - a folder path ending in prose that later names a source file: the
+    source-file fence keeps the whole path readable (older than the
+    file-name reader; narrowing the fence would label spaced binaries);
   - folders under a system root;
   - folders in source or binary paths;
   - customer folders in a Windows profile tail, which `windows_user_path`
     keeps readable. Relabelling that tail changes its pseudonym shape, which
     the utility excerpt depends on: a cassette re-record.
 
-  Open: with tier 2 on, the readable `Shared Documents` between folder
-  labels is labelled a person by tier 2. Fixing that is a pipeline rule over
-  tier 2 spans, a design conversation.
+  Structure under tier 2: `pipeline.in_structural_path_segment` drops a
+  tier 2 span (both backends) inside path segments that are all structural,
+  bounded by separators on both sides; prose and final unclosed segments
+  are deliberately outside the rule (safe direction), tier 1 spans are
+  never touched, intent tests in `test_paths.py`.
 - **Dotted names.** `pipeline.in_dotted_chain` suppresses a tier 2 span inside
   a dotted chain of three or more labels, because tier 2 reads .NET namespace
   parts as organisations and vaults them (187 false spans over 145 of 1,000
@@ -301,10 +321,15 @@ Listed with owners in the README's Limitations section and in
   too (`esmcp.prompt_findings`), headless before launch and interactive
   as a `UserPromptSubmit` hook whose command ends in `|| exit 2`, so a
   broken check blocks. `es-eval` runs the fixture through the real MCP
-  endpoint (`mcp_*` gates) and currently **fails `mcp_no_leaks`**: a job
-  name present only in free text on a fresh case's first page survives
-  scrubbing. A scrubber gap, tracked in the design doc; do not reorder the
-  eval's calls to hide it. A case saved before the log-vocabulary trim
+  endpoint (`mcp_*` gates); all pass. The job-name-in-free-text leak it
+  found (a fresh case's first page, the referenced job's field on another
+  document) is closed by `elastic._JOB_REF`: "job <Title Case run>" in a
+  text field is labelled JOB_NAME when the site map declares that type, at
+  the declared cost of hiding any capitalised run right after the word
+  "job". `es_schema` and the esmcp instructions also tell Claude that keep
+  fields hold spellings as logged (err/Error/ERROR): aggregate a keep
+  field's values before an exact filter, then filter with `in` across the
+  spellings; values are never normalised. A case saved before the log-vocabulary trim
   may hold "Info" as a value: `load_session` keeps such labels for
   unmasking but not as known values (`elastic.log_vocabulary_only`).
 

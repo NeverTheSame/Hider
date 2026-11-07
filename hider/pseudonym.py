@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 
-from . import entities
+from . import entities, paths
 
 ENV_KEY = "HIDER_VAULT_KEY"
 
@@ -58,7 +58,15 @@ def _split_first_path_segment(tail: str) -> tuple[str, str, str]:
     return tail[:m.start()], m.group(0), tail[m.end():]
 
 
+#: Path labels key on the name as :func:`hider.paths.norm` reads it, so one
+#: file keeps one label however a log layer spelled it: case, ``%20`` for a
+#: space, a non-breaking space, a doubled space, a typographic apostrophe.
+_PATH_LABEL_TYPES = frozenset({"PATH_SEGMENT", "FILE_NAME", "PATH_ACCOUNT"})
+
+
 def _digest(key: bytes, entity_type: str, value: str) -> str:
+    if entity_type in _PATH_LABEL_TYPES:
+        value = paths.norm(value)
     msg = f"{entity_type}\x1f{value.strip().casefold()}".encode()
     return hmac.new(key, msg, sha256).hexdigest()
 

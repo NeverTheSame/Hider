@@ -492,11 +492,15 @@ Added after the first version:
   three labels the oracle cases are written against. The 38 oracle cases
   go through the tools (5 raw-DSL shapes stop at the tool layer as
   `bad_request`). Then 13 hostile transport requests, which must not reach
-  Kibana, the decision log, the launch and the prompt gate. On the example
-  map it finds **one leak** and fails `mcp_no_leaks`: a job name present only
-  in `job.status_message` on the first page of a fresh case. The direct
-  path leaks it too; the offline section misses it because its session
-  learnt the name earlier. A scrubber gap, open, not fixed here.
+  Kibana, the decision log, the launch and the prompt gate. The leak this
+  section found on its first run - a job name present only in
+  `job.status_message` on the first page of a fresh case, which
+  harvest-then-sweep can never see because the referenced job's field is on
+  some other document - is closed by `elastic._JOB_REF`: at a site whose
+  map declares `JOB_NAME` an identifier, a title-case run after the word
+  "job" in a text field is labelled with the same label the name gets as a
+  field value. Log-vocabulary runs ("Job Failed") are left alone. Every
+  gate passes, `mcp_no_leaks` included.
 - **Old cases and log words.** `EsScrubber.load_session` no longer makes a
   value of only `pipeline.LOG_VOCABULARY` words a known value. The label
   stays in the mapping, so old answers unmask; the vocabulary-only value
@@ -504,7 +508,11 @@ Added after the first version:
 
 Known limits of this layer: one call at a time (a polling search holds
 every other call, and `es-login` holds the tools while the human signs
-in); the refusal codes reach the model, so `known_value` confirms that a
+in); keep-field values are never normalised, so `es_schema` and the
+instructions tell Claude to aggregate a keep field's actual spellings
+(err/Error/ERROR) before an exact filter and to use `in` across them,
+guidance the model can still ignore; the refusal codes reach the model, so
+`known_value` confirms that a
 word Claude typed is a value this case has pseudonymised, a narrower
 form of the declared text-query channel; and the zero-hit field check
 `es-smoke` runs is not done for the tools (Claude can ask `es_count` with

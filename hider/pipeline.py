@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol, Sequence
 
-from . import classifier, entities, pseudonym, recognizers
+from . import classifier, entities, paths, pseudonym, recognizers
 
 
 @dataclass(frozen=True)
@@ -143,6 +143,56 @@ def in_dotted_chain(text: str, start: int, end: int, min_labels: int = 3) -> boo
     return all(lb[0].isalnum() for lb in labels)
 
 
+#: Path separators, and the characters a file-path segment never contains.
+#: The stop set errs toward keeping a span: scanning into one of these means
+#: "this is prose, not a path", and the span stays.
+_PATH_SEP = frozenset("\\/")
+_PATH_SEG_STOP = frozenset("\"'<>|\n\r\t,;:=`\u2018\u201c\u201d")
+
+
+def in_structural_path_segment(text: str, start: int, end: int) -> bool:
+    """True when the span lies inside path segments that are all structural
+    names (:mod:`hider.paths`), bounded by path separators on both sides.
+
+    Tier 2 reads the structure tier 1 deliberately leaves readable as names:
+    the ``Shared Documents`` between two labelled folders became a person,
+    and so did the ``Files`` of ``C:\\Program Files\\``. The containing
+    segment is checked whole, so a span inside ``Program Files`` qualifies
+    while a span inside ``Anna Documents`` does not, and both separators are
+    required, so the same words in prose (no separators) are untouched and a
+    final path segment with no closing separator stays labelled - the safe
+    direction, over-redacting structure rather than leaking a name. Only
+    tier 2 spans are offered to this; a tier 1 span is never touched."""
+    i = start
+    floor = max(0, start - 120)
+    left = -1
+    while i > floor:
+        c = text[i - 1]
+        if c in _PATH_SEP:
+            left = i
+            break
+        if c in _PATH_SEG_STOP:
+            return False
+        i -= 1
+    if left < 0:
+        return False
+    j = end
+    ceiling = min(len(text), end + 120)
+    right = -1
+    while j < ceiling:
+        c = text[j]
+        if c in _PATH_SEP:
+            right = j
+            break
+        if c in _PATH_SEG_STOP:
+            return False
+        j += 1
+    if right < 0:
+        return False
+    parts = [p.strip() for p in re.split(r"[\\/]+", text[left:right]) if p.strip()]
+    return bool(parts) and all(paths.is_structural(p) for p in parts)
+
+
 #: Words every log uses as a level, severity or outcome. They are never a
 #: name, but tier 2 read them as one: "Info Lena" as one person, "Debug" as a
 #: person on its own, "Critical Contoso Holdings" as one organisation. That
@@ -234,6 +284,10 @@ class ManagedNerTier:
                 # under ORG_NAME. Offsets are absolute here on purpose - the
                 # chain can run past the residue segment it was found in.
                 if in_dotted_chain(text, start + s0, start + e0):
+                    continue
+                # Structure tier 1 leaves readable in a path ("Shared
+                # Documents" between two labelled folders) is not a name.
+                if in_structural_path_segment(text, start + s0, start + e0):
                     continue
                 spans.append(Span(start + s0, start + e0, etype, float(score),
                                    self.name, detector="trained-classifier"))

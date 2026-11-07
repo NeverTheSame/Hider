@@ -505,3 +505,29 @@ def test_incomplete_refusals_say_how_to_narrow(patch, why):
     assert e.value.code == "incomplete" and why in e.value.message
     assert "shorter time window" in e.value.message and "phrase" in e.value.message
     assert "index pattern" in e.value.message
+
+
+def test_a_job_named_only_in_free_text_is_labelled_on_a_fresh_case():
+    """The es-eval leak: a status message names a job whose name is in no
+    identifier field on the page, on the first call of a fresh case, so
+    neither harvesting nor a session's memory can know it. The site map
+    declares JOB_NAME an identifier, and the message introduces the name
+    with the word "job": that reference is labelled, with the same label
+    the name gets as a field value, so correlation survives."""
+    doc = copy.deepcopy(APP_DOC)
+    doc["job"]["name"] = "Mailbox Sweep"
+    doc["job"]["status_message"] = ("Job Harbor Nightly (7c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f) "
+                                    "scheduled on ctr-amer-042, 61 sites enqueued")
+    doc["message"] = "Backup job Fernhill Weekly for tenant Fabrikam Industries completed with 3 warnings"
+    s = _session()
+    out = s.scrub_response(_envelope([_hit(doc)]), PLAN).output["hits"]["hits"][0]["_source"]
+    blob = json.dumps(out)
+    assert "Harbor Nightly" not in blob and "Fernhill Weekly" not in blob
+    assert out["job"]["status_message"].startswith("Job <Job_Name-")
+    # the reference and the field value share one label
+    label = s._scrub_text("job Harbor Nightly queued").split()[1]
+    assert s.label_for(CFG.rule("job.name"), "Harbor Nightly") == label
+    # the word "job" before ordinary text stays ordinary
+    for line in ("Scheduler tick: 3 jobs due, 2 running", "picked up job for the queue",
+                 "job failed, see Retry policy", "Job Failed (timeout) on the worker"):
+        assert s._scrub_text(line) == line

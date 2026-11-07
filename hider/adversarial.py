@@ -599,7 +599,149 @@ CASES: tuple[Case, ...] = (
         "<<WINDOWS_USER_PATH|Harbor Ridge>>/<<WINDOWS_USER_PATH|Budget>>.docx",
         expect_tier1=True,
     ),
+    # The last segment is a file name, and it is never partly labelled: the
+    # whole stem is one FILE_NAME label (a known extension stays readable) or,
+    # with an extension the rule does not know, the whole segment is. Each
+    # case below is a shape a blind test on real bundles found coming out as
+    # "<Folder-03> payroll.xlsb": a folder label over the first words and the
+    # rest of the name readable. The owner line says why it fell back.
+    Case(
+        "path-file-colon",
+        "A file name with a colon and a date after it, unquoted, in prose",
+        "[21.08.2026 09:02:52.100] <2f> Info [Sync] Uploaded /Sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Harbor Ridge>>"
+        "/<<WINDOWS_USER_PATH|Alpine Trust: 09-16-22 with staff IDs>>.xlsx in 2 s",
+        expect_tier1=True,
+        owner="fell back because a path word could not hold ':' (the drive-letter "
+              "character), so the name ended at 'Trust' and the title-case fallback "
+              "labelled 'Alpine Trust' as a folder.",
+    ),
+    Case(
+        "path-file-colon-quoted",
+        "The same colon-bearing file name inside a quoted path",
+        "[21.08.2026 09:02:52.200] <2f> Error [Sync] Upload failed for \"/Sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Harbor Ridge>>"
+        "/<<WINDOWS_USER_PATH|Alpine Trust: 09-16-22 with staff IDs>>.xlsx\"",
+        expect_tier1=True,
+        owner="worse than the unquoted form: the quoted-segment reader excluded ':' as "
+              "well, could not reach the closing quote, and dropped the last segment, "
+              "so the whole file name stayed readable.",
+    ),
+    Case(
+        "path-file-unknown-extension",
+        "A file name with spaces and an extension the rule does not know, followed by prose",
+        "[21.08.2026 09:02:52.300] <2f> Warn [Sync] /Sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Harbor Ridge>>"
+        "/<<WINDOWS_USER_PATH|Alpine Trust payroll.xlsl>> was locked by another user",
+        expect_tier1=True,
+        owner="fell back because the spaced-file reader only accepted known extensions; "
+              "'.xlsl' was not one, so the title-case fallback stopped at 'payroll'. "
+              "An unknown extension is hidden with the name: it is not on any list, so "
+              "nothing says it is not part of the name.",
+    ),
+    Case(
+        "path-file-office-binary-extension",
+        "A file name with spaces and the Office binary workbook extension, on a drive path",
+        r"[21.08.2026 09:02:52.400] <2f> Info [Copy] Copied C:\Shares\<<WINDOWS_USER_PATH|Bramble Hill>>"
+        r"\<<WINDOWS_USER_PATH|Northgate Fund payroll>>.xlsb to backup",
+        expect_tier1=True,
+        owner="fell back for the unknown-extension reason; .xlsb is a real Office format "
+              "and is now a known document extension, so it stays readable.",
+    ),
+    Case(
+        "path-file-comma-all-caps",
+        "A file name with a comma followed by all-caps words, then lower-case words",
+        "[21.08.2026 09:02:52.500] <2f> Info [Sync] Synced /sites/<<WINDOWS_USER_PATH|Legal>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Saltmarsh Lane, LLC FINAL signed copy>>.pdf",
+        expect_tier1=True,
+        owner="caught before this change when the extension is known and the name is at "
+              "most eight words; it fell back only in combination with an unknown "
+              "extension, a long name or a non-breaking space. Kept as a guard.",
+    ),
+    Case(
+        "path-file-long-name",
+        "A file name of more than eight words, mostly lower case",
+        "[21.08.2026 09:02:52.600] <2f> Info [Sync] Uploaded /Sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Heron Bay>>/<<WINDOWS_USER_PATH|"
+        "Heron Bay quarterly review of the northern region board meeting final draft>>.docx",
+        expect_tier1=True,
+        owner="fell back because the spaced-file reader stopped at eight words; the "
+              "title-case fallback then stopped at 'quarterly'.",
+    ),
+    Case(
+        "path-file-work-order-code",
+        "A file name with a work-order code and lower-case words",
+        r"[21.08.2026 09:02:52.700] <2f> Info [Scan] indexed D:\Shares\<<WINDOWS_USER_PATH|Wren Hollow>>"
+        r"\<<WINDOWS_USER_PATH|WO-12345 Wren Hollow roof repair quote>>.pdf in 1 s",
+        expect_tier1=True,
+        owner="caught before this change with a known extension; a guard for the code "
+              "staying inside the one label.",
+    ),
+    Case(
+        "path-file-dollar-amount-month",
+        "A file name with a dollar amount and a month",
+        "[21.08.2026 09:02:52.800] <2f> Info [Sync] Uploaded /Sites/<<WINDOWS_USER_PATH|Finance>>"
+        "/Shared Documents/<<WINDOWS_USER_PATH|Fernhill Estates $1,250.00 March invoice>>.pdf",
+        expect_tier1=True,
+        owner="caught before this change with a known extension; a guard for the amount "
+              "and the month staying inside the one label.",
+    ),
+    Case(
+        "path-file-double-space",
+        "A file name with two spaces between words",
+        r"[21.08.2026 09:02:52.900] <2f> Info [Copy] Copied C:\Shares\<<WINDOWS_USER_PATH|Bramble Hill>>"
+        r"\<<WINDOWS_USER_PATH|Larch  Valley payroll>>.xlsx to backup",
+        expect_tier1=True,
+        owner="fell back because every name reader joined words with exactly one ASCII "
+              "space, so the name ended at 'Larch'.",
+    ),
+    Case(
+        "path-file-non-breaking-space",
+        "A file name with a non-breaking space between words, as Office copies it",
+        "[21.08.2026 09:02:53.000] <2f> Info [Copy] Copied C:\\Shares\\<<WINDOWS_USER_PATH|Bramble Hill>>"
+        "\\<<WINDOWS_USER_PATH|Larch\u00a0Valley payroll>>.xlsx to backup",
+        expect_tier1=True,
+        owner="fell back for the double-space reason: a non-breaking space was not a "
+              "word joiner.",
+    ),
     # Declared misses of the path rule, each with its owner.
+    Case(
+        "path-file-name-over-sixteen-words",
+        "An unquoted file name of more than sixteen words, mostly lower case, in prose",
+        r"[21.08.2026 09:02:53.100] <2f> Info [Copy] Copied C:\Shares\<<WINDOWS_USER_PATH|Bramble Hill>>"
+        r"\<<WINDOWS_USER_PATH|Kestrel Row notes from the second planning meeting about the "
+        r"new west wing extension and the parking area>>.docx to backup",
+        expect_tier1=False,
+        owner="accepted tier 1 miss: an unquoted name is read up to sixteen more words "
+              "looking for its extension, because the same reader running further also "
+              "swallows the prose after a folder path up to the next file mentioned on "
+              "the line. Past the cap the title-case fallback applies. Quoted paths have "
+              "no cap.",
+    ),
+    Case(
+        "path-file-extensionless-in-prose",
+        "An unquoted file name with no extension, lower-case words in it, followed by prose",
+        r"[21.08.2026 09:02:53.200] <2f> Info [Copy] Copied C:\Shares\<<WINDOWS_USER_PATH|Bramble Hill>>"
+        r"\<<WINDOWS_USER_PATH|Kestrel Row payroll final>> to backup",
+        expect_tier1=False,
+        owner="accepted tier 1 miss, the same one as path-lowercase-final-folder-in-prose: "
+              "with no extension and no closing quote nothing marks where the name ends, "
+              "so 'Kestrel Row' is labelled and 'payroll final' reads as prose. Hiding "
+              "to the end of the line instead would destroy the message text of every "
+              "line that ends a sentence on a folder path.",
+    ),
+    Case(
+        "path-folder-then-source-file-in-prose",
+        "A folder path ending in prose that later names a source file",
+        r"[21.08.2026 09:02:53.300] <2f> Info [Restore] Restore to C:\Exports\<<WINDOWS_USER_PATH|Cormorant Quay>>"
+        r" completed, see Program.cs",
+        expect_tier1=False,
+        owner="accepted tier 1 miss, found while fixing the file-name shapes and older than "
+              "them: the name reader runs from the folder to 'Program.cs', and a path to a "
+              "source file stays readable whole, so the folder does too. Narrowing the "
+              "source-file fence to one-word names would label spaced application binaries "
+              "(D:\\Apps\\Backup Agent\\Agent Host.exe), which stay readable by decision.",
+    ),
     Case(
         "path-rootless-relative",
         "A relative path with no root and no library name to anchor its left edge",
@@ -688,6 +830,17 @@ PATH_LOOKALIKES: tuple[str, ...] = (
     "[21.08.2026 09:03:01.800] <2f> Info [Sync] library Shared Documents has 41 items",
     "[21.08.2026 09:03:01.900] <2f> Info [Agent] cache under ~/.cache/backup-agent/state.db",
     "[21.08.2026 09:03:02.000] <2f> Info [Js] at handler (/app/node_modules/express/lib/router/index.js:284:15)",
+    # structural segments between separators: tier 1 leaves them readable and
+    # tier 2 must not label them (pipeline.in_structural_path_segment)
+    "[21.08.2026 09:03:02.100] <2f> Info [Sync] crawling /sites/portals/Shared Documents/Forms finished",
+    # the file-name reader runs on past spaces and colons to find an
+    # extension; none of these may turn into a customer file name
+    "[21.08.2026 09:03:02.200] <2f> Info [Api] route /jobs/run/status answered 200, details in agent.log",
+    "[21.08.2026 09:03:02.400] <2f> Info [Svc] logging to C:\\ProgramData\\BackupAgent\\Logs\\Agent Service.log",
+    "[21.08.2026 09:03:02.500] <2f> Info [Ssh] key ~/.ssh/id_rsa.pub accepted",
+    "[21.08.2026 09:03:02.600] <2f> Info [Agent] installed under /opt/agent/12.3.1/bin: version 12.3.1.1139 ready",
+    "[21.08.2026 09:03:02.700] <2f> Info [Api] GET /v1.0/sites/root/drives/items returned 200, see trace.json",
+    "[21.08.2026 09:03:02.800] <2f> Error [Worker]    at Run() in D:\\a\\1\\s\\src\\Proxy\\SessionWorker.cs:line 214, retrying",
 )
 
 

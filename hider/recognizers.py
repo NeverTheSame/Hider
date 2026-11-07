@@ -985,9 +985,31 @@ _ARTIFACT_EXT = frozenset({
 _PATH_EXT = (FILE_EXT | paths.CODE_EXT | paths.BINARY_EXT | paths.DOCUMENT_EXT
              | _ARTIFACT_EXT | {"gz", "tar", "bz2", "xz", "tgz"})
 _PATH_WORD = r"[^\s\\/\"<>|*?:\x00-\x1f]+"
+#: A word of a file name: a path word that may also hold a colon, as long as
+#: no separator follows it (a colon before a separator is a drive or a URL
+#: scheme, and ends the name).
+_NAME_WORD = r"(?:[^\s\\/\"<>|*?:\x00-\x1f]|:(?![\\/]))+"
+#: What joins the words of one name: a run of spaces, including the
+#: non-breaking and narrow spaces Office and macOS write. Tabs and line breaks
+#: are field and record separators in a log, never part of a name.
+_NAME_GAP = r"[ \u00a0\u2007\u202f]+"
+#: How many words after the first an unquoted last segment is searched for
+#: its extension. Past this the title-case fallback applies (a declared miss,
+#: adversarial path-file-name-over-sixteen-words): the further the search
+#: runs, the more prose after a folder path it swallows up to the next file
+#: mentioned on the line.
+_MAX_NAME_WORDS = 16
+#: Endings that are a host's, not a file's, when the extension is not known.
+_NOT_EXT = frozenset({"local", "lan", "corp", "internal", "intra", "home", "localdomain"})
+_UNKNOWN_EXT = re.compile(r"(?![vV]\d+$)(?:[a-z][a-z0-9]{1,5}|[A-Z][A-Z0-9]{1,5})")
 _HTTP_METHOD = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+$")
 _QUOTES = {'"': '"', "'": "'", "\u2018": "\u2019", "\u201c": "\u201d", "`": "`"}
 _LOG_WORDS = None
+
+
+def _has_gap(name: str) -> bool:
+    """True when a path segment holds more than one word."""
+    return any(c.isspace() for c in name)
 
 
 class CustomerPathRecognizer(LocalRecognizer):
@@ -1004,10 +1026,15 @@ class CustomerPathRecognizer(LocalRecognizer):
     A path starts at a root: a drive (``C:\\`` or ``C:/``), a UNC server
     (``\\\\server\\share``), ``~/``, a leading slash after whitespace, a quote
     or a bracket, or a library name (``Shared Documents/``). Folder names may
-    hold spaces when a separator closes them. The last segment may hold
-    spaces when it ends in a known extension, when the path is quoted (it
-    then runs to the closing quote), or as far as the following words are
-    title-case or all-caps; a lower-case or log-vocabulary word ends it.
+    hold spaces (runs of them, non-breaking ones too) when a separator closes
+    them. The last segment is a file name and is labelled whole or not at
+    all, never with a folder label over its first words. Quoted, it runs to
+    the closing quote. Unquoted, it runs over up to sixteen more words (colons,
+    commas, codes and amounts included) to the first word with a known
+    extension, else to the last with an unknown one (``.xlsl``: the whole
+    segment, extension included, is the label). With no extension in reach,
+    it runs as far as the following words are title-case or all-caps; a
+    lower-case or log-vocabulary word ends it.
 
     What stays readable, each a named fence with a test:
 
@@ -1036,11 +1063,13 @@ class CustomerPathRecognizer(LocalRecognizer):
         + r")(?=[\\/]))"
     )
     _SEP = re.compile(r"[\\/]+")
-    _INTERIOR = re.compile(_PATH_WORD + r"(?: " + _PATH_WORD + r"){0,9}(?=[\\/])")
-    _QUOTED_SEG = re.compile(r"[^\\/\"<>|*?:\x00-\x1f]+?(?=[\\/]|$)")
+    _INTERIOR = re.compile(_PATH_WORD + r"(?:" + _NAME_GAP + _PATH_WORD + r"){0,9}(?=[\\/])")
+    # Inside quotes the quote delimits the name, so a colon is part of it; a
+    # colon right before a separator is still a drive or a scheme.
+    _QUOTED_SEG = re.compile(r"(?:[^\\/\"<>|*?:\x00-\x1f]|:(?![\\/]))+?(?=[\\/]|$)")
     _WORD = re.compile(_PATH_WORD)
-    _SPACED_FILE = re.compile(_PATH_WORD + r"(?: " + _PATH_WORD + r"){1,7}?"
-                              r"\.([A-Za-z0-9]{1,8})(?![A-Za-z0-9])")
+    _NAME_WORD = re.compile(_NAME_WORD)
+    _GAP = re.compile(_NAME_GAP)
     _HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
     _IP = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
@@ -1062,9 +1091,24 @@ class CustomerPathRecognizer(LocalRecognizer):
         return ext.lower() if dot and stem and ext.lower() in _PATH_EXT else ""
 
     @staticmethod
+    def _unknown_ext(seg: str) -> bool:
+        """True when ``seg`` ends in something shaped like an extension that is
+        on no list (``.xlsl``): two to six letters and digits after a single
+        dot, one case throughout. A second dot, a public TLD or an ``@`` makes
+        it a host or an address, not a file."""
+        stem, dot, ext = seg.rpartition(".")
+        if not dot or not stem or stem.endswith(".") or "." in stem or "@" in stem:
+            return False
+        if ext.lower() in _PATH_EXT:
+            return False
+        e = ext.casefold()
+        return bool(_UNKNOWN_EXT.fullmatch(ext)) and e not in _PUBLIC_TLDS \
+            and e not in _SECOND_LEVEL and e not in _NOT_EXT
+
+    @staticmethod
     def _strip_tail(text: str, a: int, b: int) -> int:
         """End of a last segment without the sentence punctuation after it."""
-        while b > a and text[b - 1] in ".,;!?\"\u201d":
+        while b > a and text[b - 1] in ".,;:!?\"\u201d":
             b -= 1
         for opener, closer in ("()", "[]", "{}"):
             while b > a and text[b - 1] == closer and \
@@ -1082,8 +1126,11 @@ class CustomerPathRecognizer(LocalRecognizer):
             return b
         end = b
         pos = b
-        while pos < lim and text[pos] == " ":
-            m = self._WORD.match(text, pos + 1, lim)
+        while pos < lim:
+            gap = self._GAP.match(text, pos, lim)
+            if not gap:
+                break
+            m = self._WORD.match(text, gap.end(), lim)
             if not m:
                 break
             word = m.group(0)
@@ -1100,6 +1147,37 @@ class CustomerPathRecognizer(LocalRecognizer):
                 break  # "Trust," ends the name and the sentence goes on
             pos = m.end()
         return end
+
+    def _file_end(self, text: str, a: int, lim: int) -> int | None:
+        """End of an unquoted file name that starts at ``a``, or None.
+
+        The name runs over words joined by space runs (NBSP included) to the
+        first word with a known extension, else to the last word with an
+        unknown one, within :data:`_MAX_NAME_WORDS` words. Words may hold a
+        colon, a comma, ``$`` and anything else a file name can, so
+        "Alpine Trust: 09-16-22 with staff IDs.xlsx" is one name. It stops at
+        a line break, a tab, a separator or a quote, which no unquoted name
+        crosses. When it errs it errs long: prose between a folder path and a
+        file mentioned later on the line is hidden with the name."""
+        pos = a
+        unknown: int | None = None
+        for i in range(_MAX_NAME_WORDS + 1):
+            if i:
+                gap = self._GAP.match(text, pos, lim)
+                if not gap:
+                    break
+                pos = gap.end()
+            w = self._NAME_WORD.match(text, pos, lim)
+            if not w:
+                break
+            end = self._strip_tail(text, w.start(), w.end())
+            word = text[w.start():end]
+            if self._ext(word):
+                return end
+            if self._unknown_ext(word):
+                unknown = end
+            pos = w.end()
+        return unknown
 
     def _segments(self, text: str, pos: int, lim: int, quoted: bool) -> list[tuple[int, int, bool]]:
         """(start, end, is_last) of each segment after the root, separators skipped."""
@@ -1133,11 +1211,8 @@ class CustomerPathRecognizer(LocalRecognizer):
             if b <= a:
                 break
             if not self._ext(text[a:b]):
-                spaced = self._SPACED_FILE.match(text, pos, lim)
-                if spaced and spaced.group(1).lower() in _PATH_EXT:
-                    b = spaced.end()
-                else:
-                    b = self._continue_title(text, a, b, lim)
+                end = self._file_end(text, a, lim)
+                b = end if end is not None else self._continue_title(text, a, b, lim)
             segs.append((a, b, True))
             break
         return segs
@@ -1185,6 +1260,17 @@ class CustomerPathRecognizer(LocalRecognizer):
         ext = self._ext(names[-1]) if is_last else ""
         if ext in paths.CODE_EXT or ext in paths.BINARY_EXT:
             return []  # a source file or a program: readable whole
+        # An extension on no list (.xlsl): the whole segment is the label,
+        # extension included, since nothing says the "extension" is not part
+        # of the name.
+        unknown = is_last and not ext and self._unknown_ext(names[-1])
+        spaced = is_last and (_has_gap(names[-1]) or "%20" in names[-1])
+        evidence = names
+        if spaced and ext and ext not in paths.DOCUMENT_EXT:
+            # "/jobs/run/status answered 200, see agent.log": a spaced last
+            # segment found by reading on to an artifact's extension is not
+            # evidence of a document path; judge the route by its first word.
+            evidence = names[:-1] + [names[-1].split()[0]]
         first = paths.norm(names[0])
         mode = "customer"
         account = None
@@ -1205,21 +1291,30 @@ class CustomerPathRecognizer(LocalRecognizer):
                 return []  # /MIR, /s: a switch, not a path
             elif first in paths.PROFILE_ROOTS:
                 account = 1
-            elif not (ext or first in paths.LIBRARY_ROOTS
-                      or any(" " in n or "%20" in n or paths.is_structural(n) or n[:1].isupper()
-                             for n in names)):
+            elif not ((ext and evidence is names) or unknown or first in paths.LIBRARY_ROOTS
+                      or any(_has_gap(n) or "%20" in n or paths.is_structural(n) or n[:1].isupper()
+                             for n in evidence)):
                 return []  # lower-case and nothing a document path has: an API route
         if any(n.startswith(".") and n.strip(".") for n, (_, _, last) in zip(names, segs)
                if not last):
             mode = "system"  # ~/.cache/<app>, /srv/x/.git/...: application state
         found = list(spans)
         for i, ((a, b, last), name) in enumerate(zip(segs, names)):
+            # The last segment is a file name and is labelled whole or not at
+            # all: never a folder label over its first words.
+            if last and unknown:
+                if (mode == "system" and not spaced) or paths.is_structural(name) \
+                        or paths.is_version(name):
+                    continue
+                found.append((a, b, "FILE_NAME"))
+                continue
             if last and ext:
                 stem_end = b - len(ext) - 1
                 stem = text[a:stem_end]
                 if mode == "system" and ext not in paths.DOCUMENT_EXT:
                     continue
-                if ext in _ARTIFACT_EXT or paths.is_structural(stem) or paths.is_version(stem):
+                if (ext in _ARTIFACT_EXT and not spaced) or paths.is_structural(stem) \
+                        or paths.is_version(stem):
                     continue  # agent.log, setup.json: application artifacts keep their names
                 found.append((a, stem_end, "FILE_NAME"))
                 continue

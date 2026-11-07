@@ -499,6 +499,22 @@ class Scrubbed:
 _SHAPE_BOUND_L = r"(?<![A-Za-z0-9_-])"
 _SHAPE_BOUND_R = r"(?![A-Za-z0-9_-])"
 
+#: A job named in free text: the word "job", then a title-case run. This is
+#: how status messages reference a job whose name sits in no field of the
+#: page ("Job Teams Nightly (<id>) scheduled on ..."), which was the one
+#: value the harvest-then-sweep order could never see on a fresh case's
+#: first page: harvesting reads fields, and the referenced job's field is on
+#: some other document. The run ends at the first word that does not start
+#: with a capital or a short number, so "for tenant", "(", "scheduled" and
+#: sentence punctuation all end it. A run that is nothing but log vocabulary
+#: ("Job Failed") is not a name and is left alone; everything else
+#: capitalised after "job" is labelled, which is the readability cost the
+#: rule accepts and the README declares.
+_JOB_REF = re.compile(
+    r"(?<![A-Za-z0-9_-])[Jj]ob[ ]+"
+    r"((?:[A-Z][\w'’&-]*)(?:[ ](?:[A-Z][\w'’&-]*|\d{1,4}(?![\w-])))*)"
+)
+
 
 class EsScrubber(jsonscrub.JsonScrubber):
     """A case-scoped scrubber for Kibana async-search responses.
@@ -527,6 +543,11 @@ class EsScrubber(jsonscrub.JsonScrubber):
             (r, re.compile(_SHAPE_BOUND_L + r"(?:" + r.shape.pattern + r")" + _SHAPE_BOUND_R))
             for r in config.shaped_rules
         ]
+        #: the job-reference rule fires only at a site whose map declares job
+        #: names identifiers; without that declaration a job name is not
+        #: sensitive and the word "job" in text means nothing special
+        self._job_rule = next((r for r in config.fields
+                               if r.kind == "identifier" and r.type == "JOB_NAME"), None)
         self._meta = {k: _parse_rule(k, v, "meta") for k, v in META_RULES.items()}
         for t in self.terms:
             if not (t.endswith("*") and len(t) > 2):
@@ -590,6 +611,12 @@ class EsScrubber(jsonscrub.JsonScrubber):
         for rule, rx in self._shape_rx:
             for m in rx.finditer(text):
                 self.label_for(rule, m.group(0))
+        if self._job_rule is not None:
+            for m in _JOB_REF.finditer(text):
+                words = m.group(1).split()
+                if all(pipeline.is_log_word(w) for w in words):
+                    continue  # "job Failed", "Job Running": an outcome, not a name
+                self.label_for(self._job_rule, m.group(1))
         return super()._scrub_text(text, shaped_only=shaped_only)
 
     # -- the response ------------------------------------------------------

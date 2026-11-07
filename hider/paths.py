@@ -106,6 +106,12 @@ DOCUMENT_EXT: frozenset[str] = frozenset({
     "vsdx", "pages", "numbers", "key", "md", "zip", "7z", "rar", "jpg", "jpeg",
     "png", "gif", "bmp", "tif", "tiff", "heic", "mp4", "mov", "mp3", "wav",
     "vbk", "vib", "vbm", "vrb", "bak",
+    # the rest of the Office and Visio family: templates, binary and macro
+    # workbooks, shows, projects, databases and XPS documents (not .pub or
+    # .dot: an SSH public key and a Graphviz file as often as Office)
+    "xlsb", "xltx", "xltm", "xlt", "dotx", "dotm", "potx", "potm", "ppsx",
+    "ppsm", "pps", "vsd", "vsdm", "vstx", "mpp", "accdb", "mdb", "xps", "oxps",
+    "odg", "epub", "webp",
 })
 
 #: Version and number segments stay readable: 12.3.1, v2, 2026, 2026-08-20.
