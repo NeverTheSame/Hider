@@ -318,11 +318,15 @@ template reshuffles the generator and invalidates it.
 | Stub Elasticsearch engine for the grammar; stub Kibana speaking the async protocol with required headers and a cookie | `eseval.StubEngine`, `eseval.StubKibana` | `test_eseval.py` |
 | The numbers: leak rate, refusals, clean-traffic refusals, round trip, oracle, coverage, text queries, latency | `eseval.run_eval`, `python -m hider es-eval` | writes `out/es-eval.json` |
 
-Figures from `python -m hider es-eval` on the example map (600 synthetic
-documents, 120 queries, tier 2 on) are in the session notes and reproduced
-by the command; the gates are zero leaks, zero degraded pages, every oracle
-case refused with its declared code, every label round trip passing, and
-the two deliberately planted unlisted fields never shown.
+Figures from `python -m hider es-eval` on the example map (620 synthetic
+documents: 600 generated and 20 fixed ones for unmarked job and customer
+names; 120
+queries, tier 2 on) are in the session notes and reproduced by the command;
+the gates are zero leaks, zero degraded pages, every oracle case refused
+with its declared code, every label round trip passing, a fresh case's
+first page clean for every unmarked job and customer name (no word of
+the name readable), and the two deliberately
+planted unlisted fields never shown.
 
 One change outside the new modules: `jsonscrub._phone` no longer labels a
 run of eight or more consecutive digits as a phone number unless it starts
@@ -501,6 +505,29 @@ Added after the first version:
   "job" in a text field is labelled with the same label the name gets as a
   field value. Log-vocabulary runs ("Job Failed") are left alone. Every
   gate passes, `mcp_no_leaks` included.
+- **Job names with no marker** ("Harbour Nightly finished with warnings").
+  The fixture had none, so the gate passed while the shape leaked:
+  `eseval.UNMARKED_JOBS` adds five, each message on a worker document with
+  no job field and the job's record on an application document, appended
+  after the RNG stream. A fresh case's first page is checked offline
+  (`fresh_case_no_leaks`) and through MCP (a second case, `mcp_no_leaks`,
+  `mcp_fresh_case_shown`); both failed (3 of 5 leaking) before the fix.
+  The fix reads the names from the cluster: `Bridge.run` sends
+  `EsScrubber.vocabulary_request()` (one terms aggregation per field in
+  `vocabulary.fields`, all configured indices, `ignore_unavailable`, the
+  last `vocabulary.days`, size `vocabulary.max`) before a case's first page
+  per cluster and every ten minutes after, and every value becomes a known
+  value under its field's rule. One extra request per case per cluster per
+  refresh, however many fields, logged as counts per field against the
+  cap. An unreadable or capped reply refuses the page.
+- **Tenant, resource and site names with no marker** (`eseval.UNMARKED_NAMES`):
+  the same shape for the other name fields, each message on a document
+  whose own fields hold a different tenant. Before the fix they failed
+  only once the fresh-case pages were also checked word by word
+  (`eseval.name_part_leaks`): tier 2 hid part of a name ("Tenant <Org-01>
+  Estates"), which the whole-value check counts as clean. Fixed by listing
+  the fields under `vocabulary.fields`; ordinary one-word names are kept
+  out by `ORDINARY_NAME_WORDS`.
 - **Old cases and log words.** `EsScrubber.load_session` no longer makes a
   value of only `pipeline.LOG_VOCABULARY` words a known value. The label
   stays in the mapping, so old answers unmask; the vocabulary-only value

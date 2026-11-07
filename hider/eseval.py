@@ -313,7 +313,143 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
                 "service": {"name": "backup-api"},
             }
         out.append(Doc(index, src, f.seeded, clean))
+    out.extend(unmarked_job_docs(ts, servers))
+    out.extend(unmarked_name_docs(ts, servers))
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
+
+
+#: Job names in free text with no "job" in front of them, the shape
+#: ``elastic._JOB_REF`` cannot see: the name comes first in the message, or
+#: after some other word. (job name, message, a phrase that finds the
+#: message without naming the job). Each message sits on a worker document
+#: with no job field at all; the job's own ``job.name`` is on a separate
+#: application document, so a fresh case's first page holds the message and
+#: not the field. A fixed list outside the generator's RNG stream, appended
+#: after it, so every generated document is unchanged; all names invented.
+UNMARKED_JOBS: tuple[tuple[str, str, str], ...] = (
+    ("Harbour Nightly", "Harbour Nightly finished with warnings", "finished with warnings"),
+    ("Mailbox Sweep", "Mailbox Sweep started on a server, 61 sites enqueued",
+     "started on a server"),
+    ("Quillon Ledger Export", "Quillon Ledger Export completed after 3 retries",
+     "completed after"),
+    ("Saltmarsh Retention", "Retry 3 of Saltmarsh Retention scheduled after throttling",
+     "scheduled after throttling"),
+    ("Kittiwake", "Kittiwake finished, 0 items changed", "items changed"),
+)
+
+
+#: Customer names in free text with nothing that marks them as names, the
+#: same shape as UNMARKED_JOBS for the other name fields: (field, the name,
+#: the message, a phrase that finds the message without naming it). Each
+#: message sits on a worker document whose own tenant field holds a
+#: different tenant; the name is in its field only on a separate record
+#: document. Appended after the RNG stream, like the job names.
+UNMARKED_NAMES: tuple[tuple[str, str, str, str], ...] = (
+    ("labels.resource_name", "LegalHold2031", "Resource LegalHold2031 on a server: 24% quota used",
+     "24 quota used"),
+    ("labels.resource_name", "Brackenvault", "Brackenvault crossed its soft limit",
+     "crossed its soft limit"),
+    ("labels.tenant_name", "Thornbury Estates", "Tenant Thornbury Estates exceeded its quota",
+     "exceeded its quota"),
+    ("labels.tenant_full_name", "Pellworth Analytics GmbH",
+     "Quota report for Pellworth Analytics GmbH is ready", "quota report for"),
+    ("labels.site_name", "Oak Creek Holdings", "Site Oak Creek Holdings failed to sync",
+     "failed to sync"),
+)
+
+
+def unmarked_name_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """Two documents per :data:`UNMARKED_NAMES` entry: the message, on a
+    worker document of another tenant, and a record that carries the name in
+    its field. Positions, not draws: no RNG is consumed."""
+    docs: list[Doc] = []
+    for i, (field_path, name, message, _phrase) in enumerate(UNMARKED_NAMES):
+        other = tenants[(i + 3) % len(tenants)]
+        prx = servers["prx"][(i + 2) % len(servers["prx"])]
+        at = (NOW - timedelta(minutes=19 + 2 * i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-worker-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success"},
+            "log": {"level": "warn"},
+            "message": message,
+            "agent": {"name": prx.name},
+            "host": {"name": prx.name, "ip": prx.ip},
+            "labels": {"tenant_name": other.name, "tenant_id": other.tenant_id},
+        }, {name: "NAME", prx.name: "SERVER_NAME", prx.ip: "IPV4", other.name: "ORG_NAME",
+            other.tenant_id: "TENANT_ID"}))
+        t = tenants[i % len(tenants)]
+        ctr = servers["ctr"][(i + 3) % len(servers["ctr"])]
+        labels = {"tenant_name": t.name, "tenant_full_name": t.full_name,
+                  "tenant_id": t.tenant_id, "resource_name": t.resources[0]}
+        labels[field_path.split(".", 1)[1]] = name
+        before = (NOW - timedelta(hours=4, minutes=i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-app-*", {
+            "@timestamp": before,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success", "action": "inventory"},
+            "log": {"level": "info", "logger": "Engine.Inventory"},
+            "message": "Inventory refreshed",
+            "agent": {"name": ctr.name},
+            "host": {"name": ctr.name, "ip": ctr.ip},
+            "labels": labels,
+        }, {**{v: "NAME" for v in labels.values()}, labels["tenant_id"]: "TENANT_ID",
+            ctr.name: "SERVER_NAME", ctr.ip: "IPV4"}))
+    return docs
+
+
+def unmarked_job_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """Two documents per :data:`UNMARKED_JOBS` entry: the message, on a worker
+    document with no job field, and the job's own record on an application
+    document. Every field a generated document of that index has, with the
+    tenant and server taken by position, not drawn: no RNG is consumed."""
+    docs: list[Doc] = []
+    for i, (job, message, _phrase) in enumerate(UNMARKED_JOBS):
+        t = tenants[i % len(tenants)]
+        prx, ctr = servers["prx"][i % len(servers["prx"])], servers["ctr"][i % len(servers["ctr"])]
+        at = (NOW - timedelta(minutes=7 + 2 * i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        person = f"Wren Ashdown {i + 1}"
+        docs.append(Doc("logs-worker-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success"},
+            "log": {"level": "info"},
+            "message": message,
+            "agent": {"name": prx.name},
+            "host": {"name": prx.name, "ip": prx.ip},
+            "labels": {"tenant_name": t.name, "tenant_id": t.tenant_id},
+            "user": {"full_name": person},
+        }, {job: "JOB_NAME", prx.name: "SERVER_NAME", prx.ip: "IPV4", t.name: "ORG_NAME",
+            t.tenant_id: "TENANT_ID", person: "PERSON_NAME"}))
+        before = (NOW - timedelta(hours=3, minutes=i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hider-es-eval/{job}/id"))
+        session_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hider-es-eval/{job}/session"))
+        object_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hider-es-eval/{job}/object"))
+        docs.append(Doc("logs-app-*", {
+            "@timestamp": before,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "ecs": {"version": "8.11.0"},
+            "event": {"outcome": "success", "action": "job-step"},
+            "log": {"level": "info", "logger": "Engine.Jobs",
+                    "file": {"path": "/var/log/backup/engine.log"}},
+            "message": "Scheduler tick: 1 jobs due, 0 running, 0 queued",
+            "agent": {"name": ctr.name},
+            "host": {"name": ctr.name, "ip": ctr.ip, "mac": ctr.mac},
+            "cloud": {"account": {"id": t.account_id}, "instance": {"name": ctr.instance}},
+            "labels": {"tenant_name": t.name, "tenant_full_name": t.full_name,
+                       "tenant_id": t.tenant_id, "resource_name": t.resources[0]},
+            "job": {"id": job_id, "session_id": session_id, "object_id": object_id,
+                    "name": job, "status": "Success", "status_message": "Completed",
+                    "counters": {"items": 412, "bytes": 1048576, "errors": 0}},
+            "tenant": {"users_in_tenant": t.users},
+            "service": {"name": "backup-engine", "version": "8.4.1"},
+            "process": {"command_line": f"engine.exe --tenant {t.name}"},
+        }, {job: "JOB_NAME", ctr.name: "SERVER_NAME", ctr.ip: "IPV4", ctr.mac: "MAC_ADDRESS",
+            t.account_id: "CLOUD_ACCOUNT", ctr.instance: "INSTANCE_NAME", t.name: "ORG_NAME",
+            t.full_name: "ORG_NAME", t.tenant_id: "TENANT_ID", t.resources[0]: "RESOURCE_NAME",
+            job_id: "SESSION_GUID", session_id: "SESSION_GUID", object_id: "OBJECT_GUID",
+            str(t.users): "TENANT_SIZE"}))
+    return docs
 
 
 # ---------------------------------------------------------------------------
@@ -558,13 +694,20 @@ class StubEngine:
 
     # -- entry point -------------------------------------------------------
 
-    def search(self, index: str, body: dict) -> dict:
-        """A raw Elasticsearch response for a compiled body."""
+    def search(self, index: str, body: dict, *, ignore_unavailable: bool = False) -> dict:
+        """A raw Elasticsearch response for a compiled body. With
+        ``ignore_unavailable`` a pattern the engine does not have matches no
+        documents instead of failing, as in Elasticsearch."""
         with self.lock:
             self.requests.append({"index": index, "body": body})
-        if index not in self.indices:
+        parts = index.split(",")
+        if ignore_unavailable:
+            parts = [p for p in parts if p in self.indices]
+        elif any(p not in self.indices for p in parts):
             raise KeyError(index)
-        rows = [(i, flatten(d.source)) for i, d in enumerate(self._select(index))]
+        if len(parts) > 1 and body.get("size", 10):
+            raise ValueError("stub: a search over several indices is aggregation-only")
+        rows = [(i, flatten(d.source)) for p in parts for i, d in enumerate(self._select(p))]
         for f, nth in self.missing.items():
             for i, flat in rows:
                 if i % nth == 0:
@@ -731,7 +874,9 @@ class StubKibana:
                 if not isinstance(params, dict) or "index" not in params:
                     return self._reply(400, kibana_error(400, "[request body.params.index]: expected value"))
                 try:
-                    result = stub.engine.search(params["index"], params.get("body") or {})
+                    result = stub.engine.search(
+                        params["index"], params.get("body") or {},
+                        ignore_unavailable=params.get("ignore_unavailable") is True)
                 except KeyError:
                     return self._reply(404, kibana_error(
                         404, f"[index_not_found_exception] no such index [{params['index']}]"))
@@ -943,6 +1088,48 @@ _CLEAN_PHRASES = ["Scheduler tick", "Connection pool stats", "GC pause", "Retry 
                   "Graph endpoint"]
 
 
+def unmarked_cases() -> list[tuple[str, str]]:
+    """(phrase, name) for every unmarked job and customer name."""
+    return [(p, j) for j, _, p in UNMARKED_JOBS] + [(p, n) for _, n, _, p in UNMARKED_NAMES]
+
+
+def name_part_leaks(messages: Iterable[str], phrase: str, name: str) -> list[str]:
+    """Words of ``name`` still readable in the message that names it (the one
+    holding ``phrase``). Stricter than the whole-value check: "Tenant <Org-01>
+    Estates" passes that one and fails this one."""
+    want = _TOKEN.findall(phrase.lower())
+    out: list[str] = []
+    for m in messages:
+        toks = _TOKEN.findall(m.lower())
+        if not any(toks[i:i + len(want)] == want for i in range(len(toks) - len(want) + 1)):
+            continue
+        out += [w for w in _TOKEN.findall(name.lower()) if len(w) >= 3 and w in toks]
+    return out
+
+
+def _messages(page: Any) -> list[str]:
+    hits = (page or {}).get("hits") if isinstance(page, dict) else None
+    rows = hits.get("hits", []) if isinstance(hits, dict) else (hits or [])
+    return [str((h.get("_source") or {}).get("message", "")) for h in rows if isinstance(h, dict)]
+
+
+def unmarked_phrases() -> list[str]:
+    """The phrase of every unmarked job and name message: each finds its
+    message on a worker page without naming anything."""
+    return [p for _, _, p in UNMARKED_JOBS] + [p for _, _, _, p in UNMARKED_NAMES]
+
+
+def learn_vocabulary(scrubber: elastic.EsScrubber, engine: StubEngine,
+                     cluster: str = "stub") -> dict[str, int]:
+    """What ``esbridge.Bridge`` does before a case's first page: one fixed
+    request, every name in it a known value."""
+    vq = scrubber.vocabulary_request()["params"]
+    return scrubber.learn_vocabulary(cluster, {
+        "isPartial": False, "isRunning": False,
+        "rawResponse": engine.search(vq["index"], vq["body"],
+                                     ignore_unavailable=vq["ignore_unavailable"])})
+
+
 class Session:
     """Compile, run against the engine, scrub: one tool call as the bridge will do it."""
 
@@ -951,12 +1138,16 @@ class Session:
         self.engine = engine
         self.scrubber = elastic.EsScrubber(config, tier2=tier2)
         self.log: list[dict] = []
+        self.vocabulary_requests = 0
 
     def call(self, query: dict) -> tuple[dict | None, elastic.Refused | None, float, esquery.Compiled | None]:
         t0 = time.perf_counter()
         compiled = None
         try:
             compiled = esquery.compile_query(query, self.cfg, self.scrubber)
+            if self.scrubber.vocabulary_due("stub"):
+                self.vocabulary_requests += 1
+                learn_vocabulary(self.scrubber, self.engine)
             raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
             envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}
             out = self.scrubber.scrub_response(envelope, compiled.plan).output
@@ -1164,6 +1355,20 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
                     oracle["wrong_code"].append({"case": case.name, "expected": want_code,
                                                  "got": code})
 
+        # -- a fresh case: its first calls are pages with an unmarked job name
+        fresh_open = control.call("open_case", case="es-eval-fresh", tier2=tier2, terms=[])
+        fresh_client = _McpClient(fresh_open["url"], fresh_open["token"])
+        fresh = {"cases": 0, "shown": 0, "part_leaks": 0}
+        for phrase, name in unmarked_cases():
+            payload, code = fresh_client.tool("es_search", {
+                "index": "logs-worker-*", "time_range": tr, "size": 20,
+                "filters": [{"field": "message", "op": "phrase", "value": phrase}]})
+            fresh["cases"] += 1
+            fresh["part_leaks"] += bool(name_part_leaks(_messages(payload), phrase, name))
+            fresh["shown"] += bool(payload) and (payload.get("hits_total") or {}).get("value", 0) > 0
+        control.call("close_case", token=fresh_open["token"])
+        c.received.extend(fresh_client.received)
+
         # -- requests the transport must reject ----------------------------
         ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode()
         port = c.port
@@ -1200,6 +1405,7 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
 
         for r in rejections:
             reject(*r)
+
         control.call("close_case", token=opened["token"])
         reject("token of a closed case", c, {}, "POST", None, 401)
         rejected["reached_kibana"] = len(kb.calls) - kibana_before
@@ -1265,6 +1471,7 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
         "leaks": len(leaked),
         "leaked_types": sorted(set(leaked)),
         "label_round_trip": round_trip,
+        "fresh_case": fresh,
         "oracle": oracle,
         "rejected_requests": rejected,
         "log_rows": len(log_rows),
@@ -1280,7 +1487,9 @@ def mcp_gates(m: dict) -> dict[str, bool]:
     rj = m["rejected_requests"]
     return {
         "mcp_protocol": m["protocol_ok"],
-        "mcp_no_leaks": m["leaks"] == 0,
+        "mcp_no_leaks": m["leaks"] == 0 and m["fresh_case"]["part_leaks"] == 0,
+        "mcp_fresh_case_shown": m["fresh_case"]["shown"] == m["fresh_case"]["cases"]
+        == len(unmarked_phrases()),
         "mcp_oracle_all_refused": m["oracle"]["refused"] == m["oracle"]["cases"]
         and not m["oracle"]["wrong_code"],
         "mcp_round_trip_complete": m["label_round_trip"]["tried"] > 0
@@ -1384,6 +1593,27 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
                  "filters": [{"field": "message", "op": "phrase", "value": rng.choice(_CLEAN_PHRASES)}]},
                 clean=True)
 
+    # A fresh case's first page, for each job named with no marker: nothing
+    # seeded, nothing harvested yet, the job's own record on another document.
+    fresh = {"cases": 0, "shown": 0, "leaks": 0, "leaked_types": [], "vocabulary_requests": 0,
+             "part_leaks": 0}
+    for phrase, name in unmarked_cases():
+        first = Session(cfg, engine, tier2=tier2)
+        out, refused, dt, _ = first.call({
+            "index": "logs-worker-*", "time_range": tr, "size": 20,
+            "filters": [{"field": "message", "op": "phrase", "value": phrase}]})
+        timings.append(dt)
+        fresh["vocabulary_requests"] += first.vocabulary_requests
+        fresh["cases"] += 1
+        if out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0:
+            fresh["shown"] += 1
+            leaked = _leaks(out, truth)
+            if name_part_leaks(_messages(out), phrase, name):
+                fresh["part_leaks"] += 1
+                leaked = leaked + ["NAME_PART"]
+            fresh["leaks"] += bool(leaked)
+            fresh["leaked_types"] = sorted(set(fresh["leaked_types"]) | set(leaked))
+
     # Label round trip: a label learnt from a page, used as a filter.
     round_trip = {"tried": 0, "passed": 0, "failures": []}
     field_for_type = {}
@@ -1458,6 +1688,12 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "clean_refusal_rate": round(clean_refused / clean_pages, 4) if clean_pages else 0.0,
         "degraded": s.degraded,
         "label_round_trip": round_trip,
+        "fresh_case": fresh,
+        # extra requests the bridge sends on its own: one per case per
+        # cluster, then one per refresh interval; none here has a value
+        "vocabulary": {**s.vocabulary_report(),
+                       "requests": sess.vocabulary_requests + fresh["vocabulary_requests"],
+                       "cases": 1 + fresh["cases"]},
         "oracle": oracle,
         "text_queries": text_queries,
         "labels_issued": len(s.mapping),
@@ -1477,6 +1713,9 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "no_degraded": s.degraded == 0,
         "oracle_all_refused": oracle["refused"] == oracle["cases"],
         "round_trip_complete": round_trip["tried"] > 0 and round_trip["passed"] == round_trip["tried"],
+        # every unmarked job-name page shown, not refused, and clean
+        "fresh_case_no_leaks": fresh["cases"] == len(unmarked_phrases())
+        and fresh["shown"] == fresh["cases"] and fresh["leaks"] == 0,
         # planted in every fixture, projected out by the engine or dropped
         # here; either way never shown
         "unlisted_never_shown": not (set(fx.unlisted_fields) & shown_paths),
@@ -1526,6 +1765,15 @@ def format_report(r: dict) -> str:
         f"(rate {r['clean_refusal_rate']})",
         f"degraded          {r['degraded']}",
         f"label round trip  {r['label_round_trip']['passed']}/{r['label_round_trip']['tried']}",
+        f"fresh case        {r['fresh_case']['shown']}/{r['fresh_case']['cases']} first pages with an "
+        f"unmarked job or customer name shown, {r['fresh_case']['leaks']} leaking "
+        f"({r['fresh_case']['part_leaks']} by a word of the name)"
+        + (f" (types: {r['fresh_case']['leaked_types']})" if r['fresh_case']['leaked_types'] else ""),
+        f"vocabulary        {r['vocabulary']['requests']} extra requests for "
+        f"{r['vocabulary']['cases']} cases (one per case per cluster, then one per "
+        f"{elastic.VOCABULARY_REFRESH_S:g}s); values per field against the cap "
+        f"{r['vocabulary']['max']}: {r['vocabulary']['fields']}; skipped "
+        f"{r['vocabulary']['skipped'] or 'none'}",
         f"oracle cases      {r['oracle']['refused']}/{r['oracle']['cases']} refused with the declared code"
         + (f"; wrong code: {r['oracle']['wrong_code']}" if r['oracle']['wrong_code'] else "")
         + (f"; COMPILED: {r['oracle']['compiled']}" if r['oracle']['compiled'] else ""),
@@ -1547,6 +1795,9 @@ def format_report(r: dict) -> str:
             f"mcp leaks         {m['leaks']} in {m['responses_received']} responses received"
             + (f" (types: {m['leaked_types']})" if m["leaked_types"] else ""),
             f"mcp round trip    {m['label_round_trip']['passed']}/{m['label_round_trip']['tried']}",
+            f"mcp fresh case    {m['fresh_case']['shown']}/{m['fresh_case']['cases']} first pages "
+            f"with an unmarked job or customer name shown, {m['fresh_case']['part_leaks']} with a "
+            f"word of the name readable (counted in mcp_no_leaks)",
             f"mcp oracle        {o['refused']}/{o['cases']} refused ({o['by_grammar']} by the "
             f"grammar with the declared code, {o['by_tool_layer']} by the tool layer as "
             f"bad_request)" + (f"; wrong code: {o['wrong_code']}" if o["wrong_code"] else "")

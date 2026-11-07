@@ -147,8 +147,11 @@ def test_search_submits_polls_and_releases(stub, tmp_path):
     seq = [m for m, _, _ in stub.calls]
     assert seq[:2] == ["GET", "POST"]            # probe, submit
     assert "DELETE" in seq and seq[-1] == "DELETE"  # released after the poll
-    assert len(stub.deleted) == 1
+    # two searches, each released: the case's job-name vocabulary, then the page
+    assert len(stub.deleted) == 2
     assert "_source" in o.output["hits"]["hits"][0]
+    b.run("stub", {"index": "logs-app-*", "size": 2})
+    assert len(stub.deleted) == 3                # no second vocabulary inside the interval
 
 
 def test_expired_session_is_a_refusal_before_anything_is_submitted(stub, tmp_path):
@@ -234,14 +237,19 @@ def test_labels_round_trip_through_the_live_path_and_the_log_holds_no_values(stu
                                    {"field": "message", "op": "phrase", "value": lab}]})
     assert o.hits_total > 0
     # the stub saw the real value; Claude's page shows the label
-    submitted = next(body for m, p, body in stub.calls if m == "POST" and p == esbridge.SEARCH_PATH)
-    assert tenant.name in json.dumps(submitted)
+    submitted = [body for m, p, body in stub.calls if m == "POST" and p == esbridge.SEARCH_PATH]
+    # the first search is the job-name vocabulary: fixed, no value in it
+    assert tenant.name not in json.dumps(submitted[0]) and \
+        elastic.VOCABULARY_AGG in json.dumps(submitted[0])
+    assert tenant.name in json.dumps(submitted[1])
     page = json.dumps(o.output)
     assert tenant.name not in page and lab in page
     assert all(h["_source"]["labels"]["tenant_name"] == lab for h in o.output["hits"]["hits"])
     rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
-    assert len(rows) == 1
-    row = rows[0]
+    assert len(rows) == 2
+    vocab, row = rows
+    assert vocab["vocabulary"] == "names" and vocab["fields"]["job.name"] > 0 \
+        and vocab["max"] == elastic.DEFAULT_VOCABULARY_MAX and "refused" not in vocab
     assert row["cluster"] == "stub" and row["labels_used"] == [lab]
     assert row["text_queries"] == [lab]
     assert row["filters"] == [{"field": "labels.tenant_name", "op": "eq"},
@@ -316,7 +324,9 @@ def test_smoke_count_by_server_per_interval_prints_counts_not_keys(stub, tmp_pat
                              interval="1h", buckets=5)
     assert esbridge.smoke(b, "stub", q) == 0
     out = capsys.readouterr().out
-    assert out.count("\n") == 1 and "since=now-6h until=now" in out
+    assert out.count("\n") == 2 and "since=now-6h until=now" in out
+    # the second line: each vocabulary field against its cap, counts only
+    assert re.search(r"^VOCAB    job\.name=\d+/10000 labels\.tenant_name=\d+/10000 ", out, re.M)
     m = re.search(r"buckets=5 bucket_docs=\[([\d, ]+)\] other_docs=(\d+) count_error_bound=0 "
                   r"docs_with_field=\d+ time_buckets=(\d+)", out)
     assert m, out
@@ -411,7 +421,7 @@ def test_smoke_histogram_within_the_cap_reaches_kibana(stub, tmp_path, capsys, k
     n = len(stub.engine.requests)
     q = esbridge.smoke_query(b.config, size=0, **kw)
     assert esbridge.smoke(b, "stub", q) == 0, capsys.readouterr().out
-    assert len(stub.engine.requests) == n + 1
+    assert len(stub.engine.requests) == n + 2  # the job-name vocabulary, then the query
     aggs = b.outcomes[-1].output["aggregations"]
     lists = ([r[esbridge.TIME_AGG]["buckets"] for r in aggs[esbridge.COUNT_AGG]["buckets"]]
              if esbridge.COUNT_AGG in aggs else [aggs[esbridge.TIME_AGG]["buckets"]])
@@ -1233,3 +1243,59 @@ def test_broker_with_real_chrome_serves_many_runs_from_one_login(fixture, short_
     finally:
         sb.stop()
         kb.stop()
+
+
+# -- the job-name vocabulary on the live path ------------------------------------
+
+
+def test_a_refused_vocabulary_refuses_the_page_before_it_is_submitted(stub, tmp_path):
+    """Fail closed: if the case's job names cannot all be read, no page is
+    shown, and the query itself never reaches Kibana."""
+    b = _bridge(stub, tmp_path)
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": stub.url}}
+    raw["vocabulary"]["max"] = 1  # the fixture has more job names than this
+    b.config = elastic.parse(raw, source="test")
+    b.scrubber = elastic.EsScrubber(b.config, tier2="none")
+    with pytest.raises(elastic.Refused) as e:
+        b.run("stub", {"index": "logs-app-*", "size": 1})
+    assert e.value.code == "vocabulary"
+    searches = [body for m, p, body in stub.calls if m == "POST" and p == esbridge.SEARCH_PATH]
+    assert len(searches) == 1 and elastic.VOCABULARY_AGG in json.dumps(searches[0])
+    rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
+    assert rows[0]["vocabulary"] == "names" and rows[0]["refused"] == "vocabulary"
+    assert rows[1]["refused"] == "vocabulary"
+
+
+def test_an_unmarked_job_name_is_labelled_on_the_first_live_page(stub, tmp_path, fixture):
+    b = _bridge(stub, tmp_path)
+    job, message, phrase = eseval.UNMARKED_JOBS[0]
+    o = b.run("stub", {"index": "logs-worker-*", "time_range": {"gte": "now-6h", "lte": "now"},
+                       "size": 5, "filters": [{"field": "message", "op": "phrase", "value": phrase}]})
+    page = json.dumps(o.output)
+    assert o.hits_shown >= 1 and job not in page and "finished with warnings" in page
+    assert eseval._leaks(o.output, fixture.truth) == []
+
+
+def test_smoke_shows_each_vocabulary_field_against_its_cap_even_when_refused(stub, tmp_path, capsys):
+    b = _bridge(stub, tmp_path)
+    q = esbridge.smoke_query(b.config, size=0, since="now-6h")
+    assert esbridge.smoke(b, "stub", q) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("VOCAB"))
+    assert "labels.site_name=" in line and "/10000" in line
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": stub.url}}
+    raw["vocabulary"]["max"] = 13
+    b2 = _bridge(stub, tmp_path)
+    b2.config = elastic.parse(raw, source="test")
+    b2.scrubber = elastic.EsScrubber(b2.config, tier2="none")
+    assert esbridge.smoke(b2, "stub", q) == 0
+    out = capsys.readouterr().out
+    assert "NEAR CAP: job.name" in out  # 12 of 13: an investigation about to stop, said early
+    raw["vocabulary"]["max"] = 5
+    b3 = _bridge(stub, tmp_path)
+    b3.config = elastic.parse(raw, source="test")
+    b3.scrubber = elastic.EsScrubber(b3.config, tier2="none")
+    assert esbridge.smoke(b3, "stub", q) == 2
+    out = capsys.readouterr().out
+    assert "code=vocabulary" in out and "job.name has at least 5 distinct values" in out

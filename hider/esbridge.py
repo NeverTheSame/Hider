@@ -509,6 +509,8 @@ class Bridge:
         self.log_path = Path(log_path) if log_path else None
         self._lock = threading.Lock()
         self.outcomes: list[Outcome] = []
+        #: the last vocabulary read per cluster: counts against the caps
+        self.vocabulary: dict[str, dict] = {}
 
     def cluster(self, name: str) -> elastic.Cluster:
         c = self.config.cluster(name) if isinstance(name, str) else None
@@ -532,6 +534,8 @@ class Bridge:
                 row.update(_describe(query, compiled))
                 if probe:
                     self.session.probe(cluster)
+                if self.scrubber.vocabulary_due(cluster.name):
+                    self._vocabulary(cluster)
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
                 envelope = self.session.search(cluster, compiled.body)
@@ -553,6 +557,28 @@ class Bridge:
                 self.outcomes.append(outcome)
                 self._log(row)
         return outcome
+
+    def _vocabulary(self, cluster: elastic.Cluster) -> None:
+        """One extra request before a case's first page on a cluster, and
+        every ``VOCABULARY_REFRESH_S`` after: the names the sweep must know
+        before it can label one that nothing marks. Its own log row holds,
+        per field, how many values came back against the cap, and how many
+        were skipped by reason; never a value. A failure refuses the page it
+        was fetched for (``vocabulary``, or ``upstream_error``)."""
+        t0 = time.perf_counter()
+        row: dict[str, Any] = {"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                               "cluster": cluster.name, "vocabulary": "names"}
+        try:
+            reply = self.session.search(cluster, self.scrubber.vocabulary_request())
+            self.scrubber.learn_vocabulary(cluster.name, reply)
+            row.update(self.scrubber.vocabulary_report())
+            self.vocabulary[cluster.name] = self.scrubber.vocabulary_report()
+        except elastic.Refused as e:
+            row["refused"] = e.code
+            raise
+        finally:
+            row["seconds"] = round(time.perf_counter() - t0, 3)
+            self._log(row)
 
     def _log(self, row: dict) -> None:
         if self.log_path is None:
@@ -756,11 +782,26 @@ def run_case(bridge: Bridge, cluster: str, query: dict) -> dict:
     try:
         o = bridge.run(cluster, query)
     except elastic.Refused as e:
-        return {"refused": {"code": e.code, "message": e.message}}
+        return {"refused": {"code": e.code, "message": e.message},
+                "vocabulary": bridge.vocabulary.get(cluster)}
     s = bridge.scrubber
     return {"refused": None, "output": o.output, "hits_total": o.hits_total,
             "hits_shown": o.hits_shown, "seconds": o.seconds,
-            "labels_issued": len(s.mapping), "dropped": sorted(s.dropped)}
+            "labels_issued": len(s.mapping), "dropped": sorted(s.dropped),
+            "vocabulary": bridge.vocabulary.get(cluster)}
+
+
+def vocabulary_line(v: dict | None) -> str | None:
+    """How close each vocabulary field is to its cap: counts, never values."""
+    if not v or not v.get("fields"):
+        return None
+    parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()]
+    line = "VOCAB    " + " ".join(parts)
+    if v.get("skipped"):
+        line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
+    if v.get("near_cap"):
+        line += f" NEAR CAP: {', '.join(v['near_cap'])}"
+    return line
 
 
 def _bucket_summary(query: dict, output: dict, hits_total: Any) -> tuple[str, list[str]]:
@@ -839,8 +880,11 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
     """Decisions only. Exit code 0 on a clean page, 2 on a refusal, 3 when a
     filtered query had nothing to search (EMPTY: zero hits that mean nothing)."""
     refused = report.get("refused")
+    vline = vocabulary_line(report.get("vocabulary"))
     if refused:
         print(f"REFUSED  cluster={cluster} code={refused['code']}: {refused['message']}")
+        if vline:
+            print(vline)
         return 2
     tr = query.get("time_range") or {}
     output = report.get("output") or {}
@@ -869,6 +913,8 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
         print(f"NOTE     {note}")
     if report["dropped"]:
         print(f"         unlisted fields dropped: {report['dropped']}")
+    if vline:
+        print(vline)
     if show:
         print(json.dumps(output, indent=1))
     return 3 if findings else 0

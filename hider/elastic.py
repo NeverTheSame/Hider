@@ -59,7 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import entities, jsonscrub, localcfg, pipeline, pseudonym
+from . import entities, jsonscrub, localcfg, paths, pipeline, pseudonym
 
 ENV = "HIDER_ELASTIC"
 EXAMPLE = Path(__file__).resolve().parent.parent / "templates" / "elastic.example.json"
@@ -93,6 +93,57 @@ DEFAULT_MAX_PHRASES = 8
 MAX_PHRASES_CEILING = 16
 DEFAULT_POLL_TIMEOUT_S = 120
 MAX_POLL_TIMEOUT_S = 600
+#: The name vocabulary (``EsScrubber.vocabulary_request``): how far back it
+#: reads, how many distinct values one field may return before the case is
+#: refused rather than run on a partial list, and how often it is fetched
+#: again so a name first logged mid-case is in it within ten minutes.
+DEFAULT_VOCABULARY_DAYS = 30
+MAX_VOCABULARY_DAYS = 400
+DEFAULT_VOCABULARY_MAX = 10_000
+MAX_VOCABULARY_MAX = 65_536
+VOCABULARY_REFRESH_S = 600.0
+VOCABULARY_AGG = "hider_vocabulary"
+#: A field at or above this share of its cap is reported as near it.
+VOCABULARY_NEAR_CAP = 0.8
+#: Identifier types a site may not read as a vocabulary, and why: one value
+#: per person, mailbox, object or machine (tens of thousands, and a terms
+#: aggregation over them is the expensive kind), numbers (a vocabulary of
+#: numbers would erase counts and sizes from every message), and types tier 1
+#: already finds by shape in any text.
+NO_VOCABULARY_TYPES: dict[str, str] = {
+    **dict.fromkeys(("UPN_EMAIL", "EMAIL", "PERSON_NAME", "USER_NAME", "ACCOUNT_NAME"),
+                    "one value per user account"),
+    **dict.fromkeys(("GUID", "TENANT_ID", "SESSION_GUID", "OBJECT_GUID", "DOC_ID", "ITEM_ID"),
+                    "one value per object; tier 1 finds ids by shape"),
+    **dict.fromkeys(("IPV4", "IPV6", "MAC_ADDRESS", "HOSTNAME_FQDN", "SERVER_NAME",
+                     "INSTANCE_NAME"), "one value per machine; shaped, found by tier 1 or a site shape"),
+    **dict.fromkeys(("TENANT_SIZE", "CLOUD_ACCOUNT"), "a number: it would erase counts from text"),
+}
+#: One-word names that are ordinary words in log text. A one-word name is
+#: matched as a word anywhere in a message, so a resource called "Archive"
+#: would hide "archive" from every line. These are never vocabulary; their
+#: own field still gets its label. A fixed list on purpose, not the system
+#: dictionary: what is hidden must not depend on the machine it runs on.
+ORDINARY_NAME_WORDS: frozenset[str] = frozenset({
+    "archive", "archives", "backup", "backups", "default", "defaults", "primary", "secondary",
+    "main", "master", "test", "tests", "testing", "dev", "development", "prod", "production",
+    "staging", "stage", "demo", "sandbox", "legacy", "temp", "tmp", "shared", "public",
+    "private", "general", "common", "global", "local", "internal", "external", "data",
+    "files", "file", "documents", "document", "reports", "report", "mail", "mailbox",
+    "mailboxes", "inbox", "sites", "site", "teams", "team", "users", "user", "admin",
+    "admins", "finance", "legal", "sales", "marketing", "support", "operations", "security",
+    "compliance", "audit", "records", "projects", "project", "exports", "export", "imports",
+    "import", "logs", "log", "system", "service", "services", "server", "servers", "cloud",
+    "storage", "vault", "store", "repository", "library", "home", "office", "retention",
+    "hold", "policy", "policies", "daily", "weekly", "monthly", "nightly", "hourly", "full",
+    "incremental", "delta", "sync", "job", "jobs", "task", "tasks", "queue", "worker",
+    "workers", "agent", "agents", "engine", "cache", "index", "database", "network", "quota",
+    "limit", "tenant", "tenants", "resource", "resources", "new", "old", "copy", "final",
+    "draft", "current", "latest", "standard", "basic", "premium", "trial", "other", "misc",
+    "all", "everyone", "group", "groups", "contacts", "calendar", "notes", "tasks", "onedrive",
+    "sharepoint", "exchange", "outlook", "teams", "graph", "portal", "intranet", "extranet",
+    *(w for w in paths.STRUCTURAL if " " not in w),
+})
 #: Elasticsearch names a data stream's backing indices
 #: ``.ds-<stream>-<yyyy.MM.dd>-<generation>``, and a hit names the backing
 #: index, never the stream the query targeted. The suffix is fixed, so the
@@ -177,6 +228,19 @@ class ElasticConfig:
     profile_dir: str = ""
     poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S
     max_phrases: int = DEFAULT_MAX_PHRASES
+    #: identifier fields read as a vocabulary; None: the site map did not
+    #: say, so every non-glob JOB_NAME field (the behaviour before the list)
+    vocabulary_fields: tuple[str, ...] | None = None
+    vocabulary_days: int = DEFAULT_VOCABULARY_DAYS
+    vocabulary_max: int = DEFAULT_VOCABULARY_MAX
+
+    @property
+    def vocabulary_rules(self) -> tuple["FieldRule", ...]:
+        if self.vocabulary_fields is None:
+            return tuple(r for r in self.fields
+                         if r.kind == "identifier" and r.type == "JOB_NAME" and not r.is_glob)
+        by = {r.pattern: r for r in self.fields}
+        return tuple(by[f] for f in self.vocabulary_fields)
 
     def cluster(self, name: str) -> Cluster | None:
         for c in self.clusters:
@@ -324,12 +388,50 @@ def _parse_clusters(raw: Any, source: str) -> tuple[Cluster, ...]:
     return tuple(out)
 
 
+def _parse_vocabulary(raw: Any, rules: tuple[FieldRule, ...], source: str) -> dict:
+    """``"vocabulary": {"fields": [...], "days": 30, "max": 10000}``, all optional.
+
+    Each field must be a listed, non-glob identifier without a shape, of a
+    type a vocabulary may hold (:data:`NO_VOCABULARY_TYPES` says which may
+    not, and why). Absent: job names only."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or set(raw) - {"fields", "days", "max", "_comment"}:
+        raise ConfigError(f"{source}: vocabulary must be an object with fields, days, max")
+    out: dict[str, Any] = {}
+    for key, default, ceiling in (("days", DEFAULT_VOCABULARY_DAYS, MAX_VOCABULARY_DAYS),
+                                  ("max", DEFAULT_VOCABULARY_MAX, MAX_VOCABULARY_MAX)):
+        v = raw.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= ceiling:
+            raise ConfigError(f"{source}: vocabulary.{key} must be an integer, 1..{ceiling}")
+        out[f"vocabulary_{key}"] = v
+    if "fields" in raw:
+        fields = raw["fields"]
+        if not isinstance(fields, list) or not all(isinstance(f, str) for f in fields) \
+                or len(set(fields)) != len(fields):
+            raise ConfigError(f"{source}: vocabulary.fields must list distinct field names")
+        by = {r.pattern: r for r in rules}
+        for f in fields:
+            r = by.get(f)
+            if r is None or r.kind != "identifier" or r.is_glob:
+                raise ConfigError(f"{source}: vocabulary field {f} must be a listed identifier "
+                                  "field, not a glob")
+            if r.shape is not None:
+                raise ConfigError(f"{source}: vocabulary field {f} has a shape; the shape "
+                                  "already finds its values in text")
+            why = NO_VOCABULARY_TYPES.get(r.type)
+            if why:
+                raise ConfigError(f"{source}: vocabulary field {f} is {r.type}: {why}")
+        out["vocabulary_fields"] = tuple(fields)
+    return out
+
+
 def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"{source}: top level must be an object")
     allowed = {"_comment", "indices", "fields", "time_field", "max_hits", "max_buckets",
                "max_text_chars", "clusters", "profile_dir", "poll_timeout_s",
-               "max_phrases"}
+               "max_phrases", "vocabulary"}
     unknown = set(raw) - allowed
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
@@ -386,7 +488,8 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
         if owner != r.type:
             raise ConfigError(f"{source}: identifier type {r.type!r} would label as "
                               f"<{prefix}-NN>, which {owner!r} already uses")
-    return cfg
+    # last: the fields it names are checked against everything above
+    return dataclasses.replace(cfg, **_parse_vocabulary(raw.get("vocabulary"), rules, source))
 
 
 def load(path: str | Path) -> ElasticConfig:
@@ -548,6 +651,13 @@ class EsScrubber(jsonscrub.JsonScrubber):
         #: sensitive and the word "job" in text means nothing special
         self._job_rule = next((r for r in config.fields
                                if r.kind == "identifier" and r.type == "JOB_NAME"), None)
+        #: the fields read as a vocabulary, when each cluster's was last
+        #: read, and the last read's counts (values per field, skipped by
+        #: reason): counts only, for the log and the site's view of its caps
+        self._vocab_rules = list(config.vocabulary_rules)
+        self._vocabulary_at: dict[str, float] = {}
+        self.vocabulary_counts: dict[str, int] = {}
+        self.vocabulary_skipped: dict[str, int] = {}
         self._meta = {k: _parse_rule(k, v, "meta") for k, v in META_RULES.items()}
         for t in self.terms:
             if not (t.endswith("*") and len(t) > 2):
@@ -555,7 +665,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
 
     # -- labels ------------------------------------------------------------
 
-    def label_for(self, rule: FieldRule, value: str) -> str:
+    def label_for(self, rule: FieldRule, value: str, *, parts: bool = True) -> str:
         """The stable label for a value seen under an identifier rule."""
         n = jsonscrub._norm(value)
         if n in self.known:
@@ -576,7 +686,8 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 return label
         label = self._label(rule.type, value)
         self.types.setdefault(label, pseudonym._canonical_type(rule.type, value))
-        self._register_parts(pseudonym._canonical_type(rule.type, value), value, label)
+        if parts:
+            self._register_parts(pseudonym._canonical_type(rule.type, value), value, label)
         return label
 
     def seed(self, value: str, etype: str = "ORG_NAME") -> str:
@@ -618,6 +729,126 @@ class EsScrubber(jsonscrub.JsonScrubber):
                     continue  # "job Failed", "Job Running": an outcome, not a name
                 self.label_for(self._job_rule, m.group(1))
         return super()._scrub_text(text, shaped_only=shaped_only)
+
+    # -- the name vocabulary ------------------------------------------------
+    #
+    # A customer name in free text with nothing that marks it as one ("Tenant
+    # Thornbury Estates exceeded its quota", "Harbour Nightly finished") has
+    # no shape a rule could read, and its own field is usually on another
+    # document than the message, so harvesting a page cannot see it on a fresh
+    # case's first call. The cluster can: before the first page of a case on
+    # a cluster, and again every VOCABULARY_REFRESH_S, the bridge sends one
+    # fixed request, a terms aggregation per field the site map lists under
+    # vocabulary.fields, and every value in the reply becomes a known value
+    # under that field's own rule, so it gets the label it gets as a field
+    # value. The sweep then labels the whole name wherever it appears. The
+    # names never reach Claude, and the log holds counts only.
+
+    def vocabulary_due(self, cluster: str, now: float | None = None) -> bool:
+        if not self._vocab_rules:
+            return False
+        at = self._vocabulary_at.get(cluster)
+        t = time.monotonic() if now is None else now
+        return at is None or t - at >= VOCABULARY_REFRESH_S
+
+    def vocabulary_request(self) -> dict:
+        """The one fixed request: no input from Claude, no value in it."""
+        size = self.config.vocabulary_max
+        # ignore_unavailable: a configured pattern one cluster does not have
+        # (no traces in EMEA) reads as no names, not as a failed case
+        return {"params": {"index": ",".join(self.config.indices), "ignore_unavailable": True,
+                           "body": {
+            "size": 0, "track_total_hits": False,
+            "query": {"bool": {"filter": [{"range": {self.config.time_field: {
+                "gte": f"now-{self.config.vocabulary_days}d"}}}]}},
+            "aggs": {f"{VOCABULARY_AGG}_{i}": {"terms": {"field": r.pattern, "size": size}}
+                     for i, r in enumerate(self._vocab_rules)},
+        }}}
+
+    @staticmethod
+    def vocabulary_skip(value: str) -> str | None:
+        """Why a value is not made vocabulary, or None. The reasons are the
+        readability rules: a value matched as a word in every message must
+        not be one that ordinary text, a log level or an outcome uses."""
+        v = value.strip()
+        if not v:
+            return "empty"
+        words = v.split()
+        if all(pipeline.is_log_word(w) for w in words):
+            return "log_word"
+        if jsonscrub._norm(v) in jsonscrub._STOPWORDS:
+            return "stopword"
+        if not any(c.isalpha() for c in v):
+            return "no_letters"
+        if len(words) == 1:
+            if len(v) < 4:
+                return "short"
+            if v.casefold().strip(".,;:()") in ORDINARY_NAME_WORDS:
+                return "ordinary_word"
+        return None
+
+    def learn_vocabulary(self, cluster: str, raw: Any, now: float | None = None) -> dict[str, int]:
+        """Make every name in a vocabulary reply a known value.
+
+        Fails closed: an error, a partial or timed-out reply, a missing
+        aggregation, or a field at ``vocabulary.max`` values is a refusal, so
+        no page is shown on a vocabulary that may be incomplete. Returns the
+        values each field returned (what its cap is measured against)."""
+        klass = error_class(raw) if isinstance(raw, dict) else None
+        if klass is not None:
+            raise Refused("upstream_error", f"upstream error: {klass}")
+        if not isinstance(raw, dict) or raw.get("isRunning") is True or raw.get("isPartial") is True:
+            raise Refused("vocabulary", "response withheld: the name vocabulary could not be "
+                                        "read from the cluster")
+        body = raw.get("rawResponse", raw)
+        aggs = body.get("aggregations") if isinstance(body, dict) else None
+        if not isinstance(aggs, dict) or body.get("timed_out") is True:
+            raise Refused("vocabulary", "response withheld: the name vocabulary reply was "
+                                        "incomplete")
+        counts: dict[str, int] = {}
+        skipped: dict[str, int] = {}
+        learnt: list[tuple[FieldRule, str]] = []
+        for i, rule in enumerate(self._vocab_rules):
+            agg = aggs.get(f"{VOCABULARY_AGG}_{i}")
+            buckets = agg.get("buckets") if isinstance(agg, dict) else None
+            if not isinstance(buckets, list):
+                raise Refused("vocabulary", "response withheld: the name vocabulary reply was "
+                                            "incomplete")
+            # fewer buckets than asked for means every distinct value came
+            # back; sum_other_doc_count is not the test, since over many
+            # shards it is nonzero even then (undercounted top buckets)
+            if len(buckets) >= self.config.vocabulary_max:
+                raise Refused("vocabulary", (
+                    f"response withheld: {rule.pattern} has at least {len(buckets)} distinct "
+                    f"values in the last {self.config.vocabulary_days} days, the cap is "
+                    f"vocabulary.max ({self.config.vocabulary_max}); raise it or shorten "
+                    "vocabulary.days in the site map"))
+            counts[rule.pattern] = len(buckets)
+            for b in buckets:
+                key = b.get("key") if isinstance(b, dict) else None
+                why = self.vocabulary_skip(key) if isinstance(key, str) else "empty"
+                if why:
+                    skipped[why] = skipped.get(why, 0) + 1
+                else:
+                    learnt.append((rule, key))
+        # all fields checked before anything is learnt: a refusal leaves no half
+        for rule, key in learnt:
+            # "Archive AG" is vocabulary, but its core "Archive" would be
+            # registered on its own and hide the word everywhere: the core is
+            # held to the same readability rules as a name
+            core = jsonscrub._LEGAL_SUFFIX.sub("", key.strip())
+            self.label_for(rule, key, parts=core == key.strip() or not self.vocabulary_skip(core))
+        self._vocabulary_at[cluster] = time.monotonic() if now is None else now
+        self.vocabulary_counts, self.vocabulary_skipped = counts, skipped
+        return counts
+
+    def vocabulary_report(self) -> dict:
+        """Counts only: per field, values returned against the cap."""
+        cap = self.config.vocabulary_max
+        return {"fields": dict(self.vocabulary_counts), "max": cap,
+                "near_cap": sorted(f for f, n in self.vocabulary_counts.items()
+                                   if n >= VOCABULARY_NEAR_CAP * cap),
+                "skipped": dict(self.vocabulary_skipped)}
 
     # -- the response ------------------------------------------------------
 

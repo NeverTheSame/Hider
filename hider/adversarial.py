@@ -735,12 +735,33 @@ CASES: tuple[Case, ...] = (
         "A folder path ending in prose that later names a source file",
         r"[21.08.2026 09:02:53.300] <2f> Info [Restore] Restore to C:\Exports\<<WINDOWS_USER_PATH|Cormorant Quay>>"
         r" completed, see Program.cs",
+        expect_tier1=True,
+        owner="was a declared miss: the name reader ran from the folder to 'Program.cs' "
+              "and a path to a source file stays readable whole, so the folder did too. "
+              "Closed by reading on to a source or binary extension only over words that "
+              "can be part of a program's name (title-case or digits, no sentence "
+              "punctuation); anything else is prose and the path ends at the folder.",
+    ),
+    Case(
+        "path-folder-then-binary-in-prose",
+        "A folder path ending in prose that later names a program binary",
+        r"[21.08.2026 09:02:53.400] <2f> Info [Copy] Copied D:\Shares\<<WINDOWS_USER_PATH|Gannet Moor Trust>>"
+        r" and then loaded Agent.Core.dll",
+        expect_tier1=True,
+        owner="the binary twin of path-folder-then-source-file-in-prose: the same reach "
+              "kept the folder readable as part of an install path.",
+    ),
+    Case(
+        "path-folder-then-source-file-after-title-case-words",
+        "A folder path followed only by capitalised words and then a source file",
+        r"[21.08.2026 09:02:53.500] <2f> Info [Restore] Restore to C:\Exports\<<WINDOWS_USER_PATH|Cormorant Quay>>"
+        r" Done See Program.cs",
         expect_tier1=False,
-        owner="accepted tier 1 miss, found while fixing the file-name shapes and older than "
-              "them: the name reader runs from the folder to 'Program.cs', and a path to a "
-              "source file stays readable whole, so the folder does too. Narrowing the "
-              "source-file fence to one-word names would label spaced application binaries "
-              "(D:\\Apps\\Backup Agent\\Agent Host.exe), which stay readable by decision.",
+        owner="accepted tier 1 miss, the remainder of path-folder-then-source-file-in-prose: "
+              "a program's name with spaces is title-case words ('Agent Host Service.exe'), "
+              "so when every word between the folder and the source file is capitalised "
+              "nothing tells the prose from the name and the path stays readable whole. "
+              "Labelling it would label every spaced program name outside a system root.",
     ),
     Case(
         "path-rootless-relative",

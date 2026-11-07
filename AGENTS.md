@@ -189,7 +189,7 @@ Listed with owners in the README's Limitations section and in
   classes live in `hider/paths.py` and nowhere else; a site adds structure
   through `path_structure`, never in the repo. The generated corpus has
   almost no paths (the rule changes zero generated lines), so the rule is
-  measured by the 23 caught `path-*` cases and by `adversarial.PATH_LOOKALIKES`, a
+  measured by the 25 caught `path-*` cases and by `adversarial.PATH_LOOKALIKES`, a
   fixed clean unit outside the RNG stream that `eval` reports as its own
   line. Keep new lookalikes there, not in `templates/`. A `DOMAIN_LOGON`
   match inside a path span is suppressed (`BOARD\BUDGET` is two folders).
@@ -211,9 +211,13 @@ Listed with owners in the README's Limitations section and in
   - an unquoted lower-case last folder with spaces, and an unquoted
     extensionless file name followed by prose (the same miss);
   - an unquoted file name of more than sixteen words;
-  - a folder path ending in prose that later names a source file: the
-    source-file fence keeps the whole path readable (older than the
-    file-name reader; narrowing the fence would label spaced binaries);
+  - a folder path followed only by capitalised words and then a source
+    file: indistinguishable from a spaced program name, so readable whole.
+    `_file_end` reaches a source or binary extension only across
+    program-name words (title-case or digits, no sentence punctuation);
+    with prose in between the path ends at the folder, at the declared
+    cost of labelling a lower-case spaced program name outside a system
+    root (`test_paths.py`);
   - folders under a system root;
   - folders in source or binary paths;
   - customer folders in a Windows profile tail, which `windows_user_path`
@@ -326,7 +330,27 @@ Listed with owners in the README's Limitations section and in
   document) is closed by `elastic._JOB_REF`: "job <Title Case run>" in a
   text field is labelled JOB_NAME when the site map declares that type, at
   the declared cost of hiding any capitalised run right after the word
-  "job". `es_schema` and the esmcp instructions also tell Claude that keep
+  "job". A customer name with no marker ("Harbour Nightly finished",
+  "Tenant Thornbury Estates exceeded its quota") is closed by the case's
+  **name vocabulary**: `esbridge.Bridge` sends one fixed request, a terms
+  aggregation per field in the site map's `vocabulary.fields` (default: the
+  non-glob JOB_NAME fields), before a case's first page per cluster and
+  every `VOCABULARY_REFRESH_S` after (`EsScrubber.vocabulary_request` /
+  `learn_vocabulary`); every value becomes a known value under its field's
+  rule. Fields of a type in `elastic.NO_VOCABULARY_TYPES` (accounts, ids,
+  machines, numbers), shaped fields and globs are refused at load. Values
+  that are log words, stopwords, letterless, one word under four
+  characters or one word on `elastic.ORDINARY_NAME_WORDS` are skipped (a
+  fixed list on purpose, not the system dictionary). It fails closed
+  (`vocabulary`, learning nothing from a refused reply), logs counts per
+  field against the cap (`vocabulary_report`, also `es-smoke`'s `VOCAB`
+  line, `NEAR CAP` at 80%), and is measured by `eseval.UNMARKED_JOBS` and
+  `eseval.UNMARKED_NAMES` (fixed documents appended after the RNG stream),
+  the `fresh_case_no_leaks` / `mcp_fresh_case_shown` gates, and the
+  word-by-word check `eseval.name_part_leaks`, since a half-hidden name
+  passes the whole-value one. Anything that scrubs pages outside the
+  bridge (es-eval's `Session`, tests) must learn the vocabulary first:
+  `eseval.learn_vocabulary`. `es_schema` and the esmcp instructions also tell Claude that keep
   fields hold spellings as logged (err/Error/ERROR): aggregate a keep
   field's values before an exact filter, then filter with `in` across the
   spellings; values are never normalised. A case saved before the log-vocabulary trim

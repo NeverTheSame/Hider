@@ -1158,9 +1158,18 @@ class CustomerPathRecognizer(LocalRecognizer):
         "Alpine Trust: 09-16-22 with staff IDs.xlsx" is one name. It stops at
         a line break, a tab, a separator or a quote, which no unquoted name
         crosses. When it errs it errs long: prose between a folder path and a
-        file mentioned later on the line is hidden with the name."""
+        file mentioned later on the line is hidden with the name.
+
+        Except before a source or binary extension: a path to one stays
+        readable whole, so reaching one across prose would keep the folder
+        before it readable too ("C:\\Exports\\Cormorant Quay completed, see
+        Program.cs"). Such a name is read across only words a program's name
+        has: title-case or digits, no sentence punctuation after them
+        ("Agent Host Service.exe"). Anything else is prose, the search stops,
+        and the path ends at the folder."""
         pos = a
         unknown: int | None = None
+        program_like = True
         for i in range(_MAX_NAME_WORDS + 1):
             if i:
                 gap = self._GAP.match(text, pos, lim)
@@ -1172,10 +1181,16 @@ class CustomerPathRecognizer(LocalRecognizer):
                 break
             end = self._strip_tail(text, w.start(), w.end())
             word = text[w.start():end]
-            if self._ext(word):
+            ext = self._ext(word)
+            if ext:
+                if i and not program_like and (ext in paths.CODE_EXT or ext in paths.BINARY_EXT):
+                    return unknown
                 return end
             if self._unknown_ext(word):
                 unknown = end
+            head = word.lstrip("(")
+            if w.group(0)[-1:] in ",;:!?" or (i and not (head[:1].isupper() or head[:1].isdigit())):
+                program_like = False
             pos = w.end()
         return unknown
 

@@ -139,7 +139,7 @@ active — see below) on a 5,121 line, 711,858 character synthetic bundle with
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
 | Path lookalikes changed (27 fixed system, source, API and version path lines) | 0 by tier 1; 1 with tier 2 on |
 | Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
-| Adversarial surprises across 83 hostile placements | 0 |
+| Adversarial surprises across 85 hostile placements | 0 |
 | Characters cleared before any paid or model tier is consulted | 39.6% |
 | Units degraded during the run | 0 |
 | Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 32 recognizers |
@@ -151,7 +151,7 @@ did. All of the drop is their nine declared misses (`path-*` and
 `bare-file-name` cases with `expect_tier1=False`). On the generated corpus
 alone the path rule changes no line: same recall, same spans, byte-identical
 output before and after the file-name change. That is also why the
-generated corpus cannot measure the rule; the 23 caught `path-*` cases and
+generated corpus cannot measure the rule; the 25 caught `path-*` cases and
 the 27 path lookalikes do. One lookalike still changes with tier 2 on: a prose
 "Shared Documents" with no separator around it, which tier 2 calls a person.
 That is the declared boundary of `pipeline.in_structural_path_segment`
@@ -563,9 +563,14 @@ reason blocks the prompt.
 **Measured.** `python -m hider es-eval` runs the grammar and scrubber
 offline, and then the same synthetic fixture through the MCP server: real
 HTTP to a bridge on a thread, a stub Kibana behind it. On the example map
-(600 documents, tier 2 on) the MCP section reports:
+(620 documents, tier 2 on) the MCP section reports:
 
 - 38 tool calls, 0 clean-traffic refusals, 12/12 label round trips;
+- a second, fresh case whose first ten calls are pages with a job,
+  tenant, resource or site named in free text with no marker (`Harbour
+  Nightly finished with warnings`, `Tenant Thornbury Estates exceeded its
+  quota`), the name's own field on another document: all ten shown, none
+  with the name or any word of it readable;
 - every one of the 38 oracle cases refused (33 by the grammar with the
   declared code, 5 raw-DSL shapes by the tool layer);
 - 13/13 hostile transport requests rejected, 0 of them reaching Kibana;
@@ -578,7 +583,20 @@ free-text status message on the first page of a fresh case, because the hit's
 own job-name field held a different job and nothing had harvested the
 referenced one - is closed by the job-reference rule (`Job <name> (...)` in a
 text field is labelled when the site map declares `JOB_NAME` an identifier).
-What that rule costs in readability is stated in Limitations.
+The same leak without the word "job" (`Harbour Nightly finished with
+warnings`) was not in the fixture, so the gate passed while it leaked: five
+such messages are in it now (`eseval.UNMARKED_JOBS`, appended outside the
+RNG stream), and the gate failed on them (`fresh_case_no_leaks` and
+`mcp_no_leaks`, 3 of 5 first pages leaking, the other 2 only half-hidden by
+tier 2) until the name vocabulary below closed it. The same shape for
+tenant, resource and site names (`eseval.UNMARKED_NAMES`, five more, each
+message on a document whose own fields hold a different tenant) failed
+too, and showed a blind spot in the gate: a name half-hidden by tier 2
+(`Tenant <Org-01> Estates`) passed the whole-value leak check. The fresh-case
+pages are now also checked word by word (`eseval.name_part_leaks`, counted
+in `fresh_case_no_leaks` and `mcp_no_leaks`): 3 of 10 failed before the
+vocabulary covered those fields, 0 after. What these rules cost in
+readability is stated in Limitations.
 
 ## Layout
 
@@ -594,7 +612,7 @@ What that rule costs in readability is stated in Limitations.
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 83 hand-built hostile placements, 27 path lookalikes that must stay readable, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/adversarial.py` | 85 hand-built hostile placements, 27 path lookalikes that must stay readable, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
 | `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |
@@ -699,6 +717,59 @@ recall will never be exactly 100%.
     so a capitalised component name there (`job Scheduler restarted`) gets a
     label too. Runs that are only log vocabulary (`Job Failed`) are left
     alone, and `es-eval`'s `mcp_no_leaks` gate now passes.
+  - *The name vocabulary, and what it costs.* A customer name with nothing
+    marking it in text (`Harbour Nightly finished with warnings`, `Tenant
+    Thornbury Estates exceeded its quota`, `Site Oak Creek Holdings failed
+    to sync`) has no shape a rule can read, and its own field is usually on
+    another document. Before a case's first page on a cluster, the bridge
+    reads every distinct value of the identifier fields the site map lists
+    under `vocabulary.fields` (the example: `job.name`, tenant name and full
+    name, resource name, site name) from the cluster itself: one fixed
+    request, a `terms` aggregation per field, over the configured indices
+    and the last `vocabulary.days` (30), at most `vocabulary.max` values per
+    field (10,000), with no value and no input from Claude in it. Every
+    value becomes a known value under its field's rule, so the whole name
+    is one label, the one its field gets. Without the key, job names only.
+    **Left out, refused at load (`NO_VOCABULARY_TYPES`):** user accounts
+    (`labels.principal_name`, one per user), ids (`labels.tenant_id`,
+    `job.id`, `job.session_id`, `job.object_id`; tier 1 finds GUIDs by
+    shape), machines (`agent.name`/`host.name` have a site shape that
+    already finds them in text, `host.ip`, `host.mac`,
+    `cloud.instance.name`), and numbers (`tenant.users_in_tenant`,
+    `cloud.account.id`: a number vocabulary would erase counts from text);
+    globs cannot be aggregated. **Requests:** one extra search per case per
+    cluster, whatever the number of fields, then one more every ten minutes
+    while the case is used; es-eval makes 11 for its 11 cases. **Caps, as
+    counts:** every read is logged with values per field against the cap
+    and skips by reason, never a value; `es-smoke` prints the same as a
+    `VOCAB` line, marks a field at 80% of its cap `NEAR CAP` before it
+    stops anything, and prints it under a refusal too. **Fails closed:** an
+    unreadable reply, or a field with `vocabulary.max` values, refuses the
+    page (`vocabulary`, naming the field and the cap; or `upstream_error`
+    with the class), and nothing from that reply is learnt; a configured
+    index a cluster lacks reads as no values (`ignore_unavailable`).
+    **Short and ordinary names:** a value made only of log words
+    (`Failed`, `Warning`), a stopword (`default`), a value with no letters
+    (`2026`), a one-word value shorter than four characters (`HR`, `Ops`)
+    and a one-word value on the fixed `ORDINARY_NAME_WORDS` list
+    (`Archive`, `Backup`, `Production`, `Exports`; the structural path words
+    are on it) are never vocabulary, and an organisation's core without
+    its legal suffix (`Archive` of `Archive AG`) is held to the same rules.
+    A fixed list, not the system dictionary, so what is hidden does not
+    depend on the machine. **What that leaves unprotected:** those names in
+    free text until a page shows them in their own field (the field itself
+    is always labelled). **Which messages lose readability:** every
+    occurrence of a vocabulary name, in any case, in every text field: a
+    one-word name off the list (`Kittiwake`, `Brackenvault`) hides that
+    word, and a multi-word name of ordinary words (`Legal Hold`, `Daily
+    Backup`) hides that exact phrase, though never its words alone. On the
+    es-eval fixture every word the vocabulary hid was part of a customer
+    name; no ordinary word and no log level or outcome changed.
+    `es_schema`'s label total grows by the number of names in the window,
+    which tells Claude how many tenants, resources and jobs exist. **Not
+    covered:** a name not logged in its field within the window, a name
+    only in a glob-matched field, and a name spelled differently in text
+    than in its field.
   - *Spellings are not normalised.* `log.level` on a real cluster holds
     `err`, `Error` and `ERROR` side by side; an exact filter on one spelling
     looks like absence. `es_schema` and the session instructions tell Claude
@@ -829,10 +900,14 @@ recall will never be exactly 100%.
   - *Declared misses, each an adversarial case.* An unquoted file name of
     more than sixteen words. An unquoted file name with no extension
     followed by prose (the same miss as the lower-case last folder below).
-    A folder path ending in prose that later names a source file
-    (`...\Cormorant Quay completed, see Program.cs`): the source-file fence
-    keeps the whole path readable, older than the file-name change, kept
-    because narrowing the fence would label spaced application binaries.
+    A folder path followed only by capitalised words and then a source
+    file (`...\Cormorant Quay Done See Program.cs`): a spaced program name
+    is exactly that shape (`Agent Host Service.exe`), so the path stays
+    readable whole. With any lower-case word or sentence punctuation in
+    between (`...\Cormorant Quay completed, see Program.cs`) the path now
+    ends at the folder, which is labelled; the cost is that a program name
+    with lower-case words (`D:\Apps\Backup Agent\Agent host service.exe`)
+    outside a system root is read as a customer folder path and labelled.
     A path with no root
     (`Harbor Ridge/Budget.docx`). A bare file name in prose. A lower-case
     last folder with spaces and no extension, followed by prose (only its

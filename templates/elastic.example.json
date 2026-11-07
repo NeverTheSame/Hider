@@ -17,6 +17,10 @@
     "poll_timeout_s is how long one async search may run (1..600, default 120).",
     "max_phrases caps distinct phrases per query, filters and aggregations together",
     "(0..16, default 8; 0 turns text queries off).",
+    "vocabulary.fields: identifier fields whose every value (last vocabulary.days days,",
+    "at most vocabulary.max per field) is read from the cluster before a case's first",
+    "page, so a name in text with nothing marking it is labelled. Name fields only:",
+    "never user accounts, ids, addresses or numbers (refused at load).",
     "Hits from a data stream name its backing index (.ds-<stream>-<date>-<gen>);",
     "list the stream pattern (logs-app-*), never the .ds- names.",
     "A malformed file is a startup error, never a silent skip."
@@ -35,6 +39,12 @@
   "max_text_chars": 20000,
   "poll_timeout_s": 120,
   "max_phrases": 8,
+  "vocabulary": {
+    "fields": ["job.name", "labels.tenant_name", "labels.tenant_full_name",
+               "labels.resource_name", "labels.site_name"],
+    "days": 30,
+    "max": 10000
+  },
   "fields": {
     "@timestamp": "keep",
     "data_stream.*": "keep",
@@ -73,6 +83,7 @@
     "labels.tenant_full_name": {"kind": "identifier", "type": "ORG_NAME"},
     "labels.tenant_id": {"kind": "identifier", "type": "TENANT_ID"},
     "labels.resource_name": {"kind": "identifier", "type": "RESOURCE_NAME"},
+    "labels.site_name": {"kind": "identifier", "type": "SITE_NAME"},
     "labels.principal_name": {"kind": "identifier", "type": "UPN_EMAIL"},
     "job.id": {"kind": "identifier", "type": "GUID"},
     "job.session_id": {"kind": "identifier", "type": "SESSION_GUID"},

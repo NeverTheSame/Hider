@@ -120,14 +120,14 @@ def test_declared_misses_stay_declared():
                    r"meeting about the new west wing extension and the parking area.docx to backup")
     assert _tier1().redact(r"Copied C:\Shares\Bramble Hill\Kestrel Row payroll final to backup").text \
         == r"Copied C:\Shares\<Folder-01>\<Folder-02> payroll final to backup"
-    src = r"Restore to C:\Exports\Cormorant Quay completed, see Program.cs"
+    src = r"Restore to C:\Exports\Cormorant Quay Done See Program.cs"
     assert t.redact(src).text == src
     gaps = {c.case_id: c for c in adversarial.CASES if c.case_id in {
         "path-rootless-relative", "path-lowercase-final-folder-in-prose",
         "path-customer-folder-under-system-root", "path-customer-folder-in-profile-tail",
         "path-repository-name-in-source-path", "bare-file-name-in-prose",
         "path-file-name-over-sixteen-words", "path-file-extensionless-in-prose",
-        "path-folder-then-source-file-in-prose"}}
+        "path-folder-then-source-file-after-title-case-words"}}
     assert len(gaps) == 9 and all(not c.expect_tier1 and c.owner for c in gaps.values())
 
 
@@ -351,3 +351,38 @@ def test_the_rule_never_touches_a_tier_1_span():
     line = r"Export failed for C:\Exports\Airplane Trust\Payroll Review.xlsx"
     out = _full().redact(line).text
     assert out == r"Export failed for C:\Exports\<Folder-01>\<File-01>.xlsx"
+
+
+# -- a folder path, prose, then a source file or a binary ---------------------
+
+
+@pytest.mark.parametrize("line,want", [
+    (r"Restore to C:\Exports\Cormorant Quay completed, see Program.cs",
+     r"Restore to C:\Exports\<Folder-01> completed, see Program.cs"),
+    (r"Restore to C:\Exports\Cormorant Quay completed see Program.cs",
+     r"Restore to C:\Exports\<Folder-01> completed see Program.cs"),
+    (r"Restore to C:\Exports\Cormorant Quay, see Program.cs",
+     r"Restore to C:\Exports\<Folder-01>, see Program.cs"),
+    (r"Copied D:\Shares\Gannet Moor Trust and then loaded Agent.Core.dll",
+     r"Copied D:\Shares\<Folder-01> and then loaded Agent.Core.dll"),
+])
+def test_prose_before_a_source_file_ends_the_path_at_the_folder(line, want):
+    assert _tier1().redact(line).text == want
+
+
+@pytest.mark.parametrize("line", [
+    r"started D:\Apps\Backup Agent\Agent Host Service.exe as svc",     # spaced program name
+    r"started C:\Program Files\Backup Agent\Agent host service.exe",   # under a system root
+    r"started D:\Apps\Backup Agent\agent host.exe as svc",             # nothing between
+    r"at Run() in D:\Repos\Harbor Ridge\src\Program.cs:line 12",       # a stack trace
+])
+def test_program_and_source_paths_with_spaces_stay_readable(line):
+    assert _tier1().redact(line).text == line
+
+
+def test_a_spaced_program_name_with_lower_case_words_outside_a_system_root_is_hidden():
+    """Declared over-redaction, the cost of the rule above: lower-case words
+    between the first word and a binary's extension read as prose, so the
+    path is a customer folder path. Under a system root it stays readable."""
+    assert _tier1().redact(r"started D:\Apps\Backup Agent\Agent host service.exe").text == \
+        r"started D:\Apps\<Folder-01>\<Folder-02> host service.exe"

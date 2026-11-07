@@ -275,6 +275,10 @@ def test_the_decision_log_names_the_tool_and_holds_no_values(bridge, fixture):
     c.tool("es_count", index="logs-*")
     rows = [json.loads(line) for line in
             (bridge.sessions / "logged" / "decisions.jsonl").read_text().splitlines()]
+    # the case's job-name vocabulary is logged before its first page: a count, no name
+    assert rows[0]["vocabulary"] == "names" and rows[0]["fields"]["job.name"] > 0 \
+        and "tool" not in rows[0]
+    rows = rows[1:]
     assert [r.get("tool") for r in rows] == ["es_count", "es_search", "es_count"]
     assert rows[0]["labels_used"] == [label] and rows[2]["refused"] == "bad_index"
     text = json.dumps(rows)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 
 import pytest
 
@@ -440,6 +441,7 @@ def test_with_tier2_the_fixture_pages_come_out_clean():
     fx = eseval.generate(docs=120)
     engine = eseval.StubEngine(fx, CFG.indices)
     s = _session("classifier")
+    eseval.learn_vocabulary(s, engine)  # what the bridge does before the first page
     body = {"size": 40, "query": {"match_all": {}}, "_source": {"includes": CFG.source_includes()}}
     for index in CFG.indices:
         raw = engine.search(index, body)
@@ -531,3 +533,243 @@ def test_a_job_named_only_in_free_text_is_labelled_on_a_fresh_case():
     for line in ("Scheduler tick: 3 jobs due, 2 running", "picked up job for the queue",
                  "job failed, see Retry policy", "Job Failed (timeout) on the worker"):
         assert s._scrub_text(line) == line
+
+
+# -- job names with no marker: the case's job-name vocabulary ------------------
+#
+# "Harbour Nightly finished with warnings": no "job" in front, so _JOB_REF
+# cannot see it, and the job's own job.name field is on another document, so
+# a fresh case's first page cannot harvest it. The bridge reads every job
+# name from the cluster before that page (EsScrubber.vocabulary_request).
+
+
+def _vocab_reply(*names: str, fields: int = 5, at: int = 0) -> dict:
+    """A vocabulary reply: ``names`` for field number ``at``, the others empty."""
+    aggs = {f"{elastic.VOCABULARY_AGG}_{i}": {
+        "buckets": [{"key": n, "doc_count": 1} for n in names] if i == at else [],
+        "sum_other_doc_count": 0, "doc_count_error_upper_bound": 0} for i in range(fields)}
+    return {"isPartial": False, "isRunning": False, "rawResponse": {
+        "took": 1, "timed_out": False, "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+        "aggregations": aggs}}
+
+
+def test_the_fixture_names_jobs_with_no_marker_on_documents_without_the_field():
+    """The shapes es-eval must see: a name with no "job" before it, in a
+    message whose document has no job field; its job.name is elsewhere."""
+    fx = eseval.generate()
+    for job, message, _ in eseval.UNMARKED_JOBS:
+        assert job in message and not re.search(r"(?i)\bjob\s+" + re.escape(job), message)
+        holders = [d for d in fx.docs if d.source.get("message") == message]
+        assert len(holders) == 1 and "job" not in holders[0].source
+        assert any(d.source.get("job", {}).get("name") == job for d in fx.docs)
+        assert fx.truth[job] == "JOB_NAME"
+
+
+@pytest.mark.parametrize("job,message,_phrase", eseval.UNMARKED_JOBS)
+def test_an_unmarked_job_name_is_one_label_on_a_fresh_cases_first_page(job, message, _phrase):
+    fx = eseval.generate()
+    engine = eseval.StubEngine(fx, CFG.indices)
+    bare = _session()
+    assert job in bare._scrub_text(message)  # why the vocabulary exists
+    s = _session()
+    assert eseval.learn_vocabulary(s, engine)["job.name"] >= len(eseval.UNMARKED_JOBS)
+    out = s._scrub_text(message)
+    label = s.known[job.casefold()]
+    assert out == message.replace(job, label) and job not in out
+    assert s.types[label] == "JOB_NAME"
+
+
+def test_the_vocabulary_request_is_fixed_and_carries_no_value():
+    s = _session()
+    q = s.vocabulary_request()
+    assert q["params"]["index"] == ",".join(CFG.indices) and q["params"]["ignore_unavailable"]
+    body = q["params"]["body"]
+    assert body["size"] == 0
+    assert body["query"] == {"bool": {"filter": [{"range": {"@timestamp": {"gte": "now-30d"}}}]}}
+    assert body["aggs"] == {f"{elastic.VOCABULARY_AGG}_{i}": {
+        "terms": {"field": f, "size": elastic.DEFAULT_VOCABULARY_MAX}} for i, f in enumerate(
+        ["job.name", "labels.tenant_name", "labels.tenant_full_name", "labels.resource_name",
+         "labels.site_name"])}
+    s.seed("Contoso Group")
+    assert "Contoso" not in json.dumps(s.vocabulary_request())
+
+
+@pytest.mark.parametrize("reply,code", [
+    ({"error": {"type": "search_phase_execution_exception", "reason": "x"}, "status": 500},
+     "upstream_error"),
+    ({**_vocab_reply("Harbour Nightly"), "isPartial": True}, "vocabulary"),
+    ({"isPartial": False, "isRunning": False,
+      "rawResponse": {"timed_out": False, "hits": {"hits": []}}}, "vocabulary"),
+    ("not an object", "vocabulary"),
+])
+def test_a_vocabulary_that_cannot_be_read_refuses(reply, code):
+    s = _session()
+    with pytest.raises(elastic.Refused) as e:
+        s.learn_vocabulary("c", reply, now=0.0)
+    assert e.value.code == code
+    assert s.vocabulary_due("c", now=1.0)  # still due: nothing was learnt
+
+
+def test_a_vocabulary_at_its_cap_refuses_rather_than_run_on_a_partial_list():
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"]["max"] = 2
+    s = elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none")
+    assert s.learn_vocabulary("c", _vocab_reply("Harbour Nightly"), now=0.0)["job.name"] == 1
+    assert s.vocabulary_report()["near_cap"] == []
+    s.learn_vocabulary("c", _vocab_reply("Thornbury Estates", at=1), now=700.0)
+    assert s.vocabulary_report() == {
+        "fields": {"job.name": 0, "labels.tenant_name": 1, "labels.tenant_full_name": 0,
+                   "labels.resource_name": 0, "labels.site_name": 0},
+        "max": 2, "near_cap": [], "skipped": {}}
+    with pytest.raises(elastic.Refused) as e:
+        s.learn_vocabulary("c", _vocab_reply("Oak Creek Holdings", "Fernhill Row", at=4),
+                           now=1400.0)
+    assert e.value.code == "vocabulary"
+    assert "labels.site_name has at least 2 distinct values" in e.value.message
+    assert "vocabulary.max (2)" in e.value.message and "Oak Creek" not in e.value.message
+    assert "Oak Creek Holdings" not in s.known and "oak creek holdings" not in s.known
+
+
+@pytest.mark.parametrize("key,value", [("max", 0), ("max", 70_000), ("days", 0), ("days", "30")])
+def test_vocabulary_settings_are_bounded(key, value):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"][key] = value
+    with pytest.raises(elastic.ConfigError, match=f"vocabulary.{key}"):
+        elastic.parse(raw, source="t")
+
+
+def test_log_words_and_stopwords_are_never_vocabulary():
+    """A job called "Failed" or "default" would erase that word from every
+    log level, outcome and namespace in the case."""
+    s = _session()
+    s.learn_vocabulary("c", _vocab_reply("Failed", "Warning", "default", "", "Harbour Nightly"),
+                       now=0.0)
+    assert s.vocabulary_report()["skipped"] == {"log_word": 2, "stopword": 1, "empty": 1}
+    assert s._scrub_text("Failed: default namespace, Warning raised") == \
+        "Failed: default namespace, Warning raised"
+
+
+def test_the_vocabulary_is_read_once_per_cluster_then_every_ten_minutes():
+    s = _session()
+    assert s.vocabulary_due("emea", now=0.0)
+    s.learn_vocabulary("emea", _vocab_reply("Harbour Nightly"), now=100.0)
+    assert not s.vocabulary_due("emea", now=100.0 + elastic.VOCABULARY_REFRESH_S - 1)
+    assert s.vocabulary_due("emea", now=100.0 + elastic.VOCABULARY_REFRESH_S)
+    assert s.vocabulary_due("amer", now=101.0)  # each cluster has its own jobs
+
+
+def test_without_a_job_name_field_there_is_no_vocabulary_request():
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["fields"] = {k: v for k, v in raw["fields"].items() if k != "job.name"}
+    del raw["vocabulary"]  # the default: job-name fields only, and there are none
+    s = elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none")
+    assert not s.vocabulary_due("c", now=0.0)
+    raw["vocabulary"] = {"fields": []}  # or a site that turns it off
+    assert not elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none").vocabulary_due("c")
+
+
+def test_the_vocabulary_leaves_ordinary_messages_and_levels_readable():
+    """Every clean message template, and the keep fields, come out the same
+    with the fixture's vocabulary learnt as without it."""
+    fx = eseval.generate()
+    engine = eseval.StubEngine(fx, CFG.indices)
+    with_vocab, without = _session(), _session()
+    eseval.learn_vocabulary(with_vocab, engine)
+    for d in fx.docs:
+        if d.clean:
+            m = d.source["message"]
+            assert with_vocab._scrub_text(m) == without._scrub_text(m) == m
+    for level in ("info", "warn", "error", "Error", "WARN", "Success", "Failed"):
+        assert with_vocab._scrub_text(level) == level
+
+
+# -- customer names with no marker: the vocabulary over the site's name fields --
+
+
+def test_the_fixture_names_customers_on_documents_whose_fields_hold_someone_else():
+    fx = eseval.generate()
+    for field_path, name, message, _ in eseval.UNMARKED_NAMES:
+        holders = [d for d in fx.docs if d.source.get("message") == message]
+        assert len(holders) == 1
+        flat = eseval.flatten(holders[0].source)
+        assert name not in flat.values()  # its own fields carry another tenant, never the name
+        assert any(eseval.flatten(d.source).get(field_path) == name for d in fx.docs)
+
+
+@pytest.mark.parametrize("tier2", ["none", "classifier"])
+@pytest.mark.parametrize("field_path,name,message,_phrase", eseval.UNMARKED_NAMES)
+def test_an_unmarked_customer_name_is_one_label_the_same_as_its_field_label(
+        field_path, name, message, _phrase, tier2):
+    fx = eseval.generate()
+    s = _session(tier2)
+    eseval.learn_vocabulary(s, eseval.StubEngine(fx, CFG.indices))
+    label = s.label_for(CFG.rule(field_path), name)
+    assert s._scrub_text(message) == message.replace(name, label)
+
+
+@pytest.mark.parametrize("field_path,code", [
+    ("labels.principal_name", "UPN_EMAIL: one value per user account"),
+    ("labels.tenant_id", "TENANT_ID: one value per object"),
+    ("job.id", "GUID: one value per object"),
+    ("host.ip", "IPV4: one value per machine"),
+    ("cloud.instance.name", "INSTANCE_NAME: one value per machine"),
+    ("tenant.users_in_tenant", "TENANT_SIZE: a number"),
+    ("cloud.account.id", "CLOUD_ACCOUNT: a number"),
+    ("agent.name", "has a shape"),
+    ("log.level", "must be a listed identifier"),
+    ("data_stream.*", "must be a listed identifier"),
+    ("labels.nowhere", "must be a listed identifier"),
+])
+def test_a_vocabulary_on_a_field_with_too_many_values_is_a_startup_error(field_path, code):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"]["fields"].append(field_path)
+    with pytest.raises(elastic.ConfigError, match=re.escape(code)):
+        elastic.parse(raw, source="t")
+
+
+@pytest.mark.parametrize("value,why", [
+    ("Archive", "ordinary_word"), ("Default", "stopword"), ("BACKUP", "ordinary_word"),
+    ("Production", "ordinary_word"), ("Exports", "ordinary_word"),   # a structural path word
+    ("HR", "short"), ("Ops", "short"), ("2026", "no_letters"), ("Error", "log_word"),
+    ("default", "stopword"),
+    ("Brackenvault", None), ("LegalHold2031", None), ("Kittiwake", None),
+    ("Legal Hold", None), ("Daily Backup", None),   # more than one word: the phrase is specific
+])
+def test_which_names_are_vocabulary(value, why):
+    assert elastic.EsScrubber.vocabulary_skip(value) == why
+
+
+def test_an_ordinary_word_name_leaves_the_word_readable_and_keeps_its_field_label():
+    """Declared: a resource called "Archive" is unprotected in free text
+    before a page shows it in its own field; the word stays readable."""
+    s = _session()
+    s.learn_vocabulary("c", _vocab_reply("Archive", "Default", "HR", "Brackenvault", at=3), now=0.0)
+    assert s.vocabulary_report()["skipped"] == {"ordinary_word": 1, "stopword": 1, "short": 1}
+    line = "Archive completed for the Default policy; HR export ok; Brackenvault at 91%"
+    out = s._scrub_text(line)
+    assert out.startswith("Archive completed for the Default policy; HR export ok; <Resource_Name-")
+    assert "Brackenvault" not in out
+
+
+def test_a_multi_word_name_of_ordinary_words_hides_that_phrase_and_nothing_else():
+    """The cost of protecting "Legal Hold" as a resource: the phrase, in any
+    case, is labelled in every message; its words alone are not."""
+    s = _session()
+    s.learn_vocabulary("c", _vocab_reply("Legal Hold", at=3), now=0.0)
+    out = s._scrub_text("legal hold applied; hold released; legal review pending")
+    assert out.endswith("applied; hold released; legal review pending") and out.startswith("<Resource_Name-")
+
+
+def test_an_organisations_core_is_held_to_the_same_rules():
+    """"Archive AG" is a tenant; its core "Archive" is an ordinary word, so
+    it is not registered on its own and "archive" stays readable."""
+    s = _session()
+    s.learn_vocabulary("c", _vocab_reply("Archive AG", "Thornbury Estates Ltd", at=2), now=0.0)
+    out = s._scrub_text("Archive AG quota; archive done; Thornbury Estates synced")
+    assert "Archive AG" not in out and "archive done" in out and "Thornbury" not in out
+
+
+def test_one_request_carries_every_vocabulary_field():
+    s = _session()
+    q = s.vocabulary_request()["params"]["body"]["aggs"]
+    assert len(q) == 5 and s.vocabulary_due("c", now=0.0)
