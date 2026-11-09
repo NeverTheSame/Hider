@@ -61,6 +61,12 @@ DEAD_TOKENS: dict[str, str] = {
     "slack_bot": _dead("xoxb-", "0" * 12, "-", "0" * 13, "-", "ExampleOnlyNotARealToken"),
     "slack_user": _dead("xoxp-", "0" * 12, "-", "0" * 13, "-", "ExampleOnlyNotARealToken"),
     "entra": _dead("Ab18Q~", "cDeEXAMPLEONLYnotarealsecret", "00000"),
+    # Stripe-style: the prefix carries an underscore rather than a hyphen,
+    # which is the whole of the miss. The body is the vendor's documented
+    # length, so the hygiene scanner would flag it and the fixture is the
+    # real shape; the text says what it is.
+    "stripe_live": _dead("sk_live_", "EXAMPLEONLYnotarealkey", "0" * 6),
+    "stripe_test": _dead("sk_test_", "EXAMPLEONLYnotarealkey", "0" * 6),
 }
 
 
@@ -285,6 +291,41 @@ CASES: tuple[Case, ...] = (
         "[21.08.2026 09:02:35.600] <2f> Debug [Http] Set-Cookie: auth_token=<<API_KEY|ExampleOnlyNotARealTokenValue000000>>; HttpOnly; Secure; SameSite=Lax",
         expect_tier1=True,
         owner="",
+    ),
+    # Three shapes a blind comparison against PasteGuard found missing
+    # (docs/pasteguard-comparison.md, P1). Each was readable or, worse,
+    # vaulted by tier 2 as an organisation name. The key name beside the
+    # value is the evidence, and it stays readable: the line still says what
+    # was removed. Invented values, short and plainly fake.
+    Case(
+        "vendor-key-underscore-prefix",
+        "Vendor key with an underscore after the prefix (sk_live_, sk_test_), not a hyphen",
+        "[21.08.2026 09:02:35.700] <2f> Error [Billing] charge declined with "
+        f"<<API_KEY|{DEAD_TOKENS['stripe_live']}>>, retried with "
+        f"<<API_KEY|{DEAD_TOKENS['stripe_test']}>>",
+        expect_tier1=True,
+        owner="the prefix rule was hyphen-only, so every Stripe-style key passed "
+              "tier 1 and reached tier 2, which vaulted it as an organisation.",
+    ),
+    Case(
+        "env-secret-assignment",
+        "A key name ending in _SECRET, assigned with = and with a colon",
+        "[21.08.2026 09:02:35.800] <2f> Debug [Cfg] APP_SECRET=<<API_KEY|987d7d7d7d7d23a>> and "
+        "JWT_SECRET: <<API_KEY|k3yEXAMPLEonly0012>> loaded from env",
+        expect_tier1=True,
+        owner="no rule read the key name, so the value was tier 2's to vault. "
+              "The name itself is the evidence: nothing harmless is written "
+              "to the right of APP_SECRET=.",
+    ),
+    Case(
+        "env-password-colon",
+        "A password assigned with a colon, the YAML spelling the connection-string rule misses",
+        "[21.08.2026 09:02:35.900] <2f> Debug [Cfg] settings.yaml has "
+        "db_password: <<API_KEY|PassW)1rd>> and ADMIN_PWD : <<API_KEY|Tr0ub4dorEx>>",
+        expect_tier1=True,
+        owner="connection_string needs an equals sign, so DB_PASSWORD=x was "
+              "covered and db_password: x was not. Quoted and spaced forms "
+              "are the same miss.",
     ),
     # Windows and Microsoft identifiers. All of these identify a customer, so
     # they are pseudonymised, not destroyed. The markers borrow the closest
@@ -862,6 +903,52 @@ PATH_LOOKALIKES: tuple[str, ...] = (
     "[21.08.2026 09:03:02.600] <2f> Info [Agent] installed under /opt/agent/12.3.1/bin: version 12.3.1.1139 ready",
     "[21.08.2026 09:03:02.700] <2f> Info [Api] GET /v1.0/sites/root/drives/items returned 200, see trace.json",
     "[21.08.2026 09:03:02.800] <2f> Error [Worker]    at Run() in D:\\a\\1\\s\\src\\Proxy\\SessionWorker.cs:line 214, retrying",
+)
+
+
+#: Credential lookalikes: lines that hold a credential *key name* and no
+#: credential. A key-name rule reads the name as its evidence, so every one
+#: of these is a chance to destroy something harmless - a policy word, a
+#: masked value, a count, a flag, prose about rotation. A fixed list for the
+#: same reason as ``PATH_LOOKALIKES``: adding to it never moves the
+#: generator's RNG stream, so the utility cassette stays valid.
+#: ``evaluate.run`` scores it as its own clean unit.
+#:
+#: Two lines here are deliberately *not* clean, and are listed as declared
+#: misses rather than quietly excluded: see ``CREDENTIAL_LOOKALIKE_MISSES``.
+CREDENTIAL_LOOKALIKES: tuple[str, ...] = (
+    # a key name with a non-secret on the right: a count, a flag, a policy
+    # word, a duration, a placeholder
+    "[21.08.2026 09:04:00.100] <2f> Info [Auth] client_secret_expires_at: 0, no rotation needed",
+    "[21.08.2026 09:04:00.200] <2f> Warning [Cfg] password: required, but none supplied",
+    "[21.08.2026 09:04:00.300] <2f> Info [Cfg] db_password: ********",
+    "[21.08.2026 09:04:00.400] <2f> Info [Ops] SECRET_KEY rotation scheduled for 22.08.2026",
+    "[21.08.2026 09:04:00.500] <2f> Info [Cfg] APP_SECRET=<redacted> by the agent",
+    "[21.08.2026 09:04:00.600] <2f> Info [Cfg] JWT_SECRET: null",
+    "[21.08.2026 09:04:00.700] <2f> Info [Cfg] password_policy: strict, min length 12",
+    "[21.08.2026 09:04:00.800] <2f> Info [Auth] SECRET_ROTATED=true after 90 days",
+    "[21.08.2026 09:04:00.900] <2f> Warning [Auth] password expired 3 days ago, prompt shown",
+    "[21.08.2026 09:04:01.000] <2f> Info [Cfg] ADMIN_PWD : not set",
+    "[21.08.2026 09:04:01.100] <2f> Info [Cfg] client_secret_expires_at=1790000000 epoch seconds",
+    "[21.08.2026 09:04:01.200] <2f> Error [Auth] password incorrect for the service account",
+    "[21.08.2026 09:04:01.300] <2f> Info [Cfg] vault_password_file: /etc/agent/vault-pass",
+    # the widened prefix rule must not reach a short token, a word that
+    # merely starts with the prefix, or a hyphenated identifier
+    "[21.08.2026 09:04:01.400] <2f> Info [Sdk] sk_live_short rejected, token too short",
+    "[21.08.2026 09:04:01.500] <2f> Info [Note] see sk_test_docs for the sandbox walkthrough",
+    "[21.08.2026 09:04:01.600] <2f> Info [Pkg] installed pk_helper 2.1.0 and ak_tools 0.9.4",
+    "[21.08.2026 09:04:01.700] <2f> Info [Build] artifact sk-build-00412 published",
+)
+
+#: Declared misses of the key-name rules, kept in the lookalike unit on
+#: purpose so the cost is counted rather than hidden. Each is a line where
+#: the value to the right of a credential key name cannot be told from a
+#: real secret without reading English, so the rule destroys it. Removing
+#: them from the unit would make the false-redaction figure look clean and
+#: tell the next reader nothing.
+CREDENTIAL_LOOKALIKE_MISSES: tuple[str, ...] = (
+    "[21.08.2026 09:04:02.100] <2f> Info [Cfg] db_password: unchanged since install",
+    "[21.08.2026 09:04:02.200] <2f> Info [Cfg] APP_SECRET=placeholder_value_here",
 )
 
 

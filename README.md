@@ -133,16 +133,17 @@ active — see below) on a 5,121 line, 711,858 character synthetic bundle with
 | | |
 |---|---|
 | Recall on shaped identifier types | 99.76% |
-| Same corpus, stock Presidio patterns only | 17.34% |
+| Same corpus, stock Presidio patterns only | 17.32% |
 | Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 99.65% |
 | Recall across all types | 99.75% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
 | Path lookalikes changed (27 fixed system, source, API and version path lines) | 0 by tier 1; 1 with tier 2 on |
+| Credential lookalikes changed (17 fixed lines holding a credential key name and no credential) | 0 |
 | Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
-| Adversarial surprises across 85 hostile placements | 0 |
-| Characters cleared before any paid or model tier is consulted | 39.6% |
+| Adversarial surprises across 88 hostile placements | 0 |
+| Characters cleared before any paid or model tier is consulted | 39.5% |
 | Units degraded during the run | 0 |
-| Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 32 recognizers |
+| Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 33 recognizers |
 | Tier 2 (classifier) throughput | ~0.6 milliseconds per line over the residue only |
 
 The shaped-recall figure dropped from 99.92% when the customer-path cases
@@ -612,7 +613,7 @@ readability is stated in Limitations.
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 85 hand-built hostile placements, 27 path lookalikes that must stay readable, 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/adversarial.py` | 88 hand-built hostile placements, 27 path lookalikes and 17 credential lookalikes that must stay readable (plus 2 credential lines destroyed on purpose, counted apart), 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
 | `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |
@@ -1032,6 +1033,39 @@ recall will never be exactly 100%.
   base64 run goes, which also catches public certificate bodies. Cookie names,
   cookie attributes and the PEM `BEGIN`/`END` markers are kept on purpose, so
   the line still shows what was removed.
+- **Three more shapes a blind comparison found, now destroyed by tier 1.**
+  Reading another tool's pattern set (`docs/pasteguard-comparison.md`)
+  turned up three credentials Hider let through: a vendor key whose prefix
+  carries an underscore rather than a hyphen (`sk_live_…`, which the
+  prefix rule's hyphen missed), a key name ending in `_SECRET` assigned
+  with `=` or `:` (`APP_SECRET=987d7d7d7d7d23a`), and a password assigned
+  with a colon (`db_password: PassW)1rd`, the YAML spelling — the
+  equals-sign form was already covered by the connection-string rule).
+  All three were readable or, worse, vaulted by tier 2 as organisation
+  names. The last two are `EnvCredentialRecognizer`, which reads the key
+  *name* as its evidence and reports only the value, so `db_password` and
+  the rest of the line survive and still say what was removed.
+  **What that costs, measured rather than asserted.** A rule triggered by
+  a key name gets a chance to destroy something harmless every time one
+  appears, so there is a second fixed clean unit beside the path
+  lookalikes — 17 lines of `client_secret_expires_at: 0`,
+  `password: required`, `db_password: ********`, `SECRET_KEY rotation
+  scheduled`, `SECRET_ROTATED=true`, `sk_live_short`, `password_policy:
+  strict` — and `hider eval` reports it on its own line: **0 of 17 lines
+  changed**, with the generated clean figure still 0.0000. Three guards do
+  that work: the key name must *end* at the credential word, the value
+  must have an alphanumeric and not be all digits (masks and counts), and
+  a short fixed list of config vocabulary (`null`, `required`, `strict`,
+  `redacted`, …) is never a secret. That list is the one place tier 1
+  reads English, and it stays short on purpose: every word added to it is
+  a password that then leaks.
+  **The declared misses, kept inside the unit so they are counted:**
+  `db_password: unchanged since install` and
+  `APP_SECRET=placeholder_value_here` are destroyed, because an ordinary
+  English word to the right of a credential key name cannot be told from a
+  secret without reading the sentence and the safe direction is to
+  destroy. Also missed: a secret shorter than six characters, and the tail
+  of a value containing a comma or semicolon.
 - **Windows and Microsoft identifiers are pseudonymised, with the well-known
   constants fenced off.** `DOMAIN\user` logons, domain and Azure AD SIDs,
   certificate thumbprints, `*.onmicrosoft.com` tenant domains in plain log

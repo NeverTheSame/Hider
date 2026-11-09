@@ -598,7 +598,12 @@ def test_an_unseeded_identifier_in_the_prompt_is_refused_by_type(value, etype, h
     out = _findings(f"what happened to {value} and {lab['org']}?", mapping)
     mine = [f for f in out if f"a {etype} value" in f]
     assert mine and hint in mine[0], out
-    assert len(out) == 1, out  # nothing else in it is a finding (".com" is not a word to refuse)
+    # nothing else in it is a finding (".com" is not a word to refuse). A
+    # credential may be claimed by two secret rules at once - password= is
+    # both a connection string and a key-name assignment - and both say
+    # "take it out", so the refusal is the same refusal twice.
+    others = [f for f in out if f not in mine]
+    assert all("credentials are destroyed" in f for f in others), out
     bare = value.split()[-1]
     assert all(bare not in f and "fabrikam" not in f.lower() for f in out)
 

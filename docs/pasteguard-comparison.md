@@ -94,7 +94,18 @@ credentials (value absent from the output and from `vault.entries`), and
 state any trade (`AGENTS.md` "Working rules", "Known gaps").
 
 **P1. Secret shapes** (`api-keys.ts` `sk[-_]`; `env-vars.ts` `ENV_SECRET`,
-`ENV_PASSWORD`). Effort S.
+`ENV_PASSWORD`). Effort S. **Done.** Built as written below, with three
+departures, each measured: the value floor is six characters rather than
+PasteGuard's eight (`Hunter6` is a real password, and most six-character
+config values that are not secrets are words on the stop list); the rule
+checks the value as well as the key name, because `password: required`
+would otherwise be destroyed; and the near-miss negatives went into a new
+fixed clean unit `adversarial.CREDENTIAL_LOOKALIKES` that `hider eval`
+scores, rather than into `tests/` alone, so the cost stays measured on
+every run. After: 88 adversarial cases, 0 surprises; 0 of 17 credential
+lookalikes changed; clean false redaction still 0.0000; recall unchanged
+at 99.75%. Two lines are destroyed on purpose and counted apart
+(`CREDENTIAL_LOOKALIKE_MISSES`).
 
 1. `hider/adversarial.py`: add `vendor-stripe-underscore` (`sk_live_` and
    `sk_test_` forms), `env-secret-assign` (`APP_SECRET=`, `JWT_SECRET:`),

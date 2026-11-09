@@ -98,6 +98,7 @@ SCANNER_PATTERNS = {
     "google api key": re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
     "slack token": re.compile(r"\bxox[abeprs]-\d{10,13}-\d{10,13}-[A-Za-z0-9]{24,34}\b"),
     "entra client secret": re.compile(r"\b[A-Za-z0-9_~.-]{3}8Q~[A-Za-z0-9_~.-]{31,34}\b"),
+    "stripe secret key": re.compile(r"\bsk_(?:live|test)_[0-9A-Za-z]{24,}\b"),
 }
 
 
@@ -136,6 +137,7 @@ def test_scanner_patterns_flag_the_runtime_fixtures():
         "aws_lowercased": "aws access key id",
         "google": "google api key", "slack_bot": "slack token", "slack_user": "slack token",
         "entra": "entra client secret",
+        "stripe_live": "stripe secret key", "stripe_test": "stripe secret key",
     }
     assert set(expected) == set(DEAD_TOKENS)
     for key, pattern in expected.items():

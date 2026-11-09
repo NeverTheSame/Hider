@@ -151,6 +151,38 @@ Listed with owners in the README's Limitations section and in
   the *pipeline* property, not just the recognizer: run `Pipeline.redact` and
   check the value is absent from both the output and `vault.entries`. A
   recognizer-level test passes while the vault still fills up.
+  Three more came from the PasteGuard comparison
+  (`docs/pasteguard-comparison.md`, P1) and are owned by tier 1 now: a
+  vendor key whose prefix carries an underscore (`sk_live_`; `api_key`'s
+  separator is a character class, and the 20-character floor is what keeps
+  `sk_live_short` out), a key name ending in `_SECRET` assigned with `=`
+  or `:`, and a password assigned with a colon (`db_password: …`, the YAML
+  spelling `connection_string` missed because it needs an equals sign).
+  The last two are `EnvCredentialRecognizer`, which like
+  `AwsSecretKeyRecognizer` reads the **key name as evidence and reports
+  only the value**, so the name and the prose around it stay readable. The
+  key name must *end* at the credential word, which is what keeps
+  `client_secret_expires_at:`, `password_policy:` and
+  `vault_password_file:` out.
+  **`_NON_SECRET_VALUES` is the one place tier 1 reads English** - a short
+  fixed list of config vocabulary (`null`, `required`, `strict`,
+  `redacted`, …), every entry a word that would be an indefensible
+  password and is a common config value - behind two structural tests (no
+  alphanumerics at all is a mask; all digits is a count) and a
+  six-character floor. Do not grow it into a dictionary: each word added
+  is a password that then leaks. Measured by
+  `adversarial.CREDENTIAL_LOOKALIKES`, a second fixed clean unit beside
+  `PATH_LOOKALIKES` (17 lines, 0 changed) that `eval` reports on its own
+  line; keep new lookalikes there, not in `templates/`.
+  **Two declared misses live inside that unit on purpose**
+  (`adversarial.CREDENTIAL_LOOKALIKE_MISSES`, counted apart and pinned by
+  a test): `db_password: unchanged since install` and
+  `APP_SECRET=placeholder_value_here` are destroyed, because an ordinary
+  English word to the right of a credential key name cannot be told from a
+  secret without reading the sentence, and the safe direction is to
+  destroy. Also declared: a secret shorter than six characters, and the
+  tail of a value containing a comma or semicolon, which the span stops
+  at.
 - Windows/Microsoft identifiers (`DOMAIN\user`, domain and Azure AD SIDs,
   cert thumbprints, `*.onmicrosoft.com`, support trackingIDs, formatted
   phones) are pseudonymised by tier 1. Their adversarial occurrences borrow

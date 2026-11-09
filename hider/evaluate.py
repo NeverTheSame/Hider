@@ -145,6 +145,14 @@ class Report:
     lookalike_lines: int = 0
     lookalike_lines_with_redaction: int = 0
     lookalike_false_spans: int = 0
+    #: adversarial.CREDENTIAL_LOOKALIKES: credential key names with no
+    #: credential beside them, which must come out unchanged, and
+    #: CREDENTIAL_LOOKALIKE_MISSES, which are destroyed on purpose
+    credential_lookalike_lines: int = 0
+    credential_lookalike_lines_with_redaction: int = 0
+    credential_lookalike_false_spans: int = 0
+    credential_lookalike_declared_misses: int = 0
+    credential_lookalike_misses_destroyed: int = 0
     unmatched_spans: int = 0
     total_spans: int = 0
     verbatim_survivors: list[dict] = field(default_factory=list)
@@ -286,6 +294,14 @@ class Report:
                 "path_lookalike_lines": self.lookalike_lines,
                 "path_lookalike_lines_with_redaction": self.lookalike_lines_with_redaction,
                 "path_lookalike_false_spans": self.lookalike_false_spans,
+                "credential_lookalike_lines": self.credential_lookalike_lines,
+                "credential_lookalike_lines_with_redaction":
+                    self.credential_lookalike_lines_with_redaction,
+                "credential_lookalike_false_spans": self.credential_lookalike_false_spans,
+                "credential_lookalike_declared_misses":
+                    self.credential_lookalike_declared_misses,
+                "credential_lookalike_misses_destroyed":
+                    self.credential_lookalike_misses_destroyed,
                 "unmatched_spans_overall": self.unmatched_spans,
                 "total_spans": self.total_spans,
             },
@@ -527,6 +543,20 @@ def run(
             if r.spans:
                 report.lookalike_lines_with_redaction += 1
                 report.lookalike_false_spans += len(r.spans)
+        # Credential lookalikes: the same idea for the key-name rules, which
+        # read a key name as evidence and so can destroy a policy word, a
+        # mask or a count. Its declared misses are counted apart, because a
+        # line that must be destroyed is not a false redaction.
+        for i, line in enumerate(adversarial.CREDENTIAL_LOOKALIKES):
+            r = pipe.redact(line, unit="Adversarial/credential-lookalikes.log", line_no=i)
+            report.credential_lookalike_lines += 1
+            if r.spans:
+                report.credential_lookalike_lines_with_redaction += 1
+                report.credential_lookalike_false_spans += len(r.spans)
+        for i, line in enumerate(adversarial.CREDENTIAL_LOOKALIKE_MISSES):
+            r = pipe.redact(line, unit="Adversarial/credential-lookalike-misses.log", line_no=i)
+            report.credential_lookalike_declared_misses += 1
+            report.credential_lookalike_misses_destroyed += int(bool(r.spans))
         report.injection_canaries = len(adversarial.INJECTION_CANARIES)
         report.cases = [
             CaseResult(

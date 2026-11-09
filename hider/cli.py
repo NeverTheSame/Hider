@@ -140,6 +140,13 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         print(f"path lookalikes   {full.lookalike_lines_with_redaction}/{full.lookalike_lines} "
               f"lines changed ({full.lookalike_false_spans} spans; system, source, API, "
               f"version paths)")
+    if full.credential_lookalike_lines:
+        print(f"cred lookalikes   {full.credential_lookalike_lines_with_redaction}/"
+              f"{full.credential_lookalike_lines} lines changed "
+              f"({full.credential_lookalike_false_spans} spans; key names beside a policy "
+              f"word, a mask, a count), plus "
+              f"{full.credential_lookalike_misses_destroyed}/"
+              f"{full.credential_lookalike_declared_misses} declared misses destroyed")
     print(f"survivors         {len(full.unexpected_survivors)} unexplained, "
           f"{len(full.verbatim_survivors) - len(full.unexpected_survivors)} known gap")
     print(f"adversarial       {len(full.surprises)} surprises of {len(full.cases)} cases")

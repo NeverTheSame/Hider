@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from hider import adversarial
 from hider import recognizers as R
 from hider.adversarial import DEAD_TOKENS as T
 
@@ -179,6 +180,15 @@ COOKIE_LINE = "[Http] Cookie: session_id=abc123exampleonlynotarealcookievalue000
 SET_COOKIE_LINE = ("[Http] Set-Cookie: auth_token=ExampleOnlyNotARealTokenValue000000; "
                    "HttpOnly; Secure; SameSite=Lax")
 PEM_BODY_LINE = "MIIEowIBAAKCAQEAxEXAMPLEONLYnotarealprivatekeymaterial0000000000"
+# The three shapes the PasteGuard comparison found missing: an underscore
+# after the vendor prefix, a *_SECRET assignment, and a colon-assigned
+# password. All invented, all short.
+STRIPE_LINE = f"[Billing] charge declined with {T['stripe_live']}, retrying"
+ENV_SECRET_EQ_LINE = "[Cfg] APP_SECRET=987d7d7d7d7d23a read from the environment"
+ENV_SECRET_COLON_LINE = "[Cfg] JWT_SECRET: k3yEXAMPLEonly0012 read from the environment"
+PASSWORD_COLON_LINE = "[Cfg] settings.yaml has db_password: PassW)1rd for the agent"
+PWD_COLON_LINE = "[Cfg] ADMIN_PWD : Tr0ub4dorEx accepted at startup"
+PASSWORD_QUOTED_LINE = '[Cfg] credentials.yml: db_password: "PassW)1rd" loaded'
 
 VAULTED_CASES = [
     ("url userinfo password", URL_USERINFO, "svcacct:Hunter2Example"),
@@ -188,6 +198,12 @@ VAULTED_CASES = [
     ("cookie value", COOKIE_LINE, "abc123exampleonlynotarealcookievalue0000"),
     ("set-cookie value", SET_COOKIE_LINE, "ExampleOnlyNotARealTokenValue000000"),
     ("pem private key body line", PEM_BODY_LINE, PEM_BODY_LINE),
+    ("vendor key with an underscore prefix", STRIPE_LINE, T["stripe_live"]),
+    ("_SECRET assigned with =", ENV_SECRET_EQ_LINE, "987d7d7d7d7d23a"),
+    ("_SECRET assigned with a colon", ENV_SECRET_COLON_LINE, "k3yEXAMPLEonly0012"),
+    ("password assigned with a colon", PASSWORD_COLON_LINE, "PassW)1rd"),
+    ("_PWD assigned with a spaced colon", PWD_COLON_LINE, "Tr0ub4dorEx"),
+    ("password in quotes", PASSWORD_QUOTED_LINE, "PassW)1rd"),
 ]
 
 
@@ -249,6 +265,63 @@ def test_cookie_attributes_survive_but_values_do_not():
     assert "auth_token" in out.text
     assert "HttpOnly" in out.text and "Secure" in out.text and "SameSite" in out.text
     assert "ExampleOnlyNotARealTokenValue000000" not in out.text
+
+
+@pytest.mark.parametrize("line,key", [
+    (ENV_SECRET_EQ_LINE, "APP_SECRET"),
+    (ENV_SECRET_COLON_LINE, "JWT_SECRET"),
+    (PASSWORD_COLON_LINE, "db_password"),
+    (PWD_COLON_LINE, "ADMIN_PWD"),
+])
+def test_the_credential_key_name_and_the_prose_around_it_survive(line, key):
+    """The key name is the rule's evidence, not its target: the line has to
+    keep saying what was removed."""
+    from hider import pipeline, pseudonym
+
+    out = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k")).redact(line).text
+    assert key in out
+    assert out.startswith("[Cfg] ") and out.rstrip().endswith(line.rsplit(" ", 1)[-1])
+
+
+@pytest.mark.parametrize("line", adversarial.CREDENTIAL_LOOKALIKES)
+def test_a_credential_key_name_with_no_credential_is_left_alone(line):
+    """The fixed clean unit the eval scores: a key name beside a policy
+    word, a mask, a count, a flag or prose must come out unchanged."""
+    from hider import pipeline, pseudonym
+
+    out = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k")).redact(line)
+    assert out.text == line, f"over-redacted: {out.text}"
+    assert not out.spans
+
+
+@pytest.mark.parametrize("line", adversarial.CREDENTIAL_LOOKALIKE_MISSES)
+def test_the_declared_misses_are_destroyed_on_purpose(line):
+    """Pinned as intent, not discovered as behaviour: an ordinary English
+    word to the right of a credential key name cannot be told from a secret
+    without reading the sentence, so it goes. Changing this is a decision."""
+    from hider import pipeline, pseudonym
+
+    out = pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k")).redact(line)
+    assert out.spans and "REDACTED" in out.text
+
+
+@pytest.mark.parametrize("line,why", [
+    ("[Sdk] sk_live_short rejected", "under the 20-character floor"),
+    ("[Cfg] client_secret_expires_at: 0", "the key name does not end at _SECRET"),
+    ("[Cfg] password_policy: strict", "the key name does not end at PASSWORD"),
+    ("[Cfg] vault_password_file: /etc/agent/vault-pass", "ends at _file, not PASSWORD"),
+    ("[Auth] SECRET_ROTATED=true after 90 days", "ends at _ROTATED"),
+    ("[Ops] SECRET_KEY rotation scheduled", "no assignment at all"),
+    ("[Cfg] db_password: ********", "a mask has no alphanumerics"),
+    ("[Cfg] APP_SECRET=<redacted>", "a bracketed placeholder"),
+    ("[Cfg] client_secret_expires_at=1790000000", "digits only, and the wrong key name"),
+    ("[Cfg] ADMIN_PWD : not set", "under the six-character floor"),
+])
+def test_near_misses_of_the_key_name_rules(line, why):
+    """One line per reason the rule says no, so a future widening has to
+    face each of them separately."""
+    assert R.EnvCredentialRecognizer().analyze(line, ["API_KEY"]) == [], why
+    assert not R.api_key().analyze(line, ["API_KEY"], None), why
 
 
 def test_pem_markers_survive_so_the_removal_is_visible():

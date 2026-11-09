@@ -276,7 +276,13 @@ def api_key() -> PatternRecognizer:
         supported_entity="API_KEY",
         name="ApiKeyRecognizer",
         patterns=[
-            Pattern(name="prefixed", regex=r"\b(?:sk|ak|vk|pk)-[A-Za-z0-9_-]{20,}\b", score=0.9),
+            # The separator is a character class because Stripe-style keys
+            # spell it with an underscore (sk_live_...), and a hyphen-only
+            # rule left every one of them to tier 2, which vaults them. The
+            # 20-character floor is what keeps sk_live_short and the word
+            # sk_test_docs out; it is measured by CREDENTIAL_LOOKALIKES.
+            Pattern(name="prefixed", regex=r"\b(?:sk|ak|vk|pk)[-_][A-Za-z0-9_-]{20,}\b",
+                    score=0.9),
         ],
         context=["key", "secret", "clientsecret", "apikey"],
     )
@@ -783,6 +789,104 @@ class CookieHeaderRecognizer(LocalRecognizer):
                 out.append(RecognizerResult(
                     entity_type=self.supported_entity, start=start,
                     end=start + len(value), score=0.9, analysis_explanation=None))
+        return out
+
+
+#: Values that are never a credential, whatever key name they sit under.
+#: A rule that reads a key name has to read the value too, or it destroys
+#: ``password: required`` and the line stops saying anything. This is the
+#: one place in tier 1 that reads English, so it is a short fixed list of
+#: config vocabulary - states, placeholders and policy words - and not a
+#: dictionary: every entry is a word that would be an indefensible password
+#: and is a common config value. Anything else to the right of a credential
+#: key name is destroyed, including words this list does not know
+#: (``adversarial.CREDENTIAL_LOOKALIKE_MISSES``).
+_NON_SECRET_VALUES: frozenset[str] = frozenset({
+    "null", "none", "nil", "nan", "undefined", "unset", "empty", "blank",
+    "true", "false", "yes", "no", "on", "off", "set", "unknown",
+    "required", "optional", "strict", "disabled", "enabled", "default",
+    "redacted", "hidden", "masked", "removed", "omitted", "sanitized",
+    "sanitised", "scrubbed", "present", "missing", "absent", "expired",
+    "rotated", "invalid", "incorrect", "correct", "ok", "error", "failed",
+    "success", "changeme", "todo", "tbd", "n/a", "na", "example",
+})
+#: Brackets a placeholder wears: ``<redacted>``, ``[REDACTED]``, ``(none)``,
+#: ``${APP_SECRET}``, ``{{ password }}``.
+_PLACEHOLDER_EDGES = "<>[](){}$ \t\"'"
+
+
+def _is_non_secret(value: str) -> bool:
+    """Is this the value half of a credential assignment that holds no
+    credential? Structure first, then the short word list."""
+    core = value.strip(_PLACEHOLDER_EDGES)
+    if not core:
+        return True
+    if not any(c.isalnum() for c in core):
+        return True                      # ********, ••••••, ------
+    if core.isdigit():
+        return True                      # an epoch, a count, 0
+    return core.casefold().strip(".,;:!?") in _NON_SECRET_VALUES
+
+
+class EnvCredentialRecognizer(LocalRecognizer):
+    """A credential named by its key, in the two spellings tier 1 missed.
+
+    ``*_SECRET=`` / ``*_SECRET:`` and ``*PASSWORD:`` / ``*_PWD:``. The
+    equals-sign password form was already covered by
+    :func:`connection_string`; the colon form, which is how every YAML file
+    on earth spells it, was not, and neither was any ``_SECRET`` key. Both
+    were left to tier 2, which labels a high-entropy run as an organisation
+    and writes it to the vault - a secret on disk under a reversible
+    mapping, worse than a miss.
+
+    Like :class:`AwsSecretKeyRecognizer`, the key name *is* the evidence and
+    only the value is reported, so the line still says what was removed.
+    The key name has to *end* at the credential word, which is what keeps
+    ``client_secret_expires_at:``, ``password_policy:`` and
+    ``vault_password_file:`` out; the value is then checked against
+    :func:`_is_non_secret`.
+    """
+
+    #: Six, not PasteGuard's eight: ``Hunter6`` is a real password and a
+    #: six-character config value that is not a secret is almost always one
+    #: of the words in _NON_SECRET_VALUES. A shorter secret is a declared
+    #: miss.
+    MIN_VALUE = 6
+
+    ASSIGNMENT = re.compile(
+        r"(?i)(?<![A-Za-z0-9_])"
+        r"(?:"
+        r"[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)*_SECRET"
+        r"|(?:[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)*[_-])?(?:PASSWORD|PWD)"
+        r")"
+        r"[ \t]*[:=][ \t]*"
+        r"(\"[^\"\n]{%d,}\"|'[^'\n]{%d,}'|[^\s\"',;]{%d,})" % (MIN_VALUE, MIN_VALUE, MIN_VALUE)
+    )
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["API_KEY"],
+            name="EnvCredentialRecognizer",
+            context=["secret", "password", "credential", "config", "env"],
+        )
+        self.supported_entity = "API_KEY"
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        out = []
+        for m in self.ASSIGNMENT.finditer(text):
+            start, end = m.span(1)
+            value = m.group(1)
+            if value[:1] in "\"'" and value[-1:] == value[:1]:
+                start, end, value = start + 1, end - 1, value[1:-1]
+            if len(value) < self.MIN_VALUE or _is_non_secret(value):
+                continue
+            out.append(RecognizerResult(entity_type=self.supported_entity, start=start,
+                                        end=end, score=0.9, analysis_explanation=None))
         return out
 
 
@@ -1477,6 +1581,7 @@ def custom() -> list[LocalRecognizer]:
         http_credential_header(),
         CookieHeaderRecognizer(),
         AwsSecretKeyRecognizer(),
+        EnvCredentialRecognizer(),
         PrivateKeyBlockRecognizer(),
         windows_user_path(),
         CustomerPathRecognizer(),
