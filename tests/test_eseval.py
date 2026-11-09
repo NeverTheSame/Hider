@@ -204,10 +204,13 @@ def test_the_build_pages_through_the_whole_catalogue_one_field_at_a_time(bulk):
     vocab, build = eseval.build_vocabulary(CFG, engine)
     counts = vocab.counts
     assert counts["job.name"] > 12_000
-    # one page per thousand names of the widest field, plus one page for
-    # each of the other four (they fit in one)
+    # One page per thousand names of the widest field, plus one page for
+    # each of the other four - but now per slice, and the catalogue is
+    # spread over several days, so the floor is the whole-catalogue count
+    # and the ceiling allows a page per field per slice.
     pages = -(-counts["job.name"] // elastic.VOCABULARY_PAGE)
-    assert build.requests == pages + 4
+    slices = CFG.vocabulary_days
+    assert pages + 4 <= build.requests <= pages + len(CFG.vocabulary_rules) * slices
     s = elastic.EsScrubber(CFG, tier2="none")
     s.apply_vocabulary("stub", vocab)
     assert eseval.bulk_job_name(0).casefold() in s.known
@@ -215,15 +218,22 @@ def test_the_build_pages_through_the_whole_catalogue_one_field_at_a_time(bulk):
 
 def test_the_stub_charges_what_a_page_really_costs(bulk):
     """Without a simulated cost an in-memory build looks free, and the whole
-    reason this is built once per bridge disappears from the measurement."""
+    reason this is built once per bridge disappears from the measurement.
+
+    The budget is now per **slice**, not per cover: the cover over thirty
+    days is far past it, and that is the measured fact that made slicing
+    necessary rather than a failure.
+    """
     fx, engine = bulk
     engine.page_seconds = eseval.PAGE_SECONDS
+    engine.wide_page_seconds = eseval.WIDE_PAGE_SECONDS
     engine.simulated_seconds = 0.0
     before = engine.simulated_seconds
-    _vocab, build = eseval.build_vocabulary(CFG, engine)
+    _vocab, cover = eseval.build_cover(CFG, engine)
     spent = engine.simulated_seconds - before
-    assert spent > 300                        # minutes, not milliseconds
-    assert spent <= CFG.vocabulary_budget_s   # and still inside the budget
+    assert spent > 300                           # minutes, not milliseconds
+    assert cover["max_slice_s"] <= CFG.vocabulary_budget_s   # each slice is inside it
+    assert not cover["wide_pages"]               # no page asked for a wide range
     assert min(eseval.PAGE_SECONDS) >= 8 and max(eseval.PAGE_SECONDS) <= 35
     # a top-up reads only what is new, so it costs a page per field
     before = engine.simulated_seconds
@@ -232,7 +242,53 @@ def test_the_stub_charges_what_a_page_really_costs(bulk):
         _vocab.covered_until + elastic.VOCABULARY_REFRESH_S)
     assert topup.requests == len(CFG.vocabulary_rules)
     assert engine.simulated_seconds - before < spent
-    engine.page_seconds = ()
+    engine.page_seconds = engine.wide_page_seconds = ()
+
+
+def test_a_wide_range_page_costs_what_the_cluster_measured(bulk):
+    """The measurement that made slicing necessary: the same page is 8-35s
+    over a day and 31-297s over the whole retention period. A build that
+    still asked for the whole range would be charged the second number."""
+    fx, engine = bulk
+    engine.page_seconds = eseval.PAGE_SECONDS
+    engine.wide_page_seconds = eseval.WIDE_PAGE_SECONDS
+    engine.simulated_seconds = 0.0
+    until = eseval.NOW.timestamp()
+    eseval.build_slice(CFG, engine, until - 86400.0, until)
+    narrow = engine.simulated_seconds
+    assert engine.wide_pages == 0
+    engine.simulated_seconds = 0.0
+    # and a build that still asked for the whole range at once is charged
+    # so much that it fails its own budget - which is what happened on the
+    # real cluster, and why the range is sliced before it is paged
+    with pytest.raises(elastic.Refused) as e:
+        eseval.build_slice(CFG, engine, until - 30 * 86400.0, until)
+    assert e.value.code == "vocabulary" and "budget_s" in e.value.message
+    assert engine.wide_pages > 0
+    assert engine.simulated_seconds > narrow
+    assert min(eseval.WIDE_PAGE_SECONDS) >= 31 and max(eseval.WIDE_PAGE_SECONDS) <= 297
+    engine.page_seconds = engine.wide_page_seconds = ()
+    engine.wide_pages = 0
+
+
+def test_a_case_runs_off_the_recent_slices_while_the_older_ones_build(bulk):
+    """The shape of the whole change: the recent days are enough to show a
+    page, the rest keeps reading behind it, and the broker answers between
+    steps instead of disappearing for the length of a page."""
+    fx, engine = bulk
+    engine.page_seconds = eseval.PAGE_SECONDS
+    engine.wide_page_seconds = eseval.WIDE_PAGE_SECONDS
+    try:
+        out = eseval.run_slice_eval(CFG, fx, engine, tier2="none")
+    finally:
+        engine.page_seconds = engine.wide_page_seconds = ()
+    assert out["refused_before_cover"] == "vocabulary_building"
+    assert out["case_shown"] and not out["case_leaks"] and not out["case_part_leak"]
+    assert out["still_building_older"]           # the cover is not complete
+    assert out["covered_days_at_first_case"] <= elastic.VOCABULARY_SERVE_DAYS
+    assert out["pings"] == out["pings_answered"] > 0
+    assert out["max_step_s"] <= out["poll_interval_s"]
+    assert out["steps"] > out["slices_at_first_case"]   # many steps per slice
 
 
 # -- a site map with no vocabulary section -------------------------------------

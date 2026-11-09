@@ -121,12 +121,30 @@ MAX_VOCABULARY_MAX = 200_000
 #: safety boundary (the ceiling and the budget are), and a site that could
 #: tune it could only make the read slower or heavier.
 VOCABULARY_PAGE = 1_000
-#: Wall clock a whole build may take before it is abandoned. Twenty minutes
-#: because the measured page cost puts a large estate's first build in the
-#: minutes, and because it is paid once per bridge rather than per case.
+#: Wall clock **one slice** of a build may take before that slice is
+#: abandoned (see :data:`VOCABULARY_SLICE_S`). It used to be the budget for
+#: a whole build, which could not work: a build over the whole retention
+#: period is hours on a real estate, so one number either refused every
+#: build or meant nothing. Per slice, a slow slice fails alone and the next
+#: tick retries it, and what is already saved stays saved.
 DEFAULT_VOCABULARY_BUDGET_S = 1200.0
 MAX_VOCABULARY_BUDGET_S = 7200.0
 VOCABULARY_REFRESH_S = 600.0
+#: How much of the time range one slice of a build covers. One day, newest
+#: first, for two measured reasons. **Cost**: a composite page over a
+#: 30-day range was measured at 31 to 297 seconds against 8 to 35 for the
+#: same page over a day or an hour, so narrowing the range is what makes a
+#: page affordable at all. **Usefulness**: the recent slices are the ones a
+#: case needs, they are saved as soon as they are read, and the build keeps
+#: extending backwards without holding anything up.
+VOCABULARY_SLICE_S = 86400.0
+#: How far back the vocabulary must reach before cases are served from it.
+#: Until then a case is refused with ``vocabulary_building``; after it,
+#: cases run while the older slices are still being read. Two days, so a
+#: case about yesterday is covered.
+VOCABULARY_SERVE_DAYS = 2
+#: How long a failed slice waits before the serve loop tries it again.
+VOCABULARY_RETRY_S = 60.0
 VOCABULARY_AGG = "hider_vocabulary"
 #: The one composite source name in a vocabulary aggregation.
 VOCABULARY_SOURCE = "v"
@@ -1298,6 +1316,32 @@ class ClusterVocabulary:
                                  max(self.covered_until, other.covered_until),
                                  other.built_at or self.built_at, fields)
 
+    def covered_days(self, now: float) -> float:
+        """How far back the cover reaches from ``now``, in days. What the
+        VOCAB line shows and the only thing a user can use to know whether
+        a name from a given day can be known at all."""
+        return max(0.0, (self.covered_until - self.covered_from) / 86400.0)
+
+    def serves(self, config: "ElasticConfig", now: float) -> bool:
+        """Whether a case may be served from this cover.
+
+        The recent slices are enough: they are what a case asks about, and
+        waiting for the whole retention period means waiting hours. A name
+        logged only in a day not yet covered is **not known** until the
+        build reaches it - stated in AGENTS.md and visible on the VOCAB
+        line as the covered range.
+        """
+        want = min(VOCABULARY_SERVE_DAYS * 86400.0, config.vocabulary_days * 86400.0)
+        # How far back the cover reaches, not how fresh it is: a stale
+        # cover is still served (with its age on the VOCAB line), which is
+        # the trade the ten-minute refresh already accepted. ``now`` is
+        # here because what counts as enough depends on the site map.
+        return self.covered_until - self.covered_from >= want - 1.0
+
+    def complete(self, config: "ElasticConfig", now: float) -> bool:
+        """Whether the cover reaches the whole of ``vocabulary.days``."""
+        return self.covered_from <= now - config.vocabulary_days * 86400.0 + 1.0
+
     def to_json(self) -> dict:
         return {"covered_from": self.covered_from, "covered_until": self.covered_until,
                 "built_at": self.built_at, "fields": self.fields}
@@ -1386,24 +1430,64 @@ class VocabularyIndex:
             # site map with no learnable field (or one that lists none) is
             # ready at once, or every case would wait for a build that is
             # never going to start.
-            state = "building" if config.vocabulary_rules else "ready"
-            return {"state": state, "fields": {}, "max": config.vocabulary_max,
+            nothing_to_read = not config.vocabulary_rules
+            return {"state": "ready" if nothing_to_read else "building",
+                    "serving": nothing_to_read, "complete": nothing_to_read,
+                    "fields": {}, "max": config.vocabulary_max,
                     "near_cap": [], "skipped": {}, "omitted": list(config.vocabulary_omitted)}
         counts = vocab.counts
         cap = config.vocabulary_max
+        serving = vocab.serves(config, t)
+        complete = vocab.complete(config, t)
+        if not serving:
+            # read something, but not far enough back yet to answer a case
+            state = "building"
+        elif t - vocab.covered_until > VOCABULARY_REFRESH_S:
+            state = "stale"
+        elif not complete:
+            # serving cases while the older slices are still being read
+            state = "extending"
+        else:
+            state = "ready"
         return {
-            "state": "stale" if t - vocab.covered_until > VOCABULARY_REFRESH_S else "ready",
+            "state": state, "serving": serving, "complete": complete,
             "fields": counts, "max": cap,
             "near_cap": sorted(f for f, n in counts.items() if n >= VOCABULARY_NEAR_CAP * cap),
             "skipped": {},
             "omitted": list(config.vocabulary_omitted),
-            "covered_days": round((vocab.covered_until - vocab.covered_from) / 86400.0, 2),
+            "covered_days": round(vocab.covered_days(t), 2),
+            "wanted_days": config.vocabulary_days,
             "age_s": round(max(0.0, t - vocab.covered_until), 1),
         }
 
 
+def next_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",
+                          now: float) -> tuple[float, float] | None:
+    """The next one-day slice to read for a cluster, or None if the cover
+    is complete and fresh.
+
+    Newest first, and contiguous: the slice is either the gap between what
+    is covered and now (a top-up, which is also the very first slice when
+    nothing is held), or the day immediately before the oldest day covered.
+    Contiguity is what lets the saved cover stay a single range, and what
+    makes a restart resume rather than start over - whatever was saved
+    before the bridge stopped is still covered.
+    """
+    if not config.vocabulary_rules:
+        return None
+    oldest = now - config.vocabulary_days * 86400.0
+    if held is None:
+        return (max(oldest, now - VOCABULARY_SLICE_S), now)
+    if now - held.covered_until >= VOCABULARY_REFRESH_S:
+        # the newest end first: a case cares about now, not about 30 days ago
+        return (held.covered_until, now)
+    if held.covered_from > oldest + 1.0:
+        return (max(oldest, held.covered_from - VOCABULARY_SLICE_S), held.covered_from)
+    return None
+
+
 class VocabularyBuild:
-    """One build (or top-up) of a cluster's vocabulary: resumable, paged,
+    """One **slice** of a cluster's vocabulary: resumable, paged,
     one field per request.
 
     Why one field per request rather than one aggregation per field in one
@@ -1423,10 +1507,16 @@ class VocabularyBuild:
     done.
 
     **Nothing is learnt from a partial read.** A field is committed to the
-    build only when its last page has come back; a build is committed to
+    build only when its last page has come back; a slice is committed to
     the index only when every field is done. An upstream error, a partial
-    or misshapen reply, a field over ``vocabulary.max``, or the whole build
-    over ``vocabulary.budget_s`` leaves the index exactly as it was.
+    or misshapen reply, a field over ``vocabulary.max``, or the slice over
+    ``vocabulary.budget_s`` leaves the index exactly as it was - including
+    every slice already saved, which is the point of slicing: one bad day
+    does not cost the twenty-nine good ones.
+
+    One instance covers one slice (:func:`next_vocabulary_slice` decides
+    which), so the budget below is per slice, and ``requests`` and
+    ``seconds`` are that slice's.
     """
 
     def __init__(self, config: ElasticConfig, covered_from: float, covered_until: float, *,
@@ -1529,8 +1619,9 @@ class VocabularyBuild:
         self.seconds = self._clock() - self._t0
         if self.pending() and self.seconds > self.config.vocabulary_budget_s:
             raise self._fail("vocabulary", (
-                f"reading the name vocabulary passed {self.config.vocabulary_budget_s:g}s "
-                f"(vocabulary.budget_s) after {self.requests} requests and "
+                f"reading one slice of the name vocabulary passed "
+                f"{self.config.vocabulary_budget_s:g}s (vocabulary.budget_s, which is per "
+                f"slice) after {self.requests} requests and "
                 f"{self._at} of {len(self.rules)} fields"))
 
     def _fail(self, code: str, message: str) -> Refused:

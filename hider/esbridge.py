@@ -448,6 +448,40 @@ class KibanaSession:
             raise elastic.Refused("session_expired",
                                   f"cluster {cluster.name}: no session; run es-login")
 
+    # The protocol is three steps - submit, poll, release - and they are
+    # separate methods because one caller needs them separately. ``search``
+    # below is the blocking spelling every query uses; the vocabulary build
+    # on the broker's serve loop drives the same three steps one serve-loop
+    # iteration at a time, so a page that takes minutes never stops the
+    # broker answering a ping, a tool call or a stop.
+
+    def submit(self, cluster: elastic.Cluster, body: dict) -> dict:
+        """Start an async search. The reply is usually ``isRunning``."""
+        return self.parse_reply(
+            cluster, self.transport.request(cluster, "POST", SEARCH_PATH, body))
+
+    @staticmethod
+    def search_id(data: dict) -> str:
+        """The async-search id, checked. A bad one is a refusal, not a URL
+        built out of whatever the reply held."""
+        sid = data.get("id")
+        if not isinstance(sid, str) or not re.fullmatch(r"[\w=/+.-]{1,512}", sid):
+            raise elastic.Refused("malformed", "response withheld: bad async search id")
+        return sid
+
+    def poll_once(self, cluster: elastic.Cluster, sid: str, body: dict) -> dict:
+        """One poll of a search already submitted."""
+        return self.parse_reply(
+            cluster, self.transport.request(cluster, "POST", f"{SEARCH_PATH}/{sid}", body))
+
+    def release(self, cluster: elastic.Cluster, sid: str | None) -> None:
+        """Delete the server-side search. Best effort: Kibana expires it."""
+        if isinstance(sid, str) and sid:
+            try:
+                self.transport.request(cluster, "DELETE", f"{SEARCH_PATH}/{sid}")
+            except elastic.Refused:
+                pass
+
     def search(self, cluster: elastic.Cluster, body: dict) -> dict:
         """Submit the compiled body, poll to completion, release the search.
 
@@ -456,31 +490,25 @@ class KibanaSession:
         bodies). A poll that does not finish inside ``poll_timeout`` deletes
         the server-side search and refuses as ``incomplete``.
         """
-        data = self.parse_reply(cluster, self.transport.request(cluster, "POST", SEARCH_PATH, body))
+        data = self.submit(cluster, body)
         if elastic.error_class(data) is not None:
             return data  # the scrubber turns it into an upstream_error refusal
         sid = data.get("id")
         deadline = time.monotonic() + self.poll_timeout
         try:
             while data.get("isRunning") is True:
-                if not isinstance(sid, str) or not re.fullmatch(r"[\w=/+.-]{1,512}", sid):
-                    raise elastic.Refused("malformed", "response withheld: bad async search id")
+                sid = self.search_id(data)
                 if time.monotonic() >= deadline:
                     raise elastic.Refused("incomplete", (
                         f"response withheld: search did not finish in "
                         f"{self.poll_timeout:g}s; {elastic.INCOMPLETE_HINT}"))
                 self._sleep(self.poll_interval)
-                data = self.parse_reply(
-                    cluster, self.transport.request(cluster, "POST", f"{SEARCH_PATH}/{sid}", body))
+                data = self.poll_once(cluster, sid, body)
                 if elastic.error_class(data) is not None:
                     return data
             return data
         finally:
-            if isinstance(sid, str) and sid:
-                try:
-                    self.transport.request(cluster, "DELETE", f"{SEARCH_PATH}/{sid}")
-                except elastic.Refused:
-                    pass  # best effort; Kibana expires it anyway
+            self.release(cluster, sid if isinstance(sid, str) else None)
 
 
 # ---------------------------------------------------------------------------
@@ -572,21 +600,26 @@ class Bridge:
     def _apply_vocabulary(self, cluster: elastic.Cluster) -> None:
         """Give this case the names the bridge already read for the cluster.
 
-        No request: the build happened once, when the bridge signed in. If
-        it has not finished, the page is refused with ``vocabulary_building``
-        rather than shown against a vocabulary that does not yet know the
-        customer's name. Logged as counts, never a name.
+        No request: the build happened on the bridge's serve loop, a day's
+        slice at a time, newest first. A case is refused with
+        ``vocabulary_building`` only until the **recent** slices are saved
+        (``ClusterVocabulary.serves``); after that it runs while the older
+        slices are still being read, because waiting for the whole
+        retention period is hours. A name logged only in a day not yet
+        covered is not known - the VOCAB line is where the covered range
+        is visible. Logged as counts, never a name.
         """
         if self.index is None or self.scrubber.vocabulary_applied(cluster.name):
             return
         vocab = self.index.get(cluster.name)
-        if vocab is None:
+        if vocab is None or not vocab.serves(self.config, clock()):
             raise elastic.Refused(
                 "vocabulary_building",
-                "response withheld: the name vocabulary for this cluster is still being "
-                "built (it is read once per sign-in, and a page shown before it is ready "
-                "could leak a customer name in message text). Try again shortly; "
-                "es-smoke's VOCAB line shows the progress.")
+                "response withheld: the name vocabulary for this cluster does not yet cover "
+                f"the last {elastic.VOCABULARY_SERVE_DAYS} days (it is read in one-day "
+                "slices, newest first, and a page shown before those are in could leak a "
+                "customer name in message text). Try again shortly; es-smoke's VOCAB line "
+                "shows how far back the cover reaches.")
         counts = self.scrubber.apply_vocabulary(cluster.name, vocab)
         report = {**self.index.report(cluster.name, self.config, now=clock()), "fields": counts,
                   "skipped": dict(self.scrubber.vocabulary_skipped)}
@@ -818,8 +851,11 @@ def vocabulary_line(v: dict | None) -> str | None:
     if v.get("building"):
         b = v["building"]
         done, total = b["fields_done"], b["fields_total"]
-        return (f"VOCAB    building {done}/{total} fields, {b['requests']} requests, "
-                f"{b['seconds']:g}s of {b['budget_s']:g}s"
+        covered = (f"covering {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
+                   f"{'serving cases' if v.get('serving') else 'no case yet'}; "
+                   if v.get("covered_days") is not None else "")
+        return (f"VOCAB    {covered}slice {done}/{total} fields, {b['requests']} requests, "
+                f"{b['seconds']:g}s of {b['budget_s']:g}s a slice"
                 + (f", reading {b['field']}" if b.get("field") else "")
                 + (f", values so far {b['values']}" if b.get("values") else ""))
     if v.get("state") == "failed":
@@ -829,7 +865,14 @@ def vocabulary_line(v: dict | None) -> str | None:
     parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()]
     line = "VOCAB    " + " ".join(parts)
     if v.get("covered_days") is not None:
-        line += f" over {v['covered_days']}d, {v.get('state', 'ready')} ({v.get('age_s', 0)}s old)"
+        # the covered range is the one number that says which days a name
+        # can be known from at all: a name logged outside it is not known
+        line += (f" over the last {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
+                 f"{v.get('state', 'ready')} ({v.get('age_s', 0)}s old)")
+        if v.get("state") == "extending":
+            line += " - cases run; older days still reading"
+        elif not v.get("serving", True):
+            line += " - NOT ENOUGH COVER YET: cases are refused"
     if v.get("skipped"):
         line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
     if v.get("near_cap"):
@@ -1058,6 +1101,11 @@ class Broker:
         #: caller has to be able to tell "still going" from "it failed, and
         #: nothing is coming unless you ask again".
         self._build_failed: dict[str, str] = {}
+        #: when a cluster whose last slice failed may be tried again
+        self._retry_at: dict[str, float] = {}
+        #: the async search in flight for the build, if any: submitted on
+        #: one serve-loop iteration, polled on later ones
+        self._page: dict | None = None
         self._build_log: list[dict] = []
         #: clusters signed in to this bridge, in sign-in order
         self._signed_in: list[elastic.Cluster] = []
@@ -1167,65 +1215,120 @@ class Broker:
     # between pages instead of disappearing for twenty minutes.
 
     def start_vocabulary(self, cluster: elastic.Cluster, *, now: float | None = None) -> None:
-        """Begin a build (first time) or a top-up (afterwards) for a cluster."""
+        """Begin the next slice for a cluster, if one is due."""
         if not self.config.vocabulary_rules or self._build is not None:
             return
         if cluster not in self._signed_in:
             self._signed_in.append(cluster)
         t = clock() if now is None else now
-        held = self.vocabulary.get(cluster.name)
-        start = held.covered_until if held is not None \
-            else t - self.config.vocabulary_days * 86400.0
-        if held is not None and t - held.covered_until < elastic.VOCABULARY_REFRESH_S:
+        if t < self._retry_at.get(cluster.name, 0.0):
+            return  # a slice failed moments ago; do not spin on it
+        slice_range = elastic.next_vocabulary_slice(
+            self.config, self.vocabulary.get(cluster.name), t)
+        if slice_range is None:
             return
-        self._build = elastic.VocabularyBuild(self.config, start, t)
+        start, until = slice_range
+        self._build = elastic.VocabularyBuild(self.config, start, until)
         self._build_cluster = cluster
         self._build_failed.pop(cluster.name, None)
         self._log_vocabulary(cluster.name, "start", self._build.progress())
 
+    def _end_slice(self, cluster: elastic.Cluster, code: str, build) -> None:
+        """A slice that failed teaches the index nothing. Everything saved
+        by earlier slices stays saved, and this one is retried later."""
+        self._log_vocabulary(cluster.name, "failed", {**build.progress(), "refused": code})
+        self._build_failed[cluster.name] = code
+        self._retry_at[cluster.name] = clock() + elastic.VOCABULARY_RETRY_S
+        self._drop_page()
+        self._build = self._build_cluster = None
+
+    def _drop_page(self) -> None:
+        """Release the async search in flight, if any."""
+        page, self._page = self._page, None
+        if page is None:
+            return
+        try:
+            page["session"].release(page["cluster"], page.get("sid"))
+        except Exception:
+            pass
+
     def pump_vocabulary(self) -> bool:
-        """One page of the build in flight, if any. Returns True if it did
-        work, so the serve loop knows not to idle out."""
+        """**One step** of the build in flight: submit a page, poll a page
+        once, or take a finished page. Returns True if it did work, so the
+        serve loop knows not to idle out.
+
+        One step, not one page, is the whole point. A page over a slice is
+        8 to 35 seconds (and was minutes before slicing), and the browser
+        belongs to this thread: a pump that ran a page to completion left
+        the broker unable to answer a ping, a tool call or a stop for that
+        long. es-login timed out against its own broker, and es-logout then
+        read the timeout as "no bridge" and left it running. Each step here
+        is one HTTP call, so no serve-loop iteration is longer than one
+        poll interval.
+        """
         build, cluster = self._build, self._build_cluster
         if build is None or cluster is None:
-            self._start_due_vocabulary()
-            return False
+            # starting the next slice is work: the loop must not idle out
+            # between slices, and a caller driving it step by step must not
+            # read "nothing to do" as "the build is over"
+            return self._start_due_vocabulary()
         self.last_used = time.monotonic()   # a build in flight is not an idle bridge
-        session = KibanaSession(self.transport, poll_interval=self.poll_interval,
-                                poll_timeout=self.config.poll_timeout_s)
+        page = self._page
         try:
-            build.feed(session.search(cluster, build.request()))
+            if page is None:
+                session = KibanaSession(self.transport, poll_interval=self.poll_interval,
+                                        poll_timeout=self.config.poll_timeout_s)
+                body = build.request()
+                data = session.submit(cluster, body)
+                self._page = {"session": session, "cluster": cluster, "body": body,
+                              "sid": data.get("id") if isinstance(data.get("id"), str) else None,
+                              "deadline": time.monotonic() + self.config.poll_timeout_s,
+                              "data": data}
+                if data.get("isRunning") is True:
+                    self._page["sid"] = session.search_id(data)
+                    return True          # poll it on the next iteration
+                done = data
+            else:
+                if time.monotonic() >= page["deadline"]:
+                    raise elastic.Refused("incomplete", (
+                        f"the name vocabulary page did not finish in "
+                        f"{self.config.poll_timeout_s:g}s"))
+                data = page["session"].poll_once(page["cluster"], page["sid"], page["body"])
+                if data.get("isRunning") is True:
+                    page["sid"] = page["session"].search_id(data)
+                    return True          # still running: come back next iteration
+                done = data
+            self._drop_page()
+            build.feed(done)
         except elastic.Refused as e:
-            # A failed or timed-out read teaches the index nothing: what was
-            # already saved stays, and the next sign-in or tick retries.
-            self._log_vocabulary(cluster.name, "failed", {**build.progress(), "refused": e.code})
-            self._build_failed[cluster.name] = e.code
-            self._build = self._build_cluster = None
+            self._end_slice(cluster, e.code, build)
             return True
         except Exception as e:  # a transport fault is the same answer
-            self._log_vocabulary(cluster.name, "failed",
-                                 {**build.progress(), "refused": type(e).__name__})
-            self._build_failed[cluster.name] = type(e).__name__
-            self._build = self._build_cluster = None
+            self._end_slice(cluster, type(e).__name__, build)
             return True
         if build.pending():
             self._log_vocabulary(cluster.name, "progress", build.progress())
             return True
+        # the slice is whole: save it, and let the next iteration plan the
+        # next slice. A restart resumes from here rather than starting over.
         self.vocabulary.put(cluster.name, build.result())
         self._build_failed.pop(cluster.name, None)
-        self._log_vocabulary(cluster.name, "ready",
+        self._log_vocabulary(cluster.name, "slice",
                              {**build.progress(),
                               **self.vocabulary.report(cluster.name, self.config, now=clock())})
         self._build = self._build_cluster = None
         return True
 
-    def _start_due_vocabulary(self) -> None:
-        """Top up a cluster whose vocabulary has gone stale."""
+    def _start_due_vocabulary(self) -> bool:
+        """Start the next slice for any signed-in cluster that has one due:
+        a top-up, or another day of cover to reach back for. True if one
+        started."""
         for cluster in self._signed_in:
-            held = self.vocabulary.get(cluster.name)
-            if held is not None and clock() - held.covered_until >= elastic.VOCABULARY_REFRESH_S:
+            if elastic.next_vocabulary_slice(
+                    self.config, self.vocabulary.get(cluster.name), clock()) is not None:
                 self.start_vocabulary(cluster)
-                return
+                return self._build is not None
+        return False
 
     def vocabulary_progress(self, cluster: str) -> dict:
         """Counts and state for the caller's own screen; never a name."""
@@ -1373,11 +1476,26 @@ class BrokerClient:
 
 
 def broker_running(socket_path: str | Path) -> bool:
+    return broker_state(socket_path) == "running"
+
+
+def broker_state(socket_path: str | Path) -> str:
+    """``running``, ``busy`` or ``absent``.
+
+    A client must be able to tell a busy broker from a dead one. It could
+    not before: any refusal, a timeout included, read as "no bridge", so
+    es-logout printed "no bridge was running" at a broker that was mid-page
+    and left it alive holding the Kibana session. A connect that fails is
+    absent; a connect that succeeds and then times out is busy; a socket
+    file that is still there is at worst busy.
+    """
     try:
         BrokerClient(socket_path, timeout=5.0).call("ping")
-        return True
-    except elastic.Refused:
-        return False
+        return "running"
+    except elastic.Refused as e:
+        if e.code == "session_expired":   # nothing accepted the connection
+            return "absent"
+        return "busy" if Path(socket_path).exists() else "absent"
 
 
 def spawn_broker(socket_path: Path, argv: list[str], *, wait: float = BROKER_START_S) -> None:

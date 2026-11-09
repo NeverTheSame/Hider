@@ -1285,7 +1285,7 @@ def test_a_page_before_the_vocabulary_is_built_is_refused_and_never_submitted(st
     with pytest.raises(elastic.Refused) as e:
         b.run("stub", {"index": "logs-app-*", "size": 1})
     assert e.value.code == "vocabulary_building"
-    assert "still being built" in e.value.message
+    assert "does not yet cover" in e.value.message
     assert len(stub.engine.requests) == n       # nothing was submitted
     rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
     assert rows[-1]["refused"] == "vocabulary_building"

@@ -443,6 +443,72 @@ Listed with owners in the README's Limitations section and in
   itself is **not closed**. Closing it needs a decision (per-case label
   namespaces, or labels that are not guessable integers) and a change to
   how `label_for` numbers labels - out of scope for a fixture change.
+  **The read is sliced by day, newest first, and never blocks the broker.**
+  Measured on a real cluster, the whole-range build did not work at all:
+  one 1,000-value page over the **30-day** range takes **31 to 297
+  seconds**, not the 8 to 35 measured over an hour or a day, and a site
+  map with 12 learnable fields of ~10,000 names each needs over a hundred
+  pages - hours, against a twenty-minute budget. Worse, the broker ran a
+  whole page inside one serve-loop iteration on its only thread, so it
+  answered nothing while a page ran: `es-login`'s progress poll (60s
+  client timeout) hit its own broker and crashed with an uncaught refusal
+  after the first long page even though sign-in had worked, and `es-logout`
+  then read that timeout as "no bridge was running" and left the process
+  alive holding the Kibana session. Four changes, all defaults:
+  - **Slices.** `elastic.next_vocabulary_slice` hands out one
+    `VOCABULARY_SLICE_S` (one day) at a time, newest first and contiguous,
+    until the cover reaches `vocabulary.days`. Each slice is its own
+    `VocabularyBuild` and is saved by `VocabularyIndex` as soon as it is
+    whole, so a restart resumes instead of starting over, and a page is
+    charged the day-range cost rather than the 30-day one.
+  - **A case is served from the recent slices.** `ClusterVocabulary.serves`
+    is true once the cover spans `VOCABULARY_SERVE_DAYS` (2), so a case
+    about yesterday runs while the older slices are still being read;
+    before that it is still refused with `vocabulary_building`. The
+    report's state is `building` -> `extending` -> `ready`, and the VOCAB
+    line prints the covered range: **a name logged only in a day not yet
+    covered is not known until the build reaches it**, and that line is
+    where a user sees how far back the cover goes.
+  - **A step, not a page, per serve-loop iteration.**
+    `KibanaSession.submit` / `poll_once` / `release` are the three steps
+    `search` was already made of; `Broker.pump_vocabulary` now does one of
+    them per iteration and keeps the search in flight in `Broker._page`.
+    No iteration is longer than one poll interval, so ping, stop and tool
+    calls are answered mid-page.
+  - **The budget is per slice** (`vocabulary.budget_s`, still 1200s). One
+    slow slice fails alone, teaches the index nothing, and is retried
+    after `VOCABULARY_RETRY_S`; the slices already saved stay.
+  Clients tell a busy broker from a dead one: `esbridge.broker_state`
+  returns `running`/`busy`/`absent` (a failed connect is absent, a timeout
+  with the socket file present is busy), `_wait_for_vocabulary` treats a
+  refusal as "ask again" while ping still answers and returns as soon as
+  the cover *serves* rather than when it is complete, and `es-logout`
+  retries for a minute and never says "no bridge" while the socket is
+  there.
+  **What it costs, stated plainly.** On the es-eval fixture (5 fields,
+  21,751 job names, 30 days): **30 slices, 162 requests and 3,123
+  simulated seconds for the whole cover**, worst slice 127s of the 1200s
+  per-slice budget - but only **10 requests and 191 simulated seconds, two
+  slices, before the first case can run**. That second number is the one a
+  person waits for; the rest is read behind them. On the shape that
+  motivated this (12 name fields, ~10,000 values each, a day's page at the
+  measured 8-35s) a slice is about 12 pages, four minutes, so the first
+  case is roughly **eight minutes** after sign-in and the full 30-day cover
+  about two hours, in the background. If a *day's* page really costs two
+  minutes at some site, a slice is 24 minutes: that **exceeds the
+  per-slice budget**, every slice fails and retries, and the site must
+  raise `vocabulary.budget_s` (ceiling 7200s) or list fewer
+  `vocabulary.fields` - there is no setting at which a cover that size is
+  free. Measured by the `vocabulary_slices_serve_early` gate
+  (`eseval.run_slice_eval` drives the real `Broker` one step at a time
+  against `SteppedSearchTransport`, which hands a page back over as many
+  polls as its cost: a case shown off the recent cover while older slices
+  build, refused before it, every ping answered, no step longer than one
+  poll interval) and by `vocabulary_build_in_budget` (per slice now, plus
+  zero pages charged at the wide rate). `eseval.WIDE_PAGE_SECONDS` holds
+  the 31-297s measurement, and the stub charges by the width of the range
+  a request asks for, so a build that stopped slicing would fail its
+  budget in the eval rather than quietly cost hours.
   **The read happens once per cluster, at sign-in - never inside a case.**
   Two earlier shapes failed against measured cost. One capped `terms`
   aggregation over the retention period refused every case on any estate
@@ -504,10 +570,12 @@ Listed with owners in the README's Limitations section and in
   charges `eseval.PAGE_SECONDS` (8-35s, cycled) per field per page, so the
   eval reports what a build really costs without waiting for it: over the
   whole fixture, back catalogue and realistic estate together (21,751 job
-  names, 9,555 tenants, 9,746 tenant full names), **44 requests and 839
-  simulated seconds** for the first build and **5 requests and 106
-  seconds** for a top-up - 70% of the twenty-minute budget, which is the
-  closest measurement there is to what a real sign-in will cost.
+  names, 9,555 tenants, 9,746 tenant full names), **30 one-day slices,
+  162 requests and 3,123 simulated seconds** for the whole cover, **10
+  requests and 191 seconds to the first case**, and **5 requests and 95
+  seconds** for a top-up. (Before slicing this was quoted as one 44-request,
+  839-second build - a figure that only held because the stub charged
+  every page at the one-day rate.)
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.

@@ -863,10 +863,22 @@ def test_the_index_report_is_counts_and_state_never_a_name(tmp_path):
     assert index.report("emea", CFG)["state"] == "building"
     built = _build(CFG, *_for("job.name", "Harbour Nightly")).result()
     index.put("emea", built)
-    r = index.report("emea", CFG, now=built.covered_until)
-    assert r["state"] == "ready" and r["fields"]["job.name"] == 1
+    now = built.covered_until
+    # one day of cover is not enough to answer a case: the state says so
+    r = index.report("emea", CFG, now=now)
+    assert r["state"] == "building" and not r["serving"] and r["fields"]["job.name"] == 1
     assert "Harbour" not in json.dumps(r)
-    stale = index.report("emea", CFG, now=built.covered_until + elastic.VOCABULARY_REFRESH_S + 1)
+    # two days is, and the state says the rest is still coming
+    index.put("emea", elastic.ClusterVocabulary(now - 2 * 86400.0, now - 86400.0, 0.0, {}))
+    r = index.report("emea", CFG, now=now)
+    assert r["state"] == "extending" and r["serving"] and not r["complete"]
+    assert r["covered_days"] == 2.0 and r["wanted_days"] == CFG.vocabulary_days
+    # the whole of vocabulary.days is "ready"
+    index.put("emea", elastic.ClusterVocabulary(
+        now - CFG.vocabulary_days * 86400.0, now - 2 * 86400.0, 0.0, {}))
+    full = index.report("emea", CFG, now=now)
+    assert full["state"] == "ready" and full["complete"]
+    stale = index.report("emea", CFG, now=now + elastic.VOCABULARY_REFRESH_S + 1)
     assert stale["state"] == "stale" and stale["age_s"] > elastic.VOCABULARY_REFRESH_S
 
 

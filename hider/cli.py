@@ -32,6 +32,12 @@ from . import (
 
 OUT = Path(__file__).resolve().parent.parent / "out"
 
+#: How long es-logout keeps asking a busy broker to stop before giving up
+#: and saying so. A page of the vocabulary read is seconds; a minute is
+#: more than enough, and saying "no bridge" at one that is still running is
+#: the failure worth avoiding.
+_LOGOUT_WAIT_S = 60.0
+
 
 def _real_backend(kind: str, model: str | None, base_url: str | None,
                   usage: llm_backend.UsageMeter):
@@ -452,9 +458,10 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
               "finishes.", file=sys.stderr)
         state = _wait_for_vocabulary(
             esbridge.BrokerClient(sock, timeout=60), cluster.name)
-        if state.get("state") == "building":
-            print(f"the name vocabulary for {cluster.name} is still building; cases will be "
-                  "refused until it finishes. Run es-login again to see the progress.")
+        if state.get("state") == "building" and not state.get("serving"):
+            print(f"the name vocabulary for {cluster.name} does not yet cover the last "
+                  f"{elastic.VOCABULARY_SERVE_DAYS} days; cases will be refused until it "
+                  "does. The bridge keeps reading - run es-login again to see the progress.")
             return 1
         return 0
     print(f"timed out: cluster {cluster.name} did not reach Kibana; run es-login again")
@@ -466,13 +473,30 @@ def _cmd_es_logout(args: argparse.Namespace) -> int:
 
     cfg = _es_config(args.config)
     sock = esbridge.broker_socket(args.profile_dir or cfg.profile_dir)
-    try:
-        esbridge.BrokerClient(sock, timeout=30).call("stop")
-    except elastic.Refused:
-        print("no bridge was running")
-        return 0
-    print("bridge stopped; every Kibana session ended with its browser")
-    return 0
+    # A busy broker is not a missing one. While the socket file is there,
+    # keep asking: a refusal used to print "no bridge was running" at a
+    # broker that was mid-page, which left it alive holding the Kibana
+    # session - the opposite of what es-logout is for.
+    deadline = time.monotonic() + _LOGOUT_WAIT_S
+    said = False
+    while True:
+        try:
+            esbridge.BrokerClient(sock, timeout=30).call("stop")
+            print("bridge stopped; every Kibana session ended with its browser")
+            return 0
+        except elastic.Refused as e:
+            if esbridge.broker_state(sock) == "absent":
+                print("no bridge was running")
+                return 0
+            if time.monotonic() >= deadline:
+                print(f"the bridge is busy and did not stop ({e.code}); it is still running "
+                      "and still holds the Kibana session. Try es-logout again.")
+                return 1
+            if not said:
+                print("the bridge is busy (it reads the name vocabulary a page at a time); "
+                      "waiting for it to stop", file=sys.stderr)
+                said = True
+            time.sleep(1.0)
 
 
 def _cmd_es_broker(args: argparse.Namespace) -> int:
@@ -668,29 +692,53 @@ def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
     is refused, so every entry point that opens a case waits here first.
     Progress goes to stderr as counts, never a name.
     """
-    from . import esbridge
+    from . import elastic, esbridge
 
-    state = control.call("vocabulary", cluster=cluster, build=True)["vocabulary"]
+    def poll(**fields) -> dict | None:
+        """One progress call. A refusal is not an answer: a broker mid-page
+        can time out a client, and a caller that treated that as the end of
+        the build would give up on a bridge that is working. None means
+        "ask again"; only a broker that has stopped answering ping at all
+        ends the wait."""
+        try:
+            return control.call("vocabulary", cluster=cluster, **fields)["vocabulary"]
+        except elastic.Refused:
+            try:
+                control.call("ping")
+            except elastic.Refused:
+                return {"state": "failed", "refused": "the bridge stopped answering"}
+            return None
+
+    state = poll(build=True)
     deadline = time.monotonic() + timeout
     shown = None
-    # "failed" ends the wait as surely as "ready": the build is not coming
-    # back on its own, and a caller that only watched for "ready" would wait
-    # out the whole timeout.
-    while state.get("state") == "building" and time.monotonic() < deadline:
-        line = esbridge.vocabulary_line(state)
+    # The wait ends when the cover reaches the recent days ("serving"), not
+    # when the whole of vocabulary.days is in: that is hours on a real
+    # estate, and the older slices keep building behind the case.
+    # "failed" ends it as surely, or a caller would wait out the timeout.
+    while (state is None or (state.get("state") == "building"
+                             and not state.get("serving"))) \
+            and time.monotonic() < deadline:
+        line = esbridge.vocabulary_line(state) if state else None
         if line and line != shown and not quiet:
             print(line, file=sys.stderr)
             shown = line
         time.sleep(0.05)
-        state = control.call("vocabulary", cluster=cluster)["vocabulary"]
+        state = poll()
+    state = state or {"state": "building"}
     if not quiet:
         line = esbridge.vocabulary_line(state)
         if line:
             print(line, file=sys.stderr)
+        if state.get("state") == "extending":
+            print("the recent days are in, so cases can run now; the bridge keeps reading "
+                  "further back on its own. A name logged only in a day not yet covered is "
+                  "not known until it is - the VOCAB line shows how far back the cover goes.",
+                  file=sys.stderr)
         if state.get("state") == "failed":
             print(f"the name vocabulary build stopped: {state.get('refused')}. Cases stay "
-                  "refused until a build finishes; run es-login again to retry.",
-                  file=sys.stderr)
+                  "refused until the recent days are read; the bridge retries on its own, "
+                  "and es-login again shows the progress.", file=sys.stderr)
     return state
 
 

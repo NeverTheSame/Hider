@@ -780,14 +780,21 @@ recall will never be exactly 100%.
     `cloud.account.id`: a number vocabulary would erase counts from text);
     globs cannot be aggregated. **What it costs, measured:** the es-eval
     stub charges what a real page costs (8-35s, cycled) so the figure is
-    not an in-memory fiction. On its cluster - the back catalogue plus the
-    realistic estate, 21,751 job names and 9,555 tenants - the first build
-    takes **44 requests and 839 simulated seconds**, about fourteen
-    minutes and 70% of the twenty-minute budget, and a ten-minute top-up
-    takes **5 requests and 106 seconds**. Every case after that
-    reads **nothing**: the one-hour case that used to need its own read
-    now costs 0 requests. Under the previous per-case design the same
-    fixture refused on the first request.
+    not an in-memory fiction, and it charges by the width of the range a
+    request asks for, because that is what the cost turned out to depend
+    on: one 1,000-value page measured **31 to 297 seconds over the 30-day
+    range** against **8 to 35 over a day or an hour**. So the read is
+    **sliced by day, newest first**, each slice saved as soon as it is
+    whole. On its cluster - the back catalogue plus the realistic estate,
+    21,751 job names and 9,555 tenants - the whole 30-day cover is **30
+    slices, 162 requests and 3,123 simulated seconds**, worst slice 127s
+    of the 1,200s per-slice budget; but a case can run after **two slices,
+    10 requests and 191 seconds**, and the rest is read behind it. Every
+    case reads **nothing**: the one-hour case that used to need its own
+    read costs 0 requests. Under the previous per-case design the same
+    fixture refused on the first request; under the previous
+    whole-range-at-once build it would have spent hours before showing
+    anything, which is what the slicing is for.
     **Caps and progress, as counts:** every build logs values per field
     against the cap, skips by reason, requests and seconds, never a value;
     `es-smoke` prints build progress while it runs and then a `VOCAB` line

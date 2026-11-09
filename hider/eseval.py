@@ -38,6 +38,8 @@ import math
 import os
 import random
 import re
+import shutil
+import tempfile
 import threading
 import time
 import urllib.error
@@ -342,6 +344,18 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
 #: build over the fixture reports a realistic time without the eval
 #: actually waiting (see ``StubEngine.page_seconds``).
 PAGE_SECONDS: tuple[float, ...] = (18.0, 11.0, 27.0, 8.0, 35.0, 14.0, 22.0)
+#: What the same page costs over a **wide** range: measured on a real
+#: cluster at 31 to 297 seconds for one 1,000-value page over 30 days,
+#: against the 8-35 above for the same page over a day or an hour. This is
+#: the measurement that killed the single whole-range build - 12 fields of
+#: ~10,000 names each is over a hundred pages, which at these numbers is
+#: hours, not the twenty minutes the budget allowed - and it is the reason
+#: the build now reads one-day slices. The stub charges by the width of
+#: the range the request asks for, so the eval shows the difference
+#: instead of asserting it.
+WIDE_PAGE_SECONDS: tuple[float, ...] = (31.0, 88.0, 142.0, 297.0, 64.0, 210.0, 119.0)
+#: A request whose range is wider than this is charged WIDE_PAGE_SECONDS.
+WIDE_RANGE_S = 2 * 86400.0
 
 #: The estate's back catalogue of job names: how many distinct values one
 #: vocabulary field holds over the retention period on a cluster that is not
@@ -1144,6 +1158,31 @@ def _cmp_value(field_name: str, v: Any):
     return v
 
 
+def _query_range_seconds(body: dict) -> float | None:
+    """How wide the request's time range is, which is what a composite page
+    is charged by. None when the request carries no range."""
+    def walk(clause: Any) -> float | None:
+        if not isinstance(clause, dict):
+            return None
+        for kind, spec in clause.items():
+            if kind == "bool":
+                for c in spec.get("filter", []) if isinstance(spec, dict) else []:
+                    got = walk(c)
+                    if got is not None:
+                        return got
+            elif kind == "range" and isinstance(spec, dict):
+                for f, bounds in spec.items():
+                    if f != "@timestamp" or not isinstance(bounds, dict):
+                        continue
+                    lo = _parse_time(bounds.get("gte") or bounds.get("gt"))
+                    hi = _parse_time(bounds.get("lte") or bounds.get("lt"), round_up=True)
+                    if lo is not None and hi is not None:
+                        return (hi - lo).total_seconds()
+        return None
+
+    return walk(body.get("query"))
+
+
 def backing_index(pattern: str) -> str:
     """The backing index a hit from ``pattern`` names, as Elasticsearch
     names a data stream's write index."""
@@ -1178,8 +1217,14 @@ class StubEngine:
         #: random so a run is reproducible. Zero (the default) charges
         #: nothing, which is what every test that is not about timing wants.
         self.page_seconds: tuple[float, ...] = ()
+        #: what a page over a range wider than WIDE_RANGE_S costs
+        self.wide_page_seconds: tuple[float, ...] = ()
         self.simulated_seconds = 0.0
         self._pages = 0
+        #: how many pages were charged at the wide rate: a build that is
+        #: slicing properly has none
+        self.wide_pages = 0
+        self._range_s: float | None = None
 
     # -- matching ----------------------------------------------------------
 
@@ -1291,8 +1336,13 @@ class StubEngine:
                 }
             elif atype == "composite":
                 if self.page_seconds:
-                    self.simulated_seconds += self.page_seconds[
-                        self._pages % len(self.page_seconds)]
+                    # charged by how wide the request's range is: the same
+                    # page costs 8-35s over a day and 31-297s over thirty
+                    wide = (self._range_s or 0.0) > WIDE_RANGE_S
+                    cost = self.wide_page_seconds if wide and self.wide_page_seconds \
+                        else self.page_seconds
+                    self.simulated_seconds += cost[self._pages % len(cost)]
+                    self.wide_pages += int(wide)
                     self._pages += 1
                 # One source, as the vocabulary read builds it: values in
                 # key order, a page at a time, after_key to carry on.
@@ -1378,6 +1428,7 @@ class StubEngine:
             raise KeyError(index)
         if len(parts) > 1 and body.get("size", 10):
             raise ValueError("stub: a search over several indices is aggregation-only")
+        self._range_s = _query_range_seconds(body)
         rows = [r for p in parts for r in self._rows(p)]
         rows = [r for r in rows if self._match(r[1], body.get("query", {"match_all": {}}))]
         total = len(rows)
@@ -1786,18 +1837,17 @@ def unmarked_phrases() -> list[str]:
     return [p for _, _, p in UNMARKED_JOBS] + [p for _, _, _, p in UNMARKED_NAMES]
 
 
-def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
-                     covered_from: float | None = None, covered_until: float | None = None,
-                     ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
-    """What the broker does on sign-in, driven to completion in one call.
+def build_slice(config: elastic.ElasticConfig, engine: StubEngine,
+                covered_from: float, covered_until: float,
+                ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
+    """One slice, driven to completion in one call.
 
-    The stub charges simulated seconds per page (``StubEngine.page_seconds``)
-    and the build's clock reads that, so a build over the 12,000-name
-    fixture costs what a real one would without the eval taking minutes.
+    The stub charges simulated seconds per page (``StubEngine.page_seconds``,
+    or ``wide_page_seconds`` when the range is wide) and the build's clock
+    reads that, so a slice costs what a real one would without the eval
+    waiting for it.
     """
-    until = NOW.timestamp() if covered_until is None else covered_until
-    start = (until - config.vocabulary_days * 86400.0) if covered_from is None else covered_from
-    build = elastic.VocabularyBuild(config, start, until,
+    build = elastic.VocabularyBuild(config, covered_from, covered_until,
                                     clock=lambda: engine.simulated_seconds)
     while build.pending():
         vq = build.request()["params"]
@@ -1805,6 +1855,75 @@ def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
                     "rawResponse": engine.search(vq["index"], vq["body"],
                                                  ignore_unavailable=vq["ignore_unavailable"])})
     return build.result(), build
+
+
+def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
+                     covered_from: float | None = None, covered_until: float | None = None,
+                     ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
+    """The whole cover, slice by slice, as the broker builds it over many
+    serve-loop iterations - driven to completion in one call here.
+
+    Callers that only want the names known (tests, es-eval sessions outside
+    the bridge) get what a finished build holds. ``run_eval`` drives the
+    slices itself, because *when* each slice lands is the thing worth
+    measuring.
+    """
+    until = NOW.timestamp() if covered_until is None else covered_until
+    held: elastic.ClusterVocabulary | None = None
+    last: elastic.VocabularyBuild | None = None
+    requests = 0
+    if covered_from is not None:
+        # an explicit range: one slice of exactly that width (what a top-up
+        # over the refresh window is)
+        vocab, build = build_slice(config, engine, covered_from, until)
+        return vocab, build
+    while True:
+        nxt = elastic.next_vocabulary_slice(config, held, until)
+        if nxt is None:
+            break
+        vocab, last = build_slice(config, engine, *nxt)
+        requests += last.requests
+        held = vocab if held is None else held.merge(vocab)
+    if held is None or last is None:    # nothing to read
+        return build_slice(config, engine, until - config.vocabulary_days * 86400.0, until)
+    last.requests = requests            # the cover's cost, not the last slice's
+    return held, last
+
+
+def build_cover(config: elastic.ElasticConfig, engine: StubEngine,
+                ) -> tuple[elastic.ClusterVocabulary, dict]:
+    """Every slice of the cover, newest first, with what each one cost.
+
+    The numbers that matter are not the total: they are **what it costs
+    before a case can run** (the recent slices) and **the worst single
+    slice against the per-slice budget**. The total is reported too, as
+    the thing that used to be one unaffordable build.
+    """
+    until = NOW.timestamp()
+    held: elastic.ClusterVocabulary | None = None
+    report = {"slices": 0, "requests": 0, "seconds": 0.0, "max_slice_s": 0.0,
+              "serving_after_slices": None, "serving_requests": 0, "serving_seconds": 0.0,
+              "budget_s": config.vocabulary_budget_s, "wide_pages": 0}
+    before_all = engine.simulated_seconds
+    while True:
+        nxt = elastic.next_vocabulary_slice(config, held, until)
+        if nxt is None:
+            break
+        before = engine.simulated_seconds
+        vocab, build = build_slice(config, engine, *nxt)
+        held = vocab if held is None else held.merge(vocab)
+        took = engine.simulated_seconds - before
+        report["slices"] += 1
+        report["requests"] += build.requests
+        report["max_slice_s"] = round(max(report["max_slice_s"], took), 1)
+        if report["serving_after_slices"] is None and held.serves(config, until):
+            report["serving_after_slices"] = report["slices"]
+            report["serving_requests"] = report["requests"]
+            report["serving_seconds"] = round(engine.simulated_seconds - before_all, 1)
+    report["seconds"] = round(engine.simulated_seconds - before_all, 1)
+    report["wide_pages"] = engine.wide_pages
+    report["covered_days"] = round(held.covered_days(until), 2) if held else 0.0
+    return held, report
 
 
 def learn_vocabulary(scrubber: elastic.EsScrubber, engine: StubEngine,
@@ -1851,6 +1970,179 @@ def cold_bridge_refusal(config: elastic.ElasticConfig, engine: StubEngine, *,
         return {"refused": None, "shown": bool(out.hits_shown)}
     except elastic.Refused as e:
         return {"refused": e.code, "shown": False, "names_a_rule": "vocabulary" in e.message}
+
+
+class SteppedSearchTransport:
+    """Kibana's async-search protocol over the stub engine, with a page
+    that takes **many polls** to finish.
+
+    The broker's serve loop owns the browser, so what matters is not how
+    long a page takes but how long one *step* takes. This transport makes
+    the difference visible: a submit returns ``isRunning`` at once, each
+    poll returns ``isRunning`` until the page's simulated seconds are up,
+    and only then does the result come back. A broker that ran a page to
+    completion inside one serve-loop iteration cannot answer anything for
+    the length of the page; one that submits and polls across iterations
+    answers between every step.
+    """
+
+    #: how much of a page's simulated cost one poll gets through
+    POLL_STEP_S = 5.0
+
+    def __init__(self, engine: StubEngine) -> None:
+        self.engine = engine
+        self.closed = False
+        self.searches: dict[str, dict] = {}
+        self._n = 0
+        #: every (method, path) the broker made, for the step count
+        self.calls: list[tuple[str, str]] = []
+
+    def start(self) -> None:
+        return None
+
+    def login(self, cluster, timeout: float = 0.0) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def request(self, cluster, method: str, path: str, body: dict | None = None,
+                *, navigate: bool = False):
+        from . import esbridge
+
+        self.calls.append((method, path))
+        url = cluster.kibana + path
+        data = self._dispatch(method, path, body)
+        return esbridge.Reply(200, url, "application/json", json.dumps(data), False)
+
+    def _dispatch(self, method: str, path: str, body: dict | None) -> dict:
+        from . import esbridge
+
+        if method == "DELETE":
+            self.searches.pop(path.rsplit("/", 1)[-1], None)
+            return {"ok": True}
+        if path == esbridge.SEARCH_PATH:
+            # Run it now and charge it now; then hand it back over as many
+            # polls as its cost takes, which is what a real async search
+            # does and what the step count has to see.
+            params = (body or {}).get("params", {})
+            before = self.engine.simulated_seconds
+            result = self.engine.search(params.get("index", ""), params.get("body", {}),
+                                        ignore_unavailable=params.get("ignore_unavailable", False))
+            cost = self.engine.simulated_seconds - before
+            self._n += 1
+            sid = f"stub-search-{self._n}"
+            self.searches[sid] = {
+                "result": result,
+                "polls": max(1, int(math.ceil(cost / self.POLL_STEP_S))),
+            }
+            return {"id": sid, "isRunning": True, "isPartial": True}
+        sid = path.rsplit("/", 1)[-1]
+        held = self.searches.get(sid)
+        if held is None:
+            return {"id": sid, "isRunning": False, "isPartial": False,
+                    "rawResponse": {"hits": {"total": {"value": 0}, "hits": []}}}
+        held["polls"] -= 1
+        if held["polls"] > 0:
+            return {"id": sid, "isRunning": True, "isPartial": True}
+        return {"id": sid, "isRunning": False, "isPartial": False,
+                "rawResponse": held["result"]}
+
+
+def run_slice_eval(config: elastic.ElasticConfig, fx: Fixture, engine: StubEngine, *,
+                   tier2: str = "none") -> dict:
+    """The sliced build on the real broker, one serve-loop step at a time.
+
+    What this measures, and why each number is here:
+
+    * **a case is served from the recent slices while the older ones are
+      still being read** - the whole reason for slicing. Before it, a case
+      waited for the whole of ``vocabulary.days``, which on a real estate
+      (12 name fields, ~10,000 names each, 31-297s a page over 30 days) is
+      hours, so every case was refused and the bridge looked broken;
+    * **requests and simulated seconds to the first case served**, which is
+      what the person who signed in actually waits for;
+    * **no serve-loop step runs long**: a ping sent after every step is
+      answered, and no step costs more than one poll interval, so es-login
+      polling the progress and es-logout asking it to stop both get an
+      answer mid-build.
+    """
+    from . import esbridge
+
+    cluster = elastic.Cluster("stub", "https://kibana-stub.example.net")
+    cfg = dataclasses.replace(config, clusters=(cluster,))
+    transport = SteppedSearchTransport(engine)
+    tmp = Path(tempfile.mkdtemp(prefix="hider-es-eval-slices-"))
+    before_requests = len(engine.requests)
+    before_seconds = engine.simulated_seconds
+    saved_clock = esbridge.clock
+    esbridge.clock = lambda: NOW.timestamp()
+    out: dict = {"steps": 0, "slices_at_first_case": 0, "max_step_s": 0.0,
+                 "pings": 0, "pings_answered": 0, "poll_interval_s": esbridge.POLL_INTERVAL_S,
+                 "case_shown": False, "case_refused": None, "case_leaks": [],
+                 "case_part_leak": False, "still_building_older": False,
+                 "refused_before_cover": None, "requests_to_first_case": 0,
+                 "seconds_to_first_case": 0.0, "covered_days_at_first_case": 0.0,
+                 "wide_pages": 0}
+    query = {"index": "logs-worker-*", "time_range": WINDOW_CASE_RANGE, "size": 20,
+             "filters": [{"field": "message", "op": "phrase", "value": WINDOW_CASE_PHRASE}]}
+    try:
+        broker = esbridge.Broker(cfg, lambda: transport, poll_interval=0.0, sessions_dir=tmp)
+        broker.open()
+        broker.start_vocabulary(cluster)
+
+        def case() -> tuple[dict | None, str | None]:
+            bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2),
+                                     EngineSession(engine), index=broker.vocabulary)
+            try:
+                return bridge.run("stub", query), None
+            except elastic.Refused as e:
+                return None, e.code
+
+        # before any slice is in, a case is refused with its own code
+        _page, out["refused_before_cover"] = case()
+        while out["steps"] < 2000:
+            t0 = time.perf_counter()
+            worked = broker.pump_vocabulary()
+            out["max_step_s"] = round(max(out["max_step_s"],
+                                          time.perf_counter() - t0), 4)
+            if not worked:
+                break
+            out["steps"] += 1
+            # a ping between every step: this is what es-login's progress
+            # poll and es-logout's stop are, and both must be answered
+            out["pings"] += 1
+            out["pings_answered"] += int(broker.handle(
+                {"schema": esbridge.BROKER_SCHEMA, "op": "ping"}).get("ok") is True)
+            held = broker.vocabulary.get("stub")
+            if held is not None and held.serves(cfg, NOW.timestamp()):
+                break
+        held = broker.vocabulary.get("stub")
+        out["requests_to_first_case"] = len(engine.requests) - before_requests
+        out["seconds_to_first_case"] = round(engine.simulated_seconds - before_seconds, 1)
+        out["covered_days_at_first_case"] = round(held.covered_days(NOW.timestamp()), 2) \
+            if held else 0.0
+        out["slices_at_first_case"] = sum(1 for r in broker._build_log if r["vocabulary"] == "slice")
+        # the older slices are not done: the case below is served from the
+        # recent ones while the build carries on
+        out["still_building_older"] = elastic.next_vocabulary_slice(
+            cfg, held, NOW.timestamp()) is not None
+        page, refused = case()
+        out["case_refused"] = refused
+        if page is not None and page.output is not None:
+            out["case_shown"] = bool(page.hits_shown)
+            out["case_leaks"] = _leaks(page.output, fx.truth)
+            out["case_part_leak"] = bool(name_part_leaks(
+                _messages(page.output), WINDOW_CASE_PHRASE, WINDOW_CASE_JOB))
+        # and the bridge still answers after the case, with the build live
+        out["pings"] += 1
+        out["pings_answered"] += int(broker.handle(
+            {"schema": esbridge.BROKER_SCHEMA, "op": "ping"}).get("ok") is True)
+        out["wide_pages"] = engine.wide_pages
+    finally:
+        esbridge.clock = saved_clock
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out
 
 
 class Session:
@@ -2002,13 +2294,20 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
         # Sign in, which starts the one vocabulary build for this bridge,
         # then wait for it as the operator does. Cases opened before it is
         # ready are refused; that refusal is measured offline above.
+        # Wait for the **whole** cover here, not just the recent slices a
+        # case needs: this section measures the MCP layer, and a build
+        # still running in the background would put its own Kibana calls
+        # in the middle of the transport-rejection count. That a case runs
+        # off the recent slices while the rest builds is measured by
+        # run_slice_eval, where it is the point rather than a confounder.
         control.call("vocabulary", cluster="stub", build=True)
         vocab_state: dict = {}
-        for _ in range(3000):
+        deadline = time.monotonic() + 300.0
+        while time.monotonic() < deadline:
             vocab_state = control.call("vocabulary", cluster="stub")["vocabulary"]
-            if vocab_state.get("state") != "building":
+            if vocab_state.get("state") in ("ready", "stale"):
                 break
-            time.sleep(0.01)
+            time.sleep(0.005)
         vocabulary_ready = vocab_state.get("state") in ("ready", "stale")
         # what the human seeds: the tenant the case is about, and the two
         # labels the oracle cases are written against (esquery: <Org-01>,
@@ -2375,17 +2674,15 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     truth = fx.truth
     engine = StubEngine(fx, cfg.indices)
     engine.page_seconds = PAGE_SECONDS
+    engine.wide_page_seconds = WIDE_PAGE_SECONDS
     rng = random.Random(seed + 1)
 
     # Sign-in: the one vocabulary build for this bridge, paid once, with the
     # stub charging what a real page costs. Every case below starts from its
     # result; none of them reads anything.
-    vocab, first_build = build_vocabulary(cfg, engine)
-    build_report = {"requests": first_build.requests,
-                    "simulated_s": round(engine.simulated_seconds, 1),
-                    "fields": {f: len(v) for f, v in vocab.fields.items()},
-                    "budget_s": cfg.vocabulary_budget_s,
-                    "covered_days": round((vocab.covered_until - vocab.covered_from) / 86400.0)}
+    vocab, cover = build_cover(cfg, engine)
+    build_report = {**cover, "simulated_s": cover["seconds"],
+                    "fields": {f: len(v) for f, v in vocab.fields.items()}}
     # ...and one top-up ten minutes later, reading only what is new.
     before_topup = engine.simulated_seconds
     topup_vocab, topup = build_vocabulary(
@@ -2509,6 +2806,11 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # shown against a vocabulary that does not know the customer's name
     # yet. Through the real Bridge, with an index that holds nothing.
     building = cold_bridge_refusal(cfg, engine, tier2=tier2)
+
+    # The sliced build on the real broker, a serve-loop step at a time:
+    # a case runs off the recent slices while the older ones are still
+    # being read, and the broker answers between every step.
+    slices = run_slice_eval(cfg, fx, engine, tier2=tier2)
 
     # A site map with no vocabulary section at all, which is what a site has
     # before anyone writes one. The default decides what is read, and a
@@ -2708,6 +3010,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "keep_field": keep,
         "window_case": window_case,
         "building_case": building,
+        "slices": slices,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -2716,6 +3019,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
                        "topup": topup_report,
                        "page": elastic.VOCABULARY_PAGE,
                        "page_seconds": list(PAGE_SECONDS),
+                       "wide_page_seconds": list(WIDE_PAGE_SECONDS),
                        "bulk_jobs": BULK_JOBS,
                        "cases_served": 3 + fresh["cases"] + default_map["cases"]},
         "oracle": oracle,
@@ -2768,10 +3072,24 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # the job name labelled, served from the sign-in build at no cost
         "window_case_shown": window_case["shown"] and not window_case["leaks"]
         and not window_case["part_leak"] and window_case["requests"] == 0,
-        # the whole build fits its budget, and a top-up is cheap
+        # every slice fits the per-slice budget, no page was charged at the
+        # wide-range rate (a build that slices never asks for one), and a
+        # top-up is cheaper than the cover
         "vocabulary_build_in_budget":
-            build_report["simulated_s"] <= cfg.vocabulary_budget_s
+            build_report["max_slice_s"] <= cfg.vocabulary_budget_s
+            and not build_report["wide_pages"]
             and topup_report["simulated_s"] < build_report["simulated_s"],
+        # A case runs off the recent slices while the older ones are still
+        # being read, and no serve-loop step blocks the broker: a ping
+        # after every step is answered, and no step takes longer than one
+        # poll interval.
+        "vocabulary_slices_serve_early":
+            slices["case_shown"] and not slices["case_leaks"]
+            and not slices["case_part_leak"]
+            and slices["refused_before_cover"] == "vocabulary_building"
+            and slices["still_building_older"]
+            and slices["pings"] == slices["pings_answered"] > 0
+            and slices["max_step_s"] <= slices["poll_interval_s"],
         # a case before the build finishes is refused, not shown
         "vocabulary_building_refuses":
             building["refused"] == "vocabulary_building" and not building["shown"],
@@ -2811,6 +3129,28 @@ def _num(v: str):
         return int(v)
     except ValueError:
         return v
+
+
+def _slice_lines(s: dict | None) -> list[str]:
+    """The sliced build on the real broker: when a case can first run, and
+    that the broker keeps answering while it builds."""
+    if not s:
+        return []
+    return [
+        f"  on the broker   a case over the recent cover is "
+        f"{'shown' if s['case_shown'] else 'NOT SHOWN'}"
+        + (f" (refused {s['case_refused']})" if s["case_refused"] else "")
+        + f", {len(s['case_leaks'])} leaks, "
+        f"{'a word of the name readable' if s['case_part_leak'] else 'name hidden'}; "
+        f"before any cover it was {s['refused_before_cover'] or 'NOT REFUSED'}; older slices "
+        f"{'still building' if s['still_building_older'] else 'ALREADY DONE (nothing proved)'}"
+        f" after {s['slices_at_first_case']} slices "
+        f"({s['covered_days_at_first_case']}d covered, {s['requests_to_first_case']} requests, "
+        f"{s['seconds_to_first_case']}s simulated)",
+        f"  steps           {s['steps']} serve-loop steps, longest {s['max_step_s']}s against a "
+        f"{s['poll_interval_s']:g}s poll interval; {s['pings_answered']}/{s['pings']} pings "
+        f"answered mid-build (es-login's progress and es-logout's stop are these)",
+    ]
 
 
 def _estate_lines(e: dict | None) -> list[str]:
@@ -2894,11 +3234,18 @@ def format_report(r: dict) -> str:
         f"(cluster back catalogue {r['vocabulary']['bulk_jobs']} job names)",
         f"before the build  a case is {r['building_case']['refused'] or 'NOT REFUSED'}, "
         f"{'no page shown' if not r['building_case']['shown'] else 'A PAGE WAS SHOWN'}",
-        f"vocabulary build  {b['requests']} requests, {b['simulated_s']}s simulated of a "
-        f"{b['budget_s']:g}s budget, over {b['covered_days']} days, once per cluster at "
-        f"sign-in ({r['vocabulary']['page']} values a page, one field a page, "
-        f"page cost {r['vocabulary']['page_seconds']}s); values per field against the cap "
+        f"vocabulary build  {b['slices']} one-day slices, newest first: {b['requests']} "
+        f"requests and {b['simulated_s']}s simulated for the whole {b['covered_days']}d cover, "
+        f"worst slice {b['max_slice_s']}s of the {b['budget_s']:g}s per-slice budget, "
+        f"{b['wide_pages']} pages charged at the wide-range rate "
+        f"({r['vocabulary']['page']} values a page, one field a page, a page over a slice "
+        f"{r['vocabulary']['page_seconds']}s against {r['vocabulary']['wide_page_seconds']}s "
+        f"over the whole range); values per field against the cap "
         f"{r['vocabulary']['max']}: {b['fields']}",
+        f"  to first case   {b['serving_requests']} requests and {b['serving_seconds']}s "
+        f"simulated, after {b['serving_after_slices']} slices: what someone signing in waits "
+        f"for before a case can run; the rest of the cover is read behind them",
+        *_slice_lines(r.get("slices")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "
