@@ -335,6 +335,11 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
 
     fx = eseval.generate(docs=200)
     cfg0 = elastic.load(elastic.EXAMPLE)
+    # the synthetic documents sit at eseval.NOW and the stub resolves date
+    # math against it, so the clock that decides which window the name
+    # vocabulary is read for has to be the same one. Against a real cluster
+    # both are the wall clock and this is never touched.
+    esbridge.clock = eseval.NOW.timestamp
     # headless sign-in is allowed here only: the real IdP refuses it. With
     # --expired the IdP is closed too, or Chrome parking its tab would sign
     # the run straight back in.
@@ -580,6 +585,7 @@ def _es_research_stub(args: argparse.Namespace) -> int:
 
     fx = eseval.generate(docs=300)
     cfg0 = elastic.load(elastic.EXAMPLE)
+    esbridge.clock = eseval.NOW.timestamp  # the fixture's clock; see _es_smoke_stub
     stub = eseval.StubKibana(eseval.StubEngine(fx, cfg0.indices),
                              cookie="sid=synthetic-stub").start()
     # a socket path must fit in 104 bytes; the default temp root on macOS is long

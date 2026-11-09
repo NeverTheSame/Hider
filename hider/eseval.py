@@ -220,13 +220,18 @@ class _Filler:
 
 
 def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
-             clean_share: float = 0.25) -> Fixture:
+             clean_share: float = 0.25, bulk_jobs: int | None = None) -> Fixture:
     """Documents in the three index shapes, with ground truth.
 
     ``clean_share`` of the documents carry a message with no customer value
     (their identifier fields are still real; that is what the field map is
     for). The unlisted fields are planted with a customer value on purpose,
     so a failure of default-deny shows up as a leak.
+
+    ``bulk_jobs`` is the estate's back catalogue of job names (see
+    :func:`bulk_job_docs`); ``run_eval`` asks for :data:`BULK_JOBS` of them.
+    It defaults to none, so a test that only needs the three index shapes
+    does not carry twelve thousand documents it never reads.
     """
     rng = random.Random(seed)
     tpl = _load()
@@ -315,7 +320,231 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
         out.append(Doc(index, src, f.seeded, clean))
     out.extend(unmarked_job_docs(ts, servers))
     out.extend(unmarked_name_docs(ts, servers))
+    out.extend(default_map_docs(ts, servers))
+    out.extend(keep_leak_docs(ts, servers))
+    out.extend(window_case_docs(ts, servers))
+    out.extend(bulk_job_docs(bulk_jobs or 0))
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
+
+
+#: The estate's back catalogue of job names: how many distinct values one
+#: vocabulary field holds over the retention period on a cluster that is not
+#: small. Twelve thousand is past what one ``terms`` aggregation was asked
+#: for (the cap was 10,000), so before the vocabulary was read in pages over
+#: the case's own window, every case on this fixture was refused with
+#: ``vocabulary`` and no page was ever shown. All names invented, and built
+#: by position rather than drawn, so the generator's RNG stream is untouched.
+BULK_JOBS = 12_000
+_BULK_FIRST = ("Orchard", "Wolds", "Kestrel", "Fenmoor", "Calder", "Brindle", "Harlow",
+               "Pentland", "Sableford", "Larkspur", "Tarnmouth", "Ridgeway")
+_BULK_SECOND = ("Sweep", "Export", "Rollup", "Retention", "Archive Run", "Reindex",
+                "Verify", "Compaction", "Restore Drill", "Inventory")
+
+
+def bulk_job_name(i: int) -> str:
+    return (f"{_BULK_FIRST[i % len(_BULK_FIRST)]} "
+            f"{_BULK_SECOND[(i // len(_BULK_FIRST)) % len(_BULK_SECOND)]} {i:05d}")
+
+
+def bulk_job_docs(count: int = BULK_JOBS) -> list[Doc]:
+    """One application document per back-catalogue job name.
+
+    Every one of them is older than any case window the eval uses, which is
+    the point: a windowed read must not pay for them, and a read of the whole
+    retention period must still either page through them or refuse. They are
+    not ground truth - no query returns one and no page shows one - so they
+    add volume to the cluster, not values to the leak check.
+    """
+    docs: list[Doc] = []
+    for i in range(count):
+        at = (NOW - timedelta(days=10) - timedelta(minutes=2 * i)) \
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-app-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success", "action": "job-step"},
+            "log": {"level": "info", "logger": "Engine.Jobs"},
+            "message": "Scheduler tick: 1 jobs due, 0 running, 0 queued",
+            "job": {"name": bulk_job_name(i), "status": "Success"},
+            "service": {"name": "backup-engine", "version": "8.4.1"},
+        }, {}))
+    return docs
+
+
+#: Tenant and resource names on a site map with **no** vocabulary section.
+#: The default used to be JOB_NAME fields only, so at any site that had not
+#: written the section - the common case - a tenant or resource named in
+#: message text stayed readable, its own field being on another document.
+#: The case window is one hour; the field records sit outside it, inside the
+#: margin. (multi-word tenant, resource, the message, a phrase that finds
+#: the message without naming either). All values invented.
+DEFAULT_MAP_TENANT = "Thornbury Estates"
+DEFAULT_MAP_RESOURCE = "vault07"
+DEFAULT_MAP_MESSAGE = (f"Quota warning for {DEFAULT_MAP_TENANT}, resource "
+                       f"{DEFAULT_MAP_RESOURCE} near capacity")
+DEFAULT_MAP_PHRASE = "near capacity"
+DEFAULT_MAP_RANGE = {"gte": "now-4h", "lte": "now-3h"}
+#: One-word tenant names, which is what many real tenants are called. Each
+#: gets the same treatment as the multi-word one; the skip rules
+#: (:meth:`elastic.EsScrubber.vocabulary_skip`) drop some of them on purpose,
+#: and those stay readable in message text. ``es-eval`` reports which, and
+#: AGENTS.md records it as a declared miss - the point of the spread is that
+#: the number is measured rather than assumed.
+DEFAULT_MAP_ONE_WORD = ("Thornbury", "Brackenvault", "Meridian", "Larkspur",
+                        "Archive", "Vault", "Ops", "Nimbus")
+
+
+def default_map_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """Two documents per name: the message, on a worker document whose own
+    tenant field holds someone else, and the record that carries the name in
+    its own field, logged before the case's hour. Positions, not draws."""
+    docs: list[Doc] = []
+    prx, ctr = servers["prx"][4], servers["ctr"][4]
+    other = tenants[5]
+
+    def pair(i: int, tenant: str, resource: str, message: str) -> None:
+        at = (NOW - timedelta(minutes=200 + i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-worker-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success"},
+            "log": {"level": "warn"},
+            "message": message,
+            "agent": {"name": prx.name},
+            "host": {"name": prx.name, "ip": prx.ip},
+            "labels": {"tenant_name": other.name, "tenant_id": other.tenant_id},
+        }, {tenant: "ORG_NAME", resource: "RESOURCE_NAME", prx.name: "SERVER_NAME",
+            prx.ip: "IPV4", other.name: "ORG_NAME", other.tenant_id: "TENANT_ID"}))
+        before = (NOW - timedelta(hours=5, minutes=i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-app-*", {
+            "@timestamp": before,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success", "action": "inventory"},
+            "log": {"level": "info", "logger": "Engine.Inventory"},
+            "message": "Inventory refreshed",
+            "agent": {"name": ctr.name},
+            "host": {"name": ctr.name, "ip": ctr.ip},
+            "labels": {"tenant_name": tenant, "tenant_full_name": f"{tenant} Limited",
+                       "tenant_id": other.tenant_id, "resource_name": resource},
+        }, {tenant: "ORG_NAME", f"{tenant} Limited": "ORG_NAME", resource: "RESOURCE_NAME",
+            ctr.name: "SERVER_NAME", ctr.ip: "IPV4", other.tenant_id: "TENANT_ID"}))
+
+    pair(0, DEFAULT_MAP_TENANT, DEFAULT_MAP_RESOURCE, DEFAULT_MAP_MESSAGE)
+    for i, name in enumerate(DEFAULT_MAP_ONE_WORD):
+        pair(i + 1, name, f"vault{i + 10}",
+             f"Quota warning for {name}, resource vault{i + 10} near capacity")
+    return docs
+
+
+def default_map_cases() -> list[tuple[str, str, str]]:
+    """(tenant, resource, message) for every default-map name, the
+    multi-word one first."""
+    out = [(DEFAULT_MAP_TENANT, DEFAULT_MAP_RESOURCE, DEFAULT_MAP_MESSAGE)]
+    out += [(n, f"vault{i + 10}",
+             f"Quota warning for {n}, resource vault{i + 10} near capacity")
+            for i, n in enumerate(DEFAULT_MAP_ONE_WORD)]
+    return out
+
+
+#: A sensitive value in a keep field: a real cluster's level field held a
+#: SharePoint personal-site URL (a person's name in the path) among its
+#: ordinary info/Warning/ERR spellings, once a day. A keep field passes
+#: through unchanged by declaration, and the value reaches Claude two ways:
+#: in a hit, and as a bucket key when the field's values are aggregated,
+#: which the esmcp instructions tell Claude to do before filtering. All
+#: values invented; the GUIDs are fixed, not drawn.
+KEEP_LEAK_URL = "https://bellpointe-my.sharepoint.com/personal/lena_mareau_bellpointe_com"
+KEEP_LEAK_SITE = "8c0e7d9a-4f3b-4a2e-9a1d-5b6c7e8f9a0b"
+KEEP_LEAK_WEB = "2b9f3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d"
+KEEP_LEAK_VALUE = f"site: {KEEP_LEAK_SITE}, web: {KEEP_LEAK_WEB}, url: {KEEP_LEAK_URL}"
+#: finds the document without naming anything in it
+KEEP_LEAK_PHRASE = "one site collection moved"
+#: The ordinary spellings a level and outcome field really hold, which must
+#: come back from the keep pass exactly as written - as hit values, as
+#: bucket keys, and as filter values that still match.
+KEEP_LEVEL_SPELLINGS = ("info", "Information", "INFO", "warn", "wrn", "err", "Critical")
+KEEP_OUTCOME_SPELLINGS = ("success", "failure")
+
+
+def keep_leak_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """One worker document whose ``log.level`` holds :data:`KEEP_LEAK_VALUE`,
+    then one per level/outcome spelling pair, all inside the 6h spread.
+    Positions, not draws: no RNG is consumed."""
+    t, prx = tenants[2], servers["prx"][3]
+    base = {
+        "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+        "agent": {"name": prx.name},
+        "host": {"name": prx.name, "ip": prx.ip},
+        "labels": {"tenant_name": t.name, "tenant_id": t.tenant_id},
+    }
+    common = {prx.name: "SERVER_NAME", prx.ip: "IPV4", t.name: "ORG_NAME",
+              t.tenant_id: "TENANT_ID"}
+    docs = [Doc("logs-worker-*", {
+        **base,
+        "@timestamp": (NOW - timedelta(minutes=33)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "event": {"outcome": "success"},
+        "log": {"level": KEEP_LEAK_VALUE},
+        "message": "Processing finished, one site collection moved",
+    }, {**common, KEEP_LEAK_URL: "SITE_URL", "lena_mareau": "PERSON_NAME",
+        KEEP_LEAK_SITE: "OBJECT_GUID", KEEP_LEAK_WEB: "OBJECT_GUID"})]
+    for i, level in enumerate(KEEP_LEVEL_SPELLINGS):
+        docs.append(Doc("logs-worker-*", {
+            **base,
+            "@timestamp": (NOW - timedelta(minutes=35 + i)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "event": {"outcome": KEEP_OUTCOME_SPELLINGS[i % len(KEEP_OUTCOME_SPELLINGS)]},
+            "log": {"level": level},
+            "message": "Worker heartbeat",
+        }, dict(common), clean=True))
+    return docs
+
+
+#: The one-hour case, the shape the windowed read exists for: a support case
+#: scoped to a single hour, a message in that hour naming a job with nothing
+#: marking it as a name, and the job's own ``job.name`` record logged hours
+#: earlier - outside the case window, inside the margin. On a cluster with
+#: :data:`BULK_JOBS` names, this page is only shown if the vocabulary can be
+#: read for an hour-wide window; a read of the whole retention period hits
+#: the ceiling and refuses the case.
+WINDOW_CASE_JOB = "Harbour Ridge Nightly"
+WINDOW_CASE_MESSAGE = "Harbour Ridge Nightly finished with warnings on a proxy"
+#: finds the message without naming the job
+WINDOW_CASE_PHRASE = "finished with warnings on a proxy"
+WINDOW_CASE_RANGE = {"gte": "now-2h", "lte": "now-1h"}
+
+
+def window_case_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """The two documents of :data:`WINDOW_CASE_JOB`: the message inside the
+    case's hour, the job's own record ten hours before it."""
+    t, prx = tenants[1], servers["prx"][1]
+    ctr = servers["ctr"][1]
+    at = (NOW - timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    before = (NOW - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return [
+        Doc("logs-worker-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success"},
+            "log": {"level": "warn"},
+            "message": WINDOW_CASE_MESSAGE,
+            "agent": {"name": prx.name},
+            "host": {"name": prx.name, "ip": prx.ip},
+            "labels": {"tenant_name": t.name, "tenant_id": t.tenant_id},
+        }, {WINDOW_CASE_JOB: "JOB_NAME", prx.name: "SERVER_NAME", prx.ip: "IPV4",
+            t.name: "ORG_NAME", t.tenant_id: "TENANT_ID"}),
+        Doc("logs-app-*", {
+            "@timestamp": before,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success", "action": "job-step"},
+            "log": {"level": "info", "logger": "Engine.Jobs"},
+            "message": "Scheduler tick: 1 jobs due, 0 running, 0 queued",
+            "agent": {"name": ctr.name},
+            "host": {"name": ctr.name, "ip": ctr.ip},
+            "labels": {"tenant_name": t.name, "tenant_id": t.tenant_id},
+            "job": {"name": WINDOW_CASE_JOB, "status": "Success"},
+            "service": {"name": "backup-engine", "version": "8.4.1"},
+        }, {WINDOW_CASE_JOB: "JOB_NAME", ctr.name: "SERVER_NAME", ctr.ip: "IPV4",
+            t.name: "ORG_NAME", t.tenant_id: "TENANT_ID"}),
+    ]
 
 
 #: Job names in free text with no "job" in front of them, the shape
@@ -548,6 +777,7 @@ class StubEngine:
         self.terms_error = terms_error
         self.requests: list[dict] = []
         self.lock = threading.Lock()
+        self._flat: dict[str, list[tuple[int, dict]]] = {}
 
     # -- matching ----------------------------------------------------------
 
@@ -593,6 +823,22 @@ class StubEngine:
 
     def _select(self, index: str) -> list[Doc]:
         return [d for d in self.fixture.docs if d.index == index]
+
+    def _rows(self, index: str) -> list[tuple[int, dict]]:
+        """Flattened documents of one index, built once. The rows are only
+        ever read, except when ``missing`` is set, which copies."""
+        rows = self._flat.get(index)
+        if rows is None:
+            rows = [(i, flatten(d.source)) for i, d in enumerate(self._select(index))]
+            self._flat[index] = rows
+        if not self.missing:
+            return rows
+        out = [(i, dict(flat)) for i, flat in rows]
+        for f, nth in self.missing.items():
+            for i, flat in out:
+                if i % nth == 0:
+                    flat.pop(f, None)
+        return out
 
     @staticmethod
     def _project(flat: dict, includes: list[str] | None) -> dict:
@@ -641,6 +887,25 @@ class StubEngine:
                     + max(lost, 0),
                     "buckets": bucket_rows,
                 }
+            elif atype == "composite":
+                # One source, as the vocabulary read builds it: values in
+                # key order, a page at a time, after_key to carry on.
+                (src, term), = a["sources"][0].items()
+                f = term["terms"]["field"]
+                size = a.get("size", 10)
+                after = (a.get("after") or {}).get(src)
+                counts = {}
+                for r in rows:
+                    v = r[1].get(f)
+                    if v is not None and (after is None or str(v) > str(after)):
+                        counts.setdefault(v, []).append(r)
+                ordered = sorted(counts.items(), key=lambda kv: str(kv[0]))
+                shown = ordered[:size]
+                node = {"buckets": [{"key": {src: k}, "doc_count": len(v),
+                                     **self._aggs(v, sub, index)} for k, v in shown]}
+                if shown:
+                    node["after_key"] = {src: shown[-1][0]}
+                out[name] = node
             elif atype == "date_histogram":
                 iv = a.get("fixed_interval") or a.get("calendar_interval") or "1h"
                 m = re.fullmatch(r"(\d+)(ms|s|m|h|d)", iv)
@@ -707,11 +972,7 @@ class StubEngine:
             raise KeyError(index)
         if len(parts) > 1 and body.get("size", 10):
             raise ValueError("stub: a search over several indices is aggregation-only")
-        rows = [(i, flatten(d.source)) for p in parts for i, d in enumerate(self._select(p))]
-        for f, nth in self.missing.items():
-            for i, flat in rows:
-                if i % nth == 0:
-                    flat.pop(f, None)
+        rows = [r for p in parts for r in self._rows(p)]
         rows = [r for r in rows if self._match(r[1], body.get("query", {"match_all": {}}))]
         total = len(rows)
         aggs = self._aggs(rows, body.get("aggs", {}), index) if body.get("aggs") else None
@@ -1120,14 +1381,18 @@ def unmarked_phrases() -> list[str]:
 
 
 def learn_vocabulary(scrubber: elastic.EsScrubber, engine: StubEngine,
-                     cluster: str = "stub") -> dict[str, int]:
-    """What ``esbridge.Bridge`` does before a case's first page: one fixed
-    request, every name in it a known value."""
-    vq = scrubber.vocabulary_request()["params"]
-    return scrubber.learn_vocabulary(cluster, {
-        "isPartial": False, "isRunning": False,
-        "rawResponse": engine.search(vq["index"], vq["body"],
-                                     ignore_unavailable=vq["ignore_unavailable"])})
+                     cluster: str = "stub",
+                     window: tuple[float, float] | None = None) -> tuple[dict[str, int], int]:
+    """What ``esbridge.Bridge`` does before a case's first page: a paged read
+    of the case's own window, every name in it a known value. Returns the
+    counts per field and how many requests it took."""
+    fetch = scrubber.vocabulary_fetch(window)
+    while fetch.pending():
+        vq = fetch.request()["params"]
+        fetch.feed({"isPartial": False, "isRunning": False,
+                    "rawResponse": engine.search(vq["index"], vq["body"],
+                                                 ignore_unavailable=vq["ignore_unavailable"])})
+    return fetch.commit(cluster), fetch.requests
 
 
 class Session:
@@ -1138,16 +1403,26 @@ class Session:
         self.engine = engine
         self.scrubber = elastic.EsScrubber(config, tier2=tier2)
         self.log: list[dict] = []
+        #: how many vocabulary reads, and how many requests they cost
+        self.vocabulary_reads = 0
         self.vocabulary_requests = 0
+        self.vocabulary_seconds = 0.0
 
     def call(self, query: dict) -> tuple[dict | None, elastic.Refused | None, float, esquery.Compiled | None]:
         t0 = time.perf_counter()
         compiled = None
         try:
-            compiled = esquery.compile_query(query, self.cfg, self.scrubber)
-            if self.scrubber.vocabulary_due("stub"):
-                self.vocabulary_requests += 1
-                learn_vocabulary(self.scrubber, self.engine)
+            # the fixture's clock, not this machine's: the stub resolves the
+            # date math in the body against NOW, so the window the vocabulary
+            # is read for has to be the same instant
+            compiled = esquery.compile_query(query, self.cfg, self.scrubber,
+                                             now=NOW.timestamp())
+            if self.scrubber.vocabulary_due("stub", compiled.window):
+                self.vocabulary_reads += 1
+                v0 = time.perf_counter()
+                _, n = learn_vocabulary(self.scrubber, self.engine, window=compiled.window)
+                self.vocabulary_requests += n
+                self.vocabulary_seconds += time.perf_counter() - v0
             raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
             envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}
             out = self.scrubber.scrub_response(envelope, compiled.plan).output
@@ -1254,6 +1529,9 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
     cfg = dataclasses.replace(config, clusters=(elastic.Cluster("stub", kb.url),),
                               profile_dir=str(base / "profile"))
     rng = random.Random(seed + 2)
+    # the broker resolves a query's window against this clock to decide what
+    # the vocabulary read covers; the fixture sits at NOW, not at today
+    esbridge.clock = NOW.timestamp
     broker = esbridge.Broker(cfg, lambda: esbridge.UrllibTransport(cookie), poll_interval=0.01,
                              sessions_dir=base / "cases")
     sock = esbridge.broker_socket(esbridge.prepare_profile_dir(cfg.profile_dir))
@@ -1308,7 +1586,8 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
         # the seeded tenant: label out, real value to Kibana, counted against the fixture
         want = sum(1 for d in fx.docs if d.index == "logs-app-*"
                    and flatten(d.source).get("labels.tenant_name") == tenant)
-        check(tool("es_count", {"index": "logs-app-*", "filters": by_case}), want)
+        check(tool("es_count", {"index": "logs-app-*", "time_range": tr, "filters": by_case}),
+              want)
         tool("es_search", {"index": "logs-app-*", "time_range": tr, "filters": by_case, "size": 20})
         for index in ("logs-app-*", "logs-worker-*"):
             aggs = tool("es_aggregate", {"index": index, "time_range": tr, "aggs": {
@@ -1415,6 +1694,7 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
         broker.stopping = True
         thread.join(10)
         kb.stop()
+        esbridge.clock = time.time
 
     # -- what a launch hands Claude Code -------------------------------------
     hostile_env = {"HOME": "/home/analyst", "PATH": "/usr/bin", "ANTHROPIC_API_KEY": "synthetic",
@@ -1505,7 +1785,7 @@ def mcp_gates(m: dict) -> dict[str, bool]:
 def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 20261103, docs: int = 600,
              queries: int = 120, tier2: str = "classifier", mcp: bool = True) -> dict:
     cfg = config or elastic.load(elastic.EXAMPLE)
-    fx = generate(seed=seed, docs=docs)
+    fx = generate(seed=seed, docs=docs, bulk_jobs=BULK_JOBS)
     truth = fx.truth
     engine = StubEngine(fx, cfg.indices)
     rng = random.Random(seed + 1)
@@ -1593,6 +1873,133 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
                  "filters": [{"field": "message", "op": "phrase", "value": rng.choice(_CLEAN_PHRASES)}]},
                 clean=True)
 
+    # The one-hour case on a cluster with a back catalogue of BULK_JOBS
+    # names: a fresh session, an hour-wide window, the job's own record
+    # outside it but inside the margin. What the windowed, paged read is for.
+    window_case = {"shown": False, "refused": None, "leaks": [], "part_leak": False,
+                   "requests": 0, "seconds": 0.0, "values": {}}
+    hour = Session(cfg, engine, tier2=tier2)
+    out, refused, dt, _ = hour.call({
+        "index": "logs-worker-*", "time_range": WINDOW_CASE_RANGE, "size": 20,
+        "filters": [{"field": "message", "op": "phrase", "value": WINDOW_CASE_PHRASE}]})
+    timings.append(dt)
+    window_case["requests"] = hour.vocabulary_requests
+    window_case["seconds"] = round(hour.vocabulary_seconds, 3)
+    window_case["values"] = dict(hour.scrubber.vocabulary_counts)
+    window_case["refused"] = refused.code if refused else None
+    if out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0:
+        window_case["shown"] = True
+        window_case["leaks"] = _leaks(out, truth)
+        window_case["part_leak"] = bool(
+            name_part_leaks(_messages(out), WINDOW_CASE_PHRASE, WINDOW_CASE_JOB))
+
+    # The same first page with no time bounds at all: the read falls back to
+    # the whole vocabulary.days window, so it pays for the back catalogue.
+    # Measured, not gated beyond "it is still read whole and nothing leaks".
+    wide = {"shown": False, "refused": None, "requests": 0, "seconds": 0.0, "values": {}}
+    wide_sess = Session(cfg, engine, tier2=tier2)
+    out, refused, dt, _ = wide_sess.call({
+        "index": "logs-worker-*", "size": 20,
+        "filters": [{"field": "message", "op": "phrase", "value": WINDOW_CASE_PHRASE}]})
+    timings.append(dt)
+    wide.update({"requests": wide_sess.vocabulary_requests,
+                 "seconds": round(wide_sess.vocabulary_seconds, 3),
+                 "values": dict(wide_sess.scrubber.vocabulary_counts),
+                 "refused": refused.code if refused else None,
+                 "shown": out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0})
+
+    # A site map with no vocabulary section at all, which is what a site has
+    # before anyone writes one. The default decides what is read, and a
+    # one-hour case names a tenant and a resource whose own fields are on
+    # other documents. Under the old JOB_NAME-only default both stayed
+    # readable; under the "everything that could be read" default they are
+    # labelled, except the one-word names the skip rules drop - which is a
+    # declared miss, reported here rather than gated.
+    raw_default = json.loads(Path(cfg.source).read_text(encoding="utf-8")) \
+        if cfg.source and Path(cfg.source).exists() else json.loads(elastic.EXAMPLE.read_text())
+    raw_default.pop("vocabulary", None)
+    cfg_default = elastic.parse(raw_default, source="no-vocabulary-section")
+    # Counts, reasons and field names only: the names themselves are planted
+    # values, and the report must not carry one (the names live in
+    # DEFAULT_MAP_ONE_WORD and in AGENTS.md, where they are documentation).
+    default_map = {"cases": 0, "shown": 0, "tenants_hidden": 0, "tenants_readable": 0,
+                   "resources_readable": 0,
+                   "fields_read": [r.pattern for r in cfg_default.vocabulary_rules],
+                   "omitted": list(cfg_default.vocabulary_omitted),
+                   "requests": 0, "seconds": 0.0, "values": {},
+                   "skipped_by_rule": {}, "one_word_names": len(DEFAULT_MAP_ONE_WORD)}
+    readable: list[str] = []
+    for tenant_name, resource, _message in default_map_cases():
+        # a fresh case each time: nothing seeded, nothing harvested, the
+        # names' own fields outside the hour the query asks for
+        first = Session(cfg_default, engine, tier2=tier2)
+        out, refused, dt, _ = first.call({
+            "index": "logs-worker-*", "time_range": DEFAULT_MAP_RANGE, "size": 20,
+            "filters": [{"field": "message", "op": "phrase", "value": DEFAULT_MAP_PHRASE}]})
+        timings.append(dt)
+        default_map["cases"] += 1
+        default_map["requests"] += first.vocabulary_requests
+        default_map["seconds"] += first.vocabulary_seconds
+        default_map["values"] = dict(first.scrubber.vocabulary_counts)
+        default_map["skipped_by_rule"] = dict(first.scrubber.vocabulary_skipped)
+        if out is None or not (out["hits"]["total"] or {}).get("value", 0):
+            continue
+        default_map["shown"] += 1
+        page = " ".join(_messages(out))
+        if tenant_name in page:
+            readable.append(tenant_name)
+            default_map["tenants_readable"] += 1
+        else:
+            default_map["tenants_hidden"] += 1
+        default_map["resources_readable"] += int(resource in page)
+    default_map["seconds"] = round(default_map["seconds"], 3)
+    # how many one-word names the skip rules drop, by the rule's own reason
+    dropped = {n: elastic.EsScrubber.vocabulary_skip(n) for n in DEFAULT_MAP_ONE_WORD}
+    by_reason: dict[str, int] = {}
+    for why in dropped.values():
+        if why:
+            by_reason[why] = by_reason.get(why, 0) + 1
+    default_map["one_word_dropped"] = sum(1 for w in dropped.values() if w)
+    default_map["one_word_dropped_by_reason"] = by_reason
+    # every name left readable is one the skip rules dropped: the declared
+    # miss, and nothing beyond it
+    default_map["readable_all_skipped"] = all(dropped.get(n) for n in readable)
+
+    # The keep-field leak: the level value that is a SharePoint personal-site
+    # URL, shown both ways it reaches Claude - in a hit, and as a bucket key
+    # of an aggregation over the field - plus the fidelity half: the ordinary
+    # level and outcome spellings must come back exactly as logged, and a
+    # filter by one must still match.
+    keep = {"hit_shown": False, "hit_leaks": [], "agg_leaks": [], "bucket_keys": 0,
+            "levels_kept": [], "levels_changed": [], "filter_by_level": False}
+    kl = Session(cfg, engine, tier2=tier2)
+    out, refused, dt, _ = kl.call({
+        "index": "logs-worker-*", "time_range": tr, "size": 20,
+        "filters": [{"field": "message", "op": "phrase", "value": KEEP_LEAK_PHRASE}]})
+    timings.append(dt)
+    if out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0:
+        keep["hit_shown"] = True
+        keep["hit_leaks"] = _leaks(out, truth)
+    out, refused, dt, _ = kl.call({
+        "index": "logs-worker-*", "time_range": tr, "size": 0,
+        "aggs": {"levels": {"type": "terms", "field": "log.level", "size": 30},
+                 "outcomes": {"type": "terms", "field": "event.outcome", "size": 10}}})
+    timings.append(dt)
+    if out is not None:
+        keep["agg_leaks"] = _leaks(out, truth)
+        keys = {str(b["key"]) for a in out["aggregations"].values()
+                for b in a.get("buckets", [])}
+        keep["bucket_keys"] = len(keys)
+        spellings = (*KEEP_LEVEL_SPELLINGS, *KEEP_OUTCOME_SPELLINGS)
+        keep["levels_kept"] = sorted(v for v in spellings if v in keys)
+        keep["levels_changed"] = sorted(set(spellings) - keys)
+    out, refused, dt, _ = kl.call({
+        "index": "logs-worker-*", "time_range": tr, "size": 5,
+        "filters": [{"field": "log.level", "op": "eq", "value": "wrn"}]})
+    timings.append(dt)
+    keep["filter_by_level"] = (out is not None
+                               and (out["hits"]["total"] or {}).get("value", 0) == 1)
+
     # A fresh case's first page, for each job named with no marker: nothing
     # seeded, nothing harvested yet, the job's own record on another document.
     fresh = {"cases": 0, "shown": 0, "leaks": 0, "leaked_types": [], "vocabulary_requests": 0,
@@ -1614,7 +2021,12 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             fresh["leaks"] += bool(leaked)
             fresh["leaked_types"] = sorted(set(fresh["leaked_types"]) | set(leaked))
 
-    # Label round trip: a label learnt from a page, used as a filter.
+    # Label round trip: a label learnt from a page, used as a filter. The
+    # queries carry the case window: a query with no time bounds pays the
+    # vocabulary.days fallback read by design, and the fallback is measured
+    # once above (the no-window case), not forty times here - it would also
+    # add the whole back catalogue to the labels-issued figure.
+    since = NOW - timedelta(hours=6)
     round_trip = {"tried": 0, "passed": 0, "failures": []}
     field_for_type = {}
     for r in cfg.fields:
@@ -1628,7 +2040,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         index = "traces-apm-*" if rule.pattern == "labels.principal_name" else "logs-app-*"
         real = s.mapping[lab]
         round_trip["tried"] += 1
-        out, refused, dt, compiled = sess.call({"index": index, "size": 20,
+        out, refused, dt, compiled = sess.call({"index": index, "size": 20, "time_range": tr,
                                                 "filters": [{"field": rule.pattern, "op": "eq", "value": lab}]})
         timings.append(dt)
         ok = (compiled is not None and json.dumps(compiled.body).find(json.dumps(real)) >= 0
@@ -1637,7 +2049,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             flat_hits = [flatten(h.get("_source", {})) for h in out["hits"]["hits"]]
             ok = all(h.get(rule.pattern) == lab for h in flat_hits) and not _leaks(out, truth)
             raw_hits = [flatten(d.source) for d in fx.docs if d.index == index
-                        and flatten(d.source).get(rule.pattern) in (real, _num(real))]
+                        and flatten(d.source).get(rule.pattern) in (real, _num(real))
+                        and _parse_time(flatten(d.source).get("@timestamp")) >= since]
             ok = ok and out["hits"]["total"]["value"] == len(raw_hits)
         round_trip["passed"] += bool(ok)
         if not ok:
@@ -1689,11 +2102,19 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "degraded": s.degraded,
         "label_round_trip": round_trip,
         "fresh_case": fresh,
-        # extra requests the bridge sends on its own: one per case per
-        # cluster, then one per refresh interval; none here has a value
+        "default_map": default_map,
+        "keep_field": keep,
+        "window_case": window_case,
+        "wide_case": wide,
+        # extra requests the bridge sends on its own: a paged read per case
+        # per cluster, then one per refresh interval; none has a value in it
         "vocabulary": {**s.vocabulary_report(),
-                       "requests": sess.vocabulary_requests + fresh["vocabulary_requests"],
-                       "cases": 1 + fresh["cases"]},
+                       "reads": sess.vocabulary_reads + fresh["cases"] + 2,
+                       "requests": sess.vocabulary_requests + fresh["vocabulary_requests"]
+                       + window_case["requests"] + wide["requests"],
+                       "page": elastic.VOCABULARY_PAGE,
+                       "bulk_jobs": BULK_JOBS,
+                       "cases": 3 + fresh["cases"]},
         "oracle": oracle,
         "text_queries": text_queries,
         "labels_issued": len(s.mapping),
@@ -1716,6 +2137,24 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # every unmarked job-name page shown, not refused, and clean
         "fresh_case_no_leaks": fresh["cases"] == len(unmarked_phrases())
         and fresh["shown"] == fresh["cases"] and fresh["leaks"] == 0,
+        # a site map with no vocabulary section: every name the skip rules
+        # keep is hidden, and every resource. The names the skip rules drop
+        # are the declared miss, reported not gated.
+        "default_map_names_hidden": default_map["shown"] == default_map["cases"] > 0
+        and not default_map["resources_readable"] and default_map["readable_all_skipped"],
+        # the stray URL in a level field: hidden in the hit and in the bucket
+        # key, while every ordinary spelling survives and still filters
+        "keep_leak_closed": keep["hit_shown"] and not keep["hit_leaks"]
+        and not keep["agg_leaks"],
+        "keep_values_readable": not keep["levels_changed"]
+        and len(keep["levels_kept"]) == len(KEEP_LEVEL_SPELLINGS) + len(KEEP_OUTCOME_SPELLINGS)
+        and keep["filter_by_level"],
+        # the one-hour case on a cluster with BULK_JOBS names: shown, with
+        # the job name labelled, on a vocabulary read of its own window
+        "window_case_shown": window_case["shown"] and not window_case["leaks"]
+        and not window_case["part_leak"],
+        # the fallback window still reads whole rather than refusing
+        "wide_case_read_whole": wide["shown"] and wide["refused"] is None,
         # planted in every fixture, projected out by the engine or dropped
         # here; either way never shown
         "unlisted_never_shown": not (set(fx.unlisted_fields) & shown_paths),
@@ -1755,6 +2194,7 @@ def _num(v: str):
 
 
 def format_report(r: dict) -> str:
+    d = r["default_map"]
     lines = [
         f"fixture           {r['fixture']['docs']} docs, {r['fixture']['planted_values']} planted values, "
         f"{r['fixture']['clean_docs']} clean docs",
@@ -1769,8 +2209,37 @@ def format_report(r: dict) -> str:
         f"unmarked job or customer name shown, {r['fresh_case']['leaks']} leaking "
         f"({r['fresh_case']['part_leaks']} by a word of the name)"
         + (f" (types: {r['fresh_case']['leaked_types']})" if r['fresh_case']['leaked_types'] else ""),
-        f"vocabulary        {r['vocabulary']['requests']} extra requests for "
-        f"{r['vocabulary']['cases']} cases (one per case per cluster, then one per "
+        f"no-vocab site map {d['shown']}/{d['cases']} one-hour pages shown, "
+        f"{d['tenants_hidden']} tenant names hidden, {d['tenants_readable']} readable, "
+        f"{d['resources_readable']} resources readable"
+        + ("" if d["readable_all_skipped"] else "  (A NAME THE RULES KEEP IS READABLE)"),
+        f"  one-word names  {d['one_word_dropped']} of {d['one_word_names']} dropped by the "
+        f"skip rules {d['one_word_dropped_by_reason'] or 'none'}, of which "
+        f"{d['tenants_readable']} left readable in message text (a declared miss); the rest "
+        f"happen to be caught by tier 2, which is luck, not the rule",
+        f"  default reads   {len(d['fields_read'])} fields {d['fields_read']}; "
+        f"{d['requests']} requests over {d['cases']} cases in {d['seconds']}s, "
+        f"values {d['values']}",
+        f"keep-field leak   hit {'shown' if r['keep_field']['hit_shown'] else 'NOT SHOWN'}, "
+        f"{len(r['keep_field']['hit_leaks'])} leaks; aggregation "
+        f"{r['keep_field']['bucket_keys']} bucket keys, {len(r['keep_field']['agg_leaks'])} leaks; "
+        f"spellings kept {len(r['keep_field']['levels_kept'])}"
+        + (f", CHANGED {r['keep_field']['levels_changed']}" if r['keep_field']['levels_changed']
+           else "")
+        + f"; filter by a spelling {'works' if r['keep_field']['filter_by_level'] else 'BROKEN'}",
+        f"one-hour case     {'shown' if r['window_case']['shown'] else 'NOT SHOWN'} "
+        f"({r['window_case']['refused'] or 'not refused'}), {len(r['window_case']['leaks'])} leaks, "
+        f"{'a word of the name readable' if r['window_case']['part_leak'] else 'name hidden'}; "
+        f"vocabulary {r['window_case']['requests']} requests, "
+        f"{r['window_case']['seconds']}s, values {r['window_case']['values']} "
+        f"(cluster back catalogue {r['vocabulary']['bulk_jobs']} job names)",
+        f"no-window case    {'shown' if r['wide_case']['shown'] else 'NOT SHOWN'} "
+        f"({r['wide_case']['refused'] or 'not refused'}); the vocabulary.days fallback: "
+        f"{r['wide_case']['requests']} requests, {r['wide_case']['seconds']}s, values "
+        f"{r['wide_case']['values']}",
+        f"vocabulary        {r['vocabulary']['requests']} extra requests over "
+        f"{r['vocabulary']['reads']} reads for {r['vocabulary']['cases']} cases (a paged read per "
+        f"case per cluster, {r['vocabulary']['page']} values a page, then one per "
         f"{elastic.VOCABULARY_REFRESH_S:g}s); values per field against the cap "
         f"{r['vocabulary']['max']}: {r['vocabulary']['fields']}; skipped "
         f"{r['vocabulary']['skipped'] or 'none'}",

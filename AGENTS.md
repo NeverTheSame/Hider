@@ -332,25 +332,124 @@ Listed with owners in the README's Limitations section and in
   the declared cost of hiding any capitalised run right after the word
   "job". A customer name with no marker ("Harbour Nightly finished",
   "Tenant Thornbury Estates exceeded its quota") is closed by the case's
-  **name vocabulary**: `esbridge.Bridge` sends one fixed request, a terms
-  aggregation per field in the site map's `vocabulary.fields` (default: the
-  non-glob JOB_NAME fields), before a case's first page per cluster and
-  every `VOCABULARY_REFRESH_S` after (`EsScrubber.vocabulary_request` /
-  `learn_vocabulary`); every value becomes a known value under its field's
-  rule. Fields of a type in `elastic.NO_VOCABULARY_TYPES` (accounts, ids,
+  **name vocabulary**: before a case's first page per cluster and every
+  `VOCABULARY_REFRESH_S` after, `esbridge.Bridge` reads every value of
+  every field in the site map's `vocabulary.fields` and makes each one a
+  known value under its field's own rule. Fields of a type in
+  `elastic.NO_VOCABULARY_TYPES` (accounts, ids,
   machines, numbers), shaped fields and globs are refused at load. Values
   that are log words, stopwords, letterless, one word under four
   characters or one word on `elastic.ORDINARY_NAME_WORDS` are skipped (a
-  fixed list on purpose, not the system dictionary). It fails closed
-  (`vocabulary`, learning nothing from a refused reply), logs counts per
-  field against the cap (`vocabulary_report`, also `es-smoke`'s `VOCAB`
-  line, `NEAR CAP` at 80%), and is measured by `eseval.UNMARKED_JOBS` and
+  fixed list on purpose, not the system dictionary).
+  **With no `vocabulary` section the default is every field that could be
+  listed** (`ElasticConfig.learnable_rules`: non-glob, unshaped, type
+  outside `NO_VOCABULARY_TYPES`), which is exactly the set
+  `_parse_vocabulary` accepts - so the default can never be something a
+  site map would be refused for, and a map listing everything it may list
+  gets the same set as one listing nothing. It was JOB_NAME fields only,
+  which left tenant, tenant-full and resource names readable in message
+  text at every site that had not written the section: the common case,
+  and the fields most likely to hold the customer's name. A map that does
+  list `vocabulary.fields` keeps exactly its own list, and
+  `ElasticConfig.vocabulary_omitted` names what it leaves out - reported
+  in `vocabulary_report()["omitted"]` and on `es-smoke`'s `VOCAB` line as
+  `NOT READ (readable in text)`, field names only, names the map already
+  holds. Measured by `eseval.DEFAULT_MAP_*` (a map with the section
+  deleted, a one-hour case, tenant and resource names in message text with
+  their own fields on other documents outside the hour) behind the
+  `default_map_names_hidden` gate.
+  **Declared miss: a one-word tenant name the skip rules drop stays
+  readable.** Many real tenants are one word, and a one-word value that is
+  on `ORDINARY_NAME_WORDS` or shorter than four characters is never made
+  vocabulary, because registering it would hide that word from every
+  message. Of the eight invented one-word names in
+  `eseval.DEFAULT_MAP_ONE_WORD`, three are dropped (`Archive` and `Vault`
+  as `ordinary_word`, `Ops` as `short`) and two of those are then readable
+  in message text; the third happens to be caught by tier 2, which is luck
+  and not a rule to rely on. A site whose tenants are called `Archive` or
+  `Vault` gets no vocabulary protection for them and must seed the name
+  with `--term`. Widening the vocabulary to cover them is not the fix -
+  that is the skip rules' trade, out of scope here, and loosening it
+  erases the word everywhere.
+  **The read is windowed and paged** (`elastic.VocabularyFetch`), because
+  one capped `terms` aggregation over the whole retention period refused
+  every case on any estate with more distinct names than the cap, and took
+  minutes when it did not. It covers the window of the query being served,
+  widened by `vocabulary.margin_days` (1) on each side, in `composite`
+  pages of `VOCABULARY_PAGE` (1,000) per field, carrying each field's
+  `after_key`; a query with no start or no end falls back to
+  `vocabulary.days` with the date math left to the cluster's clock, which
+  is the old behaviour and the old price. The caller drives it
+  (`pending()` / `request()` / `feed()` / `commit()`), and **nothing is
+  learnt before the commit**: an upstream error, a partial, timed-out or
+  misshapen reply, a field over `vocabulary.max` (50,000) counted across
+  the whole read, or a read over `vocabulary.budget_s` (60s, wall clock
+  under the bridge's one lock) all raise `Refused` and leave the session
+  exactly as it was. The only thing the query contributes is its own
+  already-validated time bounds - never a phrase, a label or a value - and
+  the log holds counts, requests and seconds per field, never a name
+  (`vocabulary_report`, also `es-smoke`'s `VOCAB` line, `NEAR CAP` at
+  80%). The window a read covered is remembered per cluster, so a later
+  query inside it costs nothing and one reaching outside it reads again.
+  `Compiled.window` is where the bounds come from; `esbridge.clock`
+  resolves them and is replaced only by the stub harnesses, whose fixture
+  sits at `eseval.NOW` rather than today.
+  It is measured by `eseval.UNMARKED_JOBS` and
   `eseval.UNMARKED_NAMES` (fixed documents appended after the RNG stream),
   the `fresh_case_no_leaks` / `mcp_fresh_case_shown` gates, and the
   word-by-word check `eseval.name_part_leaks`, since a half-hidden name
-  passes the whole-value one. Anything that scrubs pages outside the
+  passes the whole-value one; and by `eseval.BULK_JOBS`, a back catalogue
+  of 12,000 invented job names older than any case window, with
+  `WINDOW_CASE_*` (a one-hour case whose message names a job whose own
+  record is outside that hour) behind the `window_case_shown` and
+  `wide_case_read_whole` gates. Before windowing, that fixture refused
+  every query in es-eval with `vocabulary` and showed no page at all.
+  Anything that scrubs pages outside the
   bridge (es-eval's `Session`, tests) must learn the vocabulary first:
-  `eseval.learn_vocabulary`. `es_schema` and the esmcp instructions also tell Claude that keep
+  `eseval.learn_vocabulary`.
+  Declared misses of the windowed read, each the price of not reading the
+  whole retention period: a name whose **only** occurrence in its own field
+  is outside the case window plus the margin is not learnt, so it stays
+  readable in message text unless something else marks it (the margin, not
+  the case, is what decides how far back that reaches); and Claude choosing
+  a narrow window narrows the read with it, which cannot be used to
+  *extract* anything (the vocabulary is never shown and only ever adds
+  redactions) but does mean the cover of a page depends on the window asked
+  for. A query with no time bounds still pays the full `vocabulary.days`
+  read, so an estate past `vocabulary.max` on one field refuses those, by
+  design: a partial list is worse than none.
+  **Keep fields are checked, not trusted.** A keep field used to pass
+  through unchanged (`_rewrite_leaf`) on the declaration that it holds
+  nothing sensitive, and a real level field held a SharePoint personal-site
+  URL among its `info`/`Warning`/`ERR` spellings - reaching Claude in hits
+  and as a bucket key when the field's values are aggregated. Every string
+  keep value now goes through `EsScrubber._keep_value`: tier 1 plus the
+  known-value sweep via `_scrub_text(shaped_only=True)`, never tier 2, in
+  hit leaves (`_rewrite_leaf`) and in terms-bucket keys and
+  `key_as_string` (`_rewrite_agg`); a match is replaced the way a text
+  field would replace it and the bucket stays one bucket under its
+  rewritten key. Strings of only digits and time punctuation
+  (`_TIME_SHAPED`: timestamps, durations, versions - no identifier fits
+  that alphabet) skip the pass, and `jsonscrub._detect_cache` makes
+  repeated values one detection, which is why es-eval is not measurably
+  slower. Measured by the `keep_leak_closed` gate (the invented URL in
+  `eseval.KEEP_LEAK_VALUE`, shown through a hit and through an
+  aggregation; both leaked before the pass) and the `keep_values_readable`
+  gate (`KEEP_LEVEL_SPELLINGS` + `KEEP_OUTCOME_SPELLINGS` come back
+  byte-for-byte as hit values and bucket keys, and an exact filter on one
+  still matches); intent tests in `test_elastic.py`. Declared misses and
+  costs: a keep value tier 1 recognises is labelled, so Claude cannot
+  filter by it (a keep field takes literals and it only has the label) -
+  for a value like this one, that is the point, but it also hides a
+  benign keep value that happens to be identifier-shaped (a public-TLD
+  FQDN in a dataset name, say), the same fail-toward-redaction trade the
+  recognizers make everywhere else; a sensitive keep value tier 1 has no
+  shape for (a bare name as a level, with no URL, GUID or domain around
+  it) still passes, because tier 2 deliberately stays off keep fields -
+  a classifier guessing at names inside level spellings is how `Critical`
+  stops being filterable; and a sensitive value under `keep` remains a
+  site-map error first, this pass is the net under it.
+  `es_schema` and the esmcp instructions also tell Claude that keep
   fields hold spellings as logged (err/Error/ERROR): aggregate a keep
   field's values before an exact filter, then filter with `in` across the
   spellings; values are never normalised. A case saved before the log-vocabulary trim

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from datetime import timedelta
 
 import pytest
 
@@ -147,6 +148,108 @@ def test_stub_kibana_speaks_the_async_search_protocol(engine):
         assert "not_found:index_not_found_exception" in e.value.message
     finally:
         kb.stop()
+
+
+# -- the back catalogue: more job names than one aggregation can carry ----------
+#
+# A real cluster holds tens of thousands of distinct job names over its
+# retention period. The vocabulary used to be one terms aggregation over the
+# last vocabulary.days days, capped: on an estate this size the cap was
+# always hit, so every case was refused and no page was ever shown. These
+# tests pin both halves of the fix - the catalogue is genuinely past the old
+# cap, and an hour-wide case now reads one page and still hides the name.
+
+
+@pytest.fixture(scope="module")
+def bulk():
+    fx = eseval.generate(docs=200, bulk_jobs=eseval.BULK_JOBS)
+    return fx, eseval.StubEngine(fx, CFG.indices)
+
+
+def test_the_back_catalogue_is_past_what_one_capped_aggregation_returns(bulk):
+    fx, engine = bulk
+    names = {eseval.flatten(d.source).get("job.name") for d in fx.docs}
+    names.discard(None)
+    assert len(names) > 10_000  # the cap the single-request read shipped with
+    # what the old read asked for, against this fixture: a full bucket list,
+    # which is exactly the condition that refused the case
+    body = {"size": 0, "track_total_hits": False,
+            "query": {"bool": {"filter": [{"range": {"@timestamp": {"gte": "now-30d"}}}]}},
+            "aggs": {"v": {"terms": {"field": "job.name", "size": 10_000}}}}
+    raw = engine.search(",".join(CFG.indices), body, ignore_unavailable=True)
+    assert len(raw["aggregations"]["v"]["buckets"]) == 10_000
+
+
+def test_an_hour_wide_case_reads_one_page_and_hides_the_job_name(bulk):
+    fx, engine = bulk
+    s = elastic.EsScrubber(CFG, tier2="none")
+    lo = (eseval.NOW.timestamp() - 2 * 3600, eseval.NOW.timestamp() - 3600)
+    counts, requests = eseval.learn_vocabulary(s, engine, window=lo)
+    assert requests == 1
+    assert counts["job.name"] < 100  # the hour's names, not the catalogue
+    out = s._scrub_text(eseval.WINDOW_CASE_MESSAGE)
+    assert eseval.WINDOW_CASE_JOB not in out
+    assert out == eseval.WINDOW_CASE_MESSAGE.replace(
+        eseval.WINDOW_CASE_JOB, s.known[eseval.WINDOW_CASE_JOB.casefold()])
+    # no part of the name is left readable either
+    assert not eseval.name_part_leaks([out], eseval.WINDOW_CASE_PHRASE, eseval.WINDOW_CASE_JOB)
+
+
+def test_a_read_with_no_window_pages_through_the_whole_catalogue(bulk):
+    """The fallback a query with no time bounds falls back to: still read
+    whole, in pages, under the ceiling - just at the price the windowed read
+    exists to avoid."""
+    fx, engine = bulk
+    s = elastic.EsScrubber(CFG, tier2="none")
+    counts, requests = eseval.learn_vocabulary(s, engine)
+    assert counts["job.name"] > 12_000
+    # one page per thousand names, and the last page is short, which is what
+    # says the field is exhausted
+    assert requests == -(-counts["job.name"] // elastic.VOCABULARY_PAGE)
+    assert eseval.bulk_job_name(0).casefold() in s.known
+
+
+# -- a site map with no vocabulary section -------------------------------------
+
+
+def test_the_fixture_names_tenants_and_resources_on_other_documents(fixture):
+    """The default-map shape: the message names them, its own document holds
+    another tenant, and the names sit in their own fields elsewhere."""
+    for tenant, resource, message in eseval.default_map_cases():
+        holders = [d for d in fixture.docs if d.source.get("message") == message]
+        assert len(holders) == 1
+        flat = eseval.flatten(holders[0].source)
+        assert tenant not in flat.values() and resource not in flat.values()
+        assert any(eseval.flatten(d.source).get("labels.tenant_name") == tenant
+                   for d in fixture.docs)
+        assert any(eseval.flatten(d.source).get("labels.resource_name") == resource
+                   for d in fixture.docs)
+
+
+def test_the_one_hour_window_covers_the_messages_but_not_the_name_records(fixture):
+    """The records are outside the case's hour and inside the margin: what
+    makes this a vocabulary read rather than a harvest."""
+    lo = eseval.NOW - timedelta(hours=4)
+    hi = eseval.NOW - timedelta(hours=3)
+    for tenant, _resource, message in eseval.default_map_cases():
+        msg = next(d for d in fixture.docs if d.source.get("message") == message)
+        assert lo <= eseval._parse_time(msg.source["@timestamp"]) <= hi
+        rec = next(d for d in fixture.docs
+                   if eseval.flatten(d.source).get("labels.tenant_name") == tenant
+                   and d.source.get("message") == "Inventory refreshed")
+        at = eseval._parse_time(rec.source["@timestamp"])
+        assert at < lo and at > lo - timedelta(days=1)  # outside the hour, inside the margin
+
+
+def test_the_skip_rules_leave_some_one_word_tenant_names_readable():
+    """Named, not assumed: many real tenants are one word, and a one-word
+    name that is an ordinary word or shorter than four characters is never
+    made vocabulary, so it stays readable in message text."""
+    dropped = {n: elastic.EsScrubber.vocabulary_skip(n)
+               for n in eseval.DEFAULT_MAP_ONE_WORD}
+    assert {n: w for n, w in dropped.items() if w} == {
+        "Archive": "ordinary_word", "Vault": "ordinary_word", "Ops": "short"}
+    assert sum(1 for w in dropped.values() if not w) == 5
 
 
 # -- the eval -----------------------------------------------------------------------

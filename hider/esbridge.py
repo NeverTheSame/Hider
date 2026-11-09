@@ -79,6 +79,12 @@ POLL_TIMEOUT_S = 120.0
 LOGIN_TIMEOUT_S = 600.0
 PROFILE_MARKER = ".hider-es-bridge-profile"
 LOG_SCHEMA = "hider.es-bridge.v1"
+#: What "now" is when a query's time window is resolved, which decides the
+#: window the name vocabulary is read for. The body sent to the cluster still
+#: carries date math as written, so this clock never changes what a query
+#: selects. Replaced only by the stub harness, whose fixture sits at a fixed
+#: instant; nothing in the live path replaces it.
+clock = time.time
 
 #: Stock Chrome profile roots. A profile_dir under one of these is the
 #: analyst's own browser, whatever the config says.
@@ -530,12 +536,13 @@ class Bridge:
         with self._lock:
             try:
                 cluster = self.cluster(cluster_name)
-                compiled = esquery.compile_query(query, self.config, self.scrubber)
+                compiled = esquery.compile_query(query, self.config, self.scrubber,
+                                                 now=clock())
                 row.update(_describe(query, compiled))
                 if probe:
                     self.session.probe(cluster)
-                if self.scrubber.vocabulary_due(cluster.name):
-                    self._vocabulary(cluster)
+                if self.scrubber.vocabulary_due(cluster.name, compiled.window):
+                    self._vocabulary(cluster, compiled.window)
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
                 envelope = self.session.search(cluster, compiled.body)
@@ -558,25 +565,31 @@ class Bridge:
                 self._log(row)
         return outcome
 
-    def _vocabulary(self, cluster: elastic.Cluster) -> None:
-        """One extra request before a case's first page on a cluster, and
-        every ``VOCABULARY_REFRESH_S`` after: the names the sweep must know
-        before it can label one that nothing marks. Its own log row holds,
-        per field, how many values came back against the cap, and how many
-        were skipped by reason; never a value. A failure refuses the page it
-        was fetched for (``vocabulary``, or ``upstream_error``)."""
+    def _vocabulary(self, cluster: elastic.Cluster,
+                    window: tuple[float, float] | None = None) -> None:
+        """A paged read before a case's first page on a cluster, and again
+        every ``VOCABULARY_REFRESH_S``: the names the sweep must know before
+        it can label one that nothing marks. It covers the window of the
+        query being served plus a margin, in composite pages, under a ceiling
+        and a time budget. Its own log row holds, per field, how many values
+        came back against the cap, how many were skipped by reason, how many
+        requests it took and how long; never a value. A failure refuses the
+        page it was fetched for (``vocabulary``, or ``upstream_error``)."""
         t0 = time.perf_counter()
         row: dict[str, Any] = {"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                "cluster": cluster.name, "vocabulary": "names"}
+        fetch = self.scrubber.vocabulary_fetch(window)
         try:
-            reply = self.session.search(cluster, self.scrubber.vocabulary_request())
-            self.scrubber.learn_vocabulary(cluster.name, reply)
+            while fetch.pending():
+                fetch.feed(self.session.search(cluster, fetch.request()))
+            fetch.commit(cluster.name)
             row.update(self.scrubber.vocabulary_report())
             self.vocabulary[cluster.name] = self.scrubber.vocabulary_report()
         except elastic.Refused as e:
             row["refused"] = e.code
             raise
         finally:
+            row["requests"] = fetch.requests
             row["seconds"] = round(time.perf_counter() - t0, 3)
             self._log(row)
 
@@ -792,7 +805,13 @@ def run_case(bridge: Bridge, cluster: str, query: dict) -> dict:
 
 
 def vocabulary_line(v: dict | None) -> str | None:
-    """How close each vocabulary field is to its cap: counts, never values."""
+    """How close each vocabulary field is to its cap: counts, never values.
+
+    ``NOT READ`` names the identifier fields a vocabulary could hold that
+    this site map's ``vocabulary.fields`` leaves out - their values stay
+    readable in message text, which is a choice worth seeing. Field names
+    only; a field is only listed here because the map itself names it.
+    """
     if not v or not v.get("fields"):
         return None
     parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()]
@@ -801,6 +820,8 @@ def vocabulary_line(v: dict | None) -> str | None:
         line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
     if v.get("near_cap"):
         line += f" NEAR CAP: {', '.join(v['near_cap'])}"
+    if v.get("omitted"):
+        line += (f" NOT READ (readable in text): {', '.join(sorted(v['omitted']))}")
     return line
 
 

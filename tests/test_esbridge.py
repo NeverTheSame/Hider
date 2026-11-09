@@ -31,6 +31,19 @@ def fixture():
     return eseval.generate(docs=150)
 
 
+@pytest.fixture(autouse=True)
+def _fixture_clock():
+    """The stub's documents sit at ``eseval.NOW``, and the stub resolves the
+    date math in a query against it. The window a query's vocabulary read
+    covers is resolved here, so here has to be the same instant; against a
+    real cluster both clocks are the wall clock."""
+    import time
+
+    esbridge.clock = eseval.NOW.timestamp
+    yield
+    esbridge.clock = time.time
+
+
 @pytest.fixture
 def stub(fixture):
     kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices), cookie="sid=synthetic").start()
@@ -326,7 +339,8 @@ def test_smoke_count_by_server_per_interval_prints_counts_not_keys(stub, tmp_pat
     out = capsys.readouterr().out
     assert out.count("\n") == 2 and "since=now-6h until=now" in out
     # the second line: each vocabulary field against its cap, counts only
-    assert re.search(r"^VOCAB    job\.name=\d+/10000 labels\.tenant_name=\d+/10000 ", out, re.M)
+    cap = CFG0.vocabulary_max
+    assert re.search(rf"^VOCAB    job\.name=\d+/{cap} labels\.tenant_name=\d+/{cap} ", out, re.M)
     m = re.search(r"buckets=5 bucket_docs=\[([\d, ]+)\] other_docs=(\d+) count_error_bound=0 "
                   r"docs_with_field=\d+ time_buckets=(\d+)", out)
     assert m, out
@@ -1282,20 +1296,45 @@ def test_smoke_shows_each_vocabulary_field_against_its_cap_even_when_refused(stu
     q = esbridge.smoke_query(b.config, size=0, since="now-6h")
     assert esbridge.smoke(b, "stub", q) == 0
     line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("VOCAB"))
-    assert "labels.site_name=" in line and "/10000" in line
+    assert "labels.site_name=" in line and f"/{CFG0.vocabulary_max}" in line
+    # the example map lists every field it may list, so nothing is left out
+    assert "NOT READ" not in line
+    # the caps are read against what the fixture actually holds, so this
+    # stays true as the fixture grows
+    counts = b.vocabulary["stub"]["fields"]
+    widest = max(counts, key=lambda f: counts[f])
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["clusters"] = {"stub": {"kibana": stub.url}}
-    raw["vocabulary"]["max"] = 13
+    raw["vocabulary"]["max"] = counts[widest]  # exactly at it: 100% of the cap
     b2 = _bridge(stub, tmp_path)
     b2.config = elastic.parse(raw, source="test")
     b2.scrubber = elastic.EsScrubber(b2.config, tier2="none")
     assert esbridge.smoke(b2, "stub", q) == 0
     out = capsys.readouterr().out
-    assert "NEAR CAP: job.name" in out  # 12 of 13: an investigation about to stop, said early
-    raw["vocabulary"]["max"] = 5
+    # an investigation about to stop, said before it does
+    assert widest in out.split("NEAR CAP: ")[1]
+    raw["vocabulary"]["max"] = counts[widest] - 1
     b3 = _bridge(stub, tmp_path)
     b3.config = elastic.parse(raw, source="test")
     b3.scrubber = elastic.EsScrubber(b3.config, tier2="none")
     assert esbridge.smoke(b3, "stub", q) == 2
     out = capsys.readouterr().out
-    assert "code=vocabulary" in out and "job.name has at least 5 distinct values" in out
+    assert "code=vocabulary" in out
+    assert f"{widest} has more than {counts[widest] - 1} distinct values" in out
+
+
+def test_smoke_names_the_learnable_fields_a_site_map_leaves_out(stub, tmp_path, capsys):
+    """A site map that lists fewer fields than it could is a choice, and the
+    values of the fields it skips stay readable in message text. Names only,
+    and only names the map itself already holds."""
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": stub.url}}
+    raw["vocabulary"]["fields"] = ["job.name"]
+    b = _bridge(stub, tmp_path)
+    b.config = elastic.parse(raw, source="test")
+    b.scrubber = elastic.EsScrubber(b.config, tier2="none")
+    assert esbridge.smoke(b, "stub", esbridge.smoke_query(b.config, size=0, since="now-6h")) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("VOCAB"))
+    assert "NOT READ (readable in text): labels.resource_name, labels.site_name, " \
+           "labels.tenant_full_name, labels.tenant_name" in line
+    assert "job.name=" in line  # what it does read is still counted

@@ -724,12 +724,41 @@ recall will never be exactly 100%.
     another document. Before a case's first page on a cluster, the bridge
     reads every distinct value of the identifier fields the site map lists
     under `vocabulary.fields` (the example: `job.name`, tenant name and full
-    name, resource name, site name) from the cluster itself: one fixed
-    request, a `terms` aggregation per field, over the configured indices
-    and the last `vocabulary.days` (30), at most `vocabulary.max` values per
-    field (10,000), with no value and no input from Claude in it. Every
+    name, resource name, site name) from the cluster itself. Every
     value becomes a known value under its field's rule, so the whole name
-    is one label, the one its field gets. Without the key, job names only.
+    is one label, the one its field gets.
+    **With no `vocabulary` section, the default is every field that could
+    be listed** - non-glob, unshaped, and of a type a vocabulary may hold -
+    which is exactly the set the loader accepts, so the default is never
+    something a site map would be refused for writing down. It used to be
+    job-name fields only, which meant that at a site that had not written
+    the section (the common case) a tenant or resource named in message
+    text stayed readable, its own field sitting on another document: on a
+    one-hour case page, "Quota warning for Thornbury Estates, resource
+    vault07 near capacity" came through with both names intact. A map that
+    does list `vocabulary.fields` keeps exactly its list, and `es-smoke`'s
+    `VOCAB` line now names what the list leaves out
+    (`NOT READ (readable in text): …`, field names only) so the choice is
+    visible rather than silent. Reading five fields instead of one costs
+    nothing per request - every field rides in the same search and pages
+    independently - so on the es-eval fixture nine fresh one-hour cases
+    still take nine requests, 0.17s, now learning 64 values instead of 13.
+    **The read is windowed and paged.** It covers the window of the query
+    being served, widened by `vocabulary.margin_days` (1) on each side -
+    not the whole retention period - and it pages through `composite`
+    buckets, 1,000 values per field per request. The earlier read was one
+    capped `terms` aggregation over the last 30 days, which does not
+    survive contact with a large estate: on a cluster with 12,000 distinct
+    job names it returned a full bucket list, which is indistinguishable
+    from a truncated one, so the case was refused - every case, always -
+    and a wide first read is slow in a way the analyst pays for before
+    seeing anything. The request still carries no phrase, no label and no
+    value: the only thing the query contributes is its own
+    already-validated time bounds. A query with no start or no end falls
+    back to the last `vocabulary.days` (30) and so pays the old price,
+    which is the honest trade rather than a silent half-read. The window a
+    read covered is remembered per cluster, so a later query inside it
+    costs nothing.
     **Left out, refused at load (`NO_VOCABULARY_TYPES`):** user accounts
     (`labels.principal_name`, one per user), ids (`labels.tenant_id`,
     `job.id`, `job.session_id`, `job.object_id`; tier 1 finds GUIDs by
@@ -737,17 +766,29 @@ recall will never be exactly 100%.
     already finds them in text, `host.ip`, `host.mac`,
     `cloud.instance.name`), and numbers (`tenant.users_in_tenant`,
     `cloud.account.id`: a number vocabulary would erase counts from text);
-    globs cannot be aggregated. **Requests:** one extra search per case per
-    cluster, whatever the number of fields, then one more every ten minutes
-    while the case is used; es-eval makes 11 for its 11 cases. **Caps, as
-    counts:** every read is logged with values per field against the cap
-    and skips by reason, never a value; `es-smoke` prints the same as a
-    `VOCAB` line, marks a field at 80% of its cap `NEAR CAP` before it
-    stops anything, and prints it under a refusal too. **Fails closed:** an
-    unreadable reply, or a field with `vocabulary.max` values, refuses the
-    page (`vocabulary`, naming the field and the cap; or `upstream_error`
-    with the class), and nothing from that reply is learnt; a configured
-    index a cluster lacks reads as no values (`ignore_unavailable`).
+    globs cannot be aggregated. **Requests:** one search per 1,000 values
+    of the widest field, all fields in the same request, per case per
+    cluster, then another read every ten minutes while the case is used.
+    On the es-eval fixture, whose cluster holds a back catalogue of 12,000
+    job names: a one-hour case reads **1 request in 0.02s** and learns 13
+    names; the same first page with no time bounds reads **13 requests in
+    0.55s** and learns 12,013. Before the change, the single capped
+    request took 0.10s on the same fixture and **refused**, so the case saw
+    nothing at all; es-eval's whole query stream (120 queries) was refused
+    with `vocabulary`. (Stub timings: an in-memory engine, so they measure
+    request counts and overhead, not a cluster's latency.) **Caps, as
+    counts:** every read is logged with values per field against the cap,
+    skips by reason, requests and seconds, never a value; `es-smoke`
+    prints the same as a `VOCAB` line, marks a field at 80% of its cap
+    `NEAR CAP` before it stops anything, and prints it under a refusal
+    too. **Fails closed, and nothing is learnt before the whole read
+    commits:** an unreadable, partial or misshapen reply, a field over
+    `vocabulary.max` (50,000) counted across the whole read, or a read
+    past `vocabulary.budget_s` (60s, held under the bridge's one lock)
+    refuses the page (`vocabulary`, naming the field and the cap; or
+    `upstream_error` with the class), and the session is left exactly as
+    it was; a configured index a cluster lacks reads as no values
+    (`ignore_unavailable`).
     **Short and ordinary names:** a value made only of log words
     (`Failed`, `Warning`), a stopword (`default`), a value with no letters
     (`2026`), a one-word value shorter than four characters (`HR`, `Ops`)
@@ -756,7 +797,15 @@ recall will never be exactly 100%.
     are on it) are never vocabulary, and an organisation's core without
     its legal suffix (`Archive` of `Archive AG`) is held to the same rules.
     A fixed list, not the system dictionary, so what is hidden does not
-    depend on the machine. **What that leaves unprotected:** those names in
+    depend on the machine. **Say plainly what this costs: a one-word
+    tenant name the skip rules drop stays readable in message text**, and
+    plenty of real tenants are one word. Of eight invented one-word names
+    in the es-eval fixture, three are dropped (`Archive` and `Vault` as
+    ordinary words, `Ops` as too short) and two of those are then readable
+    on the page; the third is caught by tier 2, which is luck rather than
+    a rule to lean on. A site whose customer is called `Vault` has to seed
+    that name with `--term` - the vocabulary will not find it, by design,
+    because registering `Vault` would erase the word from every message. **What that leaves unprotected:** those names in
     free text until a page shows them in their own field (the field itself
     is always labelled). **Which messages lose readability:** every
     occurrence of a vocabulary name, in any case, in every text field: a
@@ -769,7 +818,43 @@ recall will never be exactly 100%.
     which tells Claude how many tenants, resources and jobs exist. **Not
     covered:** a name not logged in its field within the window, a name
     only in a glob-matched field, and a name spelled differently in text
-    than in its field.
+    than in its field. Windowing narrows that first one, and the narrowing
+    is declared: a name whose only occurrence in its own field falls
+    outside the case window plus the margin is no longer learnt, where the
+    30-day read would have caught it. The margin is what decides how far
+    back that reaches, and a site that wants the old reach sets
+    `margin_days` higher at the old cost. Narrowing the window also
+    narrows the read, so the cover of a page depends on the window asked
+    for - which cannot be turned into an extraction, because the
+    vocabulary is never shown to Claude and can only ever add redactions,
+    but it does mean a one-minute query is covered by a one-minute-plus-
+    margin vocabulary.
+  - *A keep field is a declaration, and declarations get checked.* "Keep"
+    means the site said the field holds nothing sensitive - levels,
+    outcomes, counters, timestamps. A real cluster's level field held, among
+    the usual `info`/`Warning`/`ERR` spellings, a SharePoint personal-site
+    URL with a person's name in its path, once a day; it would have reached
+    Claude both in hits and as a bucket key when the field's values are
+    aggregated, which the session instructions tell Claude to do before
+    filtering. So every string keep value now gets the pass a text field
+    gets minus tier 2: tier 1's shared recognizers plus the known-value
+    sweep, in hit leaves and in aggregation bucket keys, with a match
+    replaced exactly as it would be in a message and the bucket kept as one
+    bucket under its rewritten key. An ordinary value matches nothing and
+    comes back byte-for-byte - the es-eval gate `keep_values_readable`
+    holds `info`, `Information`, `INFO`, `warn`, `wrn`, `err`, `Critical`,
+    `success` and `failure` to that, as hit values, as bucket keys and as
+    an exact filter that still matches - and the `keep_leak_closed` gate
+    shows the invented URL hidden both ways (it leaked both ways before the
+    pass). The costs: a keep value tier 1 recognises is now labelled, so
+    filtering by *that* value no longer works (its field takes literals,
+    not labels) - for a value like this one, that is the point; and one
+    tier-1 detection per distinct non-numeric keep value per session,
+    behind a cache, with purely time-shaped strings (timestamps, versions,
+    durations - most keep values on a page) skipped outright, so es-eval
+    is not measurably slower. Tier 2 deliberately stays off keep fields: a
+    classifier guessing at names inside level spellings is how `Critical`
+    stops being filterable.
   - *Spellings are not normalised.* `log.level` on a real cluster holds
     `err`, `Error` and `ERROR` side by side; an exact filter on one spelling
     looks like absence. `es_schema` and the session instructions tell Claude

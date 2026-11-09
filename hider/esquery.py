@@ -217,6 +217,10 @@ class Compiled:
     #: text phrases as Claude wrote them (labels, not values), for the log
     text_queries: list[str] = field(default_factory=list)
     labels_used: list[str] = field(default_factory=list)
+    #: the query's resolved time bounds in epoch seconds, or None when it
+    #: gave no start or no end. The name vocabulary is read for this window
+    #: plus a margin, instead of the whole retention period.
+    window: tuple[float, float] | None = None
 
 
 class _Compiler:
@@ -654,7 +658,8 @@ class _Compiler:
             body["aggs"] = agg_body
         plan = elastic.Plan(index, agg_plans, size)
         return Compiled({"params": {"index": index, "body": body}}, plan,
-                        list(self.text_queries), list(self.labels_used))
+                        list(self.text_queries), list(self.labels_used),
+                        (self.window[0], self.window[1]) if self.window else None)
 
 
 def _phrase_key(v: str) -> str:
@@ -674,8 +679,10 @@ def compile_query(q: Any, config: elastic.ElasticConfig, session: elastic.EsScru
                   now: float | None = None) -> Compiled:
     """Grammar in, async-search body out, or :class:`elastic.Refused`.
 
-    ``now`` (epoch seconds, default this machine's clock) is used only to
-    bound a histogram window that mixes an ISO date with ``now``.
+    ``now`` (epoch seconds, default this machine's clock) bounds a histogram
+    window that mixes an ISO date with ``now``, and resolves ``Compiled.window``,
+    the window the name vocabulary is read for. The body itself still carries
+    date math as written, so the cluster's own clock decides what it selects.
     """
     return _Compiler(config, session, now=now).compile(q)
 

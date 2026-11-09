@@ -512,14 +512,35 @@ Added after the first version:
   after the RNG stream. A fresh case's first page is checked offline
   (`fresh_case_no_leaks`) and through MCP (a second case, `mcp_no_leaks`,
   `mcp_fresh_case_shown`); both failed (3 of 5 leaking) before the fix.
-  The fix reads the names from the cluster: `Bridge.run` sends
-  `EsScrubber.vocabulary_request()` (one terms aggregation per field in
-  `vocabulary.fields`, all configured indices, `ignore_unavailable`, the
-  last `vocabulary.days`, size `vocabulary.max`) before a case's first page
-  per cluster and every ten minutes after, and every value becomes a known
-  value under its field's rule. One extra request per case per cluster per
-  refresh, however many fields, logged as counts per field against the
-  cap. An unreadable or capped reply refuses the page.
+  The fix reads the names from the cluster: `Bridge.run` drives an
+  `elastic.VocabularyFetch` (one `composite` aggregation per field in
+  `vocabulary.fields`, all configured indices, `ignore_unavailable`)
+  before a case's first page per cluster and every ten minutes after, and
+  every value becomes a known value under its field's rule. Logged as
+  counts per field against the cap, plus requests and seconds. An
+  unreadable, capped or over-budget read refuses the page and learns
+  nothing.
+- **A cluster with more names than one aggregation carries.** The first
+  version read the last `vocabulary.days` in one capped `terms`
+  aggregation. A full bucket list is indistinguishable from a truncated
+  one, so a field at the cap had to refuse - and an estate with tens of
+  thousands of job names is at the cap on every case, for ever, after a
+  wide and slow first read. `eseval.BULK_JOBS` puts 12,000 invented job
+  names in the fixture, all older than any case window, which reproduced
+  exactly that: every es-eval query refused with `vocabulary`. The fix is
+  two things, neither sufficient alone: the read covers the window of the
+  query being served widened by `vocabulary.margin_days`, so an hour-wide
+  case reads an hour and not a month; and it pages with `composite`
+  `after_key` (`VOCABULARY_PAGE` per field per request), so a wide window
+  is still readable rather than refused. The ceiling (`vocabulary.max`,
+  counted across the whole read) and a wall-clock budget
+  (`vocabulary.budget_s`, because the read holds the bridge's one lock)
+  keep "fail closed" intact, and `commit()` is the only thing that learns,
+  so a refusal on page nine leaves the session untouched. `WINDOW_CASE_*`
+  is the fixture shape it exists for: a one-hour case whose message names
+  a job whose own record is outside that hour but inside the margin
+  (`window_case_shown`, `wide_case_read_whole`). The window is the query's
+  own resolved bounds (`Compiled.window`) and nothing else from Claude.
 - **Tenant, resource and site names with no marker** (`eseval.UNMARKED_NAMES`):
   the same shape for the other name fields, each message on a document
   whose own fields hold a different tenant. Before the fix they failed
@@ -528,6 +549,35 @@ Added after the first version:
   Estates"), which the whole-value check counts as clean. Fixed by listing
   the fields under `vocabulary.fields`; ordinary one-word names are kept
   out by `ORDINARY_NAME_WORDS`.
+- **The same names at a site with no `vocabulary` section.** Listing the
+  fields fixed the example map, not the default, which stayed JOB_NAME
+  only - so a site that had not written the section (the common case) had
+  its tenant, tenant-full and resource names readable in message text.
+  `eseval.DEFAULT_MAP_*` reproduces it: the example map with the section
+  deleted, a one-hour case, "Quota warning for Thornbury Estates, resource
+  vault07 near capacity" with both fields on documents outside the hour.
+  Before: five of nine tenant names and all nine resources readable.
+  After: no resource and no name except the ones the skip rules drop. The
+  default is now `ElasticConfig.learnable_rules`, exactly the set the
+  loader accepts, so it cannot be something a map would be refused for;
+  the cost is zero extra requests, since every field rides one search.
+  `vocabulary_omitted` and `es-smoke`'s `NOT READ` make a shorter list a
+  visible choice. Declared miss: a one-word tenant name on
+  `ORDINARY_NAME_WORDS` or under four characters (`Archive`, `Vault`,
+  `Ops`) is still skipped and stays readable - seed it with `--term`.
+- **A sensitive value in a keep field.** A real level field held a
+  SharePoint personal-site URL among its `info`/`Warning`/`ERR` spellings,
+  once a day. A keep field passed through unchanged by declaration, and the
+  value reaches Claude two ways: in a hit, and as a bucket key when the
+  field's values are aggregated (which the instructions tell Claude to do
+  before filtering). `EsScrubber._keep_value` now runs tier 1 and the
+  known-value sweep (never tier 2) over every string keep value, in hit
+  leaves and bucket keys; a match is replaced as a text field would replace
+  it, the bucket stays one bucket under its rewritten key, and an ordinary
+  value comes back byte-for-byte. Time-shaped strings skip the pass and a
+  cache makes repeated values one detection. Gates: `keep_leak_closed`
+  (the invented URL, leaking both ways before) and `keep_values_readable`
+  (nine level/outcome spellings unchanged and still filterable).
 - **Old cases and log words.** `EsScrubber.load_session` no longer makes a
   value of only `pipeline.LOG_VOCABULARY` words a known value. The label
   stays in the mapping, so old answers unmask; the vocabulary-only value
