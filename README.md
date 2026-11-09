@@ -780,10 +780,11 @@ recall will never be exactly 100%.
     `cloud.account.id`: a number vocabulary would erase counts from text);
     globs cannot be aggregated. **What it costs, measured:** the es-eval
     stub charges what a real page costs (8-35s, cycled) so the figure is
-    not an in-memory fiction. On its cluster of 12,013 job names the first
-    build takes **17 requests and 326 simulated seconds** - about five and
-    a half minutes, inside the twenty-minute budget - and a ten-minute
-    top-up takes **5 requests and 97 seconds**. Every case after that
+    not an in-memory fiction. On its cluster - the back catalogue plus the
+    realistic estate, 21,751 job names and 9,555 tenants - the first build
+    takes **44 requests and 839 simulated seconds**, about fourteen
+    minutes and 70% of the twenty-minute budget, and a ten-minute top-up
+    takes **5 requests and 106 seconds**. Every case after that
     reads **nothing**: the one-hour case that used to need its own read
     now costs 0 requests. Under the previous per-case design the same
     fixture refused on the first request.

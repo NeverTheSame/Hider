@@ -261,8 +261,24 @@ class _Compiler:
             labels = sorted(self.session.mapping, key=len, reverse=True)
             if not labels:
                 return []
-            self._label_rx = re.compile(
-                r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, labels)) + r")(?![A-Za-z0-9])")
+            # Cached on the session, not on this compiler: a cluster
+            # vocabulary makes this alternation tens of thousands of
+            # branches, and compiling it once per query cost more than
+            # everything else a query does (measured on the realistic
+            # estate: 0.6s a query at 42,000 labels). The cache is keyed by
+            # how many labels the session has issued, so a label issued
+            # since the last compile rebuilds it.
+            cached = getattr(self.session, "_label_alternation", None)
+            if cached is not None and cached[0] == len(labels):
+                self._label_rx = cached[1]
+            else:
+                self._label_rx = re.compile(
+                    r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, labels))
+                    + r")(?![A-Za-z0-9])")
+                try:
+                    self.session._label_alternation = (len(labels), self._label_rx)
+                except AttributeError:
+                    pass
         return [m.group(0) for m in self._label_rx.finditer(text)]
 
     def _resolve_text(self, text: str) -> str:
@@ -741,8 +757,17 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
                                             "value": {"gte": 1000}}]}, "range_identifier"),
     OracleCase("sort-by-identifier", "sorting by an identifier reveals the order of real values",
                {"index": _IDX, "sort": [{"field": _TENANT, "order": "asc"}]}, "sort_identifier"),
+    # The number is far above any label a case can issue on purpose. It used
+    # to be <Org-77>, which stopped being unknown the moment a cluster
+    # vocabulary was applied: a sign-in build over ten thousand tenant names
+    # issues every low Org number before the case asks its first question.
+    # That the *case* is still testable this way does not make the
+    # underlying problem go away - see the estate section of es-eval and
+    # AGENTS.md: with a vocabulary applied, a guessed low-numbered label is
+    # a live reference to someone's tenant.
     OracleCase("unknown-label", "a label this case never issued: a guess, not a reference",
-               {"index": _IDX, "filters": [{"field": _TENANT, "op": "eq", "value": "<Org-77>"}]},
+               {"index": _IDX, "filters": [{"field": _TENANT, "op": "eq",
+                                            "value": "<Org-999977>"}]},
                "unknown_label"),
     OracleCase("label-of-wrong-type", "a tenant GUID label used to filter the tenant name",
                {"index": _IDX, "filters": [{"field": _TENANT, "op": "eq", "value": "<Tenant-01>"}]},

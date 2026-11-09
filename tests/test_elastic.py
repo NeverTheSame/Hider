@@ -1068,3 +1068,96 @@ def test_one_request_carries_exactly_one_vocabulary_field():
     aggs = build.request()["params"]["body"]["aggs"]
     assert len(aggs) == 1
     assert len(build.rules) == 5 and build.progress()["fields_total"] == 5
+
+
+# --- the realistic estate fixture -------------------------------------------
+#
+# Intent tests, not discovery: the estate exists to measure shapes a real
+# cluster has and the tidy fixture does not, and these pin the properties
+# the measurement depends on.
+
+
+def test_the_estate_leaves_every_existing_document_untouched():
+    """Appended after the generator's RNG stream and after the back
+    catalogue, so turning it on cannot move an existing document, a planted
+    value or a gate."""
+    plain = eseval.generate(docs=120)
+    with_estate = eseval.generate(docs=120, estate=True)
+    n = len(plain.docs)
+    assert [d.source for d in with_estate.docs[:n]] == [d.source for d in plain.docs]
+    assert with_estate.truth == plain.truth
+    assert len(with_estate.docs) > n
+
+
+def test_no_estate_name_is_ground_truth():
+    """Like the back catalogue: the estate adds volume and shapes, not
+    planted values, so the existing leak checks see exactly what they saw."""
+    fx = eseval.generate(docs=60, estate=True)
+    truth = {v.lower() for v in fx.truth}
+    names = {n.lower() for ns in eseval.estate_names().values() for n in ns}
+    assert not (truth & names)
+
+
+@pytest.mark.parametrize("shapes,total", [
+    (eseval.ESTATE_TENANT_SHAPES, eseval.ESTATE_TENANTS),
+    (eseval.ESTATE_JOB_SHAPES, eseval.ESTATE_JOBS),
+    (eseval.ESTATE_RESOURCE_SHAPES, eseval.ESTATE_RESOURCES),
+])
+def test_every_shape_class_gets_its_measured_share(shapes, total):
+    """The shares are the measurement; if they do not sum to a hundred and
+    land where they say, the per-class report is fiction."""
+    assert sum(share for _, share, _ in shapes) == 100
+    names = eseval.estate_names()
+    for key, share, _what in shapes:
+        assert len(names[key]) == total * share // 100, key
+
+
+def test_the_estate_shape_classes_are_disjoint_and_named():
+    """A name belongs to one class, so "how many of this shape" is a count."""
+    names = eseval.estate_names()
+    seen: dict[str, str] = {}
+    for key, values in names.items():
+        for v in values:
+            assert seen.setdefault(v, key) == key or v in eseval._EST_ORDINARY
+    assert set(names) == {k for _, k in eseval.estate_classes()}
+
+
+def test_only_one_word_names_are_dropped_by_the_skip_rules():
+    """The declared miss is one-word names. If a multi-word shape started
+    being dropped, the estate report would be hiding a real regression
+    behind "declared"."""
+    for key, values in eseval.estate_names().items():
+        for v in values:
+            if elastic.EsScrubber.vocabulary_skip(v):
+                assert len(v.split()) == 1, (key, v)
+
+
+def test_an_estate_mention_has_no_marker_and_its_own_field_elsewhere():
+    """A mention must be unrescuable by the page itself: nothing marks the
+    name, and the document carrying the name in its own field is days
+    outside the window the mention page asks for."""
+    mentions = eseval.estate_mentions()
+    assert len(mentions) >= 100
+    for key, name, message, phrase in mentions:
+        assert name in message and phrase in message
+        assert not re.search(rf"\b(job|tenant|site|resource)\s+{re.escape(name)}", message, re.I)
+    fx = eseval.generate(docs=60, estate=True)
+    window = [d for d in fx.docs if d.index == "logs-worker-*"
+              and "2026-08-14" in d.source["@timestamp"]]
+    assert window, "the mentions sit in their own window"
+    for d in window:
+        assert "job" not in d.source and "resource_name" not in d.source.get("labels", {})
+
+
+def test_the_estate_keeps_the_measured_spelling_skew():
+    """Seventeen level spellings with the commonest about forty to one, and
+    one of each among the most recent documents so a page of hits can be
+    checked as well as a bucket."""
+    plan = eseval._estate_level_plan()
+    assert set(plan) == set(eseval.ESTATE_LEVEL_SPELLINGS)
+    assert len(eseval.ESTATE_LEVEL_SPELLINGS) == 17
+    assert set(plan[:len(eseval.ESTATE_LEVEL_SPELLINGS)]) == set(eseval.ESTATE_LEVEL_SPELLINGS)
+    counts = {sp: plan.count(sp) for sp in eseval.ESTATE_LEVEL_SPELLINGS}
+    top = counts[eseval.ESTATE_LEVEL_SPELLINGS[0]]
+    assert 30 <= top / max(c for sp, c in counts.items()
+                           if sp != eseval.ESTATE_LEVEL_SPELLINGS[0]) <= 50

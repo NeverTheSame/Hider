@@ -404,6 +404,45 @@ Listed with owners in the README's Limitations section and in
   with `--term`. Widening the vocabulary to cover them is not the fix -
   that is the skip rules' trade, out of scope here, and loosening it
   erases the word everywhere.
+  **The realistic estate** (`eseval.estate_docs`, the `estate=True` half of
+  `generate`, reported by `run_estate_eval` under `realistic estate`) is
+  what that declared miss is now measured on. The tidy fixture - eight
+  tenants, seven level spellings, twelve thousand job names all of one
+  shape - cannot show which *shapes* survive. The estate is 10,000
+  tenants, 10,000 jobs and 100 resources in the shapes and proportions
+  measured on one real cluster (shapes and counts only, no values; every
+  name invented, built by position), with 149 free-text mentions carrying
+  no marker, and the seventeen level and three outcome spellings at their
+  measured skew (commonest level 47x the next, success 661x failure). Like
+  `BULK_JOBS` it is appended after the RNG stream and holds **no ground
+  truth**, so every existing gate sees what it saw. Thirteen shape classes,
+  each with its own page and its own line in the report: counts of names,
+  what the skip rules drop and why, and how many mentions stay readable.
+  Result: **every shape is hidden except one-word names the skip rules
+  drop** (24 of 149 mentions, all `ordinary_word`/`stopword`, 800 of 20,100
+  names), which is the declared miss above and is reported, not gated;
+  `estate_no_unexpected_readable` fails on anything else readable, whole or
+  by a word, and `estate_spellings_unchanged` pins all twenty spellings
+  byte-for-byte as hit values and as bucket keys. All-caps names, names
+  with digits and four-word job names are all covered. Costs: es-eval goes
+  from 88s to 115s, and a page per class rather than per mention is what
+  keeps it there. When adding a shape, add the class, not another fixture.
+  **An open consequence the estate found: with a vocabulary applied, a
+  guessed label is a live reference.** A case used to know only labels for
+  values it had seen, so `<Org-77>` was a guess and
+  `esquery.ORACLE_CASES["unknown-label"]` refused it. A sign-in build over
+  ten thousand tenants issues every low `<Org-NN>` before the case asks
+  anything, so that same guess now resolves to a real customer and the
+  query runs - label guessing, confirmed by hit count, over the whole
+  cluster rather than the case. Measured on the estate: applying the
+  build issues 20,033 `ORG_NAME` labels, and `<Org-77>` resolves to the
+  invented tenant `BRINDERWOLD GROUP`, which the case never saw. (It takes
+  effect from the case's second query: the vocabulary is applied after the
+  first query compiles.) The oracle case's number was moved above
+  any issuable label so it still tests what it means to test; the channel
+  itself is **not closed**. Closing it needs a decision (per-case label
+  namespaces, or labels that are not guessable integers) and a change to
+  how `label_for` numbers labels - out of scope for a fixture change.
   **The read happens once per cluster, at sign-in - never inside a case.**
   Two earlier shapes failed against measured cost. One capped `terms`
   aggregation over the retention period refused every case on any estate
@@ -463,9 +502,12 @@ Listed with owners in the README's Limitations section and in
   case served from the build at no cost to itself),
   `vocabulary_build_in_budget` and `vocabulary_building_refuses`. The stub
   charges `eseval.PAGE_SECONDS` (8-35s, cycled) per field per page, so the
-  eval reports what a build really costs without waiting for it: **17
-  requests and 326 simulated seconds** for the first build over 12,013
-  job names, **5 requests and 97 seconds** for a top-up.
+  eval reports what a build really costs without waiting for it: over the
+  whole fixture, back catalogue and realistic estate together (21,751 job
+  names, 9,555 tenants, 9,746 tenant full names), **44 requests and 839
+  simulated seconds** for the first build and **5 requests and 106
+  seconds** for a top-up - 70% of the twenty-minute budget, which is the
+  closest measurement there is to what a real sign-in will cost.
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.

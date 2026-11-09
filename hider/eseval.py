@@ -221,7 +221,8 @@ class _Filler:
 
 
 def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
-             clean_share: float = 0.25, bulk_jobs: int | None = None) -> Fixture:
+             clean_share: float = 0.25, bulk_jobs: int | None = None,
+             estate: bool = False) -> Fixture:
     """Documents in the three index shapes, with ground truth.
 
     ``clean_share`` of the documents carry a message with no customer value
@@ -233,6 +234,12 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
     :func:`bulk_job_docs`); ``run_eval`` asks for :data:`BULK_JOBS` of them.
     It defaults to none, so a test that only needs the three index shapes
     does not carry twelve thousand documents it never reads.
+
+    ``estate`` appends the realistic estate (see :func:`estate_docs`): ten
+    thousand tenants and jobs in their measured shapes, their free-text
+    mentions and the level and outcome spellings. Off by default for the
+    same reason, and appended last, so every document above it is
+    unchanged either way.
     """
     rng = random.Random(seed)
     tpl = _load()
@@ -325,6 +332,8 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
     out.extend(keep_leak_docs(ts, servers))
     out.extend(window_case_docs(ts, servers))
     out.extend(bulk_job_docs(bulk_jobs or 0))
+    if estate:
+        out.extend(estate_docs(ts, servers))
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
@@ -685,6 +694,381 @@ def unmarked_job_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -
             t.full_name: "ORG_NAME", t.tenant_id: "TENANT_ID", t.resources[0]: "RESOURCE_NAME",
             job_id: "SESSION_GUID", session_id: "SESSION_GUID", object_id: "OBJECT_GUID",
             str(t.users): "TENANT_SIZE"}))
+    return docs
+
+
+# ---------------------------------------------------------------------------
+# A realistic estate
+# ---------------------------------------------------------------------------
+#
+# Everything above this line is a small, tidy fixture: eight tenants, seven
+# level spellings, twelve thousand job names all of one shape. A real
+# cluster is none of those things, and the shapes it does hold are what
+# decide whether a name is vocabulary or stays readable. The shapes and the
+# proportions below are from a measurement of one real cluster - shapes and
+# counts only, no values; every name here is invented and built by position,
+# never drawn, so the generator's RNG stream and every existing document are
+# untouched.
+#
+# What was measured, and how it is modelled:
+#
+# * level fields hold about 17 spellings of the same few levels, with the
+#   commonest ("info") outnumbering the next by about 40 to 1;
+# * outcome fields hold success, failure and a rare third, with success
+#   about 600 times commoner than failure;
+# * about half of tenant names are one word; some carry digits; some are
+#   all capitals;
+# * job names: a few per cent are one word, about three in ten are two or
+#   three words, two in ten are four words or more, one in ten carries
+#   digits, a few per cent are an ordinary dictionary word. (The shares
+#   named leave a remainder; it is modelled as plain two-word names, which
+#   is the commonest shape.)
+# * resource names are almost all one word with digits (vault017);
+# * each name field holds about ten thousand distinct values over 30 days.
+#
+# The documents are appended after the generator's RNG stream and after the
+# back catalogue, and they sit 6 to 22 days back - outside every window the
+# existing cases query, inside the vocabulary build's 30 days. Like
+# :func:`bulk_job_docs` they are **not ground truth**: no estate name is in
+# ``Fixture.truth``, so the existing leak checks and gates see exactly what
+# they saw before. The estate's own readability is measured by the estate
+# section of ``run_eval``, against the names listed here.
+
+ESTATE_TENANTS = 10_000
+ESTATE_JOBS = 10_000
+ESTATE_RESOURCES = 100
+#: how many names of each shape class get a free-text mention. Every name
+#: of the estate is read by the vocabulary build; a sample of each class is
+#: *mentioned in a message with nothing marking it as a name*, which is what
+#: the readability check needs and what costs a page to check.
+ESTATE_MENTIONS_PER_CLASS = 12
+#: the hour the mention documents sit in: its own window, so no existing
+#: case can see them and they cannot see an existing case's documents
+ESTATE_MENTION_RANGE = {"gte": "now-7d", "lte": "now-6d"}
+
+_EST_HEAD = ("Brack", "Throck", "Fen", "Marl", "Quill", "Saltm", "Harb", "Kest",
+             "Pent", "Sabl", "Tarn", "Ridg", "Calp", "Brind", "Harl", "Orch",
+             "Wold", "Lark", "Nimb", "Vell", "Dorn", "Esk", "Ryd", "Galt")
+_EST_JOB_HEAD = ("Ambl", "Bress", "Cawd", "Derw", "Ellen", "Fairl", "Gilsl", "Hask",
+                 "Ivel", "Jarr", "Kelv", "Lund", "Mard", "Nether", "Ousel", "Prest",
+                 "Quend", "Rask", "Stean", "Thrux", "Ulv", "Vend", "Wask", "Yarl")
+_EST_MID = ("", "a", "e", "en", "in", "el", "er", "on", "ow", "um", "is", "or", "ar", "ey")
+_EST_TAIL = ("ley", "ford", "mere", "wick", "holm", "dale", "bury", "stead", "garth",
+             "thorpe", "combe", "wold", "beck", "hurst", "vale", "moor", "field",
+             "gate", "haven", "ridge", "croft", "shaw", "thwaite", "burn", "cliff",
+             "down", "marsh", "pool", "stone", "mouth")
+#: 24 x 14 x 30 = 10,080 distinct one-word stems per pool, enough for both
+#: ten-thousand-value fields with the pools kept disjoint by their heads.
+_EST_SPAN = len(_EST_MID) * len(_EST_TAIL)
+_EST_SECOND = ("Estates", "Holdings", "Partners", "Industries", "Logistics", "Analytics",
+               "Collective", "Trading", "Ventures", "Networks", "Foundation", "Group")
+_EST_SUFFIX = ("Limited", "GmbH", "AG", "LLC", "SpA", "BV")
+_EST_JOB_WORD = ("Sweep", "Export", "Rollup", "Verify", "Reindex", "Compaction",
+                 "Inventory", "Replication", "Seeding", "Trim", "Tiering", "Scrub")
+_EST_JOB_EXTRA = ("Nightly", "Weekend", "Overflow", "Secondary", "Offsite", "Priority")
+#: the ordinary dictionary words a few per cent of real names are: every one
+#: of these is on :data:`elastic.ORDINARY_NAME_WORDS` or under the length
+#: floor, which is the whole point of the class
+#: There are only so many of these: a class whose members are dictionary
+#: words has far fewer distinct values than its share of the estate, which
+#: is true of a real cluster too and is why the distinct count per field
+#: lands a little under ten thousand.
+#: ("Archive" and "Vault" belong here by shape and are deliberately absent:
+#: they are planted values of the existing no-vocabulary-section fixture,
+#: and an estate name must never be one of those.)
+_EST_ORDINARY = ("Default", "Primary", "Backup", "Staging", "Legacy",
+                 "Records", "Retention", "Mailbox", "Sandbox", "Library",
+                 "Finance", "Legal", "Compliance", "Operations", "Marketing", "Audit",
+                 "Projects", "Exports", "Imports", "Storage", "Repository", "Office",
+                 "Secondary", "Incremental", "Nightly", "Weekly", "Monthly", "Delta",
+                 "Shared", "Internal", "External", "General", "Common", "Global",
+                 "Sales", "Support", "Security", "Inbox")
+_EST_RESOURCE_WORD = ("vault", "store", "pool", "node", "shard", "bucket",
+                      "volume", "stack", "zone", "tier")
+_EST_RESOURCE_PLAIN = ("Quarrowan", "Felstrike", "Mordenhale", "Tilbrake", "Ysgarth")
+
+#: (class key, share in hundredths, what the shape is). Shares sum to 100
+#: and the classes are disjoint, so "how many of this shape" is a count and
+#: not an estimate.
+ESTATE_TENANT_SHAPES: tuple[tuple[str, int, str], ...] = (
+    ("tenant-one-word", 40, "one invented word"),
+    ("tenant-one-word-ordinary", 5, "one ordinary dictionary word"),
+    ("tenant-all-caps", 10, "two words, all capitals"),
+    ("tenant-with-digits", 10, "one word and a number"),
+    ("tenant-multi-word", 35, "two words"),
+)
+ESTATE_JOB_SHAPES: tuple[tuple[str, int, str], ...] = (
+    ("job-one-word", 5, "one invented word"),
+    ("job-one-word-ordinary", 3, "one ordinary dictionary word"),
+    ("job-two-words", 32, "two words"),
+    ("job-three-words", 30, "three words"),
+    ("job-four-plus-words", 20, "four or five words"),
+    ("job-with-digits", 10, "two words and a number"),
+)
+ESTATE_RESOURCE_SHAPES: tuple[tuple[str, int, str], ...] = (
+    ("resource-word-digits", 95, "one word and a three-digit number"),
+    ("resource-plain-word", 5, "one invented word"),
+)
+
+
+def _estate_stem(pool: tuple[str, ...], i: int) -> str:
+    """A one-word invented name, by position. Distinct for distinct ``i``
+    within one pool's span, and never equal across two pools (their heads
+    are disjoint)."""
+    return (pool[(i // _EST_SPAN) % len(pool)] + _EST_MID[(i // len(_EST_TAIL)) % len(_EST_MID)]
+            + _EST_TAIL[i % len(_EST_TAIL)]).capitalize()
+
+
+def _estate_class(shapes: tuple[tuple[str, int, str], ...], i: int) -> str:
+    """Which shape class position ``i`` falls in. Interleaved by ``i % 100``
+    rather than blocked, so any contiguous sample of the estate holds every
+    shape in its measured proportion."""
+    at = i % 100
+    run = 0
+    for key, share, _ in shapes:
+        run += share
+        if at < run:
+            return key
+    return shapes[-1][0]
+
+
+def estate_tenant(i: int) -> tuple[str, str, str]:
+    """(shape class, tenant name, tenant full name) for position ``i``."""
+    k = _estate_class(ESTATE_TENANT_SHAPES, i)
+    stem = _estate_stem(_EST_HEAD, i)
+    second = _EST_SECOND[i % len(_EST_SECOND)]
+    if k == "tenant-one-word":
+        name = stem
+    elif k == "tenant-one-word-ordinary":
+        # i // 100, not i: a class's positions are every hundredth one, so
+        # indexing by i would pick the same handful of words forever
+        name = _EST_ORDINARY[(i // 100) % len(_EST_ORDINARY)]
+    elif k == "tenant-all-caps":
+        name = f"{stem} {second}".upper()
+    elif k == "tenant-with-digits":
+        name = f"{stem} {i % 900 + 100}"
+    else:
+        name = f"{stem} {second}"
+    return k, name, f"{name} {_EST_SUFFIX[i % len(_EST_SUFFIX)]}"
+
+
+def estate_job(i: int) -> tuple[str, str]:
+    """(shape class, job name) for position ``i``."""
+    k = _estate_class(ESTATE_JOB_SHAPES, i)
+    stem = _estate_stem(_EST_JOB_HEAD, i)
+    word = _EST_JOB_WORD[i % len(_EST_JOB_WORD)]
+    extra = _EST_JOB_EXTRA[(i // 7) % len(_EST_JOB_EXTRA)]
+    if k == "job-one-word":
+        name = stem
+    elif k == "job-one-word-ordinary":
+        # i // 100, not i: a class's positions are every hundredth one, so
+        # indexing by i would pick the same handful of words forever
+        name = _EST_ORDINARY[(i // 100) % len(_EST_ORDINARY)]
+    elif k == "job-two-words":
+        name = f"{stem} {word}"
+    elif k == "job-three-words":
+        name = f"{stem} {extra} {word}"
+    elif k == "job-four-plus-words":
+        name = f"{stem} {extra} {word} Run" + (" Secondary" if i % 2 else "")
+    else:
+        name = f"{stem} {word} {i % 900 + 100}"
+    return k, name
+
+
+def estate_resource(i: int) -> tuple[str, str]:
+    """(shape class, resource name) for position ``i``."""
+    k = _estate_class(ESTATE_RESOURCE_SHAPES, i)
+    word = _EST_RESOURCE_WORD[i % len(_EST_RESOURCE_WORD)]
+    # their own invented words, not the tenant pool: a name belongs to one
+    # shape class, so the per-class counts mean what they say
+    return (k, word + f"{i:03d}") if k == "resource-word-digits" \
+        else (k, _EST_RESOURCE_PLAIN[(i // 100) % len(_EST_RESOURCE_PLAIN)
+                                     if i >= 100 else i % len(_EST_RESOURCE_PLAIN)])
+
+
+#: The seventeen level spellings and three outcome spellings a real field
+#: holds, with the measured skew: ``info`` about forty times the next
+#: spelling, ``success`` about six hundred times ``failure``. They must come
+#: back from the keep pass byte for byte, every one of them.
+ESTATE_LEVEL_SPELLINGS: tuple[str, ...] = (
+    "info", "Info", "Information", "information", "Informational", "INFO",
+    "warn", "WARN", "Warning", "warning", "wrn",
+    "err", "Error", "error", "ERROR", "debug", "Critical",
+)
+ESTATE_OUTCOME_SPELLINGS: tuple[str, ...] = ("success", "failure", "ongoing")
+#: how many documents each spelling gets. "info" at 40 to 1 over the next,
+#: "success" at ~600 to 1 over "failure"; the rest one document each, which
+#: is enough for a bucket and keeps the fixture small.
+ESTATE_LEVEL_DOCS = 1200
+ESTATE_INFO_SHARE = 40
+
+
+def _estate_level_plan() -> list[str]:
+    """One level spelling per document, in the measured proportion, and
+    **interleaved**: a real field's spellings are mixed through time, and a
+    page of the first hundred documents must hold every one of them, which
+    is what makes the spellings checkable as hit values and not only as
+    bucket keys."""
+    rest = ESTATE_LEVEL_SPELLINGS[1:]
+    per = max(2, (ESTATE_LEVEL_DOCS // (ESTATE_INFO_SHARE + len(rest))))
+    # the most recent documents, which is what one page of hits holds: one
+    # of every spelling
+    plan = list(ESTATE_LEVEL_SPELLINGS)
+    # then the skew, which is what the bucket counts show
+    plan += [ESTATE_LEVEL_SPELLINGS[0]] * (per * ESTATE_INFO_SHARE - 1)
+    for sp in rest:
+        plan += [sp] * (per - 1)
+    return plan
+
+
+def _estate_outcome(i: int, total: int) -> str:
+    """success about 600 times failure, with one rarer third spelling."""
+    if i == total - 1:
+        return "ongoing"
+    if i % max(1, total // 2) == 1:
+        return "failure"
+    return "success"
+
+
+#: The clause that finds one shape class's mentions on a worker page without
+#: naming anything in them: one per class, each invented and used nowhere
+#: else in the fixture.
+_EST_CLAUSES = (
+    "rolled past the soft ceiling tonight",
+    "queued behind the maintenance pause",
+    "left two shards waiting on the mover",
+    "reported an uneven spread across racks",
+    "paused while the catalogue was rebuilt",
+    "logged a slower than usual drain",
+    "handed back to the scheduler untouched",
+    "carried on after the throttle lifted",
+    "settled below the warning watermark",
+    "needed a second pass over the index",
+    "finished behind the published window",
+    "tripped the backlog notice twice",
+    "cleared the queue with room to spare")
+
+
+def estate_classes() -> list[tuple[str, str]]:
+    """Every shape class, as (kind, class key), in report order."""
+    return ([("tenant", k) for k, _, _ in ESTATE_TENANT_SHAPES]
+            + [("job", k) for k, _, _ in ESTATE_JOB_SHAPES]
+            + [("resource", k) for k, _, _ in ESTATE_RESOURCE_SHAPES])
+
+
+def estate_names() -> dict[str, list[str]]:
+    """Every invented estate name, by shape class."""
+    out: dict[str, list[str]] = {k: [] for _, k in estate_classes()}
+    for i in range(ESTATE_TENANTS):
+        k, name, _full = estate_tenant(i)
+        out[k].append(name)
+    for i in range(ESTATE_JOBS):
+        k, name = estate_job(i)
+        out[k].append(name)
+    for i in range(ESTATE_RESOURCES):
+        k, name = estate_resource(i)
+        out[k].append(name)
+    return out
+
+
+def estate_mentions() -> list[tuple[str, str, str, str]]:
+    """(shape class, name, message, phrase) for the sampled names of every
+    class: the name in free text with nothing marking it as a name, and a
+    phrase that finds the message without naming it.
+
+    The sample is spread across the class (every ``len/n``-th member), so it
+    is not the first twelve of one spelling. The name's own field record is
+    on an estate document days outside :data:`ESTATE_MENTION_RANGE`, so a
+    page of these mentions cannot be rescued by harvesting.
+    """
+    out: list[tuple[str, str, str, str]] = []
+    by_class = estate_names()
+    for n, (_kind, key) in enumerate(estate_classes()):
+        names = by_class[key]
+        clause = _EST_CLAUSES[n % len(_EST_CLAUSES)]
+        step = max(1, len(names) // ESTATE_MENTIONS_PER_CLASS)
+        picked = [names[(j * step) % len(names)] for j in range(ESTATE_MENTIONS_PER_CLASS)]
+        seen: set[str] = set()
+        for j, name in enumerate(picked):
+            if name in seen:
+                continue
+            seen.add(name)
+            # half the mentions lead with the name, half bury it mid-sentence:
+            # neither spelling has a marker a rule could read
+            # No word of the message outside the name may be a word *of* a
+            # name, or the word-by-word check would report the fixture's own
+            # vocabulary as a leak ("... run 2" beside a job called
+            # "... Run"). The clauses are chosen the same way.
+            message = (f"{name} {clause}, attempt {j + 1}" if j % 2 == 0
+                       else f"Retry {j} of {name} {clause}")
+            out.append((key, name, message, clause))
+    return out
+
+
+def estate_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """The estate: one document per name position, the mention documents,
+    and the level/outcome spelling documents.
+
+    Positions, not draws: no RNG is consumed, and nothing here is ground
+    truth (see the section comment).
+    """
+    docs: list[Doc] = []
+    ctr, prx = servers["ctr"][2], servers["prx"][3]
+    other = tenants[4]
+    n = max(ESTATE_TENANTS, ESTATE_JOBS)
+    for i in range(n):
+        at = (NOW - timedelta(days=8) - timedelta(minutes=2 * i)) \
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        _k, tenant, full = estate_tenant(i % ESTATE_TENANTS)
+        _jk, job = estate_job(i % ESTATE_JOBS)
+        _rk, resource = estate_resource(i % ESTATE_RESOURCES)
+        docs.append(Doc("logs-app-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "event": {"outcome": _estate_outcome(i, n), "action": "job-step"},
+            "log": {"level": ESTATE_LEVEL_SPELLINGS[i % len(ESTATE_LEVEL_SPELLINGS)],
+                    "logger": "Engine.Jobs"},
+            "message": "Scheduler tick: 1 jobs due, 0 running, 0 queued",
+            "labels": {"tenant_name": tenant, "tenant_full_name": full,
+                       "tenant_id": other.tenant_id, "resource_name": resource},
+            "job": {"name": job, "status": "Success"},
+            "service": {"name": "backup-engine", "version": "8.4.1"},
+        }, {}))
+
+    # the mentions: free text, no marker, in their own hour
+    for i, (_key, _name, message, _phrase) in enumerate(estate_mentions()):
+        at = (NOW - timedelta(days=6, hours=1) - timedelta(seconds=10 * i)) \
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-worker-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success"},
+            # the commonest spelling, so these documents join the dominant
+            # bucket instead of flattening the skew that the spelling
+            # documents are there to show
+            "log": {"level": ESTATE_LEVEL_SPELLINGS[0]},
+            "message": message,
+            "agent": {"name": prx.name},
+            "host": {"name": prx.name, "ip": prx.ip},
+            "labels": {"tenant_name": other.name, "tenant_id": other.tenant_id},
+        }, {}))
+
+    # the spelling documents: every level and outcome spelling the estate
+    # logs, in the measured proportion, in the estate's own window
+    plan = _estate_level_plan()
+    for i, level in enumerate(plan):
+        at = (NOW - timedelta(days=6, hours=3) - timedelta(seconds=5 * i)) \
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-worker-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": _estate_outcome(i, len(plan))},
+            "log": {"level": level},
+            "message": "Worker heartbeat, queue depth 0",
+            "agent": {"name": ctr.name},
+            "host": {"name": ctr.name, "ip": ctr.ip},
+            "labels": {"tenant_name": other.name, "tenant_id": other.tenant_id},
+        }, {}))
     return docs
 
 
@@ -1862,10 +2246,132 @@ def mcp_gates(m: dict) -> dict[str, bool]:
     }
 
 
+def run_estate_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
+                    vocab: elastic.ClusterVocabulary, *, tier2: str,
+                    timings: list[float]) -> dict:
+    """The realistic estate, measured per shape class.
+
+    For each class: how many of its names the skip rules drop and why, and
+    how many of its free-text mentions are still readable after the
+    vocabulary and the scrubber. One page per class rather than one per
+    name - the mentions of a class share a phrase, so twelve of them come
+    back on one page. That is what keeps the whole section at fourteen
+    queries instead of a hundred and forty-four, and the eval's runtime
+    inside a minute of where it was.
+
+    Each class gets a **fresh** session: nothing seeded, nothing harvested,
+    and every mentioned name's own field record days outside the window the
+    page asks for. So what hides a name here is the cluster vocabulary and
+    nothing else.
+    """
+    by_class = estate_names()
+    mentions: dict[str, list[tuple[str, str, str]]] = {k: [] for _, k in estate_classes()}
+    for key, name, message, phrase in estate_mentions():
+        mentions[key].append((name, message, phrase))
+
+    classes: list[dict] = []
+    unexpected: list[str] = []
+    declared: list[str] = []
+    shapes = {k: what for k, _, what in
+              (*ESTATE_TENANT_SHAPES, *ESTATE_JOB_SHAPES, *ESTATE_RESOURCE_SHAPES)}
+    for kind, key in estate_classes():
+        names = by_class[key]
+        skipped: dict[str, int] = {}
+        for n in names:
+            why = elastic.EsScrubber.vocabulary_skip(n)
+            if why:
+                skipped[why] = skipped.get(why, 0) + 1
+        row = {"kind": kind, "class": key, "shape": shapes[key], "names": len(names),
+               "distinct": len(set(names)), "skipped": skipped,
+               "skipped_total": sum(skipped.values()),
+               "mentions": len(mentions[key]), "shown": 0, "readable": 0,
+               "part_readable": 0, "declared_miss": 0, "unexpected": []}
+        sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+        phrase = mentions[key][0][2]
+        out, refused, dt, _ = sess.call({
+            "index": "logs-worker-*", "time_range": ESTATE_MENTION_RANGE, "size": 20,
+            "filters": [{"field": "message", "op": "phrase", "value": phrase}]})
+        timings.append(dt)
+        row["refused"] = refused.code if refused else None
+        msgs = _messages(out) if out is not None else []
+        row["shown"] = len(msgs)
+        page = " ".join(msgs)
+        for name, _message, _p in mentions[key]:
+            whole = name in page
+            parts = bool(name_part_leaks(msgs, phrase, name))
+            if not (whole or parts):
+                continue
+            row["readable"] += int(whole)
+            row["part_readable"] += int(parts and not whole)
+            # the one declared miss: a one-word name the skip rules drop is
+            # never made vocabulary, so it stays readable in message text
+            if whole and len(name.split()) == 1 and elastic.EsScrubber.vocabulary_skip(name):
+                row["declared_miss"] += 1
+                declared.append(name)
+            else:
+                row["unexpected"].append(name)
+                unexpected.append(name)
+        classes.append(row)
+
+    # Every level and outcome spelling the estate logs, through the keep
+    # pass: as hit values and as bucket keys, byte for byte, with the
+    # measured skew intact.
+    levels = {"bucket_keys": 0, "kept": [], "changed": [], "top_ratio": 0.0,
+              "outcome_ratio": 0.0, "hit_spellings": 0}
+    ls = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+    out, refused, dt, _ = ls.call({
+        "index": "logs-worker-*", "time_range": ESTATE_MENTION_RANGE, "size": 0,
+        "aggs": {"levels": {"type": "terms", "field": "log.level", "size": 40},
+                 "outcomes": {"type": "terms", "field": "event.outcome", "size": 10}}})
+    timings.append(dt)
+    if out is not None:
+        buckets = {a: {str(b["key"]): b["doc_count"] for b in out["aggregations"][a]["buckets"]}
+                   for a in ("levels", "outcomes")}
+        keys = set(buckets["levels"]) | set(buckets["outcomes"])
+        want = (*ESTATE_LEVEL_SPELLINGS, *ESTATE_OUTCOME_SPELLINGS)
+        levels["bucket_keys"] = len(keys)
+        levels["kept"] = sorted(v for v in want if v in keys)
+        levels["changed"] = sorted(set(want) - keys)
+        counts = sorted(buckets["levels"].values(), reverse=True)
+        if len(counts) > 1 and counts[1]:
+            levels["top_ratio"] = round(counts[0] / counts[1], 1)
+        oc = buckets["outcomes"]
+        if oc.get("failure"):
+            levels["outcome_ratio"] = round(oc.get("success", 0) / oc["failure"], 1)
+    # and as hit values, where a keep field reaches Claude the other way
+    out, refused, dt, _ = ls.call({
+        "index": "logs-worker-*", "time_range": ESTATE_MENTION_RANGE, "size": 100,
+        "filters": [{"field": "message", "op": "phrase", "value": "Worker heartbeat"}]})
+    timings.append(dt)
+    if out is not None:
+        seen = {str(((h.get("_source") or {}).get("log") or {}).get("level"))
+                for h in out["hits"]["hits"]}
+        levels["hit_spellings"] = len(seen & set(ESTATE_LEVEL_SPELLINGS))
+        levels["hit_changed"] = sorted(seen - set(ESTATE_LEVEL_SPELLINGS))
+
+    return {
+        "tenants": ESTATE_TENANTS, "jobs": ESTATE_JOBS, "resources": ESTATE_RESOURCES,
+        "names": sum(len(v) for v in by_class.values()),
+        "distinct_names": len({n for v in by_class.values() for n in v}),
+        "mentions": sum(len(v) for v in mentions.values()),
+        "classes": classes,
+        "readable": sum(c["readable"] for c in classes),
+        "part_readable": sum(c["part_readable"] for c in classes),
+        "declared_miss": sum(c["declared_miss"] for c in classes),
+        "unexpected": sorted(set(unexpected)),
+        # the shape of the declared miss, plainly: one-word names the skip
+        # rules drop. Invented names, so the report may hold them.
+        "declared_examples": sorted(set(declared))[:5],
+        "skipped_by_rule": {r: sum(c["skipped"].get(r, 0) for c in classes)
+                            for r in sorted({r for c in classes for r in c["skipped"]})},
+        "levels": levels,
+    }
+
+
 def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 20261103, docs: int = 600,
              queries: int = 120, tier2: str = "classifier", mcp: bool = True) -> dict:
     cfg = config or elastic.load(elastic.EXAMPLE)
-    fx = generate(seed=seed, docs=docs, bulk_jobs=BULK_JOBS)
+    fx = generate(seed=seed, docs=docs, bulk_jobs=BULK_JOBS, estate=True)
     truth = fx.truth
     engine = StubEngine(fx, cfg.indices)
     engine.page_seconds = PAGE_SECONDS
@@ -1897,10 +2403,14 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     case_label = s.seed(fx.tenants[0].name)
 
     labels: dict[str, list[str]] = {}  # type -> labels learnt so far
+    _seen_labels: set[str] = set()     # membership, so learn() stays linear:
+    # with a cluster vocabulary the session holds tens of thousands of
+    # labels, and a list scan per label per query is quadratic twice over
 
     def learn() -> None:
         for label, t in s.types.items():
-            if label not in labels.get(t, []):
+            if label not in _seen_labels:
+                _seen_labels.add(label)
                 labels.setdefault(t, []).append(label)
 
     learn()
@@ -2060,6 +2570,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # miss, and nothing beyond it
     default_map["readable_all_skipped"] = all(dropped.get(n) for n in readable)
 
+    estate = run_estate_eval(cfg, engine, vocab, tier2=tier2, timings=timings)
+
     # The keep-field leak: the level value that is a SharePoint personal-site
     # URL, shown both ways it reaches Claude - in a hit, and as a bucket key
     # of an aggregation over the field - plus the fidelity half: the ordinary
@@ -2192,6 +2704,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "label_round_trip": round_trip,
         "fresh_case": fresh,
         "default_map": default_map,
+        "estate": estate,
         "keep_field": keep,
         "window_case": window_case,
         "building_case": building,
@@ -2232,6 +2745,18 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # are the declared miss, reported not gated.
         "default_map_names_hidden": default_map["shown"] == default_map["cases"] > 0
         and not default_map["resources_readable"] and default_map["readable_all_skipped"],
+        # The realistic estate: every free-text mention still readable is a
+        # one-word name the skip rules dropped - the declared miss, reported
+        # with its shape and not gated. Anything else readable, whole or by
+        # a word of it, fails here.
+        "estate_no_unexpected_readable": not estate["unexpected"]
+        and estate["mentions"] > 0
+        and all(c["shown"] for c in estate["classes"]),
+        # and every level and outcome spelling the estate logs comes back
+        # exactly as written, in bucket keys and in hit values
+        "estate_spellings_unchanged": not estate["levels"]["changed"]
+        and not estate["levels"].get("hit_changed")
+        and estate["levels"]["hit_spellings"] == len(ESTATE_LEVEL_SPELLINGS),
         # the stray URL in a level field: hidden in the hit and in the bucket
         # key, while every ordinary spelling survives and still filters
         "keep_leak_closed": keep["hit_shown"] and not keep["hit_leaks"]
@@ -2288,6 +2813,43 @@ def _num(v: str):
         return v
 
 
+def _estate_lines(e: dict | None) -> list[str]:
+    """The realistic-estate section: one line per shape class, then the
+    skip-rule totals, the declared miss and the spelling check."""
+    if not e:
+        return []
+    lv = e["levels"]
+    lines = [
+        f"realistic estate  {e['tenants']} tenants, {e['jobs']} jobs, {e['resources']} resources "
+        f"({e['distinct_names']} distinct names of {e['names']}), {e['mentions']} free-text "
+        f"mentions with no marker; readable after the vocabulary: {e['readable']} whole "
+        f"({e['declared_miss']} the declared miss), {e['part_readable']} by a word"
+        + (f"; UNEXPECTED {e['unexpected']}" if e["unexpected"] else ""),
+    ]
+    for c in e["classes"]:
+        flag = f"  UNEXPECTED {c['unexpected']}" if c["unexpected"] else ""
+        lines.append(
+            f"  {c['class']:<26}{c['names']:>5} names ({c['distinct']} distinct, {c['shape']}), "
+            f"{c['skipped_total']} dropped by the skip rules {c['skipped'] or '{}'}; "
+            f"{c['shown']}/{c['mentions']} mentions on the page, {c['readable']} readable "
+            f"({c['declared_miss']} declared), {c['part_readable']} by a word" + flag)
+    lines += [
+        f"  skip rules      {e['skipped_by_rule'] or 'nothing dropped'} over all "
+        f"{e['names']} names",
+        f"  declared miss   a one-word name the skip rules drop is never vocabulary and stays "
+        f"readable in message text: {e['declared_miss']} of {e['mentions']} mentions, all of them "
+        f"one ordinary dictionary word (e.g. {', '.join(e['declared_examples']) or 'none'})",
+        f"  spellings       {lv['hit_spellings']}/{len(ESTATE_LEVEL_SPELLINGS)} level spellings "
+        f"unchanged as hit values, {len(lv['kept'])}/"
+        f"{len(ESTATE_LEVEL_SPELLINGS) + len(ESTATE_OUTCOME_SPELLINGS)} level and outcome "
+        f"spellings unchanged as bucket keys ({lv['bucket_keys']} keys); skew kept: commonest "
+        f"level {lv['top_ratio']}x the next, success {lv['outcome_ratio']}x failure"
+        + (f"; CHANGED {lv['changed'] + lv.get('hit_changed', [])}"
+           if lv["changed"] or lv.get("hit_changed") else ""),
+    ]
+    return lines
+
+
 def format_report(r: dict) -> str:
     d = r["default_map"]
     b, t = r["vocabulary"]["build"], r["vocabulary"]["topup"]
@@ -2316,6 +2878,7 @@ def format_report(r: dict) -> str:
         f"  default reads   {len(d['fields_read'])} fields {d['fields_read']}; "
         f"{d['requests']} requests over {d['cases']} cases in {d['seconds']}s, "
         f"values {d['values']}",
+        *_estate_lines(r.get("estate")),
         f"keep-field leak   hit {'shown' if r['keep_field']['hit_shown'] else 'NOT SHOWN'}, "
         f"{len(r['keep_field']['hit_leaks'])} leaks; aggregation "
         f"{r['keep_field']['bucket_keys']} bucket keys, {len(r['keep_field']['agg_leaks'])} leaks; "

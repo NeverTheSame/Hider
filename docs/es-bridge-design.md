@@ -555,8 +555,9 @@ Added after the first version:
   failed or timed-out read: the build is abandoned and the saved
   vocabulary is untouched. The read now takes no input from Claude at all,
   not even a time bound. Measured in es-eval with the stub charging
-  `PAGE_SECONDS` (8-35s per field per page): 17 requests and 326 simulated
-  seconds for the first build, 5 requests and 97 seconds for a top-up,
+  `PAGE_SECONDS` (8-35s per field per page): 44 requests and 839 simulated
+  seconds for the first build over the back catalogue and the realistic
+  estate, 5 requests and 106 seconds for a top-up,
   0 requests for a case (`window_case_shown`,
   `vocabulary_build_in_budget`, `vocabulary_building_refuses`).
   New declared costs: the first sign-in takes minutes; real names sit on
