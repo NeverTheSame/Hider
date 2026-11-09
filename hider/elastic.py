@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import time
 import dataclasses
@@ -98,14 +99,20 @@ DEFAULT_MAX_PHRASES = 8
 MAX_PHRASES_CEILING = 16
 DEFAULT_POLL_TIMEOUT_S = 120
 MAX_POLL_TIMEOUT_S = 600
-#: The name vocabulary (:class:`VocabularyFetch`): it reads the case's own
-#: time window plus a margin, in pages, so a cluster with more distinct
-#: names than one terms aggregation can carry is still readable. ``days`` is
-#: the fallback window for a query that gives no start bound; ``max`` is the
-#: hard ceiling per field, above which the case is refused rather than run on
-#: a partial list; ``budget_s`` is how long the whole paged read may take;
-#: refresh is how often it is read again so a name first logged mid-case is
-#: known within ten minutes.
+#: The name vocabulary (:class:`VocabularyBuild`, :class:`VocabularyIndex`).
+#: It is built **once per cluster, when the bridge signs in**, over the last
+#: ``days``, and topped up every ``VOCABULARY_REFRESH_S`` with only the time
+#: since the last read. ``max`` is the hard ceiling per field, above which
+#: the build fails rather than leaving a partial list; ``budget_s`` is how
+#: long a whole build may take.
+#:
+#: It used to be read inside each case, for the case's own window. Measured
+#: against a real cluster that cannot work: one composite page of 1,000
+#: values for one field takes 8 to 35 seconds, every name field holds far
+#: more than 1,000 values in an hour, and a one-hour case read 49 hours once
+#: the margin was added. No per-case budget a human would wait for covers
+#: that, so every case was refused. Once per cluster, with a long budget and
+#: a saved result, is the only shape that fits the measured cost.
 DEFAULT_VOCABULARY_DAYS = 30
 MAX_VOCABULARY_DAYS = 400
 DEFAULT_VOCABULARY_MAX = 50_000
@@ -114,14 +121,11 @@ MAX_VOCABULARY_MAX = 200_000
 #: safety boundary (the ceiling and the budget are), and a site that could
 #: tune it could only make the read slower or heavier.
 VOCABULARY_PAGE = 1_000
-#: Wall-clock a whole paged read may take before it is refused. A read runs
-#: under the bridge's one lock, so it is time no other call can use.
-DEFAULT_VOCABULARY_BUDGET_S = 60.0
-MAX_VOCABULARY_BUDGET_S = 600.0
-#: Added to each side of the case's window: a name's own field record is
-#: often logged shortly before the message that mentions it.
-DEFAULT_VOCABULARY_MARGIN_DAYS = 1
-MAX_VOCABULARY_MARGIN_DAYS = 30
+#: Wall clock a whole build may take before it is abandoned. Twenty minutes
+#: because the measured page cost puts a large estate's first build in the
+#: minutes, and because it is paid once per bridge rather than per case.
+DEFAULT_VOCABULARY_BUDGET_S = 1200.0
+MAX_VOCABULARY_BUDGET_S = 7200.0
 VOCABULARY_REFRESH_S = 600.0
 VOCABULARY_AGG = "hider_vocabulary"
 #: The one composite source name in a vocabulary aggregation.
@@ -262,7 +266,6 @@ class ElasticConfig:
     vocabulary_fields: tuple[str, ...] | None = None
     vocabulary_days: int = DEFAULT_VOCABULARY_DAYS
     vocabulary_max: int = DEFAULT_VOCABULARY_MAX
-    vocabulary_margin_days: int = DEFAULT_VOCABULARY_MARGIN_DAYS
     vocabulary_budget_s: float = DEFAULT_VOCABULARY_BUDGET_S
 
     @property
@@ -448,23 +451,21 @@ def _parse_clusters(raw: Any, source: str) -> tuple[Cluster, ...]:
 
 
 def _parse_vocabulary(raw: Any, rules: tuple[FieldRule, ...], source: str) -> dict:
-    """``{"fields": [...], "days": 30, "max": 50000, "margin_days": 1,
-    "budget_s": 60}``, all optional.
+    """``{"fields": [...], "days": 30, "max": 50000, "budget_s": 1200}``,
+    all optional.
 
     Each field must be a listed, non-glob identifier without a shape, of a
     type a vocabulary may hold (:data:`NO_VOCABULARY_TYPES` says which may
-    not, and why). Absent: job names only."""
+    not, and why). Absent: every field that could be listed."""
     if raw is None:
         return {}
-    known = {"fields", "days", "max", "margin_days", "budget_s", "_comment"}
+    known = {"fields", "days", "max", "budget_s", "_comment"}
     if not isinstance(raw, dict) or set(raw) - known:
         raise ConfigError(f"{source}: vocabulary must be an object with "
                           f"{', '.join(sorted(known - {'_comment'}))}")
     out: dict[str, Any] = {}
     for key, default, ceiling in (("days", DEFAULT_VOCABULARY_DAYS, MAX_VOCABULARY_DAYS),
-                                  ("max", DEFAULT_VOCABULARY_MAX, MAX_VOCABULARY_MAX),
-                                  ("margin_days", DEFAULT_VOCABULARY_MARGIN_DAYS,
-                                   MAX_VOCABULARY_MARGIN_DAYS)):
+                                  ("max", DEFAULT_VOCABULARY_MAX, MAX_VOCABULARY_MAX)):
         v = raw.get(key, default)
         if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= ceiling:
             raise ConfigError(f"{source}: vocabulary.{key} must be an integer, 1..{ceiling}")
@@ -804,71 +805,33 @@ class EsScrubber(jsonscrub.JsonScrubber):
     #
     # A customer name in free text with nothing that marks it as one ("Tenant
     # Thornbury Estates exceeded its quota", "Harbour Nightly finished") has
-    # no shape a rule could read, and its own field is usually on another
-    # document than the message, so harvesting a page cannot see it on a fresh
-    # case's first call. The cluster can: before the first page of a case on
-    # a cluster, and again every VOCABULARY_REFRESH_S, the bridge sends one
-    # fixed request, a terms aggregation per field the site map lists under
-    # vocabulary.fields, and every value in the reply becomes a known value
-    # under that field's own rule, so it gets the label it gets as a field
-    # value. The sweep then labels the whole name wherever it appears. The
-    # names never reach Claude, and the log holds counts only.
+    # no shape a rule could read. For a tenant that would not matter much -
+    # a message that names a tenant almost always carries the tenant fields
+    # on the same document, so harvesting the page covers it - but about
+    # three in four messages that name a *job* carry no job field at all.
+    # Job names are what the vocabulary is really for.
+    #
+    # The names come from the cluster, read once per cluster when the bridge
+    # signs in (VocabularyBuild), saved (VocabularyIndex) and topped up every
+    # VOCABULARY_REFRESH_S. A case does not read anything: it applies what
+    # the index already holds, which is local and costs no request. Every
+    # value becomes a known value under its field's own rule, so it gets the
+    # label it gets as a field value, and the sweep then labels the whole
+    # name wherever it appears. The names never reach Claude, and the log
+    # holds counts only.
 
-    def vocabulary_due(self, cluster: str, window: tuple[float, float] | None = None,
-                       now: float | None = None) -> bool:
-        """Is a read needed before showing a page of ``window`` on ``cluster``?
+    def apply_vocabulary(self, cluster: str, vocab: "ClusterVocabulary",
+                         now: float | None = None) -> dict[str, int]:
+        """Make every name the index holds for ``cluster`` a known value.
 
-        A read covers an interval, so a later query inside an interval already
-        read needs nothing; one reaching outside it does, and so does one
-        after the refresh interval. An unbounded query covers the fallback
-        window, which is the widest a read ever covers.
+        Local work only: the read happened once, for the whole bridge. The
+        skip rules below decide what is safe to register.
         """
-        if not self._vocab_rules:
-            return False
-        at = self._vocabulary_at.get(cluster)
-        if at is None:
-            return True
-        t = time.monotonic() if now is None else now
-        if t - at[0] >= VOCABULARY_REFRESH_S:
-            return True
-        covered_lo, covered_hi = at[1], at[2]
-        if window is None:
-            # no bounds: only a fallback read (covered_lo None) covers it
-            return covered_lo is not None
-        if covered_lo is None:
-            return False
-        # the case's own window against what was read, margins not counted:
-        # two queries over "now-6h" a second apart are the same case window,
-        # and the margin is exactly the slack that makes them so
-        lo, hi = window
-        return not (covered_lo <= lo and (covered_hi is None or hi <= covered_hi))
+        return self._learn_vocabulary(cluster, vocab.fields, now=now,
+                                      covers=(vocab.covered_from, vocab.covered_until))
 
-    def vocabulary_window(self, window: tuple[float, float] | None
-                          ) -> tuple[float | None, float | None]:
-        """The interval a read covers, in epoch seconds; ``None`` is open.
-
-        The case's own window widened by ``vocabulary.margin_days`` on each
-        side, because a name's own field record is usually logged a little
-        before the message that mentions it. A query with no start or no end
-        falls back to ``vocabulary.days`` with no end, the behaviour before
-        windowing, expressed as ``(None, None)`` so the request keeps using
-        the cluster's clock rather than ours.
-        """
-        if window is None:
-            return None, None
-        margin = self.config.vocabulary_margin_days * 86400.0
-        lo, hi = window
-        return lo - margin, hi + margin
-
-    def vocabulary_fetch(self, window: tuple[float, float] | None = None, *,
-                         now: float | None = None) -> "VocabularyFetch":
-        """A paged read of the name vocabulary for one case window.
-
-        The caller drives it: while ``pending()``, send ``request()`` and hand
-        the reply to ``feed()``; then ``commit(cluster)``. Nothing is learnt
-        before the commit, so a refusal anywhere leaves the session unchanged.
-        """
-        return VocabularyFetch(self, self.vocabulary_window(window), now=now)
+    def vocabulary_applied(self, cluster: str) -> bool:
+        return not self._vocab_rules or cluster in self._vocabulary_at
 
     @staticmethod
     def vocabulary_skip(value: str) -> str | None:
@@ -896,8 +859,8 @@ class EsScrubber(jsonscrub.JsonScrubber):
                           now: float | None = None,
                           covers: tuple[float | None, float | None] | None = None
                           ) -> dict[str, int]:
-        """Make every name a read returned a known value. Called by
-        :meth:`VocabularyFetch.commit`, never from a transport."""
+        """Make every name a build returned a known value. Called by
+        :meth:`apply_vocabulary`, never from a transport."""
         counts: dict[str, int] = {}
         skipped: dict[str, int] = {}
         learnt: list[tuple[FieldRule, str]] = []
@@ -1302,128 +1265,286 @@ class EsScrubber(jsonscrub.JsonScrubber):
         return s
 
 
-class VocabularyFetch:
-    """One paged read of the name vocabulary, transport-agnostic.
+@dataclass
+class ClusterVocabulary:
+    """What one cluster's name vocabulary holds, and what it covers.
 
-    Why paged: one ``terms`` aggregation can only return what fits in one
-    reply, so a cluster with more distinct names than the cap was refused
-    outright - on a large estate, every case, always. A ``composite``
-    aggregation pages instead, and the window it pages over is the case's own
-    plus a margin rather than the whole retention period, which is what makes
-    the read small enough to be worth doing at all.
-
-    Fails closed, and nothing is learnt until :meth:`commit`: an upstream
-    error, a partial or timed-out reply, a missing or malformed aggregation,
-    a field over ``vocabulary.max`` or a read over ``vocabulary.budget_s``
-    all raise :class:`Refused`, and the session is left exactly as it was.
-    The request carries no input from Claude but the already-validated time
-    bounds of the query being served, and never a value.
+    ``fields`` maps a field pattern to the distinct values read for it.
+    These are **real customer names**, so this object is only ever written
+    to the vocabulary file (0600 under the sessions directory, gitignored)
+    and never to a log, a report or anything Claude sees.
     """
 
-    def __init__(self, scrubber: "EsScrubber", covers: tuple[float | None, float | None], *,
-                 now: float | None = None) -> None:
-        self.scrubber = scrubber
-        self.config = scrubber.config
-        self.covers = covers
-        self.rules = list(scrubber._vocab_rules)
-        #: field pattern -> values read so far, in reply order
+    covered_from: float
+    covered_until: float
+    built_at: float = 0.0
+    fields: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {f: len(v) for f, v in self.fields.items()}
+
+    def total(self) -> int:
+        return sum(len(v) for v in self.fields.values())
+
+    def merge(self, other: "ClusterVocabulary") -> "ClusterVocabulary":
+        """Fold a top-up into what is already known, keeping order and
+        dropping values already held."""
+        fields = {f: list(v) for f, v in self.fields.items()}
+        for f, values in other.fields.items():
+            have = set(fields.setdefault(f, []))
+            fields[f] += [v for v in values if v not in have and not have.add(v)]
+        return ClusterVocabulary(min(self.covered_from, other.covered_from),
+                                 max(self.covered_until, other.covered_until),
+                                 other.built_at or self.built_at, fields)
+
+    def to_json(self) -> dict:
+        return {"covered_from": self.covered_from, "covered_until": self.covered_until,
+                "built_at": self.built_at, "fields": self.fields}
+
+    @classmethod
+    def from_json(cls, raw: Any) -> "ClusterVocabulary | None":
+        if not isinstance(raw, dict):
+            return None
+        try:
+            fields = {str(f): [v for v in vs if isinstance(v, str)]
+                      for f, vs in (raw.get("fields") or {}).items() if isinstance(vs, list)}
+            return cls(float(raw["covered_from"]), float(raw["covered_until"]),
+                       float(raw.get("built_at") or 0.0), fields)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+class VocabularyIndex:
+    """The built vocabularies, by cluster, saved beside the case state.
+
+    Saved because the build is expensive and paid once per bridge: without
+    a file, every ``es-login`` would pay it again. The file holds real
+    names, so it lives under the sessions directory (gitignored), its
+    directory is 0700 and the file is 0600, and nothing else in the system
+    reads it - a log line, a report or a reply to Claude carries counts.
+    """
+
+    FILENAME = "vocabulary.json"
+    SCHEMA = "hider.es-vocabulary.v1"
+
+    def __init__(self, directory: str | Path | None) -> None:
+        self.directory = Path(directory) if directory is not None else None
+        self.clusters: dict[str, ClusterVocabulary] = {}
+        self.load()
+
+    @property
+    def path(self) -> Path | None:
+        return None if self.directory is None else self.directory / self.FILENAME
+
+    def get(self, cluster: str) -> ClusterVocabulary | None:
+        return self.clusters.get(cluster)
+
+    def put(self, cluster: str, vocab: ClusterVocabulary) -> None:
+        held = self.clusters.get(cluster)
+        self.clusters[cluster] = vocab if held is None else held.merge(vocab)
+        self.save()
+
+    def load(self) -> None:
+        path = self.path
+        if path is None or not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # unreadable or half-written: rebuild rather than guess
+        if not isinstance(raw, dict) or raw.get("schema") != self.SCHEMA:
+            return
+        for name, entry in (raw.get("clusters") or {}).items():
+            vocab = ClusterVocabulary.from_json(entry)
+            if vocab is not None:
+                self.clusters[str(name)] = vocab
+
+    def save(self) -> None:
+        path = self.path
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        body = {"schema": self.SCHEMA,
+                "clusters": {n: v.to_json() for n, v in self.clusters.items()}}
+        tmp = path.with_suffix(".tmp")
+        old = os.umask(0o077)
+        try:
+            tmp.write_text(json.dumps(body), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(path)
+        finally:
+            os.umask(old)
+
+    def report(self, cluster: str, config: ElasticConfig,
+               now: float | None = None) -> dict:
+        """Counts and coverage for the log and the VOCAB line, never a name."""
+        vocab = self.clusters.get(cluster)
+        t = time.time() if now is None else now
+        if vocab is None:
+            # Nothing to read is not the same as not having read it yet: a
+            # site map with no learnable field (or one that lists none) is
+            # ready at once, or every case would wait for a build that is
+            # never going to start.
+            state = "building" if config.vocabulary_rules else "ready"
+            return {"state": state, "fields": {}, "max": config.vocabulary_max,
+                    "near_cap": [], "skipped": {}, "omitted": list(config.vocabulary_omitted)}
+        counts = vocab.counts
+        cap = config.vocabulary_max
+        return {
+            "state": "stale" if t - vocab.covered_until > VOCABULARY_REFRESH_S else "ready",
+            "fields": counts, "max": cap,
+            "near_cap": sorted(f for f, n in counts.items() if n >= VOCABULARY_NEAR_CAP * cap),
+            "skipped": {},
+            "omitted": list(config.vocabulary_omitted),
+            "covered_days": round((vocab.covered_until - vocab.covered_from) / 86400.0, 2),
+            "age_s": round(max(0.0, t - vocab.covered_until), 1),
+        }
+
+
+class VocabularyBuild:
+    """One build (or top-up) of a cluster's vocabulary: resumable, paged,
+    one field per request.
+
+    Why one field per request rather than one aggregation per field in one
+    request: the measured cost is per aggregation, not per round trip (8 to
+    35 seconds for a page of 1,000 values), and a request carrying every
+    field pays all of them before it can be stopped, checked or logged. One
+    field at a time makes the budget enforceable between fields, lets
+    progress be logged as it happens, and lets a build resume where it
+    stopped. Each request also carries an ``exists`` filter on the field
+    it reads, which is what makes the job-name read affordable: most
+    documents have no job field.
+
+    Fields are read JOB_NAME-first, because a message naming a tenant
+    almost always carries the tenant fields on the same document (the page
+    harvest covers it) while about three in four messages naming a job do
+    not. If a build is interrupted, the valuable half is the part already
+    done.
+
+    **Nothing is learnt from a partial read.** A field is committed to the
+    build only when its last page has come back; a build is committed to
+    the index only when every field is done. An upstream error, a partial
+    or misshapen reply, a field over ``vocabulary.max``, or the whole build
+    over ``vocabulary.budget_s`` leaves the index exactly as it was.
+    """
+
+    def __init__(self, config: ElasticConfig, covered_from: float, covered_until: float, *,
+                 clock=None) -> None:
+        self.config = config
+        self.covered_from = covered_from
+        self.covered_until = covered_until
+        #: job names first: see the class docstring
+        self.rules = sorted(config.vocabulary_rules,
+                            key=lambda r: (r.type != "JOB_NAME", r.pattern))
         self.values: dict[str, list[str]] = {r.pattern: [] for r in self.rules}
-        self._after: dict[int, dict | None] = {i: None for i in range(len(self.rules))}
-        self._done: set[int] = set()
+        self._clock = clock if clock is not None else time.monotonic
+        self._t0 = self._clock()
+        self._at = 0                      # index of the field being read
+        self._after: dict | None = None   # composite after_key for that field
         self.requests = 0
         self.seconds = 0.0
-        self._now = now
-        self._t0 = time.monotonic()
+        self.failed: str | None = None
+
+    # -- progress ----------------------------------------------------------
+
+    def pending(self) -> bool:
+        return self.failed is None and self._at < len(self.rules)
+
+    @property
+    def field(self) -> str | None:
+        return self.rules[self._at].pattern if self._at < len(self.rules) else None
+
+    def progress(self) -> dict:
+        """Counts only, for the decision log and the VOCAB line."""
+        return {"fields_done": self._at, "fields_total": len(self.rules),
+                "field": self.field, "values": {f: len(v) for f, v in self.values.items() if v},
+                "requests": self.requests, "seconds": round(self.seconds, 1),
+                "budget_s": self.config.vocabulary_budget_s}
 
     # -- driving -----------------------------------------------------------
 
-    def pending(self) -> bool:
-        return len(self._done) < len(self.rules)
-
     def request(self) -> dict:
-        """The next page's request, one composite aggregation per field that
-        has more to give."""
+        """The next page: one composite aggregation over one field, with an
+        ``exists`` filter on it. No input from Claude, no value in it."""
+        rule = self.rules[self._at]
         self.requests += 1
-        aggs = {}
-        for i, rule in enumerate(self.rules):
-            if i in self._done:
-                continue
-            comp: dict[str, Any] = {
-                "size": VOCABULARY_PAGE,
-                "sources": [{VOCABULARY_SOURCE: {"terms": {"field": rule.pattern}}}],
-            }
-            if self._after[i] is not None:
-                comp["after"] = self._after[i]
-            aggs[f"{VOCABULARY_AGG}_{i}"] = {"composite": comp}
-        lo, hi = self.covers
-        bounds = {"gte": f"now-{self.config.vocabulary_days}d" if lo is None else _iso(lo)}
-        if hi is not None:
-            bounds["lte"] = _iso(hi)
+        comp: dict[str, Any] = {
+            "size": VOCABULARY_PAGE,
+            "sources": [{VOCABULARY_SOURCE: {"terms": {"field": rule.pattern}}}],
+        }
+        if self._after is not None:
+            comp["after"] = self._after
         # ignore_unavailable: a configured pattern one cluster does not have
-        # (no traces in EMEA) reads as no names, not as a failed case
+        # (no traces in EMEA) reads as no names, not as a failed build
         return {"params": {"index": ",".join(self.config.indices), "ignore_unavailable": True,
                            "body": {
             "size": 0, "track_total_hits": False,
-            "query": {"bool": {"filter": [{"range": {self.config.time_field: bounds}}]}},
-            "aggs": aggs,
+            "query": {"bool": {"filter": [
+                {"range": {self.config.time_field: {"gte": _iso(self.covered_from),
+                                                    "lte": _iso(self.covered_until)}}},
+                {"exists": {"field": rule.pattern}},
+            ]}},
+            "aggs": {f"{VOCABULARY_AGG}_0": {"composite": comp}},
         }}}
 
     def feed(self, raw: Any) -> None:
-        """Take one reply. Raises :class:`Refused`; learns nothing."""
+        """Take one page. Raises :class:`Refused`; the index is untouched
+        until :meth:`commit`."""
+        rule = self.rules[self._at]
         klass = error_class(raw) if isinstance(raw, dict) else None
         if klass is not None:
-            raise Refused("upstream_error", f"upstream error: {klass}")
+            raise self._fail("upstream_error", f"upstream error: {klass}")
         if not isinstance(raw, dict) or raw.get("isRunning") is True \
                 or raw.get("isPartial") is True:
-            raise Refused("vocabulary", "response withheld: the name vocabulary could not be "
-                                        "read from the cluster")
+            raise self._fail("vocabulary", "the name vocabulary could not be read from the "
+                                           "cluster")
         body = raw.get("rawResponse", raw)
         aggs = body.get("aggregations") if isinstance(body, dict) else None
         if not isinstance(aggs, dict) or body.get("timed_out") is True:
-            raise Refused("vocabulary", "response withheld: the name vocabulary reply was "
-                                        "incomplete")
-        for i, rule in enumerate(self.rules):
-            if i in self._done:
-                continue
-            agg = aggs.get(f"{VOCABULARY_AGG}_{i}")
-            buckets = agg.get("buckets") if isinstance(agg, dict) else None
-            if not isinstance(buckets, list):
-                raise Refused("vocabulary", "response withheld: the name vocabulary reply was "
-                                            "incomplete")
-            got = self.values[rule.pattern]
-            for b in buckets:
-                key = b.get("key") if isinstance(b, dict) else None
-                value = key.get(VOCABULARY_SOURCE) if isinstance(key, dict) else None
-                if not isinstance(value, str):
-                    raise Refused("vocabulary", "response withheld: the name vocabulary reply "
-                                                "was not the shape it was asked for")
-                got.append(value)
-            if len(got) > self.config.vocabulary_max:
-                raise Refused("vocabulary", (
-                    f"response withheld: {rule.pattern} has more than "
-                    f"{self.config.vocabulary_max} distinct values in the window read "
-                    f"(the cap is vocabulary.max); narrow the query's time range, or raise "
-                    "vocabulary.max in the site map"))
-            after = agg.get("after_key")
-            if len(buckets) < VOCABULARY_PAGE or not isinstance(after, dict):
-                self._done.add(i)
-            else:
-                self._after[i] = after
-        self.seconds = time.monotonic() - self._t0
+            raise self._fail("vocabulary", "the name vocabulary reply was incomplete")
+        agg = aggs.get(f"{VOCABULARY_AGG}_0")
+        buckets = agg.get("buckets") if isinstance(agg, dict) else None
+        if not isinstance(buckets, list):
+            raise self._fail("vocabulary", "the name vocabulary reply was incomplete")
+        got = self.values[rule.pattern]
+        for b in buckets:
+            key = b.get("key") if isinstance(b, dict) else None
+            value = key.get(VOCABULARY_SOURCE) if isinstance(key, dict) else None
+            if not isinstance(value, str):
+                raise self._fail("vocabulary", "the name vocabulary reply was not the shape "
+                                               "it was asked for")
+            got.append(value)
+        if len(got) > self.config.vocabulary_max:
+            raise self._fail("vocabulary", (
+                f"{rule.pattern} has more than {self.config.vocabulary_max} distinct values "
+                f"in the range read (the cap is vocabulary.max); raise it or shorten "
+                "vocabulary.days in the site map"))
+        after = agg.get("after_key")
+        if len(buckets) < VOCABULARY_PAGE or not isinstance(after, dict):
+            self._at += 1            # this field is read whole
+            self._after = None
+        else:
+            self._after = after
+        self.seconds = self._clock() - self._t0
         if self.pending() and self.seconds > self.config.vocabulary_budget_s:
-            raise Refused("vocabulary", (
-                f"response withheld: reading the name vocabulary passed "
-                f"{self.config.vocabulary_budget_s:g}s (vocabulary.budget_s) after "
-                f"{self.requests} requests; narrow the query's time range"))
+            raise self._fail("vocabulary", (
+                f"reading the name vocabulary passed {self.config.vocabulary_budget_s:g}s "
+                f"(vocabulary.budget_s) after {self.requests} requests and "
+                f"{self._at} of {len(self.rules)} fields"))
 
-    def commit(self, cluster: str) -> dict[str, int]:
-        """Learn everything read, atomically. Counts per field, never values."""
-        if self.pending():
-            raise Refused("vocabulary", "response withheld: the name vocabulary was not "
-                                        "read whole")
-        self.seconds = time.monotonic() - self._t0
-        return self.scrubber._learn_vocabulary(cluster, self.values, now=self._now,
-                                               covers=self.covers)
+    def _fail(self, code: str, message: str) -> Refused:
+        self.failed = code
+        return Refused(code, f"the name vocabulary build failed: {message}")
+
+    def result(self) -> ClusterVocabulary:
+        """What was read, once every field is done. Never called on a
+        failed or unfinished build."""
+        if self.pending() or self.failed:
+            raise Refused("vocabulary", "the name vocabulary was not read whole")
+        self.seconds = self._clock() - self._t0
+        return ClusterVocabulary(self.covered_from, self.covered_until, time.time(),
+                                 {f: list(v) for f, v in self.values.items()})
 
 
 def _iso(t: float) -> str:

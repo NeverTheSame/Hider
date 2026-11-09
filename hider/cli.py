@@ -293,6 +293,13 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
     q = _smoke_query(esbridge, cfg, args, size)
     client = esbridge.BrokerClient(esbridge.broker_socket(args.profile_dir or cfg.profile_dir),
                                    timeout=cfg.poll_timeout_s + 120)
+    # es-smoke is the tool that shows where the bridge is, so it reports the
+    # build rather than hiding behind it; a query before it is ready is
+    # refused with vocabulary_building, and this says why.
+    try:
+        _wait_for_vocabulary(client, cluster, timeout=0.0)
+    except elastic.Refused:
+        pass
     seeded: list[str] = []
 
     def run(query: dict) -> dict:
@@ -342,10 +349,8 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
 
     fx = eseval.generate(docs=200)
     cfg0 = elastic.load(elastic.EXAMPLE)
-    # the synthetic documents sit at eseval.NOW and the stub resolves date
-    # math against it, so the clock that decides which window the name
-    # vocabulary is read for has to be the same one. Against a real cluster
-    # both are the wall clock and this is never touched.
+    # the synthetic documents sit at eseval.NOW, so the vocabulary build has
+    # to read the range around that instant; see esbridge.clock
     esbridge.clock = eseval.NOW.timestamp
     # headless sign-in is allowed here only: the real IdP refuses it. With
     # --expired the IdP is closed too, or Chrome parking its tab would sign
@@ -373,9 +378,25 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
                 return 2
             for label in labels:
                 print(f"seeded    {label}  (the real value stays here)", file=sys.stderr)
-            bridge = esbridge.Bridge(cfg, scrubber,
-                                     esbridge.KibanaSession(transport, poll_timeout=cfg.poll_timeout_s),
-                                     log_path=Path(args.log) if args.log else None)
+            session = esbridge.KibanaSession(transport, poll_timeout=cfg.poll_timeout_s)
+            # the sign-in build, which a real bridge does once and keeps; here
+            # it runs in line, printing its progress as the broker logs it
+            index = elastic.VocabularyIndex(None)
+            cluster = cfg.cluster("stub")
+            build = elastic.VocabularyBuild(
+                cfg, esbridge.clock() - cfg.vocabulary_days * 86400.0, esbridge.clock())
+            try:
+                while build.pending():
+                    build.feed(session.search(cluster, build.request()))
+                    print(esbridge.vocabulary_line({"building": build.progress()}),
+                          file=sys.stderr)
+                index.put("stub", build.result())
+            except elastic.Refused as e:
+                print(f"REFUSED  cluster=stub code={e.code}: {e.message}")
+                return 2
+            bridge = esbridge.Bridge(cfg, scrubber, session,
+                                     log_path=Path(args.log) if args.log else None,
+                                     index=index)
             q = _smoke_query(esbridge, cfg, args, size)
             report = esbridge.run_smoke(lambda query: esbridge.run_case(bridge, "stub", query), q,
                                         max_buckets=cfg.max_buckets)
@@ -423,6 +444,18 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
     if reply["signed_in"]:
         print(f"signed in: cluster {cluster.name}; the session lasts while the bridge runs "
               "(es-logout, closing its window, or 8 hours idle ends it)")
+        # The one vocabulary build for this bridge. It is slow - minutes on a
+        # large estate - and a case opened before it finishes is refused, so
+        # wait here, where someone is already waiting, and show the progress.
+        print("reading the cluster's customer names once, so a name in message text can be "
+              "labelled. This is the slow part of signing in; cases are refused until it "
+              "finishes.", file=sys.stderr)
+        state = _wait_for_vocabulary(
+            esbridge.BrokerClient(sock, timeout=60), cluster.name)
+        if state.get("state") == "building":
+            print(f"the name vocabulary for {cluster.name} is still building; cases will be "
+                  "refused until it finishes. Run es-login again to see the progress.")
+            return 1
         return 0
     print(f"timed out: cluster {cluster.name} did not reach Kibana; run es-login again")
     return 1
@@ -616,13 +649,49 @@ def _es_research_stub(args: argparse.Namespace) -> int:
             print(f"stub: synthetic tenants you can seed with --term: {[t.name for t in fx.tenants[:3]]}",
                   file=sys.stderr)
         try:
-            return _es_research(args, esbridge.BrokerClient(sock, timeout=60), base / "cases", cfg)
+            control = esbridge.BrokerClient(sock, timeout=60)
+            _wait_for_vocabulary(control, "stub")
+            return _es_research(args, control, base / "cases", cfg)
         finally:
             broker.stopping = True
             thread.join(10)
     finally:
         stub.stop()
         shutil.rmtree(base, ignore_errors=True)
+
+
+def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
+                         quiet: bool = False) -> dict:
+    """Start the cluster's name vocabulary build and wait for it.
+
+    The build is paid once per bridge, and a case opened before it finishes
+    is refused, so every entry point that opens a case waits here first.
+    Progress goes to stderr as counts, never a name.
+    """
+    from . import esbridge
+
+    state = control.call("vocabulary", cluster=cluster, build=True)["vocabulary"]
+    deadline = time.monotonic() + timeout
+    shown = None
+    # "failed" ends the wait as surely as "ready": the build is not coming
+    # back on its own, and a caller that only watched for "ready" would wait
+    # out the whole timeout.
+    while state.get("state") == "building" and time.monotonic() < deadline:
+        line = esbridge.vocabulary_line(state)
+        if line and line != shown and not quiet:
+            print(line, file=sys.stderr)
+            shown = line
+        time.sleep(0.05)
+        state = control.call("vocabulary", cluster=cluster)["vocabulary"]
+    if not quiet:
+        line = esbridge.vocabulary_line(state)
+        if line:
+            print(line, file=sys.stderr)
+        if state.get("state") == "failed":
+            print(f"the name vocabulary build stopped: {state.get('refused')}. Cases stay "
+                  "refused until a build finishes; run es-login again to retry.",
+                  file=sys.stderr)
+    return state
 
 
 def _cmd_es_prompt_check(args: argparse.Namespace) -> int:

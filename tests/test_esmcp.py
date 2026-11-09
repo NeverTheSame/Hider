@@ -16,6 +16,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,16 @@ def short_dir():
     shutil.rmtree(d, ignore_errors=True)
 
 
+@pytest.fixture(autouse=True)
+def _fixture_clock():
+    """The stub's documents sit at ``eseval.NOW``, so the vocabulary build
+    has to read the range around that instant rather than around today.
+    Against a real cluster ``esbridge.clock`` is the wall clock."""
+    esbridge.clock = eseval.NOW.timestamp
+    yield
+    esbridge.clock = time.time
+
+
 def _config(url: str, profile: Path, **extra) -> elastic.ElasticConfig:
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["clusters"] = {"stub": {"kibana": url}}
@@ -72,7 +83,24 @@ class _Bridge:
     def call(self, op, **kw):
         return esbridge.BrokerClient(self.sock, timeout=30).call(op, **kw)
 
-    def open(self, case="c1", terms=(), **kw):
+    def vocabulary(self, cluster="stub", timeout=20.0):
+        """Build the cluster's name vocabulary and wait for it, as es-login
+        does after signing in. A case opened before this is refused with
+        ``vocabulary_building``, which is the point of the code."""
+        self.call("vocabulary", cluster=cluster, build=True)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.call("vocabulary", cluster=cluster)["vocabulary"]
+            if state.get("state") != "building":
+                return state
+            threading.Event().wait(0.01)
+        raise AssertionError("the vocabulary never finished building")
+
+    def open(self, case="c1", terms=(), vocabulary=True, **kw):
+        # as es-login leaves a bridge: signed in, vocabulary built. A case
+        # opened before that is refused (test_a_case_before_the_build...).
+        if vocabulary:
+            self.vocabulary()
         return self.call("open_case", case=case, terms=list(terms), tier2="none", **kw)
 
     def stop(self):
@@ -235,9 +263,13 @@ def test_a_failing_transport_is_bridge_error_with_nothing_in_it(stub, short_dir)
 
     cfg = _config(stub.url, short_dir / "profile")
     b = _Bridge(cfg, short_dir / "cases")
-    b.broker._factory = lambda: Exploding(COOKIE)
     try:
-        opened = b.open()
+        # build the vocabulary first, then break the transport: this test is
+        # about what a transport fault says, not about the build
+        b.vocabulary()
+        b.broker._factory = lambda: Exploding(COOKIE)
+        b.broker.transport = Exploding(COOKIE)
+        opened = b.open(vocabulary=False)
         text, err = Mcp(opened["url"], opened["token"]).tool("es_count", index="logs-app-*")
         assert err and text.startswith("refused (bridge_error): ")
         assert "Contoso" not in text and "127.0.0.1" not in text
@@ -276,7 +308,7 @@ def test_the_decision_log_names_the_tool_and_holds_no_values(bridge, fixture):
     rows = [json.loads(line) for line in
             (bridge.sessions / "logged" / "decisions.jsonl").read_text().splitlines()]
     # the case's job-name vocabulary is logged before its first page: a count, no name
-    assert rows[0]["vocabulary"] == "names" and rows[0]["fields"]["job.name"] > 0 \
+    assert rows[0]["vocabulary"] == "applied" and rows[0]["fields"]["job.name"] > 0 \
         and "tool" not in rows[0]
     rows = rows[1:]
     assert [r.get("tool") for r in rows] == ["es_count", "es_search", "es_count"]
@@ -376,6 +408,49 @@ def test_a_case_keeps_its_labels_across_a_bridge_restart(stub, short_dir, fixtur
         assert not err and n["hits_total"]["value"] == server["doc_count"]
     finally:
         b.stop()
+
+
+def test_a_case_before_the_build_finishes_is_refused_with_its_own_code(stub, short_dir):
+    """The bridge is signed in but the names are not read yet. A page now
+    could show a customer name in message text, so there is no page: the
+    refusal names the rule and the operator waits."""
+    cfg = _config(stub.url, short_dir / "profile")
+    b = _Bridge(cfg, short_dir / "cases")
+    try:
+        opened = b.open(vocabulary=False)      # no build started
+        text, err = Mcp(opened["url"], opened["token"]).tool("es_count", index="logs-app-*")
+        assert err and "vocabulary_building" in text
+        assert "still being built" in text
+        # and once it is built, the same call works
+        b.vocabulary()
+        again = b.open(case="c1", vocabulary=False)
+        text, err = Mcp(again["url"], again["token"]).tool("es_count", index="logs-app-*")
+        assert not err, text
+    finally:
+        b.stop()
+
+
+def test_the_vocabulary_file_is_written_beside_the_cases_and_kept_private(stub, short_dir):
+    cfg = _config(stub.url, short_dir / "profile")
+    b = _Bridge(cfg, short_dir / "cases")
+    try:
+        b.vocabulary()
+    finally:
+        b.stop()
+    path = short_dir / "cases" / elastic.VocabularyIndex.FILENAME
+    assert path.exists() and stat.S_IMODE(path.stat().st_mode) == 0o600
+    held = json.loads(path.read_text())
+    assert held["schema"] == elastic.VocabularyIndex.SCHEMA
+    assert held["clusters"]["stub"]["fields"]["job.name"]
+    # a second bridge on the same directory starts from it, reading nothing
+    n = len(stub.engine.requests)
+    b2 = _Bridge(cfg, short_dir / "cases")
+    try:
+        state = b2.call("vocabulary", cluster="stub")["vocabulary"]
+        assert state["state"] in ("ready", "stale") and state["fields"]["job.name"]
+        assert len(stub.engine.requests) == n
+    finally:
+        b2.stop()
 
 
 def test_two_cases_have_two_vaults(bridge, fixture):

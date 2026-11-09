@@ -10,6 +10,7 @@ import json
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,16 @@ import pytest
 from hider import elastic, esbridge, eseval
 
 CFG0 = elastic.load(elastic.EXAMPLE)
+
+
+@pytest.fixture(autouse=True)
+def _fixture_clock():
+    """The stub's documents sit at ``eseval.NOW``, so the vocabulary build
+    has to read the range around that instant rather than around today.
+    Against a real cluster ``esbridge.clock`` is the wall clock."""
+    esbridge.clock = eseval.NOW.timestamp
+    yield
+    esbridge.clock = time.time
 
 
 def _config(url: str, tmp_path) -> elastic.ElasticConfig:
@@ -31,19 +42,6 @@ def fixture():
     return eseval.generate(docs=150)
 
 
-@pytest.fixture(autouse=True)
-def _fixture_clock():
-    """The stub's documents sit at ``eseval.NOW``, and the stub resolves the
-    date math in a query against it. The window a query's vocabulary read
-    covers is resolved here, so here has to be the same instant; against a
-    real cluster both clocks are the wall clock."""
-    import time
-
-    esbridge.clock = eseval.NOW.timestamp
-    yield
-    esbridge.clock = time.time
-
-
 @pytest.fixture
 def stub(fixture):
     kb = eseval.StubKibana(eseval.StubEngine(fixture, CFG0.indices), cookie="sid=synthetic").start()
@@ -51,12 +49,19 @@ def stub(fixture):
     kb.stop()
 
 
-def _bridge(stub, tmp_path, **kw):
+def _bridge(stub, tmp_path, *, vocabulary=True, **kw):
+    """A bridge on a signed-in cluster whose vocabulary is already built,
+    which is what every case sees in practice: es-login builds it once."""
     cfg = _config(stub.url, tmp_path)
     scrubber = elastic.EsScrubber(cfg, tier2="none")
     session = esbridge.KibanaSession(esbridge.UrllibTransport("sid=synthetic"), sleep=lambda s: None,
                                      **kw)
-    return esbridge.Bridge(cfg, scrubber, session, log_path=tmp_path / "decisions.jsonl")
+    index = elastic.VocabularyIndex(None)
+    if vocabulary:
+        built, _ = eseval.build_vocabulary(cfg, stub.engine)
+        index.put("stub", built)
+    return esbridge.Bridge(cfg, scrubber, session, log_path=tmp_path / "decisions.jsonl",
+                           index=index)
 
 
 # -- configuration -------------------------------------------------------------
@@ -160,11 +165,12 @@ def test_search_submits_polls_and_releases(stub, tmp_path):
     seq = [m for m, _, _ in stub.calls]
     assert seq[:2] == ["GET", "POST"]            # probe, submit
     assert "DELETE" in seq and seq[-1] == "DELETE"  # released after the poll
-    # two searches, each released: the case's job-name vocabulary, then the page
-    assert len(stub.deleted) == 2
+    # one search, released: the vocabulary was built at sign-in, so the case
+    # submits only its own page
+    assert len(stub.deleted) == 1
     assert "_source" in o.output["hits"]["hits"][0]
     b.run("stub", {"index": "logs-app-*", "size": 2})
-    assert len(stub.deleted) == 3                # no second vocabulary inside the interval
+    assert len(stub.deleted) == 2                # one search per page, and nothing else
 
 
 def test_expired_session_is_a_refusal_before_anything_is_submitted(stub, tmp_path):
@@ -251,17 +257,16 @@ def test_labels_round_trip_through_the_live_path_and_the_log_holds_no_values(stu
     assert o.hits_total > 0
     # the stub saw the real value; Claude's page shows the label
     submitted = [body for m, p, body in stub.calls if m == "POST" and p == esbridge.SEARCH_PATH]
-    # the first search is the job-name vocabulary: fixed, no value in it
-    assert tenant.name not in json.dumps(submitted[0]) and \
-        elastic.VOCABULARY_AGG in json.dumps(submitted[0])
-    assert tenant.name in json.dumps(submitted[1])
+    # the case submits one search, its own: the vocabulary was built at
+    # sign-in, before this case existed
+    assert len(submitted) == 1 and tenant.name in json.dumps(submitted[0])
     page = json.dumps(o.output)
     assert tenant.name not in page and lab in page
     assert all(h["_source"]["labels"]["tenant_name"] == lab for h in o.output["hits"]["hits"])
     rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
     assert len(rows) == 2
     vocab, row = rows
-    assert vocab["vocabulary"] == "names" and vocab["fields"]["job.name"] > 0 \
+    assert vocab["vocabulary"] == "applied" and vocab["fields"]["job.name"] > 0 \
         and vocab["max"] == elastic.DEFAULT_VOCABULARY_MAX and "refused" not in vocab
     assert row["cluster"] == "stub" and row["labels_used"] == [lab]
     assert row["text_queries"] == [lab]
@@ -435,7 +440,8 @@ def test_smoke_histogram_within_the_cap_reaches_kibana(stub, tmp_path, capsys, k
     n = len(stub.engine.requests)
     q = esbridge.smoke_query(b.config, size=0, **kw)
     assert esbridge.smoke(b, "stub", q) == 0, capsys.readouterr().out
-    assert len(stub.engine.requests) == n + 2  # the job-name vocabulary, then the query
+    # one request: the query. The vocabulary was built once, at sign-in.
+    assert len(stub.engine.requests) == n + 1
     aggs = b.outcomes[-1].output["aggregations"]
     lists = ([r[esbridge.TIME_AGG]["buckets"] for r in aggs[esbridge.COUNT_AGG]["buckets"]]
              if esbridge.COUNT_AGG in aggs else [aggs[esbridge.TIME_AGG]["buckets"]])
@@ -813,10 +819,16 @@ def short_dir():
     shutil.rmtree(d, ignore_errors=True)
 
 
-def _sso_config(url: str, profile: Path, **extra) -> elastic.ElasticConfig:
+def _sso_config(url: str, profile: Path, *, vocabulary=False, **extra) -> elastic.ElasticConfig:
+    """A broker config for the transport tests. The name vocabulary is off
+    unless a test is about it: signing in starts a build, and a build on a
+    stub that never answers (slow=True) would refuse every page under test
+    for a reason that has nothing to do with the transport."""
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["clusters"] = {"stub": {"kibana": url}}
     raw["profile_dir"] = str(profile)
+    if not vocabulary:
+        raw["vocabulary"] = {"fields": []}
     raw.update(extra)
     return elastic.parse(raw, source="test")
 
@@ -1189,12 +1201,15 @@ def test_browser_login_keeps_the_session_and_it_dies_with_the_browser(fixture, s
     profile = short_dir / "profile"
     transport = esbridge.BrowserTransport(profile)
     try:
-        cfg = _sso_config(kb.url, profile)
+        cfg = _sso_config(kb.url, profile, vocabulary=True)
         cluster = cfg.cluster("stub")
+        index = elastic.VocabularyIndex(None)
+        built, _ = eseval.build_vocabulary(cfg, kb.engine)
+        index.put("stub", built)   # as es-login leaves it
 
         def bridge(t):
             return esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"),
-                                   esbridge.KibanaSession(t, poll_interval=0.1))
+                                   esbridge.KibanaSession(t, poll_interval=0.1), index=index)
 
         assert transport.login(cluster, timeout=20)
         for _ in range(2):
@@ -1262,23 +1277,34 @@ def test_broker_with_real_chrome_serves_many_runs_from_one_login(fixture, short_
 # -- the job-name vocabulary on the live path ------------------------------------
 
 
-def test_a_refused_vocabulary_refuses_the_page_before_it_is_submitted(stub, tmp_path):
-    """Fail closed: if the case's job names cannot all be read, no page is
-    shown, and the query itself never reaches Kibana."""
-    b = _bridge(stub, tmp_path)
-    raw = json.loads(elastic.EXAMPLE.read_text())
-    raw["clusters"] = {"stub": {"kibana": stub.url}}
-    raw["vocabulary"]["max"] = 1  # the fixture has more job names than this
-    b.config = elastic.parse(raw, source="test")
-    b.scrubber = elastic.EsScrubber(b.config, tier2="none")
+def test_a_page_before_the_vocabulary_is_built_is_refused_and_never_submitted(stub, tmp_path):
+    """Fail closed: until the cluster's names are known, no page is shown,
+    and the query itself never reaches Kibana."""
+    b = _bridge(stub, tmp_path, vocabulary=False)   # as a bridge is mid-build
+    n = len(stub.engine.requests)
     with pytest.raises(elastic.Refused) as e:
         b.run("stub", {"index": "logs-app-*", "size": 1})
-    assert e.value.code == "vocabulary"
-    searches = [body for m, p, body in stub.calls if m == "POST" and p == esbridge.SEARCH_PATH]
-    assert len(searches) == 1 and elastic.VOCABULARY_AGG in json.dumps(searches[0])
+    assert e.value.code == "vocabulary_building"
+    assert "still being built" in e.value.message
+    assert len(stub.engine.requests) == n       # nothing was submitted
     rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
-    assert rows[0]["vocabulary"] == "names" and rows[0]["refused"] == "vocabulary"
-    assert rows[1]["refused"] == "vocabulary"
+    assert rows[-1]["refused"] == "vocabulary_building"
+
+
+def test_a_built_vocabulary_is_applied_once_per_case_and_logged_as_counts(stub, tmp_path):
+    b = _bridge(stub, tmp_path)
+    n = len(stub.engine.requests)
+    b.run("stub", {"index": "logs-app-*", "size": 1})
+    b.run("stub", {"index": "logs-app-*", "size": 1})
+    assert len(stub.engine.requests) == n + 2   # two queries, no vocabulary read
+    rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
+    applied = [r for r in rows if r.get("vocabulary") == "applied"]
+    assert len(applied) == 1 and applied[0]["state"] in ("ready", "stale")
+    assert applied[0]["fields"]["job.name"] > 0
+    # counts and field names, never a name
+    blob = json.dumps(rows)
+    for job, _message, _phrase in eseval.UNMARKED_JOBS:
+        assert job not in blob
 
 
 def test_an_unmarked_job_name_is_labelled_on_the_first_live_page(stub, tmp_path, fixture):
@@ -1291,7 +1317,7 @@ def test_an_unmarked_job_name_is_labelled_on_the_first_live_page(stub, tmp_path,
     assert eseval._leaks(o.output, fixture.truth) == []
 
 
-def test_smoke_shows_each_vocabulary_field_against_its_cap_even_when_refused(stub, tmp_path, capsys):
+def test_smoke_shows_each_vocabulary_field_against_its_cap(stub, tmp_path, capsys):
     b = _bridge(stub, tmp_path)
     q = esbridge.smoke_query(b.config, size=0, since="now-6h")
     assert esbridge.smoke(b, "stub", q) == 0
@@ -1306,21 +1332,37 @@ def test_smoke_shows_each_vocabulary_field_against_its_cap_even_when_refused(stu
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["clusters"] = {"stub": {"kibana": stub.url}}
     raw["vocabulary"]["max"] = counts[widest]  # exactly at it: 100% of the cap
-    b2 = _bridge(stub, tmp_path)
-    b2.config = elastic.parse(raw, source="test")
-    b2.scrubber = elastic.EsScrubber(b2.config, tier2="none")
+    cfg = elastic.parse(raw, source="test")
+    index = elastic.VocabularyIndex(None)
+    built, _ = eseval.build_vocabulary(cfg, stub.engine)
+    index.put("stub", built)
+    b2 = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), b.session,
+                         log_path=tmp_path / "d2.jsonl", index=index)
     assert esbridge.smoke(b2, "stub", q) == 0
-    out = capsys.readouterr().out
     # an investigation about to stop, said before it does
-    assert widest in out.split("NEAR CAP: ")[1]
-    raw["vocabulary"]["max"] = counts[widest] - 1
-    b3 = _bridge(stub, tmp_path)
-    b3.config = elastic.parse(raw, source="test")
-    b3.scrubber = elastic.EsScrubber(b3.config, tier2="none")
-    assert esbridge.smoke(b3, "stub", q) == 2
-    out = capsys.readouterr().out
-    assert "code=vocabulary" in out
-    assert f"{widest} has more than {counts[widest] - 1} distinct values" in out
+    assert widest in capsys.readouterr().out.split("NEAR CAP: ")[1]
+
+
+def test_a_build_over_the_cap_leaves_the_saved_vocabulary_alone(stub, tmp_path):
+    """The cap is the build's, not the case's: a field with more values than
+    the site map allows abandons the build and teaches the index nothing."""
+    b = _bridge(stub, tmp_path)
+    counts = b.vocabulary["stub"]["fields"] if b.vocabulary else {}
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": stub.url}}
+    raw["vocabulary"]["max"] = 1   # the fixture has more job names than this
+    cfg = elastic.parse(raw, source="test")
+    index = elastic.VocabularyIndex(None)
+    with pytest.raises(elastic.Refused) as e:
+        eseval.build_vocabulary(cfg, stub.engine)
+    assert e.value.code == "vocabulary" and "vocabulary.max" in e.value.message
+    assert index.get("stub") is None
+    # and a case on that bridge is refused rather than shown
+    cold = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), b.session,
+                           log_path=tmp_path / "d3.jsonl", index=index)
+    with pytest.raises(elastic.Refused) as e:
+        cold.run("stub", {"index": "logs-app-*", "size": 1})
+    assert e.value.code == "vocabulary_building"
 
 
 def test_smoke_names_the_learnable_fields_a_site_map_leaves_out(stub, tmp_path, capsys):

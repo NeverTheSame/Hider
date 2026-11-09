@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import stat
 
 import pytest
 
@@ -600,28 +601,43 @@ def test_a_job_named_only_in_free_text_is_labelled_on_a_fresh_case():
 # name from the cluster before that page (EsScrubber.vocabulary_request).
 
 
-def _vocab_reply(*names: str, fields: int = 5, at: int = 0, more: bool = False) -> dict:
-    """One composite page: ``names`` for field number ``at``, the others
-    empty. ``more`` claims a full page, so the reader asks for another."""
-    def page(i):
-        got = list(names) if i == at else []
-        node = {"buckets": [{"key": {elastic.VOCABULARY_SOURCE: n}, "doc_count": 1} for n in got]}
-        if got and more:
-            node["after_key"] = {elastic.VOCABULARY_SOURCE: got[-1]}
-        return node
+#: the build reads one field per request, job names first
+VOCAB_ORDER = ["job.name", "labels.resource_name", "labels.site_name",
+               "labels.tenant_full_name", "labels.tenant_name"]
 
+
+def _vocab_reply(*names: str, more: bool = False) -> dict:
+    """One composite page of one field. ``more`` claims a full page, so the
+    build asks for another."""
+    node = {"buckets": [{"key": {elastic.VOCABULARY_SOURCE: n}, "doc_count": 1} for n in names]}
+    if names and more:
+        node["after_key"] = {elastic.VOCABULARY_SOURCE: names[-1]}
     return {"isPartial": False, "isRunning": False, "rawResponse": {
         "took": 1, "timed_out": False, "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
-        "aggregations": {f"{elastic.VOCABULARY_AGG}_{i}": page(i) for i in range(fields)}}}
+        "aggregations": {f"{elastic.VOCABULARY_AGG}_0": node}}}
 
 
-def _learn(s, cluster: str, *replies: dict, now: float | None = None, window=None):
-    """Drive one paged read to its commit, as the bridge does."""
-    fetch = s.vocabulary_fetch(window, now=now)
-    for reply in replies or ({},):
-        fetch.request()
-        fetch.feed(reply)
-    return fetch.commit(cluster)
+def _build(cfg, *pages: dict, clock=None) -> elastic.VocabularyBuild:
+    """Drive a build, answering each request with the next page; a page not
+    given is an empty one (that field has no values)."""
+    build = elastic.VocabularyBuild(cfg, 0.0, 86400.0, clock=clock)
+    queue = list(pages)
+    while build.pending():
+        build.request()
+        build.feed(queue.pop(0) if queue else _vocab_reply())
+    return build
+
+
+def _learn(s, cluster: str, *names_by_field: dict, now: float | None = None):
+    """Build from fixed pages and apply the result, as the bridge does."""
+    build = _build(s.config, *names_by_field)
+    return s.apply_vocabulary(cluster, build.result(), now=now)
+
+
+def _for(field: str, *names: str, **kw) -> list[dict]:
+    """Pages for a build where only ``field`` has values."""
+    at = VOCAB_ORDER.index(field)
+    return [_vocab_reply() for _ in range(at)] + [_vocab_reply(*names, **kw)]
 
 
 def test_the_fixture_names_jobs_with_no_marker_on_documents_without_the_field():
@@ -651,76 +667,63 @@ def test_an_unmarked_job_name_is_one_label_on_a_fresh_cases_first_page(job, mess
     assert s.types[label] == "JOB_NAME"
 
 
-_VOCAB_FIELDS = ["job.name", "labels.tenant_name", "labels.tenant_full_name",
-                 "labels.resource_name", "labels.site_name"]
-
-
 def test_the_vocabulary_request_is_fixed_and_carries_no_value():
-    """The only thing a query contributes is its own resolved time bounds."""
+    """One field, one request, an exists filter on that field, and nothing
+    from a query or from Claude anywhere in it."""
     s = _session()
-    q = s.vocabulary_fetch().request()
+    build = elastic.VocabularyBuild(CFG, 1_787_140_800.0, 1_787_227_200.0)
+    q = build.request()
     assert q["params"]["index"] == ",".join(CFG.indices) and q["params"]["ignore_unavailable"]
     body = q["params"]["body"]
     assert body["size"] == 0
-    assert body["query"] == {"bool": {"filter": [{"range": {"@timestamp": {"gte": "now-30d"}}}]}}
-    assert body["aggs"] == {f"{elastic.VOCABULARY_AGG}_{i}": {"composite": {
+    # job names first: a message naming a tenant carries the tenant fields,
+    # a message naming a job usually does not
+    assert build.field == "job.name"
+    assert body["query"] == {"bool": {"filter": [
+        {"range": {"@timestamp": {"gte": "2026-08-19T12:00:00.000Z",
+                                  "lte": "2026-08-20T12:00:00.000Z"}}},
+        {"exists": {"field": "job.name"}}]}}
+    assert body["aggs"] == {f"{elastic.VOCABULARY_AGG}_0": {"composite": {
         "size": elastic.VOCABULARY_PAGE,
-        "sources": [{elastic.VOCABULARY_SOURCE: {"terms": {"field": f}}}]}}
-        for i, f in enumerate(_VOCAB_FIELDS)}
+        "sources": [{elastic.VOCABULARY_SOURCE: {"terms": {"field": "job.name"}}}]}}}
     s.seed("Contoso Group")
-    assert "Contoso" not in json.dumps(s.vocabulary_fetch().request())
+    assert "Contoso" not in json.dumps(build.request())
 
 
-def test_the_request_covers_the_cases_own_window_plus_a_margin():
-    """A one-hour case reads one hour plus a day on each side, not the whole
-    retention period: on a large cluster that is the difference between a
-    page and a refusal."""
-    s = _session()
-    lo = 1_787_227_200.0          # 2026-08-20T12:00:00Z
-    bounds = s.vocabulary_fetch((lo, lo + 3600)).request()["params"]["body"] \
-        ["query"]["bool"]["filter"][0]["range"]["@timestamp"]
-    assert bounds == {"gte": "2026-08-19T12:00:00.000Z", "lte": "2026-08-21T13:00:00.000Z"}
-    # a query with no start or no end falls back to vocabulary.days, and
-    # leaves the date math to the cluster's clock
-    assert s.vocabulary_fetch().request()["params"]["body"]["query"]["bool"]["filter"][0] \
-        == {"range": {"@timestamp": {"gte": "now-30d"}}}
-
-
-def test_a_window_already_read_is_not_read_again_but_a_wider_one_is():
-    s = _session()
-    lo = 1_787_227_200.0
-    assert s.vocabulary_due("emea", (lo, lo + 3600), now=0.0)
-    _learn(s, "emea", _vocab_reply("Harbour Nightly"), now=1.0, window=(lo, lo + 3600))
-    # the same case, a second later, and any window inside what was read
-    assert not s.vocabulary_due("emea", (lo - 1, lo + 3601), now=2.0)
-    assert not s.vocabulary_due("emea", (lo + 60, lo + 120), now=2.0)
-    # outside it: a week earlier, or no bounds at all
-    assert s.vocabulary_due("emea", (lo - 7 * 86400, lo), now=2.0)
-    assert s.vocabulary_due("emea", None, now=2.0)
-    # and the fallback read covers every window
-    _learn(s, "emea", _vocab_reply("Harbour Nightly"), now=3.0)
-    assert not s.vocabulary_due("emea", (lo - 7 * 86400, lo), now=4.0)
-
-
-def test_a_vocabulary_longer_than_one_page_is_read_in_pages():
-    s = _session()
+def test_the_build_reads_one_field_at_a_time_in_pages():
     first = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
-    fetch = s.vocabulary_fetch()
-    req = fetch.request()
+    build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    req = build.request()
     assert "after" not in req["params"]["body"]["aggs"][f"{elastic.VOCABULARY_AGG}_0"]["composite"]
-    fetch.feed(_vocab_reply(*first, more=True))
-    assert fetch.pending()
-    req = fetch.request()
-    aggs = req["params"]["body"]["aggs"]
-    # only the field with more to give is asked again, from where it stopped
-    assert list(aggs) == [f"{elastic.VOCABULARY_AGG}_0"]
-    assert aggs[f"{elastic.VOCABULARY_AGG}_0"]["composite"]["after"] == \
-        {elastic.VOCABULARY_SOURCE: first[-1]}
-    fetch.feed(_vocab_reply("Harbour Nightly"))
-    assert not fetch.pending()
-    assert fetch.commit("c")["job.name"] == elastic.VOCABULARY_PAGE + 1
-    assert fetch.requests == 2
+    build.feed(_vocab_reply(*first, more=True))
+    # the same field again, from where it stopped
+    assert build.field == "job.name" and build.pending()
+    comp = build.request()["params"]["body"]["aggs"][f"{elastic.VOCABULARY_AGG}_0"]["composite"]
+    assert comp["after"] == {elastic.VOCABULARY_SOURCE: first[-1]}
+    build.feed(_vocab_reply("Harbour Nightly"))
+    # a short page ends the field and the next one begins
+    assert build.field == VOCAB_ORDER[1] and build.pending()
+    assert build.progress()["fields_done"] == 1
+    while build.pending():
+        build.request()
+        build.feed(_vocab_reply())
+    vocab = build.result()
+    assert vocab.counts["job.name"] == elastic.VOCABULARY_PAGE + 1
+    assert build.requests == 2 + len(VOCAB_ORDER) - 1
+    s = _session()
+    s.apply_vocabulary("c", vocab)
     assert "harbour nightly" in s.known  # the last page's names are learnt too
+
+
+def test_a_build_is_applied_to_a_case_without_reading_anything():
+    s = _session()
+    assert not s.vocabulary_applied("emea")
+    build = _build(CFG, *_for("job.name", "Harbour Nightly"))
+    counts = s.apply_vocabulary("emea", build.result())
+    assert counts["job.name"] == 1 and s.vocabulary_applied("emea")
+    assert "harbour nightly" in s.known
+    # a second cluster is its own vocabulary
+    assert not s.vocabulary_applied("amer")
 
 
 @pytest.mark.parametrize("reply,code", [
@@ -731,96 +734,153 @@ def test_a_vocabulary_longer_than_one_page_is_read_in_pages():
       "rawResponse": {"timed_out": False, "hits": {"hits": []}}}, "vocabulary"),
     ("not an object", "vocabulary"),
 ])
-def test_a_vocabulary_that_cannot_be_read_refuses(reply, code):
+def test_a_build_that_cannot_be_read_teaches_nothing(reply, code):
     s = _session()
+    build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    build.request()
     with pytest.raises(elastic.Refused) as e:
-        _learn(s, "c", reply, now=0.0)
-    assert e.value.code == code
-    assert s.vocabulary_due("c", now=1.0)  # still due: nothing was learnt
+        build.feed(reply)
+    assert e.value.code == code and build.failed == code
+    with pytest.raises(elastic.Refused):
+        build.result()                      # and nothing can be taken from it
+    assert not s.vocabulary_applied("c")
 
 
 def test_a_page_that_is_not_the_shape_it_was_asked_for_refuses():
-    """The old single-aggregation reply shape, now wrong: a bucket key is an
-    object with the composite source in it, never a bare string."""
-    s = _session()
-    old = {"isPartial": False, "isRunning": False, "rawResponse": {
-        "timed_out": False, "aggregations": {f"{elastic.VOCABULARY_AGG}_{i}": {
-            "buckets": [{"key": "Harbour Nightly", "doc_count": 1}] if i == 0 else []}
-            for i in range(5)}}}
+    """A composite bucket key is an object with the source in it, never a
+    bare string (which is what a terms aggregation returns)."""
+    build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    build.request()
     with pytest.raises(elastic.Refused) as e:
-        _learn(s, "c", old, now=0.0)
+        build.feed({"isPartial": False, "isRunning": False, "rawResponse": {
+            "timed_out": False, "aggregations": {f"{elastic.VOCABULARY_AGG}_0": {
+                "buckets": [{"key": "Harbour Nightly", "doc_count": 1}]}}}})
     assert e.value.code == "vocabulary" and "Harbour" not in e.value.message
-    assert "harbour nightly" not in s.known
 
 
-def test_a_vocabulary_over_its_ceiling_refuses_rather_than_run_on_a_partial_list():
+def test_a_field_over_its_ceiling_abandons_the_build():
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["vocabulary"]["max"] = 2
-    s = elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none")
-    assert _learn(s, "c", _vocab_reply("Harbour Nightly"), now=0.0)["job.name"] == 1
+    cfg = elastic.parse(raw, source="t")
+    s = elastic.EsScrubber(cfg, tier2="none")
+    ok = _build(cfg, *_for("job.name", "Harbour Nightly"))
+    assert s.apply_vocabulary("c", ok.result())["job.name"] == 1
     assert s.vocabulary_report()["near_cap"] == []
-    _learn(s, "c", _vocab_reply("Thornbury Estates", at=1), now=700.0)
-    assert s.vocabulary_report() == {
-        "fields": {"job.name": 0, "labels.tenant_name": 1, "labels.tenant_full_name": 0,
-                   "labels.resource_name": 0, "labels.site_name": 0},
-        "max": 2, "near_cap": [], "skipped": {}, "omitted": []}
+    build = elastic.VocabularyBuild(cfg, 0.0, 86400.0)
+    build.request()
     with pytest.raises(elastic.Refused) as e:
-        _learn(s, "c", _vocab_reply("Oak Creek Holdings", "Fernhill Row", "Marlowe Trust", at=4),
-               now=1400.0)
+        build.feed(_vocab_reply("Oak Creek Holdings", "Fernhill Row", "Marlowe Trust"))
     assert e.value.code == "vocabulary"
-    assert "labels.site_name has more than 2 distinct values" in e.value.message
+    assert "job.name has more than 2 distinct values" in e.value.message
     assert "vocabulary.max" in e.value.message and "Oak Creek" not in e.value.message
-    assert "Oak Creek Holdings" not in s.known and "oak creek holdings" not in s.known
+    assert "oak creek holdings" not in s.known
 
-def test_the_ceiling_counts_a_whole_read_not_one_page_of_it():
+
+def test_the_ceiling_counts_a_whole_build_not_one_page_of_it():
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["vocabulary"]["max"] = elastic.VOCABULARY_PAGE
-    s = elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none")
+    cfg = elastic.parse(raw, source="t")
     full = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
+    build = elastic.VocabularyBuild(cfg, 0.0, 86400.0)
+    build.request()
+    build.feed(_vocab_reply(*full, more=True))
+    build.request()
     with pytest.raises(elastic.Refused) as e:
-        _learn(s, "c", _vocab_reply(*full, more=True), _vocab_reply("Harbour Nightly"), now=0.0)
+        build.feed(_vocab_reply("Harbour Nightly"))
     assert e.value.code == "vocabulary" and "more than" in e.value.message
-    assert not s.known and s.vocabulary_due("c")
 
 
-def test_a_read_over_its_time_budget_refuses():
-    """A page at a time is only safe if the whole read is bounded: an estate
-    wide enough to page forever must not hold the bridge's one lock."""
+def test_a_build_over_its_time_budget_is_abandoned():
+    """The budget is the whole build's, measured on an injectable clock so
+    the stub can charge what a real page costs."""
     raw = json.loads(elastic.EXAMPLE.read_text())
-    raw["vocabulary"]["budget_s"] = 1
-    s = elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none")
+    raw["vocabulary"]["budget_s"] = 60
+    cfg = elastic.parse(raw, source="t")
+    ticks = iter([0.0, 20.0, 40.0, 61.0, 61.0])
+    build = elastic.VocabularyBuild(cfg, 0.0, 86400.0, clock=lambda: next(ticks))
     full = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
-    fetch = s.vocabulary_fetch()
-    fetch._t0 -= 2.0  # the first page came back after the budget was gone
-    fetch.request()
-    with pytest.raises(elastic.Refused) as e:
-        fetch.feed(_vocab_reply(*full, more=True))
+    build.request()
+    build.feed(_vocab_reply(*full, more=True))      # 20s
+    build.request()
+    build.feed(_vocab_reply(*full, more=True))      # 40s
+    build.request()
+    with pytest.raises(elastic.Refused) as e:       # 61s: over
+        build.feed(_vocab_reply(*full, more=True))
     assert e.value.code == "vocabulary" and "budget_s" in e.value.message
-    assert not s.known and s.vocabulary_due("c")
-    # a read that is finished when the budget runs out is not refused: there
-    # is nothing left to ask for
-    done = s.vocabulary_fetch()
-    done._t0 -= 2.0
-    done.request()
-    done.feed(_vocab_reply("Harbour Nightly"))
-    assert done.commit("c")["job.name"] == 1
+    assert "3 requests" in e.value.message and "0 of 5 fields" in e.value.message
 
 
-def test_a_read_that_was_not_finished_cannot_be_committed():
-    s = _session()
-    full = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
-    fetch = s.vocabulary_fetch()
-    fetch.request()
-    fetch.feed(_vocab_reply(*full, more=True))
+def test_the_index_saves_the_names_private_to_the_user_and_reloads_them(tmp_path):
+    """The build is expensive and paid once per bridge, so its result is
+    saved. It holds real customer names, so the directory is 0700 and the
+    file 0600, and it lives under the (gitignored) sessions directory."""
+    index = elastic.VocabularyIndex(tmp_path / "es")
+    built = _build(CFG, *_for("job.name", "Harbour Nightly", "Quillon Ledger Export")).result()
+    index.put("emea", built)
+    path = tmp_path / "es" / elastic.VocabularyIndex.FILENAME
+    assert path.exists()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    again = elastic.VocabularyIndex(tmp_path / "es")
+    held = again.get("emea")
+    assert held is not None and held.counts["job.name"] == 2
+    assert held.covered_from == built.covered_from and held.covered_until == built.covered_until
+    assert again.get("amer") is None
+    # a second read folds in: the range widens, values are not duplicated
+    later = elastic.ClusterVocabulary(built.covered_until, built.covered_until + 600.0,
+                                      0.0, {"job.name": ["Harbour Nightly", "Kittiwake"]})
+    again.put("emea", later)
+    merged = again.get("emea")
+    assert merged.counts["job.name"] == 3
+    assert merged.covered_from == built.covered_from
+    assert merged.covered_until == later.covered_until
+
+
+def test_an_unreadable_or_foreign_vocabulary_file_is_ignored_not_trusted(tmp_path):
+    d = tmp_path / "es"
+    d.mkdir(mode=0o700)
+    (d / elastic.VocabularyIndex.FILENAME).write_text("{ not json")
+    assert elastic.VocabularyIndex(d).clusters == {}
+    (d / elastic.VocabularyIndex.FILENAME).write_text(json.dumps(
+        {"schema": "something.else", "clusters": {"emea": {"covered_from": 0,
+                                                           "covered_until": 1, "fields": {}}}}))
+    assert elastic.VocabularyIndex(d).clusters == {}
+
+
+def test_a_site_with_no_learnable_field_is_ready_not_for_ever_building(tmp_path):
+    """Nothing to read is not the same as not having read it yet: a map
+    that lists no vocabulary field would otherwise refuse every case for
+    ever, waiting for a build that never starts."""
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"] = {"fields": []}
+    off = elastic.parse(raw, source="t")
+    assert elastic.VocabularyIndex(tmp_path / "es").report("emea", off)["state"] == "ready"
+    assert elastic.VocabularyIndex(tmp_path / "es").report("emea", CFG)["state"] == "building"
+
+
+def test_the_index_report_is_counts_and_state_never_a_name(tmp_path):
+    index = elastic.VocabularyIndex(tmp_path / "es")
+    assert index.report("emea", CFG)["state"] == "building"
+    built = _build(CFG, *_for("job.name", "Harbour Nightly")).result()
+    index.put("emea", built)
+    r = index.report("emea", CFG, now=built.covered_until)
+    assert r["state"] == "ready" and r["fields"]["job.name"] == 1
+    assert "Harbour" not in json.dumps(r)
+    stale = index.report("emea", CFG, now=built.covered_until + elastic.VOCABULARY_REFRESH_S + 1)
+    assert stale["state"] == "stale" and stale["age_s"] > elastic.VOCABULARY_REFRESH_S
+
+
+def test_a_build_is_only_a_vocabulary_once_every_field_is_done():
+    build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    build.request()
+    build.feed(_vocab_reply("Harbour Nightly"))
+    assert build.pending()
     with pytest.raises(elastic.Refused) as e:
-        fetch.commit("c")
+        build.result()
     assert e.value.code == "vocabulary"
-    assert "harbour nightly" not in s.known and s.vocabulary_due("c")
-
 
 @pytest.mark.parametrize("key,value", [("max", 0), ("max", 300_000), ("days", 0), ("days", "30"),
-                                       ("margin_days", 0), ("margin_days", 90),
-                                       ("budget_s", 0), ("budget_s", 1200)])
+                                       ("budget_s", 0), ("budget_s", 9000)])
 def test_vocabulary_settings_are_bounded(key, value):
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["vocabulary"][key] = value
@@ -856,7 +916,7 @@ def test_a_map_that_lists_fewer_fields_reports_the_ones_it_leaves_out():
     assert cfg.vocabulary_omitted == ("labels.tenant_name", "labels.tenant_full_name",
                                       "labels.resource_name", "labels.site_name")
     s = elastic.EsScrubber(cfg, tier2="none")
-    _learn(s, "c", _vocab_reply("Harbour Nightly"), now=0.0)
+    _learn(s, "c", *_for("job.name", "Harbour Nightly"), now=0.0)
     assert s.vocabulary_report()["omitted"] == list(cfg.vocabulary_omitted)
     # the default and a map that lists everything leave nothing out
     del raw["vocabulary"]
@@ -867,19 +927,18 @@ def test_log_words_and_stopwords_are_never_vocabulary():
     """A job called "Failed" or "default" would erase that word from every
     log level, outcome and namespace in the case."""
     s = _session()
-    _learn(s, "c", _vocab_reply("Failed", "Warning", "default", "", "Harbour Nightly"), now=0.0)
+    _learn(s, "c", *_for("job.name", "Failed", "Warning", "default", "", "Harbour Nightly"),
+           now=0.0)
     assert s.vocabulary_report()["skipped"] == {"log_word": 2, "stopword": 1, "empty": 1}
     assert s._scrub_text("Failed: default namespace, Warning raised") == \
         "Failed: default namespace, Warning raised"
 
 
-def test_the_vocabulary_is_read_once_per_cluster_then_every_ten_minutes():
+def test_a_vocabulary_is_per_cluster():
     s = _session()
-    assert s.vocabulary_due("emea", now=0.0)
-    _learn(s, "emea", _vocab_reply("Harbour Nightly"), now=100.0)
-    assert not s.vocabulary_due("emea", now=100.0 + elastic.VOCABULARY_REFRESH_S - 1)
-    assert s.vocabulary_due("emea", now=100.0 + elastic.VOCABULARY_REFRESH_S)
-    assert s.vocabulary_due("amer", now=101.0)  # each cluster has its own jobs
+    _learn(s, "emea", *_for("job.name", "Harbour Nightly"), now=100.0)
+    assert s.vocabulary_applied("emea")
+    assert not s.vocabulary_applied("amer")  # each cluster has its own names
 
 
 def test_without_a_learnable_field_there_is_no_vocabulary_request():
@@ -888,10 +947,14 @@ def test_without_a_learnable_field_there_is_no_vocabulary_request():
              "labels.resource_name", "labels.site_name"}
     raw["fields"] = {k: v for k, v in raw["fields"].items() if k not in names}
     del raw["vocabulary"]  # the default: everything learnable, and there is none
-    s = elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none")
-    assert not s.vocabulary_due("c", now=0.0)
+    cfg = elastic.parse(raw, source="t")
+    assert cfg.vocabulary_rules == ()
+    # nothing to read, so a case needs nothing applied and is never refused
+    assert elastic.EsScrubber(cfg, tier2="none").vocabulary_applied("c")
     raw["vocabulary"] = {"fields": []}  # or a site that turns it off
-    assert not elastic.EsScrubber(elastic.parse(raw, source="t"), tier2="none").vocabulary_due("c")
+    off = elastic.parse(raw, source="t")
+    assert off.vocabulary_rules == ()
+    assert elastic.EsScrubber(off, tier2="none").vocabulary_applied("c")
 
 
 def test_the_vocabulary_leaves_ordinary_messages_and_levels_readable():
@@ -969,7 +1032,8 @@ def test_an_ordinary_word_name_leaves_the_word_readable_and_keeps_its_field_labe
     """Declared: a resource called "Archive" is unprotected in free text
     before a page shows it in its own field; the word stays readable."""
     s = _session()
-    _learn(s, "c", _vocab_reply("Archive", "Default", "HR", "Brackenvault", at=3), now=0.0)
+    _learn(s, "c", *_for("labels.resource_name", "Archive", "Default", "HR", "Brackenvault"),
+           now=0.0)
     assert s.vocabulary_report()["skipped"] == {"ordinary_word": 1, "stopword": 1, "short": 1}
     line = "Archive completed for the Default policy; HR export ok; Brackenvault at 91%"
     out = s._scrub_text(line)
@@ -981,7 +1045,7 @@ def test_a_multi_word_name_of_ordinary_words_hides_that_phrase_and_nothing_else(
     """The cost of protecting "Legal Hold" as a resource: the phrase, in any
     case, is labelled in every message; its words alone are not."""
     s = _session()
-    _learn(s, "c", _vocab_reply("Legal Hold", at=3), now=0.0)
+    _learn(s, "c", *_for("labels.resource_name", "Legal Hold"), now=0.0)
     out = s._scrub_text("legal hold applied; hold released; legal review pending")
     assert out.endswith("applied; hold released; legal review pending") and out.startswith("<Resource_Name-")
 
@@ -990,12 +1054,17 @@ def test_an_organisations_core_is_held_to_the_same_rules():
     """"Archive AG" is a tenant; its core "Archive" is an ordinary word, so
     it is not registered on its own and "archive" stays readable."""
     s = _session()
-    _learn(s, "c", _vocab_reply("Archive AG", "Thornbury Estates Ltd", at=2), now=0.0)
+    _learn(s, "c", *_for("labels.tenant_full_name", "Archive AG", "Thornbury Estates Ltd"),
+           now=0.0)
     out = s._scrub_text("Archive AG quota; archive done; Thornbury Estates synced")
     assert "Archive AG" not in out and "archive done" in out and "Thornbury" not in out
 
 
-def test_one_request_carries_every_vocabulary_field():
-    s = _session()
-    q = s.vocabulary_fetch().request()["params"]["body"]["aggs"]
-    assert len(q) == 5 and s.vocabulary_due("c", now=0.0)
+def test_one_request_carries_exactly_one_vocabulary_field():
+    """The opposite of the first design: the measured cost is per
+    aggregation, so a request that carried every field paid for all of them
+    before it could be stopped, logged or resumed."""
+    build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    aggs = build.request()["params"]["body"]["aggs"]
+    assert len(aggs) == 1
+    assert len(build.rules) == 5 and build.progress()["fields_total"] == 5

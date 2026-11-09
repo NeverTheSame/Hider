@@ -180,33 +180,59 @@ def test_the_back_catalogue_is_past_what_one_capped_aggregation_returns(bulk):
     assert len(raw["aggregations"]["v"]["buckets"]) == 10_000
 
 
-def test_an_hour_wide_case_reads_one_page_and_hides_the_job_name(bulk):
+def test_the_sign_in_build_covers_a_one_hour_case_at_no_cost_to_it(bulk):
+    """The case reads nothing: the build happened once, for the cluster,
+    and it covered thirty days, so the job's record is in it even though it
+    sits outside the case's hour."""
     fx, engine = bulk
     s = elastic.EsScrubber(CFG, tier2="none")
-    lo = (eseval.NOW.timestamp() - 2 * 3600, eseval.NOW.timestamp() - 3600)
-    counts, requests = eseval.learn_vocabulary(s, engine, window=lo)
-    assert requests == 1
-    assert counts["job.name"] < 100  # the hour's names, not the catalogue
+    n = len(engine.requests)
+    vocab, build = eseval.build_vocabulary(CFG, engine)
+    assert len(engine.requests) - n == build.requests
+    n = len(engine.requests)
+    s.apply_vocabulary("stub", vocab)
+    assert len(engine.requests) == n          # applying costs no request
     out = s._scrub_text(eseval.WINDOW_CASE_MESSAGE)
     assert eseval.WINDOW_CASE_JOB not in out
     assert out == eseval.WINDOW_CASE_MESSAGE.replace(
         eseval.WINDOW_CASE_JOB, s.known[eseval.WINDOW_CASE_JOB.casefold()])
-    # no part of the name is left readable either
     assert not eseval.name_part_leaks([out], eseval.WINDOW_CASE_PHRASE, eseval.WINDOW_CASE_JOB)
 
 
-def test_a_read_with_no_window_pages_through_the_whole_catalogue(bulk):
-    """The fallback a query with no time bounds falls back to: still read
-    whole, in pages, under the ceiling - just at the price the windowed read
-    exists to avoid."""
+def test_the_build_pages_through_the_whole_catalogue_one_field_at_a_time(bulk):
     fx, engine = bulk
-    s = elastic.EsScrubber(CFG, tier2="none")
-    counts, requests = eseval.learn_vocabulary(s, engine)
+    vocab, build = eseval.build_vocabulary(CFG, engine)
+    counts = vocab.counts
     assert counts["job.name"] > 12_000
-    # one page per thousand names, and the last page is short, which is what
-    # says the field is exhausted
-    assert requests == -(-counts["job.name"] // elastic.VOCABULARY_PAGE)
+    # one page per thousand names of the widest field, plus one page for
+    # each of the other four (they fit in one)
+    pages = -(-counts["job.name"] // elastic.VOCABULARY_PAGE)
+    assert build.requests == pages + 4
+    s = elastic.EsScrubber(CFG, tier2="none")
+    s.apply_vocabulary("stub", vocab)
     assert eseval.bulk_job_name(0).casefold() in s.known
+
+
+def test_the_stub_charges_what_a_page_really_costs(bulk):
+    """Without a simulated cost an in-memory build looks free, and the whole
+    reason this is built once per bridge disappears from the measurement."""
+    fx, engine = bulk
+    engine.page_seconds = eseval.PAGE_SECONDS
+    engine.simulated_seconds = 0.0
+    before = engine.simulated_seconds
+    _vocab, build = eseval.build_vocabulary(CFG, engine)
+    spent = engine.simulated_seconds - before
+    assert spent > 300                        # minutes, not milliseconds
+    assert spent <= CFG.vocabulary_budget_s   # and still inside the budget
+    assert min(eseval.PAGE_SECONDS) >= 8 and max(eseval.PAGE_SECONDS) <= 35
+    # a top-up reads only what is new, so it costs a page per field
+    before = engine.simulated_seconds
+    _new, topup = eseval.build_vocabulary(
+        CFG, engine, _vocab.covered_until,
+        _vocab.covered_until + elastic.VOCABULARY_REFRESH_S)
+    assert topup.requests == len(CFG.vocabulary_rules)
+    assert engine.simulated_seconds - before < spent
+    engine.page_seconds = ()
 
 
 # -- a site map with no vocabulary section -------------------------------------

@@ -32,6 +32,7 @@ one response and using them in the next, and reports:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -326,6 +327,12 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
     out.extend(bulk_job_docs(bulk_jobs or 0))
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
+
+#: What one composite page over one field costs on a real cluster, in
+#: seconds: measured between 8 and 35. The stub charges these in turn so a
+#: build over the fixture reports a realistic time without the eval
+#: actually waiting (see ``StubEngine.page_seconds``).
+PAGE_SECONDS: tuple[float, ...] = (18.0, 11.0, 27.0, 8.0, 35.0, 14.0, 22.0)
 
 #: The estate's back catalogue of job names: how many distinct values one
 #: vocabulary field holds over the retention period on a cluster that is not
@@ -778,6 +785,17 @@ class StubEngine:
         self.requests: list[dict] = []
         self.lock = threading.Lock()
         self._flat: dict[str, list[tuple[int, dict]]] = {}
+        #: Simulated cost of one composite page over one field, in seconds.
+        #: An in-memory engine answers instantly, which would make a
+        #: vocabulary build look free; on a real cluster a page of 1,000
+        #: values for one name field was measured at 8 to 35 seconds. The
+        #: cost is charged per field per page, because that is where the
+        #: work is - an aggregation, not a round trip. Cycled rather than
+        #: random so a run is reproducible. Zero (the default) charges
+        #: nothing, which is what every test that is not about timing wants.
+        self.page_seconds: tuple[float, ...] = ()
+        self.simulated_seconds = 0.0
+        self._pages = 0
 
     # -- matching ----------------------------------------------------------
 
@@ -888,6 +906,10 @@ class StubEngine:
                     "buckets": bucket_rows,
                 }
             elif atype == "composite":
+                if self.page_seconds:
+                    self.simulated_seconds += self.page_seconds[
+                        self._pages % len(self.page_seconds)]
+                    self._pages += 1
                 # One source, as the vocabulary read builds it: values in
                 # key order, a page at a time, after_key to carry on.
                 (src, term), = a["sources"][0].items()
@@ -1380,49 +1402,96 @@ def unmarked_phrases() -> list[str]:
     return [p for _, _, p in UNMARKED_JOBS] + [p for _, _, _, p in UNMARKED_NAMES]
 
 
-def learn_vocabulary(scrubber: elastic.EsScrubber, engine: StubEngine,
-                     cluster: str = "stub",
-                     window: tuple[float, float] | None = None) -> tuple[dict[str, int], int]:
-    """What ``esbridge.Bridge`` does before a case's first page: a paged read
-    of the case's own window, every name in it a known value. Returns the
-    counts per field and how many requests it took."""
-    fetch = scrubber.vocabulary_fetch(window)
-    while fetch.pending():
-        vq = fetch.request()["params"]
-        fetch.feed({"isPartial": False, "isRunning": False,
+def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
+                     covered_from: float | None = None, covered_until: float | None = None,
+                     ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
+    """What the broker does on sign-in, driven to completion in one call.
+
+    The stub charges simulated seconds per page (``StubEngine.page_seconds``)
+    and the build's clock reads that, so a build over the 12,000-name
+    fixture costs what a real one would without the eval taking minutes.
+    """
+    until = NOW.timestamp() if covered_until is None else covered_until
+    start = (until - config.vocabulary_days * 86400.0) if covered_from is None else covered_from
+    build = elastic.VocabularyBuild(config, start, until,
+                                    clock=lambda: engine.simulated_seconds)
+    while build.pending():
+        vq = build.request()["params"]
+        build.feed({"isPartial": False, "isRunning": False,
                     "rawResponse": engine.search(vq["index"], vq["body"],
                                                  ignore_unavailable=vq["ignore_unavailable"])})
-    return fetch.commit(cluster), fetch.requests
+    return build.result(), build
+
+
+def learn_vocabulary(scrubber: elastic.EsScrubber, engine: StubEngine,
+                     cluster: str = "stub") -> tuple[dict[str, int], int]:
+    """Build and apply in one step, for a caller that only wants the names
+    known (tests, es-eval sessions outside the bridge)."""
+    vocab, build = build_vocabulary(scrubber.config, engine)
+    return scrubber.apply_vocabulary(cluster, vocab), build.requests
+
+
+class EngineSession:
+    """The two calls ``esbridge.Bridge`` makes on a Kibana session, answered
+    from the stub engine. Lets the eval exercise the real Bridge without a
+    browser or an HTTP stub."""
+
+    def __init__(self, engine: StubEngine) -> None:
+        self.engine = engine
+
+    def probe(self, cluster) -> None:
+        return None
+
+    def search(self, cluster, body: dict) -> dict:
+        params = body["params"]
+        return {"id": "x", "isPartial": False, "isRunning": False,
+                "rawResponse": self.engine.search(
+                    params["index"], params["body"],
+                    ignore_unavailable=params.get("ignore_unavailable", False))}
+
+
+def cold_bridge_refusal(config: elastic.ElasticConfig, engine: StubEngine, *,
+                        tier2: str = "none") -> dict:
+    """What a case gets on a bridge whose vocabulary has not finished
+    building: a refusal with its own code, and no page."""
+    from . import esbridge
+
+    cfg = dataclasses.replace(
+        config, clusters=(elastic.Cluster("stub", "https://kibana-stub.example.net"),))
+    bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2),
+                             EngineSession(engine), index=elastic.VocabularyIndex(None))
+    query = {"index": "logs-worker-*", "time_range": WINDOW_CASE_RANGE, "size": 20,
+             "filters": [{"field": "message", "op": "phrase", "value": WINDOW_CASE_PHRASE}]}
+    try:
+        out = bridge.run("stub", query)
+        return {"refused": None, "shown": bool(out.hits_shown)}
+    except elastic.Refused as e:
+        return {"refused": e.code, "shown": False, "names_a_rule": "vocabulary" in e.message}
 
 
 class Session:
     """Compile, run against the engine, scrub: one tool call as the bridge will do it."""
 
-    def __init__(self, config: elastic.ElasticConfig, engine: StubEngine, *, tier2: str) -> None:
+    def __init__(self, config: elastic.ElasticConfig, engine: StubEngine, *, tier2: str,
+                 vocabulary: elastic.ClusterVocabulary | None = None) -> None:
         self.cfg = config
         self.engine = engine
         self.scrubber = elastic.EsScrubber(config, tier2=tier2)
         self.log: list[dict] = []
-        #: how many vocabulary reads, and how many requests they cost
-        self.vocabulary_reads = 0
-        self.vocabulary_requests = 0
-        self.vocabulary_seconds = 0.0
+        #: the cluster vocabulary this case starts from, as the bridge hands
+        #: it over: already built, applied locally, no request of its own
+        self.vocabulary = vocabulary
+        self.vocabulary_applied = 0
 
     def call(self, query: dict) -> tuple[dict | None, elastic.Refused | None, float, esquery.Compiled | None]:
         t0 = time.perf_counter()
         compiled = None
         try:
-            # the fixture's clock, not this machine's: the stub resolves the
-            # date math in the body against NOW, so the window the vocabulary
-            # is read for has to be the same instant
             compiled = esquery.compile_query(query, self.cfg, self.scrubber,
                                              now=NOW.timestamp())
-            if self.scrubber.vocabulary_due("stub", compiled.window):
-                self.vocabulary_reads += 1
-                v0 = time.perf_counter()
-                _, n = learn_vocabulary(self.scrubber, self.engine, window=compiled.window)
-                self.vocabulary_requests += n
-                self.vocabulary_seconds += time.perf_counter() - v0
+            if self.vocabulary is not None and not self.scrubber.vocabulary_applied("stub"):
+                self.scrubber.apply_vocabulary("stub", self.vocabulary)
+                self.vocabulary_applied += 1
             raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
             envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}
             out = self.scrubber.scrub_response(envelope, compiled.plan).output
@@ -1529,8 +1598,8 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
     cfg = dataclasses.replace(config, clusters=(elastic.Cluster("stub", kb.url),),
                               profile_dir=str(base / "profile"))
     rng = random.Random(seed + 2)
-    # the broker resolves a query's window against this clock to decide what
-    # the vocabulary read covers; the fixture sits at NOW, not at today
+    # the fixture sits at NOW, so the build reads the range around NOW; see
+    # esbridge.clock. Against a real cluster this is the wall clock.
     esbridge.clock = NOW.timestamp
     broker = esbridge.Broker(cfg, lambda: esbridge.UrllibTransport(cookie), poll_interval=0.01,
                              sessions_dir=base / "cases")
@@ -1546,6 +1615,17 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
     calls: list[dict] = []
     timings: list[float] = []
     try:
+        # Sign in, which starts the one vocabulary build for this bridge,
+        # then wait for it as the operator does. Cases opened before it is
+        # ready are refused; that refusal is measured offline above.
+        control.call("vocabulary", cluster="stub", build=True)
+        vocab_state: dict = {}
+        for _ in range(3000):
+            vocab_state = control.call("vocabulary", cluster="stub")["vocabulary"]
+            if vocab_state.get("state") != "building":
+                break
+            time.sleep(0.01)
+        vocabulary_ready = vocab_state.get("state") in ("ready", "stale")
         # what the human seeds: the tenant the case is about, and the two
         # labels the oracle cases are written against (esquery: <Org-01>,
         # ctr-amer-s01, <Tenant-01>)
@@ -1571,7 +1651,7 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
         protocol_ok = (init.get("result", {}).get("serverInfo", {}).get("name") == esmcp.SERVER_NAME
                        and [t.get("name") for t in listed] == list(esmcp.TOOLS))
         schema = tool("es_schema", {})
-        protocol_ok = (protocol_ok and seeded_ok and bool(schema)
+        protocol_ok = (protocol_ok and seeded_ok and bool(schema) and vocabulary_ready
                        and case_label in schema["case"]["labels"])
 
         tr = {"gte": "now-6h", "lte": "now"}
@@ -1788,8 +1868,29 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     fx = generate(seed=seed, docs=docs, bulk_jobs=BULK_JOBS)
     truth = fx.truth
     engine = StubEngine(fx, cfg.indices)
+    engine.page_seconds = PAGE_SECONDS
     rng = random.Random(seed + 1)
-    sess = Session(cfg, engine, tier2=tier2)
+
+    # Sign-in: the one vocabulary build for this bridge, paid once, with the
+    # stub charging what a real page costs. Every case below starts from its
+    # result; none of them reads anything.
+    vocab, first_build = build_vocabulary(cfg, engine)
+    build_report = {"requests": first_build.requests,
+                    "simulated_s": round(engine.simulated_seconds, 1),
+                    "fields": {f: len(v) for f, v in vocab.fields.items()},
+                    "budget_s": cfg.vocabulary_budget_s,
+                    "covered_days": round((vocab.covered_until - vocab.covered_from) / 86400.0)}
+    # ...and one top-up ten minutes later, reading only what is new.
+    before_topup = engine.simulated_seconds
+    topup_vocab, topup = build_vocabulary(
+        cfg, engine, vocab.covered_until,
+        vocab.covered_until + elastic.VOCABULARY_REFRESH_S)
+    topup_report = {"requests": topup.requests,
+                    "simulated_s": round(engine.simulated_seconds - before_topup, 1),
+                    "new_values": sum(len(v) for v in topup_vocab.fields.values())}
+    vocab = vocab.merge(topup_vocab)
+
+    sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
     s = sess.scrubber
 
     # The human seeds the case with the tenant it is about, locally.
@@ -1874,17 +1975,18 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
                 clean=True)
 
     # The one-hour case on a cluster with a back catalogue of BULK_JOBS
-    # names: a fresh session, an hour-wide window, the job's own record
-    # outside it but inside the margin. What the windowed, paged read is for.
+    # names, now served entirely from the sign-in build: no request of its
+    # own, and the job's record is covered because the build read 30 days.
     window_case = {"shown": False, "refused": None, "leaks": [], "part_leak": False,
                    "requests": 0, "seconds": 0.0, "values": {}}
-    hour = Session(cfg, engine, tier2=tier2)
+    hour = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+    before = engine.simulated_seconds
     out, refused, dt, _ = hour.call({
         "index": "logs-worker-*", "time_range": WINDOW_CASE_RANGE, "size": 20,
         "filters": [{"field": "message", "op": "phrase", "value": WINDOW_CASE_PHRASE}]})
     timings.append(dt)
-    window_case["requests"] = hour.vocabulary_requests
-    window_case["seconds"] = round(hour.vocabulary_seconds, 3)
+    window_case["requests"] = 0
+    window_case["seconds"] = round(engine.simulated_seconds - before, 3)
     window_case["values"] = dict(hour.scrubber.vocabulary_counts)
     window_case["refused"] = refused.code if refused else None
     if out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0:
@@ -1893,20 +1995,10 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         window_case["part_leak"] = bool(
             name_part_leaks(_messages(out), WINDOW_CASE_PHRASE, WINDOW_CASE_JOB))
 
-    # The same first page with no time bounds at all: the read falls back to
-    # the whole vocabulary.days window, so it pays for the back catalogue.
-    # Measured, not gated beyond "it is still read whole and nothing leaks".
-    wide = {"shown": False, "refused": None, "requests": 0, "seconds": 0.0, "values": {}}
-    wide_sess = Session(cfg, engine, tier2=tier2)
-    out, refused, dt, _ = wide_sess.call({
-        "index": "logs-worker-*", "size": 20,
-        "filters": [{"field": "message", "op": "phrase", "value": WINDOW_CASE_PHRASE}]})
-    timings.append(dt)
-    wide.update({"requests": wide_sess.vocabulary_requests,
-                 "seconds": round(wide_sess.vocabulary_seconds, 3),
-                 "values": dict(wide_sess.scrubber.vocabulary_counts),
-                 "refused": refused.code if refused else None,
-                 "shown": out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0})
+    # A case opened before the build has finished is refused, rather than
+    # shown against a vocabulary that does not know the customer's name
+    # yet. Through the real Bridge, with an index that holds nothing.
+    building = cold_bridge_refusal(cfg, engine, tier2=tier2)
 
     # A site map with no vocabulary section at all, which is what a site has
     # before anyone writes one. The default decides what is read, and a
@@ -1919,6 +2011,10 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         if cfg.source and Path(cfg.source).exists() else json.loads(elastic.EXAMPLE.read_text())
     raw_default.pop("vocabulary", None)
     cfg_default = elastic.parse(raw_default, source="no-vocabulary-section")
+    # its own bridge, so its own sign-in build: the default decides which
+    # fields that build reads
+    before = engine.simulated_seconds
+    default_vocab, default_build = build_vocabulary(cfg_default, engine)
     # Counts, reasons and field names only: the names themselves are planted
     # values, and the report must not carry one (the names live in
     # DEFAULT_MAP_ONE_WORD and in AGENTS.md, where they are documentation).
@@ -1932,14 +2028,12 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     for tenant_name, resource, _message in default_map_cases():
         # a fresh case each time: nothing seeded, nothing harvested, the
         # names' own fields outside the hour the query asks for
-        first = Session(cfg_default, engine, tier2=tier2)
+        first = Session(cfg_default, engine, tier2=tier2, vocabulary=default_vocab)
         out, refused, dt, _ = first.call({
             "index": "logs-worker-*", "time_range": DEFAULT_MAP_RANGE, "size": 20,
             "filters": [{"field": "message", "op": "phrase", "value": DEFAULT_MAP_PHRASE}]})
         timings.append(dt)
         default_map["cases"] += 1
-        default_map["requests"] += first.vocabulary_requests
-        default_map["seconds"] += first.vocabulary_seconds
         default_map["values"] = dict(first.scrubber.vocabulary_counts)
         default_map["skipped_by_rule"] = dict(first.scrubber.vocabulary_skipped)
         if out is None or not (out["hits"]["total"] or {}).get("value", 0):
@@ -1952,7 +2046,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         else:
             default_map["tenants_hidden"] += 1
         default_map["resources_readable"] += int(resource in page)
-    default_map["seconds"] = round(default_map["seconds"], 3)
+    default_map["requests"] = default_build.requests
+    default_map["seconds"] = round(engine.simulated_seconds - before, 1)
     # how many one-word names the skip rules drop, by the rule's own reason
     dropped = {n: elastic.EsScrubber.vocabulary_skip(n) for n in DEFAULT_MAP_ONE_WORD}
     by_reason: dict[str, int] = {}
@@ -1972,7 +2067,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # filter by one must still match.
     keep = {"hit_shown": False, "hit_leaks": [], "agg_leaks": [], "bucket_keys": 0,
             "levels_kept": [], "levels_changed": [], "filter_by_level": False}
-    kl = Session(cfg, engine, tier2=tier2)
+    kl = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
     out, refused, dt, _ = kl.call({
         "index": "logs-worker-*", "time_range": tr, "size": 20,
         "filters": [{"field": "message", "op": "phrase", "value": KEEP_LEAK_PHRASE}]})
@@ -2002,15 +2097,13 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
 
     # A fresh case's first page, for each job named with no marker: nothing
     # seeded, nothing harvested yet, the job's own record on another document.
-    fresh = {"cases": 0, "shown": 0, "leaks": 0, "leaked_types": [], "vocabulary_requests": 0,
-             "part_leaks": 0}
+    fresh = {"cases": 0, "shown": 0, "leaks": 0, "leaked_types": [], "part_leaks": 0}
     for phrase, name in unmarked_cases():
-        first = Session(cfg, engine, tier2=tier2)
+        first = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
         out, refused, dt, _ = first.call({
             "index": "logs-worker-*", "time_range": tr, "size": 20,
             "filters": [{"field": "message", "op": "phrase", "value": phrase}]})
         timings.append(dt)
-        fresh["vocabulary_requests"] += first.vocabulary_requests
         fresh["cases"] += 1
         if out is not None and (out["hits"]["total"] or {}).get("value", 0) > 0:
             fresh["shown"] += 1
@@ -2021,11 +2114,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             fresh["leaks"] += bool(leaked)
             fresh["leaked_types"] = sorted(set(fresh["leaked_types"]) | set(leaked))
 
-    # Label round trip: a label learnt from a page, used as a filter. The
-    # queries carry the case window: a query with no time bounds pays the
-    # vocabulary.days fallback read by design, and the fallback is measured
-    # once above (the no-window case), not forty times here - it would also
-    # add the whole back catalogue to the labels-issued figure.
+    # Label round trip: a label learnt from a page, used as a filter.
     since = NOW - timedelta(hours=6)
     round_trip = {"tried": 0, "passed": 0, "failures": []}
     field_for_type = {}
@@ -2105,16 +2194,17 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "default_map": default_map,
         "keep_field": keep,
         "window_case": window_case,
-        "wide_case": wide,
-        # extra requests the bridge sends on its own: a paged read per case
-        # per cluster, then one per refresh interval; none has a value in it
+        "building_case": building,
+        # The one build this bridge paid, and one top-up. No case reads
+        # anything: a case applies what the build already holds. Counts and
+        # seconds only, never a name.
         "vocabulary": {**s.vocabulary_report(),
-                       "reads": sess.vocabulary_reads + fresh["cases"] + 2,
-                       "requests": sess.vocabulary_requests + fresh["vocabulary_requests"]
-                       + window_case["requests"] + wide["requests"],
+                       "build": build_report,
+                       "topup": topup_report,
                        "page": elastic.VOCABULARY_PAGE,
+                       "page_seconds": list(PAGE_SECONDS),
                        "bulk_jobs": BULK_JOBS,
-                       "cases": 3 + fresh["cases"]},
+                       "cases_served": 3 + fresh["cases"] + default_map["cases"]},
         "oracle": oracle,
         "text_queries": text_queries,
         "labels_issued": len(s.mapping),
@@ -2150,11 +2240,16 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         and len(keep["levels_kept"]) == len(KEEP_LEVEL_SPELLINGS) + len(KEEP_OUTCOME_SPELLINGS)
         and keep["filter_by_level"],
         # the one-hour case on a cluster with BULK_JOBS names: shown, with
-        # the job name labelled, on a vocabulary read of its own window
+        # the job name labelled, served from the sign-in build at no cost
         "window_case_shown": window_case["shown"] and not window_case["leaks"]
-        and not window_case["part_leak"],
-        # the fallback window still reads whole rather than refusing
-        "wide_case_read_whole": wide["shown"] and wide["refused"] is None,
+        and not window_case["part_leak"] and window_case["requests"] == 0,
+        # the whole build fits its budget, and a top-up is cheap
+        "vocabulary_build_in_budget":
+            build_report["simulated_s"] <= cfg.vocabulary_budget_s
+            and topup_report["simulated_s"] < build_report["simulated_s"],
+        # a case before the build finishes is refused, not shown
+        "vocabulary_building_refuses":
+            building["refused"] == "vocabulary_building" and not building["shown"],
         # planted in every fixture, projected out by the engine or dropped
         # here; either way never shown
         "unlisted_never_shown": not (set(fx.unlisted_fields) & shown_paths),
@@ -2195,6 +2290,7 @@ def _num(v: str):
 
 def format_report(r: dict) -> str:
     d = r["default_map"]
+    b, t = r["vocabulary"]["build"], r["vocabulary"]["topup"]
     lines = [
         f"fixture           {r['fixture']['docs']} docs, {r['fixture']['planted_values']} planted values, "
         f"{r['fixture']['clean_docs']} clean docs",
@@ -2230,19 +2326,20 @@ def format_report(r: dict) -> str:
         f"one-hour case     {'shown' if r['window_case']['shown'] else 'NOT SHOWN'} "
         f"({r['window_case']['refused'] or 'not refused'}), {len(r['window_case']['leaks'])} leaks, "
         f"{'a word of the name readable' if r['window_case']['part_leak'] else 'name hidden'}; "
-        f"vocabulary {r['window_case']['requests']} requests, "
-        f"{r['window_case']['seconds']}s, values {r['window_case']['values']} "
+        f"it read {r['window_case']['requests']} requests of its own "
+        f"({r['window_case']['seconds']}s) - the sign-in build already had the name "
         f"(cluster back catalogue {r['vocabulary']['bulk_jobs']} job names)",
-        f"no-window case    {'shown' if r['wide_case']['shown'] else 'NOT SHOWN'} "
-        f"({r['wide_case']['refused'] or 'not refused'}); the vocabulary.days fallback: "
-        f"{r['wide_case']['requests']} requests, {r['wide_case']['seconds']}s, values "
-        f"{r['wide_case']['values']}",
-        f"vocabulary        {r['vocabulary']['requests']} extra requests over "
-        f"{r['vocabulary']['reads']} reads for {r['vocabulary']['cases']} cases (a paged read per "
-        f"case per cluster, {r['vocabulary']['page']} values a page, then one per "
-        f"{elastic.VOCABULARY_REFRESH_S:g}s); values per field against the cap "
-        f"{r['vocabulary']['max']}: {r['vocabulary']['fields']}; skipped "
-        f"{r['vocabulary']['skipped'] or 'none'}",
+        f"before the build  a case is {r['building_case']['refused'] or 'NOT REFUSED'}, "
+        f"{'no page shown' if not r['building_case']['shown'] else 'A PAGE WAS SHOWN'}",
+        f"vocabulary build  {b['requests']} requests, {b['simulated_s']}s simulated of a "
+        f"{b['budget_s']:g}s budget, over {b['covered_days']} days, once per cluster at "
+        f"sign-in ({r['vocabulary']['page']} values a page, one field a page, "
+        f"page cost {r['vocabulary']['page_seconds']}s); values per field against the cap "
+        f"{r['vocabulary']['max']}: {b['fields']}",
+        f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
+        f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
+        f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "
+        f"skipped {r['vocabulary']['skipped'] or 'none'}",
         f"oracle cases      {r['oracle']['refused']}/{r['oracle']['cases']} refused with the declared code"
         + (f"; wrong code: {r['oracle']['wrong_code']}" if r['oracle']['wrong_code'] else "")
         + (f"; COMPILED: {r['oracle']['compiled']}" if r['oracle']['compiled'] else ""),

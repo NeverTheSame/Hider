@@ -156,7 +156,8 @@ class CaseBook:
         self._by_digest: dict[str, Case] = {}
 
     def open(self, name: str, terms: list[str], tier2: str,
-             session: esbridge.KibanaSession) -> tuple[str, Case, bool]:
+             session: esbridge.KibanaSession,
+             index: "elastic.VocabularyIndex | None" = None) -> tuple[str, Case, bool]:
         """Open (or reopen) a case and mint its token.
 
         Returns (token, case, replaced). Reopening a case that is already
@@ -178,7 +179,7 @@ class CaseBook:
         seeded = esbridge.seed_terms(self.config, scrubber, terms)
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         bridge = esbridge.Bridge(self.config, scrubber, session,
-                                 log_path=directory / "decisions.jsonl")
+                                 log_path=directory / "decisions.jsonl", index=index)
         token = secrets.token_urlsafe(32)
         case = Case(name, directory, scrubber, bridge, _digest(token), seeded)
         case.save()

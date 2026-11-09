@@ -81,7 +81,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hider serve                  # web UI on 127.0.0.1:8790
 .venv/bin/python -m hider es-eval                # Elasticsearch core: leaks, refusals, oracle cases, no cluster
 .venv/bin/python -m hider es-smoke --stub        # one query through Chrome against a synthetic Kibana
-.venv/bin/python -m hider es-login --cluster emea # start the bridge and sign in (headed, once per bridge)
+.venv/bin/python -m hider es-login --cluster emea # start the bridge, sign in (headed, once per bridge),
+                                                 # then build the name vocabulary: minutes on a large estate
 .venv/bin/python -m hider es-research --case c1 --term "<customer>"   # Claude Code, bridge tools only
 .venv/bin/python -m hider es-research --stub --case demo --prompt "..."  # the same on a synthetic Kibana
 .venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
@@ -403,53 +404,86 @@ Listed with owners in the README's Limitations section and in
   with `--term`. Widening the vocabulary to cover them is not the fix -
   that is the skip rules' trade, out of scope here, and loosening it
   erases the word everywhere.
-  **The read is windowed and paged** (`elastic.VocabularyFetch`), because
-  one capped `terms` aggregation over the whole retention period refused
-  every case on any estate with more distinct names than the cap, and took
-  minutes when it did not. It covers the window of the query being served,
-  widened by `vocabulary.margin_days` (1) on each side, in `composite`
-  pages of `VOCABULARY_PAGE` (1,000) per field, carrying each field's
-  `after_key`; a query with no start or no end falls back to
-  `vocabulary.days` with the date math left to the cluster's clock, which
-  is the old behaviour and the old price. The caller drives it
-  (`pending()` / `request()` / `feed()` / `commit()`), and **nothing is
-  learnt before the commit**: an upstream error, a partial, timed-out or
-  misshapen reply, a field over `vocabulary.max` (50,000) counted across
-  the whole read, or a read over `vocabulary.budget_s` (60s, wall clock
-  under the bridge's one lock) all raise `Refused` and leave the session
-  exactly as it was. The only thing the query contributes is its own
-  already-validated time bounds - never a phrase, a label or a value - and
-  the log holds counts, requests and seconds per field, never a name
-  (`vocabulary_report`, also `es-smoke`'s `VOCAB` line, `NEAR CAP` at
-  80%). The window a read covered is remembered per cluster, so a later
-  query inside it costs nothing and one reaching outside it reads again.
-  `Compiled.window` is where the bounds come from; `esbridge.clock`
-  resolves them and is replaced only by the stub harnesses, whose fixture
-  sits at `eseval.NOW` rather than today.
-  It is measured by `eseval.UNMARKED_JOBS` and
+  **The read happens once per cluster, at sign-in - never inside a case.**
+  Two earlier shapes failed against measured cost. One capped `terms`
+  aggregation over the retention period refused every case on any estate
+  past the cap. Reading the *case's own window* instead looked affordable
+  and is not: measured on a real cluster, one composite page of 1,000
+  values for one field takes **8 to 35 seconds**, every name field holds
+  far more than 1,000 values in an hour, and a one-hour case read 49 hours
+  once a margin was added - so the first request alone blew a 60s budget
+  and every case was refused again. No per-case budget a human waits for
+  covers this.
+  So: `esbridge.Broker.start_vocabulary` begins a build when the bridge
+  signs in (`es-login`, or the `vocabulary` op with `build: true`), over
+  the last `vocabulary.days`, under `vocabulary.budget_s` (1200s, twenty
+  minutes, paid once per bridge rather than per case).
+  `elastic.VocabularyBuild` reads **one field per request** with an
+  `exists` filter on that field, `VOCABULARY_PAGE` (1,000) values a page,
+  carrying that field's `after_key`; one field at a time because the cost
+  is per aggregation, so a request carrying every field pays for all of
+  them before it can be stopped, logged or resumed. Fields are read
+  JOB_NAME first: a message naming a tenant almost always carries the
+  tenant fields on the same document (harvesting the page covers it),
+  while about three in four messages naming a job carry no job field - job
+  names are what the vocabulary is really for.
+  The build runs **on the broker's serve loop, one page per iteration**
+  (`pump_vocabulary`), because Playwright's sync API belongs to that
+  thread; that also keeps ping, stop and tool calls answered between pages
+  instead of the bridge vanishing for twenty minutes.
+  The result is saved by `elastic.VocabularyIndex` to
+  `<sessions>/vocabulary.json` (0700 directory, 0600 file, under the
+  gitignored `out/es`), with the range it covers, and **topped up every
+  `VOCABULARY_REFRESH_S` reading only the time since the last read**
+  (`_start_due_vocabulary`, a page per field). A case **applies** what the
+  index holds (`EsScrubber.apply_vocabulary`, `Bridge._apply_vocabulary`):
+  local work, no request, once per case per cluster.
+  **Nothing is learnt from a partial, failed or timed-out read**: an
+  upstream error, a partial or misshapen reply, a field over
+  `vocabulary.max` (50,000) or a build over the budget abandons the build
+  (`VocabularyBuild.failed`, `result()` refuses) and leaves the saved
+  vocabulary exactly as it was; the next sign-in or tick retries. **A case
+  before the first build finishes is refused** with its own code,
+  `vocabulary_building`, rather than shown against names nobody has read.
+  The read takes **no input from Claude at all** now - not even a time
+  bound, since the window no longer comes from a query - and the log holds
+  counts, requests, seconds and field names, never a name
+  (`vocabulary_report`, `VocabularyIndex.report`, the `vocabulary.log.jsonl`
+  rows, and `es-smoke`'s `VOCAB` line, which shows build progress,
+  coverage, age and `NEAR CAP` at 80%). `esbridge.clock` is what the build
+  range and the staleness check read; it is a module global because it is a
+  hook for the harnesses, whose fixtures sit at `eseval.NOW` rather than
+  today, and nothing in the live path replaces it.
+  Measured by `eseval.UNMARKED_JOBS` and
   `eseval.UNMARKED_NAMES` (fixed documents appended after the RNG stream),
   the `fresh_case_no_leaks` / `mcp_fresh_case_shown` gates, and the
   word-by-word check `eseval.name_part_leaks`, since a half-hidden name
   passes the whole-value one; and by `eseval.BULK_JOBS`, a back catalogue
-  of 12,000 invented job names older than any case window, with
-  `WINDOW_CASE_*` (a one-hour case whose message names a job whose own
-  record is outside that hour) behind the `window_case_shown` and
-  `wide_case_read_whole` gates. Before windowing, that fixture refused
-  every query in es-eval with `vocabulary` and showed no page at all.
-  Anything that scrubs pages outside the
-  bridge (es-eval's `Session`, tests) must learn the vocabulary first:
+  of 12,000 invented job names, behind `window_case_shown` (a one-hour
+  case served from the build at no cost to itself),
+  `vocabulary_build_in_budget` and `vocabulary_building_refuses`. The stub
+  charges `eseval.PAGE_SECONDS` (8-35s, cycled) per field per page, so the
+  eval reports what a build really costs without waiting for it: **17
+  requests and 326 simulated seconds** for the first build over 12,013
+  job names, **5 requests and 97 seconds** for a top-up.
+  Anything that scrubs pages outside the bridge (es-eval's `Session`,
+  tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
-  Declared misses of the windowed read, each the price of not reading the
-  whole retention period: a name whose **only** occurrence in its own field
-  is outside the case window plus the margin is not learnt, so it stays
-  readable in message text unless something else marks it (the margin, not
-  the case, is what decides how far back that reaches); and Claude choosing
-  a narrow window narrows the read with it, which cannot be used to
-  *extract* anything (the vocabulary is never shown and only ever adds
-  redactions) but does mean the cover of a page depends on the window asked
-  for. A query with no time bounds still pays the full `vocabulary.days`
-  read, so an estate past `vocabulary.max` on one field refuses those, by
-  design: a partial list is worse than none.
+  **Declared costs of building once per cluster**, all new with this
+  shape: the first sign-in takes **minutes** before any case can run, and
+  `es-login` waits there showing progress; **real customer names are
+  written to disk** in `out/es/vocabulary.json` (0600, gitignored, never
+  in the repo) rather than only living in a process, which is a larger
+  on-disk footprint than a case vault since it is every name on the
+  cluster rather than the ones a case saw; a name **older than the first
+  build's range** (`vocabulary.days`, 30 by default) is not known, and
+  neither is one logged in the gap between top-ups, up to
+  `VOCABULARY_REFRESH_S` old; and a failed top-up leaves the bridge
+  serving a vocabulary that is complete for its range but stale, which the
+  `VOCAB` line reports as `stale` with its age rather than refusing - the
+  same risk the ten-minute refresh already accepts.
+  The old declared miss about a case's window narrowing the read is
+  **gone**: the case window no longer drives anything.
   **Keep fields are checked, not trusted.** A keep field used to pass
   through unchanged (`_rewrite_leaf`) on the declaration that it holds
   nothing sensitive, and a real level field held a SharePoint personal-site

@@ -79,11 +79,12 @@ POLL_TIMEOUT_S = 120.0
 LOGIN_TIMEOUT_S = 600.0
 PROFILE_MARKER = ".hider-es-bridge-profile"
 LOG_SCHEMA = "hider.es-bridge.v1"
-#: What "now" is when a query's time window is resolved, which decides the
-#: window the name vocabulary is read for. The body sent to the cluster still
-#: carries date math as written, so this clock never changes what a query
-#: selects. Replaced only by the stub harness, whose fixture sits at a fixed
-#: instant; nothing in the live path replaces it.
+#: What "now" is when the name vocabulary decides the range to read and
+#: whether what it holds has gone stale. A module global because it is a
+#: hook for the harnesses, not per-request state: the stub fixtures sit at
+#: ``eseval.NOW`` rather than today, and nothing in the live path replaces
+#: it. It never changes what a *query* selects - a query's date math is
+#: sent as written and resolved by the cluster.
 clock = time.time
 
 #: Stock Chrome profile roots. A profile_dir under one of these is the
@@ -508,14 +509,19 @@ class Bridge:
     """
 
     def __init__(self, config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
-                 session: KibanaSession, *, log_path: str | Path | None = None) -> None:
+                 session: KibanaSession, *, log_path: str | Path | None = None,
+                 index: elastic.VocabularyIndex | None = None) -> None:
         self.config = config
         self.scrubber = scrubber
         self.session = session
         self.log_path = Path(log_path) if log_path else None
         self._lock = threading.Lock()
         self.outcomes: list[Outcome] = []
-        #: the last vocabulary read per cluster: counts against the caps
+        #: the built vocabularies, by cluster. The bridge reads it; the
+        #: broker builds it. None means no vocabulary at all (a site map
+        #: with no learnable field, or a harness that does not want one).
+        self.index = index
+        #: what the last applied vocabulary held per cluster: counts only
         self.vocabulary: dict[str, dict] = {}
 
     def cluster(self, name: str) -> elastic.Cluster:
@@ -536,13 +542,11 @@ class Bridge:
         with self._lock:
             try:
                 cluster = self.cluster(cluster_name)
-                compiled = esquery.compile_query(query, self.config, self.scrubber,
-                                                 now=clock())
+                compiled = esquery.compile_query(query, self.config, self.scrubber)
                 row.update(_describe(query, compiled))
                 if probe:
                     self.session.probe(cluster)
-                if self.scrubber.vocabulary_due(cluster.name, compiled.window):
-                    self._vocabulary(cluster, compiled.window)
+                self._apply_vocabulary(cluster)
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
                 envelope = self.session.search(cluster, compiled.body)
@@ -565,33 +569,30 @@ class Bridge:
                 self._log(row)
         return outcome
 
-    def _vocabulary(self, cluster: elastic.Cluster,
-                    window: tuple[float, float] | None = None) -> None:
-        """A paged read before a case's first page on a cluster, and again
-        every ``VOCABULARY_REFRESH_S``: the names the sweep must know before
-        it can label one that nothing marks. It covers the window of the
-        query being served plus a margin, in composite pages, under a ceiling
-        and a time budget. Its own log row holds, per field, how many values
-        came back against the cap, how many were skipped by reason, how many
-        requests it took and how long; never a value. A failure refuses the
-        page it was fetched for (``vocabulary``, or ``upstream_error``)."""
-        t0 = time.perf_counter()
-        row: dict[str, Any] = {"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                               "cluster": cluster.name, "vocabulary": "names"}
-        fetch = self.scrubber.vocabulary_fetch(window)
-        try:
-            while fetch.pending():
-                fetch.feed(self.session.search(cluster, fetch.request()))
-            fetch.commit(cluster.name)
-            row.update(self.scrubber.vocabulary_report())
-            self.vocabulary[cluster.name] = self.scrubber.vocabulary_report()
-        except elastic.Refused as e:
-            row["refused"] = e.code
-            raise
-        finally:
-            row["requests"] = fetch.requests
-            row["seconds"] = round(time.perf_counter() - t0, 3)
-            self._log(row)
+    def _apply_vocabulary(self, cluster: elastic.Cluster) -> None:
+        """Give this case the names the bridge already read for the cluster.
+
+        No request: the build happened once, when the bridge signed in. If
+        it has not finished, the page is refused with ``vocabulary_building``
+        rather than shown against a vocabulary that does not yet know the
+        customer's name. Logged as counts, never a name.
+        """
+        if self.index is None or self.scrubber.vocabulary_applied(cluster.name):
+            return
+        vocab = self.index.get(cluster.name)
+        if vocab is None:
+            raise elastic.Refused(
+                "vocabulary_building",
+                "response withheld: the name vocabulary for this cluster is still being "
+                "built (it is read once per sign-in, and a page shown before it is ready "
+                "could leak a customer name in message text). Try again shortly; "
+                "es-smoke's VOCAB line shows the progress.")
+        counts = self.scrubber.apply_vocabulary(cluster.name, vocab)
+        report = {**self.index.report(cluster.name, self.config, now=clock()), "fields": counts,
+                  "skipped": dict(self.scrubber.vocabulary_skipped)}
+        self.vocabulary[cluster.name] = report
+        self._log({"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                   "cluster": cluster.name, "vocabulary": "applied", **report})
 
     def _log(self, row: dict) -> None:
         if self.log_path is None:
@@ -812,10 +813,23 @@ def vocabulary_line(v: dict | None) -> str | None:
     readable in message text, which is a choice worth seeing. Field names
     only; a field is only listed here because the map itself names it.
     """
-    if not v or not v.get("fields"):
+    if not v:
         return None
+    if v.get("building"):
+        b = v["building"]
+        done, total = b["fields_done"], b["fields_total"]
+        return (f"VOCAB    building {done}/{total} fields, {b['requests']} requests, "
+                f"{b['seconds']:g}s of {b['budget_s']:g}s"
+                + (f", reading {b['field']}" if b.get("field") else "")
+                + (f", values so far {b['values']}" if b.get("values") else ""))
+    if v.get("state") == "failed":
+        return f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
+    if not v.get("fields"):
+        return None if v.get("state") != "building" else "VOCAB    building, no page yet"
     parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()]
     line = "VOCAB    " + " ".join(parts)
+    if v.get("covered_days") is not None:
+        line += f" over {v['covered_days']}d, {v.get('state', 'ready')} ({v.get('age_s', 0)}s old)"
     if v.get("skipped"):
         line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
     if v.get("near_cap"):
@@ -1030,9 +1044,23 @@ class Broker:
         self.stopping = False
         self.last_used = time.monotonic()
         #: cases open for MCP sessions, by token; the vaults live under here
-        self.cases = esmcp.CaseBook(config, sessions_dir or elastic.SESSIONS)
+        self.sessions_dir = Path(sessions_dir or elastic.SESSIONS)
+        self.cases = esmcp.CaseBook(config, self.sessions_dir)
         #: the MCP listener, started by the first open_case
         self.mcp = None
+        #: the cluster vocabularies, saved beside the case state. Built once
+        #: per cluster on sign-in and topped up on the serve loop; see
+        #: _pump_vocabulary.
+        self.vocabulary = elastic.VocabularyIndex(self.sessions_dir)
+        self._build: elastic.VocabularyBuild | None = None
+        self._build_cluster: elastic.Cluster | None = None
+        #: why the last build for a cluster stopped, if it did. A waiting
+        #: caller has to be able to tell "still going" from "it failed, and
+        #: nothing is coming unless you ask again".
+        self._build_failed: dict[str, str] = {}
+        self._build_log: list[dict] = []
+        #: clusters signed in to this bridge, in sign-in order
+        self._signed_in: list[elastic.Cluster] = []
 
     def open(self) -> None:
         """Start the browser before listening, so a broken setup fails at
@@ -1069,7 +1097,20 @@ class Broker:
                 if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
                         or not 1 <= timeout <= 3600:
                     return _fail("bad_request", "timeout is 1..3600 seconds")
-                return {"ok": True, "signed_in": bool(self.transport.login(cluster, timeout=timeout))}
+                signed_in = bool(self.transport.login(cluster, timeout=timeout))
+                if signed_in:
+                    self.start_vocabulary(cluster)
+                return {"ok": True, "signed_in": signed_in,
+                        "vocabulary": self.vocabulary_progress(cluster.name)}
+            if op == "vocabulary":
+                # ``build`` starts one if none is held and none is running:
+                # what es-login does after signing in, and what a transport
+                # that is already authenticated (the stub, a smoke run) asks
+                # for directly.
+                if req.get("build"):
+                    self.open()
+                    self.start_vocabulary(cluster)
+                return {"ok": True, "vocabulary": self.vocabulary_progress(cluster.name)}
             if op == "run":
                 return {"ok": True, "report": self._run(cluster, req)}
             return _fail("bad_request", "unknown op")
@@ -1106,9 +1147,110 @@ class Broker:
             self.mcp = esmcp.McpHttpServer(self.config, self.cases, on_request=self._touch)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
                                 poll_timeout=self.config.poll_timeout_s)
-        token, case, replaced = self.cases.open(req.get("case"), terms, tier2, session)
+        token, case, replaced = self.cases.open(req.get("case"), terms, tier2, session,
+                                                self.vocabulary)
         return {"ok": True, "url": self.mcp.url, "token": token, "replaced": replaced,
                 "seeded": [[lab, case.scrubber.types.get(lab, "")] for lab in case.seeded]}
+
+    # -- the name vocabulary -----------------------------------------------
+    #
+    # Built once per cluster when the bridge signs in, not once per case.
+    # The measured page cost (8-35s for 1,000 values of one field) makes a
+    # per-case read impossible: no budget a human waits for covers it, and
+    # every case was refused. Here it is paid once per bridge, saved, and
+    # topped up every VOCABULARY_REFRESH_S with only the time since the
+    # last read.
+    #
+    # It runs on the serve loop, one page per iteration, because Playwright's
+    # sync API belongs to that thread - a background thread cannot touch the
+    # browser. That also keeps the loop answering ping, stop and tool calls
+    # between pages instead of disappearing for twenty minutes.
+
+    def start_vocabulary(self, cluster: elastic.Cluster, *, now: float | None = None) -> None:
+        """Begin a build (first time) or a top-up (afterwards) for a cluster."""
+        if not self.config.vocabulary_rules or self._build is not None:
+            return
+        if cluster not in self._signed_in:
+            self._signed_in.append(cluster)
+        t = clock() if now is None else now
+        held = self.vocabulary.get(cluster.name)
+        start = held.covered_until if held is not None \
+            else t - self.config.vocabulary_days * 86400.0
+        if held is not None and t - held.covered_until < elastic.VOCABULARY_REFRESH_S:
+            return
+        self._build = elastic.VocabularyBuild(self.config, start, t)
+        self._build_cluster = cluster
+        self._build_failed.pop(cluster.name, None)
+        self._log_vocabulary(cluster.name, "start", self._build.progress())
+
+    def pump_vocabulary(self) -> bool:
+        """One page of the build in flight, if any. Returns True if it did
+        work, so the serve loop knows not to idle out."""
+        build, cluster = self._build, self._build_cluster
+        if build is None or cluster is None:
+            self._start_due_vocabulary()
+            return False
+        self.last_used = time.monotonic()   # a build in flight is not an idle bridge
+        session = KibanaSession(self.transport, poll_interval=self.poll_interval,
+                                poll_timeout=self.config.poll_timeout_s)
+        try:
+            build.feed(session.search(cluster, build.request()))
+        except elastic.Refused as e:
+            # A failed or timed-out read teaches the index nothing: what was
+            # already saved stays, and the next sign-in or tick retries.
+            self._log_vocabulary(cluster.name, "failed", {**build.progress(), "refused": e.code})
+            self._build_failed[cluster.name] = e.code
+            self._build = self._build_cluster = None
+            return True
+        except Exception as e:  # a transport fault is the same answer
+            self._log_vocabulary(cluster.name, "failed",
+                                 {**build.progress(), "refused": type(e).__name__})
+            self._build_failed[cluster.name] = type(e).__name__
+            self._build = self._build_cluster = None
+            return True
+        if build.pending():
+            self._log_vocabulary(cluster.name, "progress", build.progress())
+            return True
+        self.vocabulary.put(cluster.name, build.result())
+        self._build_failed.pop(cluster.name, None)
+        self._log_vocabulary(cluster.name, "ready",
+                             {**build.progress(),
+                              **self.vocabulary.report(cluster.name, self.config, now=clock())})
+        self._build = self._build_cluster = None
+        return True
+
+    def _start_due_vocabulary(self) -> None:
+        """Top up a cluster whose vocabulary has gone stale."""
+        for cluster in self._signed_in:
+            held = self.vocabulary.get(cluster.name)
+            if held is not None and clock() - held.covered_until >= elastic.VOCABULARY_REFRESH_S:
+                self.start_vocabulary(cluster)
+                return
+
+    def vocabulary_progress(self, cluster: str) -> dict:
+        """Counts and state for the caller's own screen; never a name."""
+        report = self.vocabulary.report(cluster, self.config, now=clock())
+        if self._build is not None and self._build_cluster is not None \
+                and self._build_cluster.name == cluster:
+            report = {**report, "building": self._build.progress()}
+            report.setdefault("state", "building")
+        elif cluster in self._build_failed and report.get("state") == "building":
+            # nothing held and nothing running: say so, or a caller waiting
+            # for "ready" waits for ever
+            report = {**report, "state": "failed", "refused": self._build_failed[cluster]}
+        return report
+
+    def _log_vocabulary(self, cluster: str, event: str, body: dict) -> None:
+        row = {"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "cluster": cluster, "vocabulary": event, **body}
+        self._build_log.append(row)
+        path = self.sessions_dir / "vocabulary.log.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+        except OSError:
+            pass  # a decision log that cannot be written must not stop the bridge
 
     def _run(self, cluster: elastic.Cluster, req: dict) -> dict:
         terms, tier2 = self._terms_tier2(req)
@@ -1119,7 +1261,7 @@ class Broker:
         seeded = seed_terms(self.config, scrubber, terms)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
                                 poll_timeout=self.config.poll_timeout_s)
-        bridge = Bridge(self.config, scrubber, session, log_path=log)
+        bridge = Bridge(self.config, scrubber, session, log_path=log, index=self.vocabulary)
         report = run_case(bridge, cluster.name, req.get("query"))
         report["seeded"] = seeded
         return report
@@ -1156,7 +1298,12 @@ class Broker:
                 if self.mcp is not None and not mcp_registered:
                     sel.register(self.mcp.socket, selectors.EVENT_READ, "mcp")
                     mcp_registered = True
-                for key, _ in sel.select(timeout=1.0):
+                # One vocabulary page per iteration, on this thread because
+                # the browser lives on it. A page is slow (8-35s measured),
+                # so the loop answers between pages rather than vanishing
+                # for the length of a build.
+                building = self.pump_vocabulary()
+                for key, _ in sel.select(timeout=0.0 if building else 1.0):
                     if key.data == "mcp":
                         self.mcp.handle_request()
                         continue

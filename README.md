@@ -741,25 +741,36 @@ recall will never be exactly 100%.
     `VOCAB` line now names what the list leaves out
     (`NOT READ (readable in text): …`, field names only) so the choice is
     visible rather than silent. Reading five fields instead of one costs
-    nothing per request - every field rides in the same search and pages
-    independently - so on the es-eval fixture nine fresh one-hour cases
-    still take nine requests, 0.17s, now learning 64 values instead of 13.
-    **The read is windowed and paged.** It covers the window of the query
-    being served, widened by `vocabulary.margin_days` (1) on each side -
-    not the whole retention period - and it pages through `composite`
-    buckets, 1,000 values per field per request. The earlier read was one
-    capped `terms` aggregation over the last 30 days, which does not
-    survive contact with a large estate: on a cluster with 12,000 distinct
-    job names it returned a full bucket list, which is indistinguishable
-    from a truncated one, so the case was refused - every case, always -
-    and a wide first read is slow in a way the analyst pays for before
-    seeing anything. The request still carries no phrase, no label and no
-    value: the only thing the query contributes is its own
-    already-validated time bounds. A query with no start or no end falls
-    back to the last `vocabulary.days` (30) and so pays the old price,
-    which is the honest trade rather than a silent half-read. The window a
-    read covered is remembered per cluster, so a later query inside it
-    costs nothing.
+    four more requests in the one build the bridge pays, and nothing at
+    all per case.
+    **The read happens once per cluster, when the bridge signs in - never
+    inside a case.** Two earlier shapes died on measured cost. One capped
+    `terms` aggregation over the retention period returned a full bucket
+    list on a cluster with 12,000 job names, which is indistinguishable
+    from a truncated one, so every case was refused. Reading the case's
+    own window instead looked affordable and is not: on a real cluster one
+    composite page of 1,000 values for one field takes **8 to 35 seconds**,
+    every name field holds far more than 1,000 values in an hour, and a
+    one-hour case read 49 hours once a margin was added - the first
+    request alone blew the budget, and every case was refused again. There
+    is no per-case budget a human will wait for that covers this.
+    So the build is paid **once per bridge**: `es-login` signs in and then
+    reads the last `vocabulary.days` under `vocabulary.budget_s` (twenty
+    minutes), showing progress; the result is saved and topped up every
+    ten minutes with only the time since the last read. A case applies
+    what is already there - local work, no request. **One field per
+    request**, with an `exists` filter on that field, because the cost is
+    per aggregation: a request carrying every field pays for all of them
+    before it can be stopped, logged or resumed. Job-name fields are read
+    first, because a message naming a tenant almost always carries the
+    tenant fields on the same document while about three in four messages
+    naming a job carry no job field - job names are what this is for.
+    The build runs on the bridge's own loop, one page at a time, so the
+    bridge keeps answering between pages instead of disappearing for the
+    length of it.
+    **Until the first build finishes, cases are refused** with a code that
+    says so (`vocabulary_building`) rather than shown pages against names
+    nobody has read yet.
     **Left out, refused at load (`NO_VOCABULARY_TYPES`):** user accounts
     (`labels.principal_name`, one per user), ids (`labels.tenant_id`,
     `job.id`, `job.session_id`, `job.object_id`; tier 1 finds GUIDs by
@@ -767,28 +778,24 @@ recall will never be exactly 100%.
     already finds them in text, `host.ip`, `host.mac`,
     `cloud.instance.name`), and numbers (`tenant.users_in_tenant`,
     `cloud.account.id`: a number vocabulary would erase counts from text);
-    globs cannot be aggregated. **Requests:** one search per 1,000 values
-    of the widest field, all fields in the same request, per case per
-    cluster, then another read every ten minutes while the case is used.
-    On the es-eval fixture, whose cluster holds a back catalogue of 12,000
-    job names: a one-hour case reads **1 request in 0.02s** and learns 13
-    names; the same first page with no time bounds reads **13 requests in
-    0.55s** and learns 12,013. Before the change, the single capped
-    request took 0.10s on the same fixture and **refused**, so the case saw
-    nothing at all; es-eval's whole query stream (120 queries) was refused
-    with `vocabulary`. (Stub timings: an in-memory engine, so they measure
-    request counts and overhead, not a cluster's latency.) **Caps, as
-    counts:** every read is logged with values per field against the cap,
-    skips by reason, requests and seconds, never a value; `es-smoke`
-    prints the same as a `VOCAB` line, marks a field at 80% of its cap
-    `NEAR CAP` before it stops anything, and prints it under a refusal
-    too. **Fails closed, and nothing is learnt before the whole read
-    commits:** an unreadable, partial or misshapen reply, a field over
-    `vocabulary.max` (50,000) counted across the whole read, or a read
-    past `vocabulary.budget_s` (60s, held under the bridge's one lock)
-    refuses the page (`vocabulary`, naming the field and the cap; or
-    `upstream_error` with the class), and the session is left exactly as
-    it was; a configured index a cluster lacks reads as no values
+    globs cannot be aggregated. **What it costs, measured:** the es-eval
+    stub charges what a real page costs (8-35s, cycled) so the figure is
+    not an in-memory fiction. On its cluster of 12,013 job names the first
+    build takes **17 requests and 326 simulated seconds** - about five and
+    a half minutes, inside the twenty-minute budget - and a ten-minute
+    top-up takes **5 requests and 97 seconds**. Every case after that
+    reads **nothing**: the one-hour case that used to need its own read
+    now costs 0 requests. Under the previous per-case design the same
+    fixture refused on the first request.
+    **Caps and progress, as counts:** every build logs values per field
+    against the cap, skips by reason, requests and seconds, never a value;
+    `es-smoke` prints build progress while it runs and then a `VOCAB` line
+    with the counts, the range covered, its age and `NEAR CAP` at 80%.
+    **Fails closed, and nothing is learnt from a partial read:** an
+    unreadable, partial or misshapen reply, a field over `vocabulary.max`
+    (50,000), or a build past its budget abandons the build and leaves the
+    saved vocabulary exactly as it was, to be retried at the next sign-in
+    or tick; a configured index a cluster lacks reads as no values
     (`ignore_unavailable`).
     **Short and ordinary names:** a value made only of log words
     (`Failed`, `Warning`), a stopword (`default`), a value with no letters
@@ -819,17 +826,24 @@ recall will never be exactly 100%.
     which tells Claude how many tenants, resources and jobs exist. **Not
     covered:** a name not logged in its field within the window, a name
     only in a glob-matched field, and a name spelled differently in text
-    than in its field. Windowing narrows that first one, and the narrowing
-    is declared: a name whose only occurrence in its own field falls
-    outside the case window plus the margin is no longer learnt, where the
-    30-day read would have caught it. The margin is what decides how far
-    back that reaches, and a site that wants the old reach sets
-    `margin_days` higher at the old cost. Narrowing the window also
-    narrows the read, so the cover of a page depends on the window asked
-    for - which cannot be turned into an extraction, because the
-    vocabulary is never shown to Claude and can only ever add redactions,
-    but it does mean a one-minute query is covered by a one-minute-plus-
-    margin vocabulary.
+    than in its field.
+    **What building once per cluster costs, stated plainly.** The first
+    sign-in takes minutes before any case can run, and `es-login` waits
+    there printing progress; on a large estate that is the slow part of
+    starting work. The names are **written to disk** -
+    `out/es/vocabulary.json`, 0600 in a 0700 directory, gitignored, never
+    in the repo - because a build this expensive cannot be repeated per
+    session; that file holds every customer name on the cluster, which is
+    more than any one case vault ever held, and deleting it just means the
+    next sign-in rebuilds. A name **older than the first build's range**
+    (`vocabulary.days`, 30 days by default) is not in it, and neither is
+    one logged in the gap since the last ten-minute top-up. If a top-up
+    fails the bridge keeps serving the vocabulary it has - complete for
+    its range, just stale - and says so on the `VOCAB` line rather than
+    refusing; that is the same risk the refresh interval already accepts.
+    The earlier design let the case's own time window decide what was
+    read, which made a page's cover depend on the window asked for; that
+    is gone with the window, and so is the declared miss that went with it.
   - *A keep field is a declaration, and declarations get checked.* "Keep"
     means the site said the field holds nothing sensitive - levels,
     outcomes, counters, timestamps. A real cluster's level field held, among
@@ -872,7 +886,13 @@ recall will never be exactly 100%.
     three letters or fewer from inside a held value are not refused, so
     `.com` hosts stay askable.
   - *One call at a time.* The bridge serves calls one by one, and a
-    polling search holds the others.
+    polling search holds the others. The name vocabulary's build shares
+    that loop, a page at a time, so during a build the bridge answers
+    between pages rather than between builds.
+  - *Signing in is slow now.* The vocabulary build runs once per cluster
+    at `es-login` and takes minutes on a large estate; cases are refused
+    (`vocabulary_building`) until it finishes, and `es-login` prints its
+    progress while you wait.
 - **Streaming adds a small delay and trusts the vault's label set.** A delta
   is held back only while the tail of the stream is still the prefix of a
   pseudonym the vault holds, so plain prose is released immediately and the

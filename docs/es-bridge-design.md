@@ -520,27 +520,48 @@ Added after the first version:
   counts per field against the cap, plus requests and seconds. An
   unreadable, capped or over-budget read refuses the page and learns
   nothing.
-- **A cluster with more names than one aggregation carries.** The first
-  version read the last `vocabulary.days` in one capped `terms`
-  aggregation. A full bucket list is indistinguishable from a truncated
-  one, so a field at the cap had to refuse - and an estate with tens of
-  thousands of job names is at the cap on every case, for ever, after a
-  wide and slow first read. `eseval.BULK_JOBS` puts 12,000 invented job
-  names in the fixture, all older than any case window, which reproduced
-  exactly that: every es-eval query refused with `vocabulary`. The fix is
-  two things, neither sufficient alone: the read covers the window of the
-  query being served widened by `vocabulary.margin_days`, so an hour-wide
-  case reads an hour and not a month; and it pages with `composite`
-  `after_key` (`VOCABULARY_PAGE` per field per request), so a wide window
-  is still readable rather than refused. The ceiling (`vocabulary.max`,
-  counted across the whole read) and a wall-clock budget
-  (`vocabulary.budget_s`, because the read holds the bridge's one lock)
-  keep "fail closed" intact, and `commit()` is the only thing that learns,
-  so a refusal on page nine leaves the session untouched. `WINDOW_CASE_*`
-  is the fixture shape it exists for: a one-hour case whose message names
-  a job whose own record is outside that hour but inside the margin
-  (`window_case_shown`, `wide_case_read_whole`). The window is the query's
-  own resolved bounds (`Compiled.window`) and nothing else from Claude.
+- **A cluster with more names than one read can carry, and the two
+  designs that died on it.** The first version read the last
+  `vocabulary.days` in one capped `terms` aggregation. A full bucket list
+  is indistinguishable from a truncated one, so a field at the cap had to
+  refuse - and an estate with tens of thousands of job names is at the cap
+  on every case, for ever. `eseval.BULK_JOBS` (12,000 invented job names)
+  reproduced it: every es-eval query refused with `vocabulary`.
+  The second version read the **case's own window** plus a margin, in
+  composite pages. That looked affordable and was not. Measured against a
+  real cluster: one page of 1,000 values for one field takes 8 to 35
+  seconds, every name field holds far more than 1,000 values in an hour,
+  and a one-hour case window plus a day of margin on each side reads 49
+  hours. The first request alone passed the 60-second budget, so every
+  case was refused again - this time with the bridge doing minutes of work
+  per case to get there. There is no per-case budget a human waits for
+  that covers this, and the window being Claude's also meant the cover of
+  a page depended on the window asked for.
+  The third version, the one in place, moves the read out of the case
+  entirely. `Broker.start_vocabulary` builds once per cluster at sign-in,
+  over `vocabulary.days`, under a twenty-minute budget paid once per
+  bridge; `VocabularyBuild` reads one field per request with an `exists`
+  filter on it (the cost is per aggregation, so a request carrying every
+  field pays for all of them before it can be stopped, logged or resumed),
+  job names first (three in four messages naming a job carry no job
+  field, while a message naming a tenant carries the tenant fields);
+  `pump_vocabulary` runs it on the serve loop, one page per iteration,
+  because Playwright's sync API belongs to that thread and the loop has to
+  keep answering between pages. `VocabularyIndex` saves the result (0600,
+  under the gitignored sessions directory) with the range it covers and
+  tops it up every ten minutes from `covered_until`. A case applies what
+  is held - no request - and a case before the first build finishes is
+  refused with `vocabulary_building`. Nothing is learnt from a partial,
+  failed or timed-out read: the build is abandoned and the saved
+  vocabulary is untouched. The read now takes no input from Claude at all,
+  not even a time bound. Measured in es-eval with the stub charging
+  `PAGE_SECONDS` (8-35s per field per page): 17 requests and 326 simulated
+  seconds for the first build, 5 requests and 97 seconds for a top-up,
+  0 requests for a case (`window_case_shown`,
+  `vocabulary_build_in_budget`, `vocabulary_building_refuses`).
+  New declared costs: the first sign-in takes minutes; real names sit on
+  disk in `out/es/vocabulary.json`; a name older than the build's range,
+  or newer than the last top-up, is not known.
 - **Tenant, resource and site names with no marker** (`eseval.UNMARKED_NAMES`):
   the same shape for the other name fields, each message on a document
   whose own fields hold a different tenant. Before the fix they failed
