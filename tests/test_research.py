@@ -276,3 +276,17 @@ def test_url_label_does_not_swallow_trailing_punctuation():
                           tier2="none")
     assert ": 429 Too Many Requests" in res.output["message"]
     assert all(not v.endswith(":") for v in res.mapping.values())
+
+
+def test_the_scrub_record_names_readable_words_as_labels_and_does_not_refuse(tmp_path):
+    """A name left readable is the declared trade, not a defect: it goes in
+    the record so the run can be asked about it, as labels (the file is
+    meant to be safe to keep), and it never makes the run refuse."""
+    out = tmp_path / "x.obfuscated.json"
+    out.write_text('{"a": "<Org-01>"}', encoding="utf-8")
+    research.write_scrub_record(out, out.read_text(), {
+        "leaks": [], "degraded_lines": 0, "mapped_values": 3, "secrets_destroyed": 0,
+        "readable_words": ["<Org-01>"]})
+    rec = json.loads(research.scrub_record_path(out).read_text())
+    assert rec["readable_words"] == ["<Org-01>"]
+    assert "Archive" not in json.dumps(rec)

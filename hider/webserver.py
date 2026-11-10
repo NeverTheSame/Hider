@@ -95,7 +95,7 @@ details summary{cursor:pointer;color:var(--mut);margin-top:10px}
   <div class="row"><button id="go">Obfuscate</button><span id="msg" class="mut"></span></div>
 </div>
 <div id="res" hidden>
-  <div class="card"><div class="grid" id="stats"></div><div id="types" style="margin-top:10px"></div><div id="leak" style="margin-top:10px"></div>
+  <div class="card"><div class="grid" id="stats"></div><div id="types" style="margin-top:10px"></div><div id="leak" style="margin-top:10px"></div><div id="readable" style="margin-top:10px"></div>
     <div class="row"><button id="dlOut">Download obfuscated JSON</button><button class="sec" id="dlMap">Download mapping (contains real values)</button></div>
     <p id="saved" class="mut" style="font-size:12px;margin:10px 0 0"></p>
     <details><summary>Preview</summary><pre id="preview"></pre></details>
@@ -217,6 +217,14 @@ function show(j){$("res").hidden=false;const s=j.stats;
   $("leak").innerHTML=s.leaks.length?'<span class="bad">Original values still present for: '+s.leaks.map(esc).join(", ")+'. Review before sharing.</span>'
     :(s.degraded_lines?'<span class="bad">Some lines degraded (a tier failed). Review before sharing.</span>':'<span class="ok">Leak check passed: no mapped original value appears in the output.</span>');
   if(s.leaks.length||s.degraded_lines)$("leak").innerHTML+=' <span class="bad">This run is recorded as flagged and the Claude Code step will refuse it.</span>';
+  // Names that are ordinary words: labelled in their own field, readable as
+  // English elsewhere. The run is clean and stays clean - this is the
+  // declared trade - but a clean run looks the same either way, so name
+  // them. The labels come back in the stats; the words come from the
+  // mapping, which never leaves this machine.
+  const rw=(s.readable_words||[]).map(l=>j.mapping[l]||l);
+  $("readable").innerHTML=rw.length?'<span class="bad">'+rw.length+' name(s) are ordinary words and stay readable in text outside the record that holds them: '
+    +rw.map(esc).join(", ")+'. Add any that is a real customer name as a term above and obfuscate again to hide it everywhere.</span>':"";
   $("saved").textContent="Saved as run "+j.run+": "+j.saved.output+"  |  "+j.saved.mapping;
   $("preview").textContent=j.output_text.length>200000?j.output_text.slice(0,200000)+"\n... (truncated preview, download for full file)":j.output_text;}
 const stem=()=>name.replace(/\.(jsonl?|txt)$/i,"");

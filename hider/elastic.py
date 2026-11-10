@@ -54,6 +54,7 @@ What the scrubber promises
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
@@ -164,31 +165,14 @@ NO_VOCABULARY_TYPES: dict[str, str] = {
                      "INSTANCE_NAME"), "one value per machine; shaped, found by tier 1 or a site shape"),
     **dict.fromkeys(("TENANT_SIZE", "CLOUD_ACCOUNT"), "a number: it would erase counts from text"),
 }
-#: One-word names that are ordinary words in log text. A one-word name is
-#: matched as a word anywhere in a message, so a resource called "Archive"
-#: would hide "archive" from every line. These are never vocabulary; their
-#: own field still gets its label. A fixed list on purpose, not the system
-#: dictionary: what is hidden must not depend on the machine it runs on.
-ORDINARY_NAME_WORDS: frozenset[str] = frozenset({
-    "archive", "archives", "backup", "backups", "default", "defaults", "primary", "secondary",
-    "main", "master", "test", "tests", "testing", "dev", "development", "prod", "production",
-    "staging", "stage", "demo", "sandbox", "legacy", "temp", "tmp", "shared", "public",
-    "private", "general", "common", "global", "local", "internal", "external", "data",
-    "files", "file", "documents", "document", "reports", "report", "mail", "mailbox",
-    "mailboxes", "inbox", "sites", "site", "teams", "team", "users", "user", "admin",
-    "admins", "finance", "legal", "sales", "marketing", "support", "operations", "security",
-    "compliance", "audit", "records", "projects", "project", "exports", "export", "imports",
-    "import", "logs", "log", "system", "service", "services", "server", "servers", "cloud",
-    "storage", "vault", "store", "repository", "library", "home", "office", "retention",
-    "hold", "policy", "policies", "daily", "weekly", "monthly", "nightly", "hourly", "full",
-    "incremental", "delta", "sync", "job", "jobs", "task", "tasks", "queue", "worker",
-    "workers", "agent", "agents", "engine", "cache", "index", "database", "network", "quota",
-    "limit", "tenant", "tenants", "resource", "resources", "new", "old", "copy", "final",
-    "draft", "current", "latest", "standard", "basic", "premium", "trial", "other", "misc",
-    "all", "everyone", "group", "groups", "contacts", "calendar", "notes", "tasks", "onedrive",
-    "sharepoint", "exchange", "outlook", "teams", "graph", "portal", "intranet", "extranet",
-    *(w for w in paths.STRUCTURAL if " " not in w),
-})
+#: One-word names that are ordinary words in log text. The list lives in
+#: ``jsonscrub`` because both scrubbers read it - the Elasticsearch one
+#: here (``vocabulary_skip``, ``readable_in_text``) and the JSON-export
+#: one (``jsonscrub._ordinary_name``) - and the import direction only
+#: allows elastic -> jsonscrub. One list, not two copies: a word added
+#: for one surface must mean the same on the other. This name stays as
+#: the documented spelling; the contents are unchanged.
+ORDINARY_NAME_WORDS: frozenset[str] = jsonscrub.ORDINARY_NAME_WORDS
 #: Elasticsearch names a data stream's backing indices
 #: ``.ds-<stream>-<yyyy.MM.dd>-<generation>``, and a hit names the backing
 #: index, never the stream the query targeted. The suffix is fixed, so the
@@ -219,10 +203,14 @@ class Refused(Exception):
     show to the model: it names the rule, not the data.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, label: str | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        #: the label a refusal was about, for the decision log. A label is
+        #: not a value - it is what Claude typed - so logging it is safe,
+        #: and it is the only way to see a case guessing at labels.
+        self.label = label
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +716,29 @@ class EsScrubber(jsonscrub.JsonScrubber):
         #: label -> entity type, so a label can be checked against the field
         #: it is used to filter
         self.types: dict[str, str] = {}
+        #: Labels this case has actually been **shown**: seeded by the
+        #: human, or carried in a page, an aggregation or a tool reply that
+        #: went back to Claude. Only these may be used in a query.
+        #:
+        #: The mapping is not that set and cannot be used as it: applying a
+        #: cluster vocabulary mints a label for every name on the estate,
+        #: so every low ``<Org-NN>`` exists before a case asks anything. A
+        #: guessed label would then resolve to some other customer's name
+        #: and the query would run - nobody is unmasked, but the case can
+        #: reach and count every customer on the cluster, which it could
+        #: not do before the vocabulary existed.
+        self.shown: set[str] = set()
+        # ``readable_words`` and the ``ordinary_words_case_wide`` measurement
+        # switch are inherited from JsonScrubber: one shared rule, two ways
+        # of deciding which values it covers (the site map here, key
+        # classification in an export). See :meth:`readable_in_text`.
+        #: label -> the site-map field the readable word came from. The
+        #: field is a decision, not data, so it can be reported where the
+        #: word itself cannot: it is what tells an operator *which* name
+        #: to go and look at before seeding it.
+        self.readable_fields: dict[str, str] = {}
+        self._learnable_patterns = {r.pattern for r in config.learnable_rules}
+        self._learnable_types = {r.type for r in config.learnable_rules}
         self.dropped: dict[str, int] = {}
         self.responses = 0
         self.refusals: dict[str, int] = {}
@@ -754,11 +765,43 @@ class EsScrubber(jsonscrub.JsonScrubber):
 
     # -- labels ------------------------------------------------------------
 
+    def readable_in_text(self, rule: FieldRule, value: str) -> bool:
+        """Whether this value keeps its label in its own field but stays an
+        ordinary word everywhere else.
+
+        The vocabulary already declares these words readable: a one-word
+        name on :data:`ORDINARY_NAME_WORDS`, a log word, a stopword, a
+        value with no letters (:meth:`vocabulary_skip`). Harvesting a page
+        used to override that declaration by the back door - a job called
+        ``Backup`` seen in its own field was indexed for the case-wide
+        sweep, and from then on *every* message in the case lost the word
+        ("Backup window opened" -> "<Job-12> window opened"). About 7 in
+        100 common job names are ordinary words, so it happened on the
+        first pages, and which pages came first decided what a later page
+        said.
+
+        Only for a field the vocabulary could learn: a value seeded by the
+        human ("the case is about Backup") is a deliberate instruction to
+        hide the word, and its rule is not one of these.
+        """
+        return (rule.pattern in self._learnable_patterns
+                and not self.ordinary_words_case_wide
+                and bool(self.vocabulary_skip(value)))
+
     def label_for(self, rule: FieldRule, value: str, *, parts: bool = True) -> str:
         """The stable label for a value seen under an identifier rule."""
         n = jsonscrub._norm(value)
         if n in self.known:
             return self.known[n]
+        if rule.shape is None and self.readable_in_text(rule, value):
+            # Labelled in its own field, and findable by that label, but
+            # never indexed for the case-wide sweep. The document that owns
+            # it still hides it in its own text (_local_sweep).
+            label = self._label(rule.type, value, index=False)
+            self.types.setdefault(label, pseudonym._canonical_type(rule.type, value))
+            self.readable_words[label] = value
+            self.readable_fields.setdefault(label, rule.pattern)
+            return label
         if rule.shape is not None:
             m = rule.shape.fullmatch(value.strip())
             if m is not None:
@@ -790,7 +833,11 @@ class EsScrubber(jsonscrub.JsonScrubber):
             if r.kind == "identifier" and r.type == etype and r.shape is not None:
                 rule = r
                 break
-        return self.label_for(rule, value)
+        label = self.label_for(rule, value)
+        # the human is given this label to hand to Claude, so it counts as
+        # shown: it is the one label a case starts with
+        self.shown.add(label)
+        return label
 
     def _remember(self, value: str, label: str, etype: str, *, index: bool = True,
                   force: bool = False) -> None:
@@ -798,10 +845,60 @@ class EsScrubber(jsonscrub.JsonScrubber):
         self.types.setdefault(label, etype)
 
     def resolve_label(self, label: str) -> tuple[str, str] | None:
-        """(value, type) for a label this session minted, else None."""
+        """(value, type) for a label this session minted, else None.
+
+        Unmasking an answer for the human. **A query must not use this**:
+        see :meth:`shown_label`.
+        """
         if label in self.mapping:
             return self.mapping[label], self.types.get(label, "")
         return None
+
+    def shown_label(self, label: str) -> tuple[str, str] | None:
+        """(value, type) for a label this case was **shown**, else None.
+
+        What a query may resolve. A label that exists but has not been
+        shown is indistinguishable here from one that was never issued -
+        both are None, so both refuse the same way and a refusal never
+        tells a live guess from a dead one.
+        """
+        return self.resolve_label(label) if label in self.shown else None
+
+    #: A label embedded in text, for the ``<Type-NN>`` spelling and for a
+    #: site map's shaped one (``ctr-amer-s01``, hyphens and all). A whole
+    #: string that is a label is matched directly, so this only has to
+    #: find the ones inside a message.
+    _LABEL_SHAPES = re.compile(r"<[^<>\s\"]{1,80}>|(?<![\w.-])[A-Za-z0-9][\w.-]*-s\d+")
+
+    def mark_shown(self, output: Any) -> None:
+        """Mark every label carried by something Claude is about to see.
+
+        One pass over the finished output rather than a hook in each
+        rewrite path, so a label cannot reach Claude by a route that
+        forgot to mark it: whatever is in the output is shown. Bucket keys
+        and identifier leaves are whole strings; a message carries labels
+        inside it.
+        """
+        if not self.mapping:
+            return
+
+        def walk(node: Any) -> None:
+            if isinstance(node, str):
+                if node in self.mapping:
+                    self.shown.add(node)
+                    return
+                for cand in self._LABEL_SHAPES.findall(node):
+                    if cand in self.mapping:
+                        self.shown.add(cand)
+            elif isinstance(node, dict):
+                for k, v in node.items():
+                    walk(k)
+                    walk(v)
+            elif isinstance(node, (list, tuple)):
+                for v in node:
+                    walk(v)
+
+        walk(output)
 
     # -- text -------------------------------------------------------------
 
@@ -985,6 +1082,10 @@ class EsScrubber(jsonscrub.JsonScrubber):
         leaks = self.leak_check(out)
         if leaks:
             raise self._refuse("leak", "response withheld: a known value survived redaction")
+        # This page is about to go to Claude, so every label in it is one
+        # the case may use from now on. After the leak check: a page that
+        # is refused was never shown and teaches no label.
+        self.mark_shown(out)
         stats = {
             "hits": len(rows),
             "mapped_values": len(self.mapping),
@@ -1045,7 +1146,43 @@ class EsScrubber(jsonscrub.JsonScrubber):
                     if self._mappable(v):
                         self.label_for(rule, str(v))
 
+    @contextlib.contextmanager
+    def _local_sweep(self, hit: Any):
+        """Hide this document's own ordinary-word names in *this* document's
+        text, and nowhere else.
+
+        A document whose job field says ``Backup`` and whose message says
+        "Backup finished" is naming the job twice; hiding one and not the
+        other would be pointless. On any other document the same word is
+        ordinary English and stays. The index entry lives for the length
+        of one hit, which is what makes a page scrub the same whatever
+        pages came before it.
+        """
+        local: list[str] = []
+        if self.readable_words and isinstance(hit, dict):
+            for section in ("_source", "fields"):
+                if not isinstance(hit.get(section), dict):
+                    continue
+                for path, value in self._leaves(hit[section]):
+                    rule = self._rule_for(path)
+                    if rule is None or rule.kind != "identifier" or not isinstance(value, str):
+                        continue
+                    n = jsonscrub._norm(value)
+                    if self.known.get(n) in self.readable_words and n not in local:
+                        local.append(n)
+        for n in local:
+            self._index_value(n)
+        try:
+            yield
+        finally:
+            for n in local:
+                self._unindex_value(n)
+
     def _rewrite_hit(self, hit: dict) -> dict:
+        with self._local_sweep(hit):
+            return self._rewrite_hit_inner(hit)
+
+    def _rewrite_hit_inner(self, hit: dict) -> dict:
         out: dict[str, Any] = {"_index": hit["_index"]}
         if "_id" in hit and hit["_id"] is not None:
             out["_id"] = self.label_for(self._meta["_id"], str(hit["_id"]))
@@ -1233,12 +1370,16 @@ class EsScrubber(jsonscrub.JsonScrubber):
             if node in self.mapping:
                 return node
             n = jsonscrub._norm(node)
-            if n in self.known and n not in jsonscrub._STOPWORDS:
+            # The whole-string branch has to honour the readable-word rule
+            # too, or a message that is just "Backup" would lose the word
+            # case-wide by this route while the sweep index does not.
+            if n in self.known and n not in jsonscrub._STOPWORDS \
+                    and self.known[n] not in self.readable_words:
                 return self.known[n]
             return self._substitute(node)
         if isinstance(node, (int, float)) and not isinstance(node, bool):
             n = jsonscrub._norm(str(node))
-            if n in self.known:
+            if n in self.known and self.known[n] not in self.readable_words:
                 return self.known[n]
         return node
 
@@ -1257,6 +1398,11 @@ class EsScrubber(jsonscrub.JsonScrubber):
             "schema": SESSION_SCHEMA,
             "mapping": self.mapping,
             "types": self.types,
+            # labels only, no values: which of them the case has been shown
+            "shown": sorted(self.shown),
+            # labels only: which of them are ordinary words, labelled in
+            # their own field and readable in text everywhere else
+            "readable_words": sorted(self.readable_words),
         }, indent=1), encoding="utf-8")
         return d
 
@@ -1280,6 +1426,36 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 s.types.setdefault(label, etype)
                 continue
             s._remember(value, label, etype)
+        # Which labels this case had been shown. A case saved **before**
+        # that was recorded gets none: the mapping cannot stand in for it,
+        # because a case saved after a cluster vocabulary was applied holds
+        # a label for every name on the estate, and trusting those would
+        # restore exactly the guessing channel this closes. The cost is
+        # that a restored old case must see a label on a page again (one
+        # query) or have its term re-seeded before using it.
+        s.shown = {lab for lab in raw.get("shown") or () if lab in s.mapping}
+        # Which labels are ordinary words, labelled in their own field and
+        # readable in text everywhere else. A case saved **before** this was
+        # recorded has them indexed for the case-wide sweep, as it was saved;
+        # the declared default is to **demote them**, by the same test a
+        # fresh case applies, so a restored case scrubs a page exactly as a
+        # fresh one does - determinism is the property the rule exists for,
+        # and a case that changed its mind about a word on restart would
+        # have none of it. The cost: a word that was being hidden case-wide
+        # becomes readable outside its own document, and an ordinary word
+        # the human *seeded* on purpose is demoted with the rest (it cannot
+        # be told from a harvested one with only the type to go on) - seed
+        # it again to get it back.
+        saved = raw.get("readable_words")
+        labels = list(saved) if saved is not None else [
+            lab for lab, value in s.mapping.items()
+            if s.types.get(lab) in s._learnable_types and cls.vocabulary_skip(value)]
+        for lab in labels:
+            value = s.mapping.get(lab)
+            if value is None:
+                continue
+            s.readable_words[lab] = value
+            s._unindex_value(jsonscrub._norm(value))
         return s
 
 

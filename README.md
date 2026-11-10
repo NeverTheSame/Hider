@@ -461,6 +461,25 @@ and a loopback-only web UI wraps the whole loop:
    a label -> original mapping, and the scrubber's verdict (`.scrub.json`:
    leak-check labels, degraded line count, a hash of the output; no values)
    are written to `out/json/` (gitignored).
+   **A name that is an ordinary English word stays readable as a word.** A
+   tenant or job field whose value is on the shared
+   `jsonscrub.ORDINARY_NAME_WORDS` list ("Archive", "Retention",
+   "Mailbox"...) gets its label in its own field and is hidden in text only
+   inside the record (top-level list element; a single-object export is one
+   record) whose own field holds it; every other record's "Moved 40 items
+   to archive, retention unchanged" keeps its words. On the invented
+   three-ticket export in `test_jsonscrub.py`, 3 of 6 name values are
+   ordinary words and one ticket's note lost all three before this rule,
+   none after. The cost, declared: a customer actually named `Archive` is
+   readable in other records' prose - seed the name as a `--term` to hide
+   it everywhere, which still wins over this rule. **The run tells you
+   which names those were**, since a clean verdict looks the same either
+   way: `scrub-json` prints a `READABLE:` line naming them and the web UI
+   shows them beside the leak check, both resolved locally from the
+   mapping, while `.scrub.json` records the *labels* only (decisions, not
+   data) and does not refuse the run. Seeding a reported name takes it off
+   the next run's list. `es-smoke` prints the same line for a Kibana page,
+   on stderr; its decision log keeps counts and labels, never the words.
 3. **Ask Claude Code.** The run is checked first, against its own verdict:
    a run the leak check flagged, one with degraded lines, one whose record
    is missing, malformed or does not match the file on disk, is refused

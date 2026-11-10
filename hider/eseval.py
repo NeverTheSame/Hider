@@ -336,6 +336,7 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
     out.extend(bulk_job_docs(bulk_jobs or 0))
     if estate:
         out.extend(estate_docs(ts, servers))
+        out.extend(ordinary_word_docs(ts, servers))
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
@@ -1082,6 +1083,87 @@ def estate_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list
             "agent": {"name": ctr.name},
             "host": {"name": ctr.name, "ip": ctr.ip},
             "labels": {"tenant_name": other.name, "tenant_id": other.tenant_id},
+        }, {}))
+    return docs
+
+
+# ---------------------------------------------------------------------------
+# Names that are ordinary words
+# ---------------------------------------------------------------------------
+#
+# A job really called "Backup" is a name in its own field and an ordinary
+# English word everywhere else. The vocabulary already knows that and skips
+# it (``elastic.ORDINARY_NAME_WORDS``), but harvesting a page used to
+# override the decision: one document whose job field said "Backup" made
+# the word a known value for the whole case, and from then on every message
+# lost it ("Backup window opened" -> "<Job-12> window opened"). On a real
+# cluster about 7 in 100 common job names are ordinary words, so it
+# happened on the first pages, and which page came first decided what a
+# later page said.
+#
+# These documents sit **outside** ``vocabulary.days`` on purpose: the
+# labels here come from harvesting a page, not from the vocabulary build,
+# which is exactly the route that bypassed the rule - and it keeps the
+# build's measured cost unchanged. Appended after the estate; all names
+# invented in the sense that matters here, which is that they are ordinary
+# words and nobody's customer.
+
+#: Seven job names that are ordinary words. Every one is on
+#: ``elastic.ORDINARY_NAME_WORDS``, which is what makes the vocabulary skip
+#: it; the list itself is not changed here.
+ORDINARY_WORD_JOBS: tuple[str, ...] = (
+    "Backup", "Retention", "Mailbox", "Inbox", "Audit", "Storage", "Sandbox")
+#: the page that shows those names in their own fields, and the page of
+#: ordinary messages that use the same words as English
+ORDINARY_RANGE = {"gte": "now-41d", "lte": "now-39d"}
+ORDINARY_OWN_PHRASE = "closed its run book entry"
+ORDINARY_TEXT_PHRASE = "queued behind the overnight window"
+#: (job name, the ordinary English sentence that uses the word)
+ORDINARY_MESSAGES: tuple[tuple[str, str], ...] = (
+    ("Backup", "Backup window opened, 14 items queued behind the overnight window"),
+    ("Retention", "Retention policy applied to 3 sites, queued behind the overnight window"),
+    ("Mailbox", "Mailbox quota raised for 2 users, queued behind the overnight window"),
+    ("Inbox", "Inbox rules synced for the team, queued behind the overnight window"),
+    ("Audit", "Audit log export started, queued behind the overnight window"),
+    ("Storage", "Storage tier changed to cool, queued behind the overnight window"),
+    ("Sandbox", "Sandbox refresh scheduled, queued behind the overnight window"),
+)
+
+
+def ordinary_word_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) -> list[Doc]:
+    """Two documents per ordinary-word job name: the one whose own field
+    holds it (and whose message names it twice over), and one whose message
+    just uses the word. Positions, not draws; not ground truth."""
+    docs: list[Doc] = []
+    ctr, prx = servers["ctr"][3], servers["prx"][5]
+    t = tenants[6]
+    for i, (job, message) in enumerate(ORDINARY_MESSAGES):
+        at = (NOW - timedelta(days=40) - timedelta(minutes=2 * i)) \
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-app-*", {
+            "@timestamp": at,
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success", "action": "job-step"},
+            "log": {"level": "info", "logger": "Engine.Jobs"},
+            # the owning document names the job in its text too
+            "message": f"{job} {ORDINARY_OWN_PHRASE} after 2 retries",
+            "agent": {"name": ctr.name},
+            "host": {"name": ctr.name, "ip": ctr.ip},
+            "labels": {"tenant_name": t.name, "tenant_id": t.tenant_id},
+            "job": {"name": job, "status": "Success"},
+            "service": {"name": "backup-engine", "version": "8.4.1"},
+        }, {}))
+        later = (NOW - timedelta(days=40) + timedelta(minutes=2 * i + 1)) \
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc("logs-worker-*", {
+            "@timestamp": later,
+            "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+            "event": {"outcome": "success"},
+            "log": {"level": "info"},
+            "message": message,
+            "agent": {"name": prx.name},
+            "host": {"name": prx.name, "ip": prx.ip},
+            "labels": {"tenant_name": t.name, "tenant_id": t.tenant_id},
         }, {}))
     return docs
 
@@ -2545,6 +2627,166 @@ def mcp_gates(m: dict) -> dict[str, bool]:
     }
 
 
+def run_ordinary_word_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
+                           vocab: elastic.ClusterVocabulary, *, tier2: str,
+                           timings: list[float]) -> dict:
+    """A job name that is an ordinary word, before and after the rule.
+
+    Two pages, in order: one showing the names in their own ``job.name``
+    fields, then one of ordinary messages that use the same words as
+    English. Run twice - once with ``ordinary_words_case_wide`` (the old
+    behaviour, kept as a measurement switch) and once without - so the
+    before and after figures come from the same documents.
+
+    Also checked: the word is still hidden in the text of the document
+    whose own field holds it, the label still filters, and the second page
+    scrubs identically whether or not the first page came before it, which
+    is the property that was actually broken.
+    """
+    out: dict = {"words": len(ORDINARY_WORD_JOBS), "labelled_in_field": 0,
+                 "swept_before": 0, "swept_after": 0, "readable_after": 0,
+                 "own_doc_hidden": 0, "filter_by_label": False, "deterministic": False}
+    own_q = {"index": "logs-app-*", "time_range": ORDINARY_RANGE, "size": 20,
+             "filters": [{"field": "message", "op": "phrase", "value": ORDINARY_OWN_PHRASE}]}
+    text_q = {"index": "logs-worker-*", "time_range": ORDINARY_RANGE, "size": 20,
+              "filters": [{"field": "message", "op": "phrase", "value": ORDINARY_TEXT_PHRASE}]}
+
+    def pages(case_wide: bool) -> tuple[list[str], list[str], elastic.EsScrubber]:
+        sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+        sess.scrubber.ordinary_words_case_wide = case_wide
+        own, _refused, dt, _c = sess.call(own_q)
+        timings.append(dt)
+        text, _refused, dt, _c = sess.call(text_q)
+        timings.append(dt)
+        return _messages(own), _messages(text), sess.scrubber
+
+    # before: the word is harvested from its own field and swept everywhere
+    _own_before, text_before, _s = pages(True)
+    out["swept_before"] = sum(1 for job, _m in ORDINARY_MESSAGES
+                              if not any(job in m for m in text_before))
+    # after: labelled in its own field, ordinary English everywhere else
+    own_after, text_after, s = pages(False)
+    out["swept_after"] = sum(1 for job, _m in ORDINARY_MESSAGES
+                             if not any(job in m for m in text_after))
+    out["readable_after"] = len(ORDINARY_MESSAGES) - out["swept_after"]
+    out["labelled_in_field"] = sum(1 for job in ORDINARY_WORD_JOBS
+                                   if s.known.get(jsonscrub_norm(job)) is not None)
+    out["label_count"] = len(s.readable_words)
+    # the owning document still hides the name in its own text
+    out["own_doc_hidden"] = sum(1 for job in ORDINARY_WORD_JOBS
+                                if not any(job in m for m in own_after))
+    # the label still filters, on its own field
+    label = s.known.get(jsonscrub_norm(ORDINARY_WORD_JOBS[0]))
+    if label:
+        # the filtering case has to be shown the label first (see the
+        # label-guessing rule), so it runs the own-field page and then
+        # filters by what that page showed it
+        hit2, refused2 = _label_filter(cfg, engine, vocab, tier2, label, timings)
+        out["filter_by_label"] = refused2 is None and hit2 is not None and (
+            (hit2["hits"]["total"] or {}).get("value", 0) == 1)
+    # the second page reads the same with no first page at all
+    alone = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+    page, _refused, dt, _c = alone.call(text_q)
+    timings.append(dt)
+    out["deterministic"] = _messages(page) == text_after
+    return out
+
+
+def _label_filter(cfg, engine, vocab, tier2, label, timings):
+    """Filter by a label on the case that was shown it: the own-field page
+    first, then the filter."""
+    sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+    _own, _refused, dt, _c = sess.call({
+        "index": "logs-app-*", "time_range": ORDINARY_RANGE, "size": 20,
+        "filters": [{"field": "message", "op": "phrase", "value": ORDINARY_OWN_PHRASE}]})
+    timings.append(dt)
+    out, refused, dt, _c = sess.call({
+        "index": "logs-app-*", "time_range": ORDINARY_RANGE, "size": 5,
+        "filters": [{"field": "job.name", "op": "eq", "value": label}]})
+    timings.append(dt)
+    return out, refused
+
+
+def jsonscrub_norm(value: str) -> str:
+    from . import jsonscrub
+
+    return jsonscrub._norm(value)
+
+
+def run_guess_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
+                   vocab: elastic.ClusterVocabulary, *, tier2: str,
+                   timings: list[float]) -> dict:
+    """Label guessing on the estate: every guess refused, a shown label kept.
+
+    With a cluster vocabulary applied a case holds a label for every name
+    on the estate, so ``<Org-77>`` and its neighbours are live references
+    to customers the case has never seen. Guessing them would let a case
+    reach and count the whole cluster - no name revealed, every customer
+    countable. A label is usable only after the case has been shown it.
+
+    Both halves matter and are measured together: the guesses are refused
+    (and with the same code and message as a label that does not exist, so
+    a refusal is not an oracle), and a label the case *was* shown still
+    works in the next query, or the rule would simply have broken the
+    tool.
+    """
+    out = {"guesses": 0, "refused": 0, "codes": {}, "resolvable_in_mapping": 0,
+           "same_message_as_dead": False, "requests": 0,
+           "shown_label_works": False, "shown_labels_before_page": 0,
+           "logged_label_never_value": True}
+    sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+    s = sess.scrubber
+    # The dangerous state, and the ordinary one: the cluster vocabulary is
+    # applied, so this case holds a label for every name on the estate
+    # before it has been shown a single page.
+    s.apply_vocabulary("stub", vocab)
+    tr = {"gte": "now-6h", "lte": "now"}
+    before_requests = len(engine.requests)
+
+    # A fresh case: nothing seeded, no page yet. Guess a hundred low
+    # numbers - on this estate most of them are live labels.
+    for n in range(1, 101):
+        label = f"<Org-{n:02d}>"
+        _out, refused, dt, _c = sess.call({
+            "index": "logs-app-*", "time_range": tr, "size": 5,
+            "filters": [{"field": "labels.tenant_name", "op": "eq", "value": label}]})
+        timings.append(dt)
+        out["guesses"] += 1
+        out["resolvable_in_mapping"] += int(s.resolve_label(label) is not None)
+        if refused is None:
+            continue
+        out["refused"] += 1
+        out["codes"][refused.code] = out["codes"].get(refused.code, 0) + 1
+        out["logged_label_never_value"] = out["logged_label_never_value"] and (
+            refused.label == label and not any(
+                v and v in (refused.message or "") for v in s.mapping.values()))
+    # a label that does not exist at all must read the same way
+    _out, dead, dt, _c = sess.call({
+        "index": "logs-app-*", "time_range": tr, "size": 5,
+        "filters": [{"field": "labels.tenant_name", "op": "eq", "value": "<Org-999977>"}]})
+    timings.append(dt)
+    live = sess.log[0]
+    out["same_message_as_dead"] = bool(dead) and dead.code == "unknown_label"
+    out["requests"] = len(engine.requests) - before_requests   # no guess reached Kibana
+    out["shown_labels_before_page"] = len(s.shown)
+
+    # Now show the case a page, and use a label off it in the next query.
+    page, refused, dt, _c = sess.call({
+        "index": "logs-app-*", "time_range": tr, "size": 5})
+    timings.append(dt)
+    shown = sorted(lab for lab in s.shown if s.types.get(lab) == "ORG_NAME")
+    if shown:
+        hit, refused2, dt, _c = sess.call({
+            "index": "logs-app-*", "time_range": tr, "size": 5,
+            "filters": [{"field": "labels.tenant_name", "op": "eq", "value": shown[0]}]})
+        timings.append(dt)
+        out["shown_label_works"] = refused2 is None and hit is not None and (
+            (hit["hits"]["total"] or {}).get("value", 0) > 0)
+    out["shown_after_page"] = len(s.shown)
+    del live
+    return out
+
+
 def run_estate_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
                     vocab: elastic.ClusterVocabulary, *, tier2: str,
                     timings: list[float]) -> dict:
@@ -2696,8 +2938,14 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
     s = sess.scrubber
 
-    # The human seeds the case with the tenant it is about, locally.
+    # The human seeds the case with the tenant it is about, locally - and
+    # with the two values the oracle cases are written against, as the MCP
+    # eval does with its terms. A seeded label is one the case has been
+    # shown, which is what makes "a label of the wrong type" (rather than
+    # "a label you were never shown") the thing those cases test.
     case_label = s.seed(fx.tenants[0].name)
+    s.seed(next(sv.name for sv in fx.servers if "-amer-" in sv.name), "SERVER_NAME")
+    s.seed(fx.tenants[0].tenant_id, "TENANT_ID")
 
     labels: dict[str, list[str]] = {}  # type -> labels learnt so far
     _seen_labels: set[str] = set()     # membership, so learn() stays linear:
@@ -2705,10 +2953,14 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # labels, and a list scan per label per query is quadratic twice over
 
     def learn() -> None:
-        for label, t in s.types.items():
+        # the labels this case has been **shown**, which is the set a query
+        # may use: the mapping holds one per vocabulary name too, and those
+        # are exactly what a case may not reach (see the label-guessing
+        # oracle cases)
+        for label in s.shown:
             if label not in _seen_labels:
                 _seen_labels.add(label)
-                labels.setdefault(t, []).append(label)
+                labels.setdefault(s.types.get(label, ""), []).append(label)
 
     learn()
     results: list[dict] = []
@@ -2873,6 +3125,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     default_map["readable_all_skipped"] = all(dropped.get(n) for n in readable)
 
     estate = run_estate_eval(cfg, engine, vocab, tier2=tier2, timings=timings)
+    guesses = run_guess_eval(cfg, engine, vocab, tier2=tier2, timings=timings)
+    ordinary = run_ordinary_word_eval(cfg, engine, vocab, tier2=tier2, timings=timings)
 
     # The keep-field leak: the level value that is a SharePoint personal-site
     # URL, shown both ways it reaches Claude - in a hit, and as a bucket key
@@ -3007,6 +3261,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "fresh_case": fresh,
         "default_map": default_map,
         "estate": estate,
+        "label_guessing": guesses,
+        "ordinary_words": ordinary,
         "keep_field": keep,
         "window_case": window_case,
         "building_case": building,
@@ -3056,6 +3312,30 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "estate_no_unexpected_readable": not estate["unexpected"]
         and estate["mentions"] > 0
         and all(c["shown"] for c in estate["classes"]),
+        # Label guessing on the estate: a fresh case guesses a hundred live
+        # vocabulary labels, every one is refused as unknown_label, no
+        # guess reaches Kibana, and a label the case *was* shown still
+        # works in the next query.
+        "label_guessing_refused":
+            guesses["refused"] == guesses["guesses"] == 100
+            and set(guesses["codes"]) == {"unknown_label"}
+            and guesses["resolvable_in_mapping"] > 0
+            and guesses["same_message_as_dead"]
+            and guesses["requests"] == 0
+            and guesses["logged_label_never_value"]
+            and guesses["shown_label_works"],
+        # A job name that is an ordinary word keeps its label in its own
+        # field, is hidden in the text of the document that owns it, and
+        # stays readable English on every other document - whatever pages
+        # the case saw first.
+        "ordinary_words_readable":
+            ordinary["readable_after"] == ordinary["words"] > 0
+            and ordinary["swept_after"] == 0
+            and ordinary["swept_before"] == ordinary["words"]
+            and ordinary["labelled_in_field"] == ordinary["words"]
+            and ordinary["own_doc_hidden"] == ordinary["words"]
+            and ordinary["filter_by_label"]
+            and ordinary["deterministic"],
         # and every level and outcome spelling the estate logs comes back
         # exactly as written, in bucket keys and in hit values
         "estate_spellings_unchanged": not estate["levels"]["changed"]
@@ -3129,6 +3409,39 @@ def _num(v: str):
         return int(v)
     except ValueError:
         return v
+
+
+def _ordinary_lines(o: dict | None) -> list[str]:
+    """Job names that are ordinary words: how many lose the word, before
+    and after."""
+    if not o:
+        return []
+    return [
+        f"ordinary words    {o['words']} job names that are ordinary words, all labelled in "
+        f"their own field ({o['labelled_in_field']}/{o['words']}); words lost from ordinary "
+        f"messages: {o['swept_before']} before the rule, {o['swept_after']} after "
+        f"({o['readable_after']}/{o['words']} readable)",
+        f"  and still       hidden in the text of the document that owns the name "
+        f"{o['own_doc_hidden']}/{o['words']}; the label filters its own field: "
+        f"{'yes' if o['filter_by_label'] else 'NO'}; the same page with no page before it reads "
+        f"the same: {'yes' if o['deterministic'] else 'NO - order still decides'}",
+    ]
+
+
+def _guess_lines(g: dict | None) -> list[str]:
+    """Label guessing: what a case can reach that it was never shown."""
+    if not g:
+        return []
+    return [
+        f"label guessing    {g['refused']}/{g['guesses']} guessed labels refused "
+        f"{g['codes'] or 'none'}, of which {g['resolvable_in_mapping']} are live vocabulary "
+        f"labels this case holds but was never shown; {g['requests']} reached Kibana; a label "
+        f"that does not exist refuses the same way: {g['same_message_as_dead']}; the log keeps "
+        f"the label and no value: {g['logged_label_never_value']}",
+        f"  shown labels    {g['shown_labels_before_page']} before the first page, "
+        f"{g.get('shown_after_page', 0)} after it; a label off that page works in the next "
+        f"query: {'yes' if g['shown_label_works'] else 'NO - the rule broke the tool'}",
+    ]
 
 
 def _slice_lines(s: dict | None) -> list[str]:
@@ -3219,6 +3532,8 @@ def format_report(r: dict) -> str:
         f"{d['requests']} requests over {d['cases']} cases in {d['seconds']}s, "
         f"values {d['values']}",
         *_estate_lines(r.get("estate")),
+        *_guess_lines(r.get("label_guessing")),
+        *_ordinary_lines(r.get("ordinary_words")),
         f"keep-field leak   hit {'shown' if r['keep_field']['hit_shown'] else 'NOT SHOWN'}, "
         f"{len(r['keep_field']['hit_leaks'])} leaks; aggregation "
         f"{r['keep_field']['bucket_keys']} bucket keys, {len(r['keep_field']['agg_leaks'])} leaks; "

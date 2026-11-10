@@ -311,326 +311,429 @@ Listed with owners in the README's Limitations section and in
 - The utility number is one model, one 40-line excerpt, fifteen questions.
 - The gateway serialises redaction; fine for a workstation, the first thing
   to change for a shared deployment.
-- **Elasticsearch: the declared text-query channel.** `esquery` lets a
-  phrase on a `text` field carry plain words, so a guessed word can be
-  confirmed by a hit count. Accepted by decision: every text query is
-  logged with its labels and counted by `es-eval`. The width of the
-  channel per query is capped: at most `max_phrases` distinct phrases
-  (site map, default 8, ceiling 16, 0 turns text queries off), counted
-  across the filters and every aggregation at any depth, so one `filters`
-  aggregation can no longer return a separate count for a whole word list
+- **Elasticsearch research.** Live Kibana through a closed grammar, a
+  long-lived broker that owns the only session, and an MCP server Claude
+  Code talks to. The rules below are what keeps a page safe to show;
+  each one says why, because the why is what stops the next change
+  undoing it.
+
+  **The query grammar, and the declared text-phrase channel.** `esquery`
+  lets a phrase on a `text` field carry plain words, so a guessed word
+  can be confirmed by a hit count. Accepted by decision: every text query
+  is logged with its labels and counted by `es-eval`. The width per query
+  is capped at `max_phrases` distinct phrases (site map, default 8,
+  ceiling 16, 0 turns text queries off), counted across the filters and
+  every aggregation at any depth, so one `filters` aggregation cannot
+  return a separate count for a whole word list
   (`phrase-flooded-filters-agg` is the oracle case). Distinct means per
   field, ignoring case and spacing: a phrase reused across buckets is one
   guess, which is also why the zero-hit check, built only from a query's
-  own filters, always fits the cap of the query it checks. What the cap
-  does **not** close: guesses across queries (`max_phrases` per query, queries
-  unlimited, no per-case budget; the log and `es-eval` count them, nothing
-  stops them); combinations of the allowed phrases (a `filters`
-  aggregation can still count up to `max_buckets` co-occurrences of its
-  allowed phrases, so it bounds the vocabulary per query, not the number of
-  counts); literals on `keep` fields, which are uncapped because a keep
-  field is declared non-sensitive (a sensitive value under `keep` is a
-  site-map error); and punctuation variants of one phrase, which count
-  separately (safe direction). OR across phrases is not built
-  (`any_of` waits for a decision). Identifier fields take
-  labels only; each forbidden shape (wildcard, prefix, range, sort, terms
-  include, scripts, raw DSL, literals, wrong-type labels) is an
-  `esquery.ORACLE_CASES` entry and must be refused with its declared code.
-  Add the case before the rule, as with `adversarial.CASES`. Only
-  `esbridge` opens a connection, and only from the broker's browser. The
-  SSO cookie never leaves Chrome and never reaches disk: Kibana's `sid` is
-  a session cookie that dies with the browser, so one long-lived broker
-  (`es-login` starts it, `es-smoke` talks to it over a 0600 socket) holds
-  the sign-in, and its Chrome context is off the record because a
-  persistent profile flushes even session cookies to its cookie database.
-  The stub enforces the same rules (cookie sessions, an IdP that refuses
-  headless and fetches) and names hits by data-stream backing index
-  (`.ds-<stream>-<date>-<gen>`), which `index_allowed` checks by stream. An
-  expired Kibana session is a 200 login page, not a 401, so every reply
-  goes through `KibanaSession.parse_reply` first. The MCP server
-  (`esmcp`) runs inside the broker, because the broker's thread owns the
-  browser: per-case bearer token, loopback, `Host` checked, no CORS. Its
-  tools take grammar keys only. Never add a tool that seeds a value,
-  signs in or unmasks: a value-to-label tool would let Claude mint a label
-  for a guess and confirm it with a count. Claude Code is launched with an
-  allowlisted environment (`esmcp.claude_env`); a variable it needs goes
-  on the allowlist, and nothing goes on a denylist. The prompt is gated
-  too (`esmcp.prompt_findings`), headless before launch and interactive
-  as a `UserPromptSubmit` hook whose command ends in `|| exit 2`, so a
-  broken check blocks. `es-eval` runs the fixture through the real MCP
-  endpoint (`mcp_*` gates); all pass. The job-name-in-free-text leak it
-  found (a fresh case's first page, the referenced job's field on another
-  document) is closed by `elastic._JOB_REF`: "job <Title Case run>" in a
-  text field is labelled JOB_NAME when the site map declares that type, at
-  the declared cost of hiding any capitalised run right after the word
-  "job". A customer name with no marker ("Harbour Nightly finished",
-  "Tenant Thornbury Estates exceeded its quota") is closed by the case's
-  **name vocabulary**: before a case's first page per cluster and every
-  `VOCABULARY_REFRESH_S` after, `esbridge.Bridge` reads every value of
-  every field in the site map's `vocabulary.fields` and makes each one a
-  known value under its field's own rule. Fields of a type in
-  `elastic.NO_VOCABULARY_TYPES` (accounts, ids,
-  machines, numbers), shaped fields and globs are refused at load. Values
-  that are log words, stopwords, letterless, one word under four
-  characters or one word on `elastic.ORDINARY_NAME_WORDS` are skipped (a
-  fixed list on purpose, not the system dictionary).
-  **With no `vocabulary` section the default is every field that could be
-  listed** (`ElasticConfig.learnable_rules`: non-glob, unshaped, type
-  outside `NO_VOCABULARY_TYPES`), which is exactly the set
-  `_parse_vocabulary` accepts - so the default can never be something a
+  own filters, always fits the cap of the query it checks.
+  What the cap does **not** close, all declared: guesses across queries
+  (`max_phrases` is per query, queries are unlimited and there is no
+  per-case budget; the log and `es-eval` count them, nothing stops them);
+  combinations of the allowed phrases (a `filters` aggregation can still
+  count up to `max_buckets` co-occurrences, so the cap bounds the
+  vocabulary per query, not the number of counts); literals on `keep`
+  fields, uncapped because a keep field is declared non-sensitive (a
+  sensitive value under `keep` is a site-map error); and punctuation
+  variants of one phrase, which count separately (safe direction). OR
+  across phrases is not built - `any_of` waits for a decision.
+  Identifier fields take labels only. Every forbidden shape (wildcard,
+  prefix, range, sort, terms include, scripts, raw DSL, literals,
+  wrong-type labels) is an `esquery.ORACLE_CASES` entry and must be
+  refused with its declared code. **Add the case before the rule**, as
+  with `adversarial.CASES`.
+
+  **The session lives in one browser, in one process.** Only `esbridge`
+  opens a connection, and only from the broker's Chrome. The SSO cookie
+  never leaves it and never reaches disk: Kibana's `sid` is a session
+  cookie that dies with the browser, so one long-lived broker holds the
+  sign-in (`es-login` starts it, `es-smoke` talks to it over a 0600
+  socket), and its Chrome context is off the record because a persistent
+  profile flushes even session cookies to its cookie database. An expired
+  Kibana session is a 200 login page, not a 401, so every reply goes
+  through `KibanaSession.parse_reply` first. A hit names its data-stream
+  backing index (`.ds-<stream>-<date>-<gen>`), which `index_allowed`
+  checks by stream. The stub enforces the same rules (cookie sessions, an
+  IdP that refuses headless and fetches).
+  Clients must tell a busy broker from a dead one: `broker_state` returns
+  `running`/`busy`/`absent` (a failed connect is absent, a timeout with
+  the socket file still there is busy), `cli._wait_for_vocabulary` treats
+  a refusal as "ask again" while ping still answers, and `es-logout`
+  retries for a minute and never says "no bridge" while the socket
+  exists - saying it at a live broker leaves the process holding the
+  Kibana session, which is the opposite of what es-logout is for.
+
+  **The MCP server runs inside the broker** (`esmcp`), because the
+  broker's thread owns the browser: per-case bearer token, loopback,
+  `Host` checked, no CORS. Its four tools (`es_schema`, `es_search`,
+  `es_count`, `es_aggregate`) take grammar keys only. **Never add a tool
+  that seeds a value, signs in or unmasks**: a value-to-label tool would
+  let Claude mint a label for a guess and confirm it with a count. Claude
+  Code is launched with an allowlisted environment (`esmcp.claude_env`) -
+  a variable it needs goes on the allowlist, and nothing goes on a
+  denylist. The prompt is gated too (`esmcp.prompt_findings`), headless
+  before launch and interactive as a `UserPromptSubmit` hook whose
+  command ends in `|| exit 2`, so a broken check blocks.
+
+  **A name in free text with nothing marking it.** "Harbour Nightly
+  finished", "Tenant Thornbury Estates exceeded its quota": no shape a
+  rule can read. Two mechanisms cover it.
+  `elastic._JOB_REF` labels "job \<Title Case run\>" in a text field as
+  JOB_NAME when the site map declares that type, at the declared cost of
+  hiding any capitalised run right after the word "job".
+  Everything else is covered by the cluster's **name vocabulary**: every
+  value of every field in `vocabulary.fields` becomes a known value under
+  its own field's rule. Fields of a type in `NO_VOCABULARY_TYPES`
+  (accounts, ids, machines, numbers), shaped fields and globs are refused
+  at load. With **no `vocabulary` section the default is every field that
+  could be listed** (`ElasticConfig.learnable_rules`: non-glob, unshaped,
+  type outside `NO_VOCABULARY_TYPES`) - exactly the set
+  `_parse_vocabulary` accepts, so the default can never be something a
   site map would be refused for, and a map listing everything it may list
   gets the same set as one listing nothing. It was JOB_NAME fields only,
-  which left tenant, tenant-full and resource names readable in message
-  text at every site that had not written the section: the common case,
-  and the fields most likely to hold the customer's name. A map that does
-  list `vocabulary.fields` keeps exactly its own list, and
-  `ElasticConfig.vocabulary_omitted` names what it leaves out - reported
-  in `vocabulary_report()["omitted"]` and on `es-smoke`'s `VOCAB` line as
-  `NOT READ (readable in text)`, field names only, names the map already
-  holds. Measured by `eseval.DEFAULT_MAP_*` (a map with the section
-  deleted, a one-hour case, tenant and resource names in message text with
-  their own fields on other documents outside the hour) behind the
-  `default_map_names_hidden` gate.
-  **Declared miss: a one-word tenant name the skip rules drop stays
-  readable.** Many real tenants are one word, and a one-word value that is
-  on `ORDINARY_NAME_WORDS` or shorter than four characters is never made
-  vocabulary, because registering it would hide that word from every
-  message. Of the eight invented one-word names in
-  `eseval.DEFAULT_MAP_ONE_WORD`, three are dropped (`Archive` and `Vault`
-  as `ordinary_word`, `Ops` as `short`) and two of those are then readable
-  in message text; the third happens to be caught by tier 2, which is luck
-  and not a rule to rely on. A site whose tenants are called `Archive` or
-  `Vault` gets no vocabulary protection for them and must seed the name
-  with `--term`. Widening the vocabulary to cover them is not the fix -
-  that is the skip rules' trade, out of scope here, and loosening it
-  erases the word everywhere.
-  **The realistic estate** (`eseval.estate_docs`, the `estate=True` half of
-  `generate`, reported by `run_estate_eval` under `realistic estate`) is
-  what that declared miss is now measured on. The tidy fixture - eight
-  tenants, seven level spellings, twelve thousand job names all of one
-  shape - cannot show which *shapes* survive. The estate is 10,000
-  tenants, 10,000 jobs and 100 resources in the shapes and proportions
-  measured on one real cluster (shapes and counts only, no values; every
-  name invented, built by position), with 149 free-text mentions carrying
-  no marker, and the seventeen level and three outcome spellings at their
-  measured skew (commonest level 47x the next, success 661x failure). Like
-  `BULK_JOBS` it is appended after the RNG stream and holds **no ground
-  truth**, so every existing gate sees what it saw. Thirteen shape classes,
-  each with its own page and its own line in the report: counts of names,
-  what the skip rules drop and why, and how many mentions stay readable.
-  Result: **every shape is hidden except one-word names the skip rules
-  drop** (24 of 149 mentions, all `ordinary_word`/`stopword`, 800 of 20,100
-  names), which is the declared miss above and is reported, not gated;
-  `estate_no_unexpected_readable` fails on anything else readable, whole or
-  by a word, and `estate_spellings_unchanged` pins all twenty spellings
-  byte-for-byte as hit values and as bucket keys. All-caps names, names
-  with digits and four-word job names are all covered. Costs: es-eval goes
-  from 88s to 115s, and a page per class rather than per mention is what
-  keeps it there. When adding a shape, add the class, not another fixture.
-  **An open consequence the estate found: with a vocabulary applied, a
-  guessed label is a live reference.** A case used to know only labels for
-  values it had seen, so `<Org-77>` was a guess and
-  `esquery.ORACLE_CASES["unknown-label"]` refused it. A sign-in build over
-  ten thousand tenants issues every low `<Org-NN>` before the case asks
-  anything, so that same guess now resolves to a real customer and the
-  query runs - label guessing, confirmed by hit count, over the whole
-  cluster rather than the case. Measured on the estate: applying the
-  build issues 20,033 `ORG_NAME` labels, and `<Org-77>` resolves to the
-  invented tenant `BRINDERWOLD GROUP`, which the case never saw. (It takes
-  effect from the case's second query: the vocabulary is applied after the
-  first query compiles.) The oracle case's number was moved above
-  any issuable label so it still tests what it means to test; the channel
-  itself is **not closed**. Closing it needs a decision (per-case label
-  namespaces, or labels that are not guessable integers) and a change to
-  how `label_for` numbers labels - out of scope for a fixture change.
-  **The read is sliced by day, newest first, and never blocks the broker.**
-  Measured on a real cluster, the whole-range build did not work at all:
-  one 1,000-value page over the **30-day** range takes **31 to 297
-  seconds**, not the 8 to 35 measured over an hour or a day, and a site
-  map with 12 learnable fields of ~10,000 names each needs over a hundred
-  pages - hours, against a twenty-minute budget. Worse, the broker ran a
-  whole page inside one serve-loop iteration on its only thread, so it
-  answered nothing while a page ran: `es-login`'s progress poll (60s
-  client timeout) hit its own broker and crashed with an uncaught refusal
-  after the first long page even though sign-in had worked, and `es-logout`
-  then read that timeout as "no bridge was running" and left the process
-  alive holding the Kibana session. Four changes, all defaults:
-  - **Slices.** `elastic.next_vocabulary_slice` hands out one
-    `VOCABULARY_SLICE_S` (one day) at a time, newest first and contiguous,
-    until the cover reaches `vocabulary.days`. Each slice is its own
-    `VocabularyBuild` and is saved by `VocabularyIndex` as soon as it is
-    whole, so a restart resumes instead of starting over, and a page is
-    charged the day-range cost rather than the 30-day one.
-  - **A case is served from the recent slices.** `ClusterVocabulary.serves`
-    is true once the cover spans `VOCABULARY_SERVE_DAYS` (2), so a case
-    about yesterday runs while the older slices are still being read;
-    before that it is still refused with `vocabulary_building`. The
-    report's state is `building` -> `extending` -> `ready`, and the VOCAB
-    line prints the covered range: **a name logged only in a day not yet
-    covered is not known until the build reaches it**, and that line is
-    where a user sees how far back the cover goes.
-  - **A step, not a page, per serve-loop iteration.**
+  which left tenant, tenant-full and resource names readable at every
+  site that had not written the section: the common case, and the fields
+  most likely to hold the customer's name. A map that does list
+  `vocabulary.fields` keeps exactly its own list, and
+  `vocabulary_omitted` names what it leaves out, reported by
+  `vocabulary_report()["omitted"]` and on the `VOCAB` line as `NOT READ
+  (readable in text)` - field names only. Gate:
+  `default_map_names_hidden`.
+
+  **The vocabulary is read once per cluster, at sign-in, in one-day
+  slices, newest first.** Never inside a case, and never from anything
+  Claude says - the read takes no input from Claude at all, not even a
+  time bound. Three shapes failed first, and each failure is why a part
+  of the current one exists: one capped `terms` aggregation over the
+  retention period refused every case on an estate past the cap; reading
+  the *case's own window* costs 8-35s per 1,000-value page, so a one-hour
+  case read 49 hours once a margin was added and every case was refused
+  again; and reading the whole 30-day range at once costs **31 to 297
+  seconds a page** (not 8-35), which on 12 name fields of ~10,000 values
+  is over a hundred pages - hours, against a twenty-minute budget.
+  So, today:
+  - `next_vocabulary_slice` hands out one `VOCABULARY_SLICE_S` (a day) at
+    a time, newest first and contiguous, until the cover reaches
+    `vocabulary.days`. A day-wide page is charged the cheap rate, and
+    `VocabularyIndex` saves each slice as soon as it is whole, so a
+    restart resumes rather than starting over.
+  - `VocabularyBuild` reads **one field per request** with an `exists`
+    filter on it, `VOCABULARY_PAGE` (1,000) values a page, carrying that
+    field's `after_key`. One field at a time because the cost is per
+    aggregation: a request carrying every field pays for all of them
+    before it can be stopped, logged or resumed. Fields are read
+    JOB_NAME-first, because a message naming a tenant almost always
+    carries the tenant fields on the same document (harvesting the page
+    covers it) while about three in four messages naming a job carry no
+    job field.
+  - **One step per serve-loop iteration**, not one page:
     `KibanaSession.submit` / `poll_once` / `release` are the three steps
-    `search` was already made of; `Broker.pump_vocabulary` now does one of
-    them per iteration and keeps the search in flight in `Broker._page`.
-    No iteration is longer than one poll interval, so ping, stop and tool
-    calls are answered mid-page.
-  - **The budget is per slice** (`vocabulary.budget_s`, still 1200s). One
-    slow slice fails alone, teaches the index nothing, and is retried
-    after `VOCABULARY_RETRY_S`; the slices already saved stay.
-  Clients tell a busy broker from a dead one: `esbridge.broker_state`
-  returns `running`/`busy`/`absent` (a failed connect is absent, a timeout
-  with the socket file present is busy), `_wait_for_vocabulary` treats a
-  refusal as "ask again" while ping still answers and returns as soon as
-  the cover *serves* rather than when it is complete, and `es-logout`
-  retries for a minute and never says "no bridge" while the socket is
-  there.
-  **What it costs, stated plainly.** On the es-eval fixture (5 fields,
-  21,751 job names, 30 days): **30 slices, 162 requests and 3,123
-  simulated seconds for the whole cover**, worst slice 127s of the 1200s
-  per-slice budget - but only **10 requests and 191 simulated seconds, two
-  slices, before the first case can run**. That second number is the one a
-  person waits for; the rest is read behind them. On the shape that
-  motivated this (12 name fields, ~10,000 values each, a day's page at the
-  measured 8-35s) a slice is about 12 pages, four minutes, so the first
-  case is roughly **eight minutes** after sign-in and the full 30-day cover
-  about two hours, in the background. If a *day's* page really costs two
-  minutes at some site, a slice is 24 minutes: that **exceeds the
-  per-slice budget**, every slice fails and retries, and the site must
-  raise `vocabulary.budget_s` (ceiling 7200s) or list fewer
-  `vocabulary.fields` - there is no setting at which a cover that size is
-  free. Measured by the `vocabulary_slices_serve_early` gate
-  (`eseval.run_slice_eval` drives the real `Broker` one step at a time
-  against `SteppedSearchTransport`, which hands a page back over as many
-  polls as its cost: a case shown off the recent cover while older slices
-  build, refused before it, every ping answered, no step longer than one
-  poll interval) and by `vocabulary_build_in_budget` (per slice now, plus
-  zero pages charged at the wide rate). `eseval.WIDE_PAGE_SECONDS` holds
-  the 31-297s measurement, and the stub charges by the width of the range
-  a request asks for, so a build that stopped slicing would fail its
-  budget in the eval rather than quietly cost hours.
-  **The read happens once per cluster, at sign-in - never inside a case.**
-  Two earlier shapes failed against measured cost. One capped `terms`
-  aggregation over the retention period refused every case on any estate
-  past the cap. Reading the *case's own window* instead looked affordable
-  and is not: measured on a real cluster, one composite page of 1,000
-  values for one field takes **8 to 35 seconds**, every name field holds
-  far more than 1,000 values in an hour, and a one-hour case read 49 hours
-  once a margin was added - so the first request alone blew a 60s budget
-  and every case was refused again. No per-case budget a human waits for
-  covers this.
-  So: `esbridge.Broker.start_vocabulary` begins a build when the bridge
-  signs in (`es-login`, or the `vocabulary` op with `build: true`), over
-  the last `vocabulary.days`, under `vocabulary.budget_s` (1200s, twenty
-  minutes, paid once per bridge rather than per case).
-  `elastic.VocabularyBuild` reads **one field per request** with an
-  `exists` filter on that field, `VOCABULARY_PAGE` (1,000) values a page,
-  carrying that field's `after_key`; one field at a time because the cost
-  is per aggregation, so a request carrying every field pays for all of
-  them before it can be stopped, logged or resumed. Fields are read
-  JOB_NAME first: a message naming a tenant almost always carries the
-  tenant fields on the same document (harvesting the page covers it),
-  while about three in four messages naming a job carry no job field - job
-  names are what the vocabulary is really for.
-  The build runs **on the broker's serve loop, one page per iteration**
-  (`pump_vocabulary`), because Playwright's sync API belongs to that
-  thread; that also keeps ping, stop and tool calls answered between pages
-  instead of the bridge vanishing for twenty minutes.
-  The result is saved by `elastic.VocabularyIndex` to
-  `<sessions>/vocabulary.json` (0700 directory, 0600 file, under the
-  gitignored `out/es`), with the range it covers, and **topped up every
-  `VOCABULARY_REFRESH_S` reading only the time since the last read**
-  (`_start_due_vocabulary`, a page per field). A case **applies** what the
-  index holds (`EsScrubber.apply_vocabulary`, `Bridge._apply_vocabulary`):
-  local work, no request, once per case per cluster.
-  **Nothing is learnt from a partial, failed or timed-out read**: an
-  upstream error, a partial or misshapen reply, a field over
-  `vocabulary.max` (50,000) or a build over the budget abandons the build
-  (`VocabularyBuild.failed`, `result()` refuses) and leaves the saved
-  vocabulary exactly as it was; the next sign-in or tick retries. **A case
-  before the first build finishes is refused** with its own code,
-  `vocabulary_building`, rather than shown against names nobody has read.
-  The read takes **no input from Claude at all** now - not even a time
-  bound, since the window no longer comes from a query - and the log holds
-  counts, requests, seconds and field names, never a name
-  (`vocabulary_report`, `VocabularyIndex.report`, the `vocabulary.log.jsonl`
-  rows, and `es-smoke`'s `VOCAB` line, which shows build progress,
-  coverage, age and `NEAR CAP` at 80%). `esbridge.clock` is what the build
-  range and the staleness check read; it is a module global because it is a
-  hook for the harnesses, whose fixtures sit at `eseval.NOW` rather than
-  today, and nothing in the live path replaces it.
-  Measured by `eseval.UNMARKED_JOBS` and
-  `eseval.UNMARKED_NAMES` (fixed documents appended after the RNG stream),
-  the `fresh_case_no_leaks` / `mcp_fresh_case_shown` gates, and the
-  word-by-word check `eseval.name_part_leaks`, since a half-hidden name
-  passes the whole-value one; and by `eseval.BULK_JOBS`, a back catalogue
-  of 12,000 invented job names, behind `window_case_shown` (a one-hour
-  case served from the build at no cost to itself),
-  `vocabulary_build_in_budget` and `vocabulary_building_refuses`. The stub
-  charges `eseval.PAGE_SECONDS` (8-35s, cycled) per field per page, so the
-  eval reports what a build really costs without waiting for it: over the
-  whole fixture, back catalogue and realistic estate together (21,751 job
-  names, 9,555 tenants, 9,746 tenant full names), **30 one-day slices,
-  162 requests and 3,123 simulated seconds** for the whole cover, **10
-  requests and 191 seconds to the first case**, and **5 requests and 95
-  seconds** for a top-up. (Before slicing this was quoted as one 44-request,
-  839-second build - a figure that only held because the stub charged
-  every page at the one-day rate.)
+    `search` is made of, and `Broker.pump_vocabulary` does one of them
+    per iteration, keeping the search in `Broker._page`. The browser
+    belongs to that thread, so a pump that ran a whole page left the
+    broker answering nothing for its length - es-login timed out against
+    its own broker, and es-logout then read that as "no bridge".
+  - **The budget is per slice** (`vocabulary.budget_s`, 1200s). One slow
+    slice fails alone and is retried after `VOCABULARY_RETRY_S`; the
+    slices already saved stay.
+  - **A case applies what the index holds** (`apply_vocabulary`,
+    `Bridge._apply_vocabulary`): local work, no request, once per case
+    per cluster. It is refused with `vocabulary_building` only until the
+    cover spans `VOCABULARY_SERVE_DAYS` (2) - `ClusterVocabulary.serves` -
+    after which cases run while the older slices are still being read.
+    State goes `building` -> `extending` -> `ready`, and the `VOCAB` line
+    prints the covered range, the age, `NEAR CAP` at 80% and build
+    progress.
+  - **Nothing is learnt from a partial, failed or timed-out read**: an
+    upstream error, a partial or misshapen reply, a field over
+    `vocabulary.max` (50,000) or a slice over its budget abandons that
+    slice (`VocabularyBuild.failed`, `result()` refuses) and leaves the
+    saved vocabulary exactly as it was.
+  - Logs hold counts, requests, seconds and field names, **never a name**
+    (`vocabulary_report`, `VocabularyIndex.report`,
+    `vocabulary.log.jsonl`, the `VOCAB` line). `esbridge.clock` is what
+    the build range and the staleness check read; it is a module global
+    because the harnesses' fixtures sit at `eseval.NOW` rather than
+    today, and nothing in the live path replaces it.
+  - Values that are log words, stopwords, letterless, one word under four
+    characters, or one word on the shared `ORDINARY_NAME_WORDS` list are
+    skipped (`vocabulary_skip`) - a fixed list on purpose, not the system
+    dictionary: what is hidden must not depend on the machine.
+  **Measured cost**, with the stub charging `PAGE_SECONDS` (8-35s a page
+  over a slice) against `WIDE_PAGE_SECONDS` (31-297s over the whole
+  range), so a build that stopped slicing fails its budget in the eval
+  rather than quietly costing hours: on the es-eval fixture (5 fields,
+  21,751 job names, 30 days) **30 slices, 162 requests and 3,123
+  simulated seconds for the whole cover**, worst slice 127s of 1200s -
+  but only **10 requests and 191 seconds, two slices, before the first
+  case can run**, and 5 requests and 95 seconds for a top-up. On the
+  shape that motivated slicing (12 name fields, ~10,000 values each) the
+  first case is roughly eight minutes after sign-in and the full cover
+  about two hours, in the background. If a *day's* page costs two minutes
+  at some site, a slice is 24 minutes, which **exceeds the per-slice
+  budget**: that site must raise `vocabulary.budget_s` (ceiling 7200) or
+  list fewer fields. There is no setting at which a cover that size is
+  free.
+  **Declared costs and misses of this shape:** the first sign-in takes
+  minutes before any case can run, and `es-login` waits there showing
+  progress; **real customer names are written to disk** in
+  `out/es/vocabulary.json` (0600, gitignored, never in the repo), a
+  larger on-disk footprint than a case vault because it is every name on
+  the cluster rather than the ones a case saw; a name **logged only in a
+  day the cover has not reached, or older than `vocabulary.days` (30), is
+  not known** - the `VOCAB` line's covered range is where that is
+  visible; so is one logged in the gap between top-ups, up to
+  `VOCABULARY_REFRESH_S`; and a failed top-up leaves the bridge serving a
+  cover that is complete for its range but stale, reported as `stale`
+  with its age rather than refusing, the same risk the ten-minute refresh
+  already accepts.
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
-  **Declared costs of building once per cluster**, all new with this
-  shape: the first sign-in takes **minutes** before any case can run, and
-  `es-login` waits there showing progress; **real customer names are
-  written to disk** in `out/es/vocabulary.json` (0600, gitignored, never
-  in the repo) rather than only living in a process, which is a larger
-  on-disk footprint than a case vault since it is every name on the
-  cluster rather than the ones a case saw; a name **older than the first
-  build's range** (`vocabulary.days`, 30 by default) is not known, and
-  neither is one logged in the gap between top-ups, up to
-  `VOCABULARY_REFRESH_S` old; and a failed top-up leaves the bridge
-  serving a vocabulary that is complete for its range but stale, which the
-  `VOCAB` line reports as `stale` with its age rather than refusing - the
-  same risk the ten-minute refresh already accepts.
-  The old declared miss about a case's window narrowing the read is
-  **gone**: the case window no longer drives anything.
+
+  **Declared miss: a one-word tenant name the skip rules drop stays
+  readable.** Many real tenants are one word, and a one-word value on
+  `ORDINARY_NAME_WORDS` or shorter than four characters is never made
+  vocabulary, because registering it would hide that word from every
+  message. Of the eight invented one-word names in
+  `eseval.DEFAULT_MAP_ONE_WORD`, three are dropped (`Archive` and `Vault`
+  as `ordinary_word`, `Ops` as `short`) and two of those are then
+  readable in message text; the third happens to be caught by tier 2,
+  which is luck and not a rule to rely on. A site whose tenants are
+  called `Archive` or `Vault` gets no vocabulary protection for them and
+  must seed the name with `--term`. Widening the vocabulary is not the
+  fix: that is the skip rules' trade, and loosening it erases the word
+  everywhere.
+
+  **A name that is an ordinary word keeps its label and stays a word.**
+  The skip rules only decide what becomes *vocabulary*; harvesting went
+  round them. `_harvest_hit` labels every identifier value on a page and
+  `jsonscrub._remember` indexed it for the case-wide sweep, so one
+  document whose `job.name` was `Backup` took the word out of every later
+  message ("Backup window opened, 14 mailboxes queued" came back as
+  "`<Job-12>` window opened"). About 7 in 100 common job names are
+  ordinary words, so it happened on the first pages, and **what a page
+  said depended on which pages came before it**.
+  Now: for a field the vocabulary *could* learn, a value `vocabulary_skip`
+  would drop is labelled in its own field as before and is **not** indexed
+  for the sweep (`EsScrubber.readable_in_text`, `readable_words`). The
+  document that owns it still hides it in its own text (`_local_sweep`
+  indexes it for the length of one hit, which is what makes a page
+  order-independent), and `_sweep`'s whole-string branch honours the same
+  rule. A **seeded** value is untouched - `--term Backup` is a human
+  saying "hide this word", and `seed` (at case open, before any page)
+  does not go through a learnable rule.
+  **The leak check treats these words as readable, by construction**: it
+  asks "did a value we promised to hide survive" and reads the same sweep
+  index the substitution does, so a word kept out of the index is out of
+  both. The alternative - calling it a leak - would refuse every page
+  that uses the word in English, which is every page.
+  **Declared miss:** if a customer really is called `Backup`, the word is
+  readable in message text on every document except the one whose own
+  field names it. Seed it to hide it everywhere.
+  **Declared default for a case saved before this**: such a word is
+  demoted on load, so a restored case scrubs a page exactly as a fresh
+  one does - determinism is the point. The cost: a word that case was
+  hiding case-wide becomes readable outside its own document, and an
+  ordinary word the human *seeded* is demoted with the rest, since a
+  restored session has only the type to tell them apart. Seed it again.
+  A case saved after the change stores `readable_words` (labels only).
+  Gate: `ordinary_words_readable` on `eseval.ORDINARY_WORD_JOBS` - seven
+  ordinary-word job names, fixed documents appended after the estate and
+  deliberately *outside* `vocabulary.days`, since these labels come from
+  harvesting a page rather than from the build. A page showing them in
+  their own fields, then a page of ordinary messages using the same
+  words: **7 of 7 words lost before the rule, 0 after**, all 7 still
+  labelled in their own field, all 7 still hidden in the owning
+  document's text, the label still filters, and the second page reads the
+  same with no page before it. `ordinary_words_case_wide` is the
+  measurement switch behind the "before" figure and is set by nothing in
+  the live path.
+  **The same rule covers JSON exports** (`jsonscrub`), which had the same
+  bug through a different door: any value under an identifier key was
+  swept across the whole export, with only `_STOPWORDS` kept out. Measured
+  on the invented three-ticket export in `test_jsonscrub.py`: **3 of its 6
+  name values are ordinary words and one ticket's note lost all three;
+  after the rule it loses none**, while the real names stay hidden.
+  `jsonscrub._ordinary_name` is deliberately narrower than
+  `vocabulary_skip` - a **one-word** value on the shared list, under the
+  name-key families (`ORG_NAME`, `PERSON_NAME`, `NAME:*`) only - because
+  adopting the `short` and `no_letters` reasons would stop sweeping the
+  short numeric values whose export-wide sweep is the measured trade
+  pinned by `test_short_values_are_swept_and_the_trade_is_measured`.
+  That trade, seeded terms (a value already known is never demoted; the
+  harvest checks `known` first) and the list's contents are all unchanged.
+  **A record is an element of the top-level list**; any other shape - a
+  single object, or a dict wrapping its lists - is one record, the whole
+  export, so in a single-object export the word is hidden throughout,
+  as before. Hiding more inside one record is the safe direction;
+  guessing deeper boundaries is not, since a wrong guess leaves a name
+  readable beside its own field. `_rewrite_record` /
+  `_record_ordinary_words` use the same index-overlay mechanism, with the
+  overlay derived from what the harvest decided so the two cannot drift.
+  **The one word list** is `jsonscrub.ORDINARY_NAME_WORDS` - both
+  scrubbers read it and the import direction only allows `elastic ->
+  jsonscrub`; `elastic.ORDINARY_NAME_WORDS` re-exports the same object
+  (pinned by a test). Contents unchanged.
+  Tier 2 may still label such a word in free text on its own judgement:
+  unchanged, and left for later.
+
+  **Every run says which names stayed readable**, because a clean verdict
+  looks identical whether or not it happened, and nobody can seed a name
+  they were never told about. Split by who reads the surface:
+  - **labels** where the output is persisted or machine-read: the
+    `readable_words` key in `jsonscrub`'s run stats and in `.scrub.json`
+    (`research.write_scrub_record`). Same rule as the leak list, and
+    non-negotiable 7 - those files carry decisions, not data. It is
+    **not** a refusal; `scrub_verdict` ignores it, because the run is
+    clean and this says what clean does not cover.
+  - **the words** only where a human asked: `scrub-json`'s `READABLE:`
+    line and the web UI's stats panel resolve the labels against the
+    mapping already on that machine. `es-smoke` prints the **count, the
+    labels and the field each came from** by default and the words only
+    under `--show-readable-names`, which also decides whether they are in
+    the report at all (`run_case(show_names=...)`): that output is read
+    by scripts and agents as well as people, so a customer name never
+    arrives there unasked. The field is a decision, so it is always
+    shown, and it is what tells an operator which name to go and look at.
+  The bridge's decision log carries counts and labels and **never these
+  words**, pinned by a test, and the `es-research` Claude Code session
+  never sees the line. Seeding a reported name takes it off the next
+  run's list - the loop the report exists to close, pinned by a test.
+
+  **A label may be used only after the case has been shown it.**
+  `_learn_vocabulary` labels every name, so applying a cluster vocabulary
+  puts a label for every customer on the estate into the case mapping
+  (20,033 `ORG_NAME` labels on the fixture) and `resolve_label` accepted
+  anything in the mapping. A case about one tenant, shown only
+  `<Org-01>`, could filter by `<Org-77>` - a guess - have it resolve to
+  `BRINDERWOLD GROUP`, a tenant it had never seen, and the query would
+  run: nobody unmasked, but the case could reach and count **every
+  customer on the cluster**, which it could not do before the vocabulary
+  existed.
+  `EsScrubber.shown` is the per-case set of labels the case has actually
+  been shown - seeded by the human, or carried in a page, an aggregation
+  or a bucket key that went back to Claude. `mark_shown` fills it with
+  one walk over the finished output after the leak check: one choke
+  point, rather than a hook in each rewrite path, so a label cannot reach
+  Claude by a route that forgot to mark it, and a refused page shows
+  nothing and teaches no label. It is saved in `session.json` and
+  restored with the case. Both label paths in `esquery` - the filter
+  value and a label inside a phrase - resolve through `shown_label`,
+  which returns None for a label that exists but has not been shown, so
+  the refusal is `unknown_label` with the **same message** a label that
+  was never issued gets: a refusal must not tell a live guess from a dead
+  one, or it becomes the oracle itself. Scrubbing and label numbering are
+  untouched; `resolve_label` still unmasks an answer for the human.
+  Oracle cases, written first: `unknown-label` (a number no case issues)
+  and `vocabulary-label-never-shown` (`<Org-77>`, live on the estate),
+  both declared `unknown_label`. A guess is refused at compile time, so
+  **no request reaches Kibana**, and the decision log row carries `label`
+  - what Claude typed - and never a value (`Refused.label`).
+  **Declared default for a case saved before this**: it starts with
+  nothing shown. The mapping cannot stand in for the shown set - a case
+  saved after a vocabulary was applied holds a label per estate name, and
+  trusting those would restore the whole channel - so an old case must
+  see a label on a page again (one query) or have its term re-seeded.
+  Unmasking an already-written answer is unaffected.
+  **What stays open**: nothing stops a case *collecting* labels by
+  running wide queries - a page of `max_hits` hits shows that many
+  labels, and those are legitimately usable afterwards, so the reachable
+  set grows with ordinary work; the cap is `max_hits` and `max_buckets`,
+  not this rule. Label numbers are still sequential and guessable, so a
+  guess is cheap to make - it is only refused, and the refusal says
+  nothing. And the text-phrase counting channel above is unchanged.
+
   **Keep fields are checked, not trusted.** A keep field used to pass
-  through unchanged (`_rewrite_leaf`) on the declaration that it holds
-  nothing sensitive, and a real level field held a SharePoint personal-site
-  URL among its `info`/`Warning`/`ERR` spellings - reaching Claude in hits
-  and as a bucket key when the field's values are aggregated. Every string
-  keep value now goes through `EsScrubber._keep_value`: tier 1 plus the
-  known-value sweep via `_scrub_text(shaped_only=True)`, never tier 2, in
-  hit leaves (`_rewrite_leaf`) and in terms-bucket keys and
-  `key_as_string` (`_rewrite_agg`); a match is replaced the way a text
-  field would replace it and the bucket stays one bucket under its
-  rewritten key. Strings of only digits and time punctuation
-  (`_TIME_SHAPED`: timestamps, durations, versions - no identifier fits
-  that alphabet) skip the pass, and `jsonscrub._detect_cache` makes
-  repeated values one detection, which is why es-eval is not measurably
-  slower. Measured by the `keep_leak_closed` gate (the invented URL in
+  through unchanged on the declaration that it holds nothing sensitive,
+  and a real level field held a SharePoint personal-site URL among its
+  `info`/`Warning`/`ERR` spellings - reaching Claude in hits and as a
+  bucket key when the field was aggregated. Every string keep value now
+  goes through `EsScrubber._keep_value`: tier 1 plus the known-value
+  sweep via `_scrub_text(shaped_only=True)`, never tier 2, in hit leaves
+  (`_rewrite_leaf`) and in terms-bucket keys and `key_as_string`
+  (`_rewrite_agg`); a match is replaced the way a text field would
+  replace it and the bucket stays one bucket under its rewritten key.
+  Strings of only digits and time punctuation (`_TIME_SHAPED`:
+  timestamps, durations, versions - no identifier fits that alphabet)
+  skip the pass, and `jsonscrub._detect_cache` makes repeated values one
+  detection, which is why es-eval is not measurably slower.
+  **Declared misses and costs:** a keep value tier 1 recognises is
+  labelled, so Claude cannot filter by it (a keep field takes literals
+  and it only has the label) - for a value like that URL this is the
+  point, but it also hides a benign keep value that happens to be
+  identifier-shaped (a public-TLD FQDN in a dataset name, say), the same
+  fail-toward-redaction trade the recognizers make everywhere; a
+  sensitive keep value tier 1 has no shape for (a bare name as a level,
+  with no URL, GUID or domain around it) still passes, because tier 2
+  deliberately stays off keep fields - a classifier guessing at names
+  inside level spellings is how `Critical` stops being filterable; and a
+  sensitive value under `keep` is a site-map error first, this pass being
+  the net under it.
+  `es_schema` and the esmcp instructions tell Claude that keep fields
+  hold spellings as logged (err/Error/ERROR): aggregate a keep field's
+  values before an exact filter, then filter with `in` across the
+  spellings; values are never normalised. A case saved before the
+  log-vocabulary trim may hold "Info" as a value - `load_session` keeps
+  such labels for unmasking but not as known values
+  (`elastic.log_vocabulary_only`).
+
+  **The realistic estate** (`eseval.estate_docs`, the `estate=True` half
+  of `generate`, reported under `realistic estate`) is what the
+  readability misses are measured on, because the tidy fixture - eight
+  tenants, seven level spellings, twelve thousand job names of one shape
+  - cannot show which *shapes* survive. It is 10,000 tenants, 10,000 jobs
+  and 100 resources in the shapes and proportions measured on one real
+  cluster (shapes and counts only, no values; every name invented, built
+  by position), with 149 free-text mentions carrying no marker, and the
+  seventeen level and three outcome spellings at their measured skew
+  (commonest level 47x the next, success 661x failure). Like `BULK_JOBS`
+  it is appended after the RNG stream and holds **no ground truth**, so
+  every existing gate sees what it saw. Thirteen shape classes, one page
+  and one report line each.
+  Result: **every shape is hidden except one-word names the skip rules
+  drop** - 24 of 149 mentions, all `ordinary_word`/`stopword`, 800 of
+  20,100 names - which is the declared miss above, reported and not
+  gated. `estate_no_unexpected_readable` fails on anything else readable,
+  whole or by a word; `estate_spellings_unchanged` pins all twenty
+  spellings byte-for-byte as hit values and as bucket keys. All-caps
+  names, names with digits and four-word job names are covered. When
+  adding a shape, add a class, not another fixture.
+
+  **Gates.** `es-eval` runs the fixture end to end and through the real
+  MCP endpoint; all 26 pass, and a change that cannot keep them passing
+  is a design conversation. Page safety: `no_leaks`, `no_degraded`,
+  `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
+  `eseval.name_part_leaks`, since a half-hidden name passes the
+  whole-value check), `round_trip_complete`. Grammar:
+  `oracle_all_refused`. Vocabulary: `default_map_names_hidden`,
+  `window_case_shown` (a one-hour case served from the build at no cost
+  to itself, on the `BULK_JOBS` back catalogue of 12,000 invented job
+  names), `vocabulary_building_refuses`, `vocabulary_build_in_budget`
+  (per slice, plus zero pages charged at the wide rate),
+  `vocabulary_slices_serve_early` (`eseval.run_slice_eval` drives the
+  real `Broker` one step at a time against `SteppedSearchTransport`,
+  which hands a page back over as many polls as its cost: a case shown
+  off the recent cover while older slices build, refused before it, every
+  ping answered, no step longer than one poll interval). Readability:
+  `estate_no_unexpected_readable`, `estate_spellings_unchanged`,
+  `ordinary_words_readable`, `keep_leak_closed` (the invented URL in
   `eseval.KEEP_LEAK_VALUE`, shown through a hit and through an
-  aggregation; both leaked before the pass) and the `keep_values_readable`
-  gate (`KEEP_LEVEL_SPELLINGS` + `KEEP_OUTCOME_SPELLINGS` come back
-  byte-for-byte as hit values and bucket keys, and an exact filter on one
-  still matches); intent tests in `test_elastic.py`. Declared misses and
-  costs: a keep value tier 1 recognises is labelled, so Claude cannot
-  filter by it (a keep field takes literals and it only has the label) -
-  for a value like this one, that is the point, but it also hides a
-  benign keep value that happens to be identifier-shaped (a public-TLD
-  FQDN in a dataset name, say), the same fail-toward-redaction trade the
-  recognizers make everywhere else; a sensitive keep value tier 1 has no
-  shape for (a bare name as a level, with no URL, GUID or domain around
-  it) still passes, because tier 2 deliberately stays off keep fields -
-  a classifier guessing at names inside level spellings is how `Critical`
-  stops being filterable; and a sensitive value under `keep` remains a
-  site-map error first, this pass is the net under it.
-  `es_schema` and the esmcp instructions also tell Claude that keep
-  fields hold spellings as logged (err/Error/ERROR): aggregate a keep
-  field's values before an exact filter, then filter with `in` across the
-  spellings; values are never normalised. A case saved before the log-vocabulary trim
-  may hold "Info" as a value: `load_session` keeps such labels for
-  unmasking but not as known values (`elastic.log_vocabulary_only`).
+  aggregation; both leaked before the pass), `keep_values_readable`.
+  Label use: `label_guessing_refused` - a fresh case on the estate
+  guesses a hundred low-numbered labels, **100 of 100 are live labels it
+  holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label
+  refuses identically, and a label off the next page does work in the
+  query after it, because the rule must not break the tool. Through MCP:
+  `mcp_protocol`, `mcp_no_leaks`, `mcp_fresh_case_shown`,
+  `mcp_oracle_all_refused`, `mcp_round_trip_complete`,
+  `mcp_requests_rejected`, `mcp_log_clean`, `mcp_launch_isolated`,
+  `mcp_prompt_gate`.
+  Fixed documents for the readability checks are appended after the RNG
+  stream so nothing existing moves: `UNMARKED_JOBS`, `UNMARKED_NAMES`,
+  `DEFAULT_MAP_*`, `ORDINARY_WORD_JOBS`, and the estate.
 
 ## Where to take questions and findings
 

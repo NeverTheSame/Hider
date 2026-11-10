@@ -139,6 +139,13 @@ def write_scrub_record(out_path: Path, output_text: str, stats: dict) -> Path:
         "degraded_lines": int(stats.get("degraded_lines") or 0),
         "mapped_values": int(stats.get("mapped_values") or 0),
         "secrets_destroyed": int(stats.get("secrets_destroyed") or 0),
+        # Names that are ordinary words, readable outside the record that
+        # owns them. Labels, never the words - the same rule as the leak
+        # list, and this file is meant to be safe to keep and read. It is
+        # **not** a refusal: the run is clean, and this says what the
+        # cleanliness does not cover. The words themselves are in the
+        # mapping beside it, and scrub-json and the web UI print them.
+        "readable_words": [str(w) for w in stats.get("readable_words") or []],
         "output_sha256": _sha256(output_text.encode("utf-8")),
         "written": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }

@@ -311,7 +311,7 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
     def run(query: dict) -> dict:
         try:
             report = client.call("run", cluster=cluster, query=query, terms=args.term,
-                                 tier2=args.tier2,
+                                 tier2=args.tier2, show_names=args.show_readable_names,
                                  log=str(Path(args.log).resolve()) if args.log else None)["report"]
         except elastic.Refused as e:
             return {"refused": {"code": e.code, "message": e.message}}
@@ -404,8 +404,10 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
                                      log_path=Path(args.log) if args.log else None,
                                      index=index)
             q = _smoke_query(esbridge, cfg, args, size)
-            report = esbridge.run_smoke(lambda query: esbridge.run_case(bridge, "stub", query), q,
-                                        max_buckets=cfg.max_buckets)
+            report = esbridge.run_smoke(
+                lambda query: esbridge.run_case(bridge, "stub", query,
+                                                show_names=args.show_readable_names),
+                q, max_buckets=cfg.max_buckets)
             return esbridge.print_smoke("stub", q, report, show=args.show)
         finally:
             transport.close()
@@ -902,6 +904,16 @@ def _cmd_scrub_json(args: argparse.Namespace) -> int:
     s = result["stats"]
     print(f"mapped {s['mapped_values']} values, destroyed {s['secrets_destroyed']} secrets, "
           f"{len(s['leaks'])} leaks, {s['degraded_lines']} degraded lines", file=sys.stderr)
+    # The names that are ordinary words. The verdict is clean and stays
+    # clean - this is the declared trade, not a defect - but a clean run
+    # looks identical whether or not it happened, so say it here, with the
+    # words, since this is the one place that both knows them and is
+    # talking to the person who can act on it.
+    readable = [result["mapping"].get(lab, lab) for lab in s.get("readable_words") or []]
+    if readable:
+        print(f"READABLE: {len(readable)} name(s) are ordinary words and stay readable in text "
+              f"outside the record that holds them: {', '.join(sorted(readable))}. "
+              f"Re-run with --term NAME for any that is a real customer name.", file=sys.stderr)
     print(f"wrote {result['saved']['output']}", file=sys.stderr)
     print(f"wrote {result['saved']['mapping']}", file=sys.stderr)
     if s["leaks"] or s["degraded_lines"]:
@@ -1059,6 +1071,11 @@ def main(argv: list[str] | None = None) -> int:
                          "identifier type (SERVER_NAME=...); stays local; repeatable")
     sm.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier")
     sm.add_argument("--show", action="store_true", help="print the scrubbed page")
+    sm.add_argument("--show-readable-names", action="store_true",
+                    help="print the real words behind the READABLE line (names that are "
+                         "ordinary words and stay readable in text). Off by default: this "
+                         "output is read by scripts too, so a customer name is never printed "
+                         "unasked")
     sm.add_argument("--log", help="append a decision-log row to this JSONL file")
     sm.set_defaults(fn=_cmd_es_smoke)
 

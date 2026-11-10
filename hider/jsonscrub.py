@@ -37,7 +37,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from . import evaluate, localcfg, pipeline, pseudonym
+from . import evaluate, localcfg, paths, pipeline, pseudonym
 
 # ---------------------------------------------------------------------------
 # Key classification
@@ -95,6 +95,34 @@ _LEGAL_SUFFIX = re.compile(
     r"co|company|group|holdings|s\.?a\.?|s\.?r\.?l\.?|oy|ab|as|kk|pty)\.?$",
     re.IGNORECASE,
 )
+
+
+#: One-word names that are ordinary words in log text. A one-word name is
+#: matched as a word anywhere in a message, so a resource called "Archive"
+#: would hide "archive" from every line. These are never an Elasticsearch
+#: vocabulary, and neither scrubber sweeps one across a case or an export;
+#: the own field still gets its label. A fixed list on purpose, not the system
+#: dictionary: what is hidden must not depend on the machine it runs on.
+ORDINARY_NAME_WORDS: frozenset[str] = frozenset({
+    "archive", "archives", "backup", "backups", "default", "defaults", "primary", "secondary",
+    "main", "master", "test", "tests", "testing", "dev", "development", "prod", "production",
+    "staging", "stage", "demo", "sandbox", "legacy", "temp", "tmp", "shared", "public",
+    "private", "general", "common", "global", "local", "internal", "external", "data",
+    "files", "file", "documents", "document", "reports", "report", "mail", "mailbox",
+    "mailboxes", "inbox", "sites", "site", "teams", "team", "users", "user", "admin",
+    "admins", "finance", "legal", "sales", "marketing", "support", "operations", "security",
+    "compliance", "audit", "records", "projects", "project", "exports", "export", "imports",
+    "import", "logs", "log", "system", "service", "services", "server", "servers", "cloud",
+    "storage", "vault", "store", "repository", "library", "home", "office", "retention",
+    "hold", "policy", "policies", "daily", "weekly", "monthly", "nightly", "hourly", "full",
+    "incremental", "delta", "sync", "job", "jobs", "task", "tasks", "queue", "worker",
+    "workers", "agent", "agents", "engine", "cache", "index", "database", "network", "quota",
+    "limit", "tenant", "tenants", "resource", "resources", "new", "old", "copy", "final",
+    "draft", "current", "latest", "standard", "basic", "premium", "trial", "other", "misc",
+    "all", "everyone", "group", "groups", "contacts", "calendar", "notes", "tasks", "onedrive",
+    "sharepoint", "exchange", "outlook", "teams", "graph", "portal", "intranet", "extranet",
+    *(w for w in paths.STRUCTURAL if " " not in w),
+})
 
 
 def _words(key: str) -> list[str]:
@@ -327,12 +355,26 @@ class JsonScrubber:
         #: matching known values in text is one dict lookup per word instead
         #: of a regex alternation that has to be recompiled as values arrive
         self._index: dict[str, list[tuple[str, int]]] = {}
+        #: label -> value for names that are ordinary English words
+        #: (:data:`ORDINARY_NAME_WORDS`): labelled in their own field,
+        #: hidden in text only inside the record whose own field holds
+        #: them, readable everywhere else. Shared with the Elasticsearch
+        #: scrubber, which fills it by its site map's rules instead.
+        self.readable_words: dict[str, str] = {}
+        #: Measurement switch, not a setting: True restores the old
+        #: behaviour (an ordinary-word name swept across the whole export
+        #: or case) so the evals can report the before figure beside the
+        #: after one. Nothing in the live path sets it.
+        self.ordinary_words_case_wide = False
+        #: norms of the current record's own ordinary-word names, hidden in
+        #: that record's text only (see ``run``)
+        self._overlay: set[str] = set()
         #: log bundles repeat the same line many times; detection is pure
         self._detect_cache: dict[tuple[str, bool], tuple[list, bool]] = {}
 
     # -- labelling ---------------------------------------------------------
 
-    def _label(self, etype: str, value: str) -> str:
+    def _label(self, etype: str, value: str, *, index: bool = True) -> str:
         n = _norm(value)
         if n in self.known:
             return self.known[n]
@@ -350,7 +392,7 @@ class JsonScrubber:
             prefix = etype.split(":", 1)[-1]
             vtype = prefix
             label = self.vault.pseudonym(prefix, value)
-        self._remember(value, label, vtype)
+        self._remember(value, label, vtype, index=index)
         return label
 
     def _remember(self, value: str, label: str, etype: str, *, index: bool = True,
@@ -370,13 +412,31 @@ class JsonScrubber:
         # over-redaction of coincidental short tokens; the trade is measured
         # in ``test_short_values_are_swept_and_the_trade_is_measured``.
         if force or index and n not in _STOPWORDS:
-            toks = list(_TOKEN.finditer(n))
-            if toks:
-                # Index under the least-shared token, so a word every URL has
-                # ("https", "sharepoint") never becomes a bucket of thousands.
-                tok = min(toks, key=lambda t: (len(self._index.get(t.group(0), ())),
-                                               -len(t.group(0))))
-                self._index.setdefault(tok.group(0), []).append((n, tok.start()))
+            self._index_value(n)
+
+    def _index_value(self, n: str) -> None:
+        """Make a normalised value findable by the sweep."""
+        toks = list(_TOKEN.finditer(n))
+        if toks:
+            # Index under the least-shared token, so a word every URL has
+            # ("https", "sharepoint") never becomes a bucket of thousands.
+            tok = min(toks, key=lambda t: (len(self._index.get(t.group(0), ())),
+                                           -len(t.group(0))))
+            self._index.setdefault(tok.group(0), []).append((n, tok.start()))
+
+    def _unindex_value(self, n: str) -> None:
+        """Undo one :meth:`_index_value`. The pair scopes a value to one
+        record or hit (the ordinary-word rule), so this removes a single
+        entry: were it to remove every entry for the value, it would strip
+        an index entry some other decision made - a seeded term's, above
+        all - the first time a record's overlay was torn down."""
+        for tok, entries in list(self._index.items()):
+            for i, e in enumerate(entries):
+                if e[0] == n:
+                    del entries[i]
+                    if not entries:
+                        del self._index[tok]
+                    return
 
     def _register_parts(self, etype: str, value: str, label: str) -> None:
         """Register sub-values that commonly appear on their own in free text."""
@@ -423,6 +483,34 @@ class JsonScrubber:
             for v in node:
                 self._harvest_value(v, None, inherited)
 
+    def _ordinary_name(self, etype: str, value: Any) -> bool:
+        """Whether a value under a name key is an ordinary English word.
+
+        Such a name keeps its label in its own field and is hidden in text
+        only inside the record whose own field holds it; everywhere else
+        the word stays readable. A tenant called "Archive" in record 1
+        must not turn record 3's "Moved 40 items to archive" into "Moved
+        40 items to <Org-01>".
+
+        Deliberately narrower than the Elasticsearch scrubber's
+        ``vocabulary_skip``: only one-word values on the shared
+        :data:`ORDINARY_NAME_WORDS` list, and only under the name-key
+        families. The ``short`` and ``no_letters`` reasons are **not**
+        adopted here, because sweeping short and numeric identifier values
+        export-wide is the measured trade pinned by
+        ``test_short_values_are_swept_and_the_trade_is_measured``, and a
+        value a person seeds as a search term never comes through a key at
+        all (``run`` registers it with ``force=True``).
+        """
+        if self.ordinary_words_case_wide:
+            return False
+        if not (etype in {"ORG_NAME", "PERSON_NAME"} or etype.startswith("NAME:")):
+            return False
+        v = str(value).strip()
+        if len(v.split()) != 1:
+            return False
+        return v.casefold().strip(".,;:()") in ORDINARY_NAME_WORDS
+
     def _harvest_value(self, v: Any, own: str | None, inherited: str | None) -> None:
         etype = own or inherited
         if isinstance(v, (dict, list)):
@@ -435,6 +523,15 @@ class JsonScrubber:
             return  # free text hanging off a sensitive parent: pass 2 handles it
         if own is not None and (len(s) > _SHORT or "\n" in s) and etype not in {"ADDRESS"}:
             return  # e.g. "customer_comments": scrubbed as text, not erased whole
+        if self._ordinary_name(etype, s) and _norm(s) not in self.known:
+            # Labelled, never indexed for the export-wide sweep; a single
+            # word has no parts to register. Only when the value is new: a
+            # value already known - a **seeded term** above all - keeps the
+            # decision already made for it, so "--term Archive" still hides
+            # the word everywhere.
+            label = self._label(etype, s, index=False)
+            self.readable_words.setdefault(label, s)
+            return
         label = self._label(etype, s)
         self._register_parts(etype, s, label)
 
@@ -601,11 +698,83 @@ class JsonScrubber:
         if not isinstance(v, str):
             return v
         n = _norm(v)
-        if n in self.known and n not in _STOPWORDS:
+        if n in self.known and n not in _STOPWORDS \
+                and (self.known[n] not in self.readable_words or n in self._overlay):
+            # the overlay is the record whose own field holds the name:
+            # there the whole-string match still labels it, elsewhere an
+            # ordinary word stays an ordinary word
             return self.known[n]
         if sweep:
             return self._substitute(v)
         return self._scrub_text(v)
+
+    # -- records -----------------------------------------------------------
+    #
+    # An export is usually a list of records (tickets, rows, documents). A
+    # name that is an ordinary word is hidden in text only inside the
+    # record whose own field holds it, so "a record" needs a boundary:
+    # **each element of the top-level list is one record; any other shape -
+    # a single object, or a dict wrapping its lists - is one record, the
+    # whole export.** For a single-object export the rule therefore changes
+    # nothing within that export: its own field holds the name, so the word
+    # is hidden throughout, as before. Hiding more within one record is the
+    # safe direction; inventing deeper record boundaries is not, because a
+    # wrong guess would leave a name readable next to its own field.
+
+    def _record_ordinary_words(self, record: Any) -> set[str]:
+        """Norms of this record's own ordinary-word names.
+
+        Keyed off what the harvest already decided (``readable_words``
+        via ``known``) rather than re-running the predicate, so the two
+        cannot drift: a value is in the overlay exactly when harvest
+        labelled it as a readable word and this record carries it under a
+        name key of its own.
+        """
+        found: set[str] = set()
+
+        def value(v: Any, own: str | None, inherited: str | None) -> None:
+            etype = own or inherited
+            if isinstance(v, (dict, list)):
+                node(v, etype)
+                return
+            if etype in (None, "SECRET") or isinstance(v, bool) or v is None:
+                return
+            n = _norm(str(v))
+            if self.known.get(n) in self.readable_words:
+                found.add(n)
+
+        def node(nd: Any, inherited: str | None) -> None:
+            if isinstance(nd, dict):
+                for k, v in nd.items():
+                    value(v, classify_key(str(k)), inherited)
+            elif isinstance(nd, list):
+                for v in nd:
+                    value(v, None, inherited)
+
+        value(record, None, None)
+        return found
+
+    def _rewrite_record(self, record: Any, source: Any, sweep: bool) -> Any:
+        """One record, with its own ordinary-word names in the sweep index
+        for exactly this long. ``source`` is the unrewritten record: by the
+        second pass the fields already hold labels, and the overlay has to
+        come from what the record held, not from what it shows."""
+        overlay = self._record_ordinary_words(source)
+        saved = self._overlay
+        self._overlay = overlay
+        for n in overlay:
+            self._index_value(n)
+        try:
+            return self._rewrite_value(record, None, None, sweep)
+        finally:
+            for n in overlay:
+                self._unindex_value(n)
+            self._overlay = saved
+
+    def _rewrite_export(self, doc: Any, source: Any, sweep: bool) -> Any:
+        if isinstance(doc, list) and isinstance(source, list) and len(doc) == len(source):
+            return [self._rewrite_record(r, s, sweep) for r, s in zip(doc, source)]
+        return self._rewrite_record(doc, source, sweep)
 
     # -- entry point -------------------------------------------------------
 
@@ -618,8 +787,8 @@ class JsonScrubber:
             elif _norm(t) not in self.known:
                 self._remember(t, self.vault.pseudonym("ORG_NAME", t), "TERM", force=True)
         self._harvest_value(doc, None, None)
-        out = self._rewrite_value(doc, None, None, sweep=False)
-        out = self._rewrite_value(out, None, None, sweep=True)
+        out = self._rewrite_export(doc, doc, sweep=False)
+        out = self._rewrite_export(out, doc, sweep=True)
         leaks = self.leak_check(out)
         stats = {
             "mapped_values": len(self.mapping),
@@ -627,6 +796,15 @@ class JsonScrubber:
             "secrets_destroyed": self.secrets_destroyed,
             "degraded_lines": self.degraded,
             "leaks": leaks,
+            # Names that are ordinary words: labelled in their own field,
+            # readable as English outside the record that owns them. Not a
+            # defect - it is the declared trade - but the one thing the run
+            # cannot tell you by itself, because a clean verdict looks the
+            # same either way. **Labels**, like the leak list: a stats dict
+            # ends up in .scrub.json, which carries decisions, not data.
+            # The human surfaces (scrub-json, the web UI) resolve them
+            # against the mapping that is already on this machine.
+            "readable_words": sorted(self.readable_words),
         }
         return Result(out, dict(self.mapping), stats)
 

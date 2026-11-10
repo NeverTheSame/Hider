@@ -13,11 +13,15 @@ CFG = elastic.load(elastic.EXAMPLE)
 
 def _session() -> elastic.EsScrubber:
     """The session the oracle cases are written against: one org, one
-    server, one tenant GUID issued."""
+    server, one tenant GUID - all three **shown** to the case, since a
+    label may only be used in a query after the case has seen it. The two
+    seeds are shown by being seeded; the GUID stands for one that came
+    back on a page, so it is marked the way a page marks it."""
     s = elastic.EsScrubber(CFG, tier2="none")
     assert s.seed("Contoso Holdings") == "<Org-01>"
     assert s.seed("ctr-amer-042", "SERVER_NAME") == "ctr-amer-s01"
     assert s.label_for(CFG.rule("labels.tenant_id"), "3f2a9c4e-1b7d-4e8a-9c2f-6d5b4a3e2f10") == "<Tenant-01>"
+    s.mark_shown({"hits": [{"labels": {"tenant_id": "<Tenant-01>"}}]})
     return s
 
 
@@ -446,3 +450,91 @@ def test_unknown_field_names_the_closest_site_map_field(field, closest):
         assert e.value.message.endswith(f"closest site-map field: {closest}")
     else:
         assert e.value.message.endswith("see the site map's field list")
+
+
+# --- a label may be used only after the case has been shown it ----------------
+#
+# Applying a cluster vocabulary mints a label for every name on the estate,
+# so a low-numbered label is a live reference to a customer the case has
+# never seen. Resolving one would let a case reach and count the whole
+# cluster: no name revealed, every customer countable.
+
+
+def _with_vocabulary() -> elastic.EsScrubber:
+    """A case whose cluster vocabulary is applied: it holds labels for
+    names it has never been shown."""
+    s = _session()
+    vocab = elastic.ClusterVocabulary(0.0, 86400.0, 0.0, {
+        "labels.tenant_name": [f"Invented Holdings {i}" for i in range(50)]})
+    s.apply_vocabulary("c", vocab)
+    return s
+
+
+def test_a_vocabulary_label_the_case_was_never_shown_is_refused():
+    s = _with_vocabulary()
+    guess = "<Org-07>"
+    # it exists: this is a live reference, not a dead one
+    assert s.resolve_label(guess) is not None
+    assert s.shown_label(guess) is None
+    with pytest.raises(elastic.Refused) as e:
+        _compile({"index": "logs-app-*",
+                  "filters": [{"field": "labels.tenant_name", "op": "eq", "value": guess}]}, s)
+    assert e.value.code == "unknown_label" and e.value.label == guess
+
+
+def test_a_live_guess_and_a_dead_one_are_refused_the_same_way():
+    """A refusal that told them apart would be the oracle the rule exists
+    to close: guess numbers, keep the ones that answer differently."""
+    s = _with_vocabulary()
+    out = []
+    for value in ("<Org-07>", "<Org-999977>"):     # live but unshown, then nonexistent
+        with pytest.raises(elastic.Refused) as e:
+            _compile({"index": "logs-app-*",
+                      "filters": [{"field": "labels.tenant_name", "op": "eq", "value": value}]}, s)
+        out.append((e.value.code, e.value.message))
+    assert out[0] == out[1]
+
+
+def test_a_label_shown_on_a_page_can_be_used_next_query():
+    """The other half: the rule must not break the tool."""
+    s = _with_vocabulary()
+    guess = "<Org-07>"
+    s.mark_shown({"hits": [{"_source": {"labels": {"tenant_name": guess}}}]})
+    compiled = _compile({"index": "logs-app-*",
+                         "filters": [{"field": "labels.tenant_name", "op": "eq", "value": guess}]}, s)
+    assert compiled.labels_used == [guess]
+
+
+def test_a_vocabulary_label_in_a_phrase_is_refused_too():
+    """The phrase path resolves labels as well, so it gates the same way."""
+    s = _with_vocabulary()
+    with pytest.raises(elastic.Refused) as e:
+        _compile({"index": "logs-app-*",
+                  "filters": [{"field": "message", "op": "phrase", "value": "quota for <Org-07>"}]}, s)
+    assert e.value.code == "unknown_label"
+
+
+def test_the_shown_set_survives_a_save_and_a_reload(tmp_path):
+    s = _with_vocabulary()
+    shown = sorted(s.shown)
+    s.save_session(tmp_path / "case")
+    back = elastic.EsScrubber.load_session(tmp_path / "case", CFG, tier2="none")
+    assert sorted(back.shown) == shown
+    assert back.shown_label("<Org-01>") is not None
+    assert back.shown_label("<Org-07>") is None
+
+
+def test_a_case_saved_before_this_rule_starts_with_nothing_shown(tmp_path):
+    """The declared default: the mapping cannot stand in for the shown set,
+    because a case saved after a vocabulary was applied holds a label for
+    every name on the estate. One page, or a re-seeded term, brings the
+    labels back."""
+    s = _with_vocabulary()
+    d = s.save_session(tmp_path / "old")
+    raw = json.loads((d / "session.json").read_text())
+    del raw["shown"]                                   # as the file used to be
+    (d / "session.json").write_text(json.dumps(raw))
+    back = elastic.EsScrubber.load_session(d, CFG, tier2="none")
+    assert back.shown == set()
+    assert back.resolve_label("<Org-01>") is not None  # unmasking still works
+    assert back.shown_label("<Org-01>") is None

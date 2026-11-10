@@ -1173,3 +1173,106 @@ def test_the_estate_keeps_the_measured_spelling_skew():
     top = counts[eseval.ESTATE_LEVEL_SPELLINGS[0]]
     assert 30 <= top / max(c for sp, c in counts.items()
                            if sp != eseval.ESTATE_LEVEL_SPELLINGS[0]) <= 50
+
+
+# --- a name that is an ordinary word -----------------------------------------
+#
+# The vocabulary already declares these readable (vocabulary_skip). Harvesting
+# a page used to override that: one document whose job field said "Backup"
+# took the word out of every message in the case, and which page came first
+# decided what a later page said.
+
+
+def _job_doc(job: str, message: str) -> dict:
+    return {"@timestamp": "2026-08-20T10:00:00.000Z",
+            "data_stream": {"dataset": "app.engine", "type": "logs", "namespace": "default"},
+            "log": {"level": "info"},
+            "message": message,
+            "job": {"name": job, "status": "Success"}}
+
+
+def test_an_ordinary_word_name_is_labelled_in_its_field_and_readable_in_text():
+    s = _session()
+    page = s.scrub_response(_envelope([
+        _hit(_job_doc("Backup", "Backup closed its run book entry")),
+        _hit(_job_doc("Harbour Ridge Nightly", "Harbour Ridge Nightly closed its run book entry"),
+             _id="b"),
+    ]), PLAN).output
+    first, second = page["hits"]["hits"]
+    # both are labelled in their own field
+    assert first["_source"]["job"]["name"].startswith("<")
+    assert second["_source"]["job"]["name"].startswith("<")
+    # and both are hidden in the text of the document that owns them
+    assert "Backup" not in first["_source"]["message"]
+    assert "Harbour" not in second["_source"]["message"]
+    # but only the ordinary word stays readable on another document
+    later = s.scrub_response(_envelope([
+        _hit({"@timestamp": "2026-08-20T11:00:00.000Z",
+              "data_stream": {"dataset": "worker.items", "type": "logs", "namespace": "default"},
+              "message": "Backup window opened, 14 items queued; Harbour Ridge Nightly is next"},
+             index="logs-worker-2026.08.20")]), elastic.Plan("logs-worker-*")).output
+    text = later["hits"]["hits"][0]["_source"]["message"]
+    assert "Backup window opened" in text
+    assert "Harbour Ridge Nightly" not in text
+
+
+def test_a_page_reads_the_same_whatever_pages_came_before_it():
+    """The property that was broken: what a page says depended on which
+    pages the case had already seen."""
+    message = "Backup window opened, 14 items queued behind the overnight window"
+    worker = _envelope([_hit({"@timestamp": "2026-08-20T11:00:00.000Z",
+                             "data_stream": {"dataset": "worker.items", "type": "logs",
+                                             "namespace": "default"},
+                             "message": message}, index="logs-worker-2026.08.20")])
+    plan = elastic.Plan("logs-worker-*")
+    alone = _session().scrub_response(copy.deepcopy(worker), plan).output
+    after = _session()
+    after.scrub_response(_envelope([_hit(_job_doc("Backup", "Backup closed its run book entry"))]),
+                         PLAN)
+    second = after.scrub_response(copy.deepcopy(worker), plan).output
+    assert alone == second
+
+
+def test_the_leak_check_does_not_call_a_readable_word_a_leak():
+    """The leak check asks "did a value we promised to hide survive". We
+    promise the opposite for these words, so they must not be in the sweep
+    index that the check reads - the same index, so the two cannot drift."""
+    s = _session()
+    label = s.label_for(CFG.rule("job.name"), "Backup")
+    assert label in s.readable_words and s.mapping[label] == "Backup"
+    assert s.leak_check({"message": "Backup window opened"}) == []
+    s.label_for(CFG.rule("job.name"), "Harbour Ridge Nightly")
+    assert s.leak_check({"message": "Harbour Ridge Nightly finished"}) != []
+
+
+def test_a_seeded_ordinary_word_is_still_hidden_everywhere():
+    """A human typing --term Backup is saying "hide this word", which is a
+    different statement from a job happening to be called Backup."""
+    s = _session()
+    s.seed("Backup")
+    assert not s.readable_words
+    assert "Backup" not in s._scrub_text("Backup window opened, 14 items queued")
+
+
+def test_the_readable_words_survive_a_save_and_a_reload(tmp_path):
+    s = _session()
+    s.label_for(CFG.rule("job.name"), "Backup")
+    s.save_session(tmp_path / "case")
+    back = elastic.EsScrubber.load_session(tmp_path / "case", CFG, tier2="none")
+    assert set(back.readable_words) == set(s.readable_words)
+    assert "Backup" in back._scrub_text("Backup window opened")   # still readable
+    assert back.resolve_label(next(iter(back.readable_words))) == ("Backup", "JOB_NAME")
+
+
+def test_a_case_saved_before_this_rule_stops_hiding_the_word(tmp_path):
+    """The declared default: an old case demotes such a word, so a restored
+    case scrubs a page exactly as a fresh one does."""
+    s = _session()
+    s.label_for(CFG.rule("job.name"), "Backup")
+    d = s.save_session(tmp_path / "old")
+    raw = json.loads((d / "session.json").read_text())
+    del raw["readable_words"]                       # as the file used to be
+    (d / "session.json").write_text(json.dumps(raw))
+    back = elastic.EsScrubber.load_session(d, CFG, tier2="none")
+    assert set(back.readable_words) == set(s.readable_words)
+    assert "Backup" in back._scrub_text("Backup window opened")

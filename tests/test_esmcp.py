@@ -83,15 +83,21 @@ class _Bridge:
     def call(self, op, **kw):
         return esbridge.BrokerClient(self.sock, timeout=30).call(op, **kw)
 
-    def vocabulary(self, cluster="stub", timeout=20.0):
+    def vocabulary(self, cluster="stub", timeout=60.0, complete=False):
         """Build the cluster's name vocabulary and wait for it, as es-login
         does after signing in. A case opened before this is refused with
-        ``vocabulary_building``, which is the point of the code."""
+        ``vocabulary_building``, which is the point of the code.
+
+        The read is sliced by day, so the wait ends as soon as the cover
+        *serves* a case ("extending"); ``complete`` waits for the whole of
+        ``vocabulary.days``, which is what a test about the saved file
+        wants."""
         self.call("vocabulary", cluster=cluster, build=True)
+        want = ("ready", "stale") if complete else ("ready", "stale", "extending")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             state = self.call("vocabulary", cluster=cluster)["vocabulary"]
-            if state.get("state") != "building":
+            if state.get("state") in want:
                 return state
             threading.Event().wait(0.01)
         raise AssertionError("the vocabulary never finished building")
@@ -420,7 +426,7 @@ def test_a_case_before_the_build_finishes_is_refused_with_its_own_code(stub, sho
         opened = b.open(vocabulary=False)      # no build started
         text, err = Mcp(opened["url"], opened["token"]).tool("es_count", index="logs-app-*")
         assert err and "vocabulary_building" in text
-        assert "still being built" in text
+        assert "does not yet cover" in text
         # and once it is built, the same call works
         b.vocabulary()
         again = b.open(case="c1", vocabulary=False)
@@ -434,7 +440,7 @@ def test_the_vocabulary_file_is_written_beside_the_cases_and_kept_private(stub, 
     cfg = _config(stub.url, short_dir / "profile")
     b = _Bridge(cfg, short_dir / "cases")
     try:
-        b.vocabulary()
+        b.vocabulary(complete=True)
     finally:
         b.stop()
     path = short_dir / "cases" / elastic.VocabularyIndex.FILENAME

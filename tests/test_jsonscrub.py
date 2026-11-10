@@ -218,3 +218,122 @@ def test_short_values_are_swept_and_the_trade_is_measured():
         assert still_present == 0, g
         assert flagged == 0, g
         assert coincidental_removed == (30 if g == "collision" else 0), g
+
+
+# --- a name that is an ordinary word ------------------------------------------
+#
+# A value under an identifier key used to be remembered and swept across the
+# whole export. For a name that is an ordinary English word that meant: one
+# ticket whose tenant field said "Archive" turned every other ticket's
+# "Moved 40 items to archive" into "Moved 40 items to <Org-01>". The word
+# list is jsonscrub.ORDINARY_NAME_WORDS, shared with the Elasticsearch
+# scrubber (elastic re-exports it).
+
+
+_TICKETS = [
+    {"ticket": "T-1001", "tenant": "Archive", "job_name": "Retention",
+     "notes": "Retention finished for the tenant with 0 errors"},
+    {"ticket": "T-1002", "tenant": "Fabrikam Industries", "job_name": "Mailbox",
+     "notes": "Mailbox completed; Fabrikam Industries confirmed by phone"},
+    {"ticket": "T-1003", "tenant": "Harbour Ridge Ltd", "job_name": "Nightly Sweep",
+     "notes": "Moved 40 items to archive, retention unchanged; mailbox quota is fine"},
+]
+
+
+def _ticket_run(case_wide: bool):
+    s = jsonscrub.JsonScrubber(tier2="none")
+    s.ordinary_words_case_wide = case_wide
+    return s.run(json.loads(json.dumps(_TICKETS)))
+
+
+def test_an_ordinary_word_name_is_readable_outside_its_own_record():
+    """The measured before and after, on the same invented export: 3 of the
+    6 name values are ordinary words, and ticket 3's note used to lose all
+    three of them."""
+    before = _ticket_run(True).output
+    assert "<" in before[2]["notes"] and "archive" not in before[2]["notes"]
+    after = _ticket_run(False).output
+    # own fields are still labelled...
+    for rec in after:
+        assert rec["tenant"].startswith("<") and rec["job_name"].startswith("<")
+    # ...the words survive as English in the other ticket's note...
+    assert "Moved 40 items to archive, retention unchanged; mailbox quota is fine" \
+        == after[2]["notes"]
+    # ...and the real names are still hidden everywhere
+    assert "Fabrikam" not in json.dumps(after) and "Harbour" not in json.dumps(after)
+
+
+def test_the_record_that_owns_the_name_still_hides_it_in_its_own_text():
+    after = _ticket_run(False).output
+    assert "Retention" not in after[0]["notes"]      # ticket 1 owns "Retention"
+    assert after[0]["notes"].startswith("<")
+    assert "Mailbox" not in after[1]["notes"]        # ticket 2 owns "Mailbox"
+
+
+def test_a_record_reads_the_same_whatever_records_sit_beside_it():
+    """The broken property: what a record said depended on which records
+    came with it."""
+    alone = jsonscrub.scrub([json.loads(json.dumps(_TICKETS[2]))], tier2="none")
+    together = _ticket_run(False)
+    assert alone.output[0]["notes"] == together.output[2]["notes"]
+
+
+def test_a_single_object_export_is_one_record():
+    """The declared boundary: elements of the top-level list are records;
+    any other shape is one record, so within a single-object export the
+    word is hidden throughout, as before."""
+    one = jsonscrub.scrub({"tenant": "Archive",
+                           "notes": "items moved to archive overnight"}, tier2="none")
+    assert one.output["tenant"].startswith("<")
+    assert "archive" not in one.output["notes"]
+    assert one.output["tenant"] in one.output["notes"]
+
+
+def test_a_seeded_ordinary_word_is_still_hidden_across_the_export():
+    """A person seeding "Archive" as a search term is saying "hide this
+    word"; the rule must not demote it just because a tenant field also
+    holds it."""
+    r = jsonscrub.scrub(json.loads(json.dumps(_TICKETS)), tier2="none", terms=["Archive"])
+    assert "archive" not in json.dumps(r.output).lower().replace("<org", "")
+    assert r.output[0]["tenant"] == r.output[2]["notes"].split()[4].rstrip(",")
+
+
+def test_the_export_leak_check_treats_readable_words_as_readable():
+    """The leak check reads the same sweep index the substitution does, so
+    a word kept out of the index is out of both: an ordinary-word name in
+    another record's prose is not a leak, a real name still is."""
+    r = _ticket_run(False)
+    assert r.stats["leaks"] == []
+    s = jsonscrub.JsonScrubber(tier2="none")
+    s._label("ORG_NAME", "Fabrikam Industries")
+    assert s.leak_check({"notes": "Fabrikam Industries called"}) != []
+
+
+def test_the_ordinary_word_list_is_shared_not_copied():
+    from hider import elastic
+
+    assert elastic.ORDINARY_NAME_WORDS is jsonscrub.ORDINARY_NAME_WORDS
+
+
+def test_the_run_names_which_words_stay_readable():
+    """A clean verdict looks the same whether or not a customer name was
+    left readable, so the run has to say which ones. Labels in the stats -
+    they end up in .scrub.json, which carries decisions, not data."""
+    r = _ticket_run(False)
+    assert r.stats["leaks"] == []                      # clean, and still
+    labels = r.stats["readable_words"]
+    assert len(labels) == 3
+    assert all(lab in r.mapping for lab in labels)
+    assert sorted(r.mapping[lab] for lab in labels) == ["Archive", "Mailbox", "Retention"]
+    # the stats themselves carry no word
+    assert "Archive" not in json.dumps(r.stats)
+
+
+def test_seeding_a_reported_name_takes_it_off_the_list():
+    """The loop the report exists to close: it names Archive, you seed
+    Archive, it stops being readable and stops being reported."""
+    before = _ticket_run(False)
+    assert "Archive" in [before.mapping[l] for l in before.stats["readable_words"]]
+    after = jsonscrub.scrub(json.loads(json.dumps(_TICKETS)), tier2="none", terms=["Archive"])
+    assert "Archive" not in [after.mapping[l] for l in after.stats["readable_words"]]
+    assert "archive" not in json.dumps(after.output).lower().replace("<org", "")

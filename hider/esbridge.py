@@ -589,6 +589,11 @@ class Bridge:
             except elastic.Refused as e:
                 outcome.refused = e.code
                 row["refused"] = e.code
+                if e.label is not None:
+                    # the label Claude typed, never the value behind it:
+                    # this is how a case guessing at labels is visible at
+                    # all, and a guess is refused before any request
+                    row["label"] = e.label
                 raise
             finally:
                 outcome.seconds = round(time.perf_counter() - t0, 3)
@@ -822,20 +827,38 @@ def seed_terms(config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
     return labels
 
 
-def run_case(bridge: Bridge, cluster: str, query: dict) -> dict:
+def run_case(bridge: Bridge, cluster: str, query: dict, *, show_names: bool = False) -> dict:
     """One query through a bridge, as the JSON report ``print_smoke`` reads.
     The same report comes back from the broker, so a run prints the same
-    whether it happened in this process or in the long-lived one."""
+    whether it happened in this process or in the long-lived one.
+
+    ``show_names`` is the operator asking, out loud, for the words behind
+    the readable-word labels. Off by default and off in every automated
+    path: es-smoke's output is read by scripts and agents as well as
+    people, so a real customer name must never arrive there unasked. With
+    it off the words are not in the report at all, not merely unprinted.
+    """
     try:
         o = bridge.run(cluster, query)
     except elastic.Refused as e:
         return {"refused": {"code": e.code, "message": e.message},
                 "vocabulary": bridge.vocabulary.get(cluster)}
     s = bridge.scrubber
-    return {"refused": None, "output": o.output, "hits_total": o.hits_total,
-            "hits_shown": o.hits_shown, "seconds": o.seconds,
-            "labels_issued": len(s.mapping), "dropped": sorted(s.dropped),
-            "vocabulary": bridge.vocabulary.get(cluster)}
+    # Names that are ordinary words: labelled in their own field, readable
+    # as English on every other document. The label and the field it came
+    # from are decisions, so they are always reported - enough to go and
+    # look the name up, and to seed it once you have. The word itself is
+    # data and waits for show_names.
+    readable = [{"label": lab, "field": s.readable_fields.get(lab, "?")}
+                for lab in sorted(s.readable_words)]
+    report = {"refused": None, "output": o.output, "hits_total": o.hits_total,
+              "hits_shown": o.hits_shown, "seconds": o.seconds,
+              "labels_issued": len(s.mapping), "dropped": sorted(s.dropped),
+              "readable_words": readable,
+              "vocabulary": bridge.vocabulary.get(cluster)}
+    if show_names:
+        report["readable_names"] = sorted(s.readable_words.values())
+    return report
 
 
 def vocabulary_line(v: dict | None) -> str | None:
@@ -991,6 +1014,20 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
         print(f"NOTE     {note}")
     if report["dropped"]:
         print(f"         unlisted fields dropped: {report['dropped']}")
+    readable = report.get("readable_words") or []
+    if readable:
+        # Labels and fields: decisions, safe for a script or an agent to
+        # read. stderr, with the other operator notes, so stdout stays the
+        # one decision line.
+        where = ", ".join(f"{r['label']} ({r['field']})" for r in readable)
+        print(f"READABLE  {len(readable)} name(s) are ordinary words and stay readable in "
+              f"message text outside the document that holds them: {where}. "
+              f"Re-run with --show-readable-names to see the words, then --term NAME for "
+              f"any that is a real customer name.", file=sys.stderr)
+        names = report.get("readable_names")
+        if names:
+            # only when the operator asked for them by flag
+            print(f"          names: {', '.join(names)}", file=sys.stderr)
     if vline:
         print(vline)
     if show:
@@ -1360,12 +1397,15 @@ class Broker:
         log = req.get("log")
         if log is not None and not (isinstance(log, str) and os.path.isabs(log)):
             raise elastic.Refused("bad_request", "log is an absolute path")
+        show_names = req.get("show_names", False)
+        if not isinstance(show_names, bool):
+            raise elastic.Refused("bad_request", "show_names is true or false")
         scrubber = elastic.EsScrubber(self.config, tier2=tier2)
         seeded = seed_terms(self.config, scrubber, terms)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
                                 poll_timeout=self.config.poll_timeout_s)
         bridge = Bridge(self.config, scrubber, session, log_path=log, index=self.vocabulary)
-        report = run_case(bridge, cluster.name, req.get("query"))
+        report = run_case(bridge, cluster.name, req.get("query"), show_names=show_names)
         report["seeded"] = seeded
         return report
 

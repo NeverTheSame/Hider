@@ -238,8 +238,8 @@ class _Compiler:
     # -- helpers -----------------------------------------------------------
 
     @staticmethod
-    def refuse(code: str, message: str) -> elastic.Refused:
-        return elastic.Refused(code, message)
+    def refuse(code: str, message: str, *, label: str | None = None) -> elastic.Refused:
+        return elastic.Refused(code, message, label=label)
 
     def rule(self, name: Any, *, what: str) -> elastic.FieldRule:
         if not isinstance(name, str) or not elastic._FIELD_RE.match(name) or "*" in name:
@@ -256,9 +256,15 @@ class _Compiler:
         return f"; closest site-map field: {hit}" if hit else "; see the site map's field list"
 
     def _labels_in(self, text: str) -> list[str]:
-        """Every label the session knows that appears in ``text``, longest first."""
+        """Every label the case has been **shown** that appears in ``text``,
+        longest first.
+
+        Shown, not merely issued: a guessed label inside a phrase has to
+        fall through to the remainder, where it is refused like any other
+        label the case does not have.
+        """
         if self._label_rx is None:
-            labels = sorted(self.session.mapping, key=len, reverse=True)
+            labels = sorted(self.session.shown, key=len, reverse=True)
             if not labels:
                 return []
             # Cached on the session, not on this compiler: a cluster
@@ -268,7 +274,7 @@ class _Compiler:
             # estate: 0.6s a query at 42,000 labels). The cache is keyed by
             # how many labels the session has issued, so a label issued
             # since the last compile rebuilds it.
-            cached = getattr(self.session, "_label_alternation", None)
+            cached = getattr(self.session, "_shown_alternation", None)
             if cached is not None and cached[0] == len(labels):
                 self._label_rx = cached[1]
             else:
@@ -276,7 +282,7 @@ class _Compiler:
                     r"(?<![A-Za-z0-9])(?:" + "|".join(map(re.escape, labels))
                     + r")(?![A-Za-z0-9])")
                 try:
-                    self.session._label_alternation = (len(labels), self._label_rx)
+                    self.session._shown_alternation = (len(labels), self._label_rx)
                 except AttributeError:
                     pass
         return [m.group(0) for m in self._label_rx.finditer(text)]
@@ -292,7 +298,7 @@ class _Compiler:
         for m in (rx.finditer(text) if rx else ()):
             out.append(text[pos:m.start()])
             remainder.append(text[pos:m.start()])
-            val = self.session.resolve_label(m.group(0))
+            val = self.session.shown_label(m.group(0))
             assert val is not None
             out.append(val[0])
             self.labels_used.append(m.group(0))
@@ -339,10 +345,14 @@ class _Compiler:
         if not isinstance(v, str):
             raise self.refuse("literal_identifier", f"{what}: identifier fields take labels, "
                                                     "not literals")
-        hit = self.session.resolve_label(v.strip())
+        # shown_label, not resolve_label: a label the case has not been
+        # shown is treated exactly as one that was never issued, so the
+        # refusal below cannot tell a live guess from a dead one
+        hit = self.session.shown_label(v.strip())
         if hit is None:
             if _LABEL_WORD.fullmatch(v.strip()) or self._looks_like_label(v.strip()):
-                raise self.refuse("unknown_label", f"{what}: that label was not issued in this case")
+                raise self.refuse("unknown_label", f"{what}: that label was not issued in this case",
+                                  label=v.strip())
             raise self.refuse("literal_identifier", f"{what}: identifier fields take labels, "
                                                     "not literals")
         value, vtype = hit
@@ -757,17 +767,23 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
                                             "value": {"gte": 1000}}]}, "range_identifier"),
     OracleCase("sort-by-identifier", "sorting by an identifier reveals the order of real values",
                {"index": _IDX, "sort": [{"field": _TENANT, "order": "asc"}]}, "sort_identifier"),
-    # The number is far above any label a case can issue on purpose. It used
-    # to be <Org-77>, which stopped being unknown the moment a cluster
-    # vocabulary was applied: a sign-in build over ten thousand tenant names
-    # issues every low Org number before the case asks its first question.
-    # That the *case* is still testable this way does not make the
-    # underlying problem go away - see the estate section of es-eval and
-    # AGENTS.md: with a vocabulary applied, a guessed low-numbered label is
-    # a live reference to someone's tenant.
+    # A label number no case issues, so this one is a guess at a label that
+    # does not exist...
     OracleCase("unknown-label", "a label this case never issued: a guess, not a reference",
                {"index": _IDX, "filters": [{"field": _TENANT, "op": "eq",
                                             "value": "<Org-999977>"}]},
+               "unknown_label"),
+    # ...and this one is a guess at a label that **does** exist. Applying a
+    # cluster vocabulary mints a label for every name on the estate, so
+    # every low Org number is live before the case has asked anything.
+    # Resolving it would let a case reach and count a customer it was never
+    # shown - nobody unmasked, but the whole cluster reachable. A label is
+    # usable only once the case has been shown it (seeded, or carried in a
+    # page or an aggregation), and the refusal is the one above, word for
+    # word: a refusal must not tell a live guess from a dead one.
+    OracleCase("vocabulary-label-never-shown",
+               "a label the vocabulary minted but this case was never shown",
+               {"index": _IDX, "filters": [{"field": _TENANT, "op": "eq", "value": "<Org-77>"}]},
                "unknown_label"),
     OracleCase("label-of-wrong-type", "a tenant GUID label used to filter the tenant name",
                {"index": _IDX, "filters": [{"field": _TENANT, "op": "eq", "value": "<Tenant-01>"}]},

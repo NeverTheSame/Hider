@@ -1380,3 +1380,27 @@ def test_smoke_names_the_learnable_fields_a_site_map_leaves_out(stub, tmp_path, 
     assert "NOT READ (readable in text): labels.resource_name, labels.site_name, " \
            "labels.tenant_full_name, labels.tenant_name" in line
     assert "job.name=" in line  # what it does read is still counted
+
+
+def test_the_smoke_report_reports_readable_words_without_naming_them(stub, tmp_path, fixture):
+    """es-smoke output is read by scripts and agents as well as people, so
+    a real customer name is never in it unasked. The label and the field
+    it came from are decisions and always reported - enough to go and look
+    the name up. The decision log carries neither word nor name."""
+    b = _bridge(stub, tmp_path)
+    s = b.scrubber
+    label = s.label_for(b.config.rule("job.name"), "Backup")
+    assert s.readable_words.get(label) == "Backup"
+    report = esbridge.run_case(b, "stub", {"index": "logs-app-*", "size": 1})
+    assert {"label": label, "field": "job.name"} in report["readable_words"]
+    assert "readable_names" not in report            # not merely unprinted
+    assert "Backup" not in json.dumps(report)
+    assert "Backup" not in (tmp_path / "decisions.jsonl").read_text()
+
+
+def test_the_words_come_back_only_when_the_operator_asks(stub, tmp_path, fixture):
+    b = _bridge(stub, tmp_path)
+    b.scrubber.label_for(b.config.rule("job.name"), "Backup")
+    report = esbridge.run_case(b, "stub", {"index": "logs-app-*", "size": 1}, show_names=True)
+    assert "Backup" in report["readable_names"]
+    assert "Backup" not in (tmp_path / "decisions.jsonl").read_text()
