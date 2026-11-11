@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import re
 import stat
@@ -382,6 +383,97 @@ def test_non_string_keep_values_are_untouched():
     assert src["http"]["response"]["status_code"] == 429
 
 
+# -- a learnt name inside a longer keep value --------------------------------
+#
+# With the vocabulary applied, a job called Harborsync turned the stream
+# logs-agent.harborsync_events-prod into logs-agent.<Job-NN>_events-prod in
+# the index, dataset and namespace. A learnt or harvested name replaces a
+# keep value only when it is the whole value; a seeded one matches anywhere.
+
+_STREAM_INDEX = eseval.backing_index(eseval.STREAM_INDEX)
+_SCFG = eseval.stream_name_map()
+_SPLAN = elastic.Plan(eseval.STREAM_INDEX)
+
+
+def _ssession() -> elastic.EsScrubber:
+    return elastic.EsScrubber(_SCFG, tier2="none")
+
+
+def _stream_doc(**extra) -> dict:
+    return {"@timestamp": "2026-08-20T10:00:00.000Z",
+            "data_stream": {"dataset": "agent.harborsync_events", "type": "logs",
+                            "namespace": "harborsync_events-prod"},
+            "log": {"level": "info"},
+            "message": "Harborsync finished 3 batches", "job": {"name": "Harborsync"}, **extra}
+
+
+def _stream_plan():
+    return elastic.Plan(eseval.STREAM_INDEX, {
+        "ds": elastic.AggPlan("terms", "data_stream.dataset", _SCFG.rule("data_stream.dataset"))})
+
+
+def test_a_learnt_name_inside_a_longer_keep_value_stays_readable():
+    s = _ssession()
+    s.label_for(_SCFG.rule("job.name"), "Harborsync")      # learnt before this page
+    aggs = {"ds": {"buckets": [{"key": "agent.harborsync_events", "doc_count": 3,
+                                "key_as_string": "agent.harborsync_events"}]}}
+    out = s.scrub_response(_envelope([_hit(_stream_doc(), index=_STREAM_INDEX)], aggs),
+                           _stream_plan()).output
+    hit = out["hits"]["hits"][0]
+    label = s.known["harborsync"]
+    assert hit["_index"] == _STREAM_INDEX
+    assert hit["_source"]["data_stream"]["dataset"] == "agent.harborsync_events"
+    assert hit["_source"]["data_stream"]["namespace"] == "harborsync_events-prod"
+    b = out["aggregations"]["ds"]["buckets"][0]
+    assert b["key"] == b["key_as_string"] == "agent.harborsync_events"
+    # text and identifier fields are untouched by the rule
+    assert hit["_source"]["job"]["name"] == label
+    assert hit["_source"]["message"] == f"{label} finished 3 batches"
+    # marks never leave the scrubber
+    assert type(hit["_index"]) is str and type(b["key"]) is str
+
+
+def test_a_keep_value_that_is_the_whole_learnt_name_is_labelled():
+    s = _ssession()
+    doc = _stream_doc(service={"name": "  HARBORSYNC "})
+    aggs = {"ds": {"buckets": [{"key": "Harborsync", "doc_count": 1}]}}
+    out = s.scrub_response(_envelope([_hit(doc, index=_STREAM_INDEX)], aggs), _stream_plan()).output
+    label = s.known["harborsync"]
+    assert out["hits"]["hits"][0]["_source"]["service"]["name"] == label
+    assert out["aggregations"]["ds"]["buckets"][0]["key"] == label
+
+
+def test_a_seeded_name_still_matches_inside_a_keep_value():
+    s = _ssession()
+    label = s.seed("Harborsync", "JOB_NAME")
+    aggs = {"ds": {"buckets": [{"key": "agent.harborsync_events", "doc_count": 3}]}}
+    out = s.scrub_response(_envelope([_hit(_stream_doc(), index=_STREAM_INDEX)], aggs),
+                           _stream_plan()).output
+    hit = out["hits"]["hits"][0]
+    assert "harborsync" not in json.dumps(out).lower()
+    assert hit["_source"]["data_stream"]["dataset"] == f"agent.{label}_events"
+    assert out["aggregations"]["ds"]["buckets"][0]["key"] == f"agent.{label}_events"
+    assert label in hit["_index"]
+
+
+def test_a_shape_tier_1_recognises_still_matches_inside_a_keep_value():
+    s = _ssession()
+    s.label_for(_SCFG.rule("job.name"), "Harborsync")
+    doc = _stream_doc(service={"name": "moved to lena.moreau@fabrikam.com"})
+    out = s.scrub_response(_envelope([_hit(doc, index=_STREAM_INDEX)]), _SPLAN).output
+    assert "lena.moreau" not in json.dumps(out)
+
+
+def test_seeded_labels_survive_a_saved_case(tmp_path):
+    s = _ssession()
+    label = s.seed("Harborsync", "JOB_NAME")
+    s.save_session(tmp_path)
+    r = elastic.EsScrubber.load_session(tmp_path, _SCFG, tier2="none")
+    assert r.seeded_labels == {label}
+    out = r.scrub_response(_envelope([_hit(_stream_doc(), index=_STREAM_INDEX)]), _SPLAN).output
+    assert "harborsync" not in json.dumps(out).lower()
+
+
 def test_unplanned_aggregation_is_refused():
     s = _session()
     with pytest.raises(elastic.Refused) as e:
@@ -617,13 +709,34 @@ def _vocab_reply(*names: str, more: bool = False) -> dict:
         "aggregations": {f"{elastic.VOCABULARY_AGG}_0": node}}}
 
 
+def _count_reply(n: int) -> dict:
+    """The distinct-count probe's reply: one cardinality value, which is
+    what every field is asked for before it is paged."""
+    return {"isPartial": False, "isRunning": False, "rawResponse": {
+        "took": 1, "timed_out": False, "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []},
+        "aggregations": {elastic.VOCABULARY_COUNT_AGG: {"value": n}}}}
+
+
+def _is_count(req: dict) -> bool:
+    return elastic.VOCABULARY_COUNT_AGG in req["params"]["body"]["aggs"]
+
+
+def _page_names(page: dict) -> int:
+    agg = page["rawResponse"]["aggregations"][f"{elastic.VOCABULARY_AGG}_0"]
+    return len(agg["buckets"])
+
+
 def _build(cfg, *pages: dict, clock=None) -> elastic.VocabularyBuild:
     """Drive a build, answering each request with the next page; a page not
-    given is an empty one (that field has no values)."""
+    given is an empty one (that field has no values). A field's distinct
+    count is answered first, as the cluster answers it."""
     build = elastic.VocabularyBuild(cfg, 0.0, 86400.0, clock=clock)
     queue = list(pages)
     while build.pending():
-        build.request()
+        req = build.request()
+        if _is_count(req):
+            build.feed(_count_reply(_page_names(queue[0]) if queue else 0))
+            continue
         build.feed(queue.pop(0) if queue else _vocab_reply())
     return build
 
@@ -683,6 +796,13 @@ def test_the_vocabulary_request_is_fixed_and_carries_no_value():
         {"range": {"@timestamp": {"gte": "2026-08-19T12:00:00.000Z",
                                   "lte": "2026-08-20T12:00:00.000Z"}}},
         {"exists": {"field": "job.name"}}]}}
+    # the field's distinct count comes first, so a field too wide to read is
+    # never paged: one aggregation, no paging, precision asked for at the cap
+    assert body["aggs"] == {elastic.VOCABULARY_COUNT_AGG: {"cardinality": {
+        "field": "job.name",
+        "precision_threshold": min(elastic.VOCABULARY_PRECISION_CEILING, CFG.vocabulary_max)}}}
+    build.feed(_count_reply(12))
+    body = build.request()["params"]["body"]
     assert body["aggs"] == {f"{elastic.VOCABULARY_AGG}_0": {"composite": {
         "size": elastic.VOCABULARY_PAGE,
         "sources": [{elastic.VOCABULARY_SOURCE: {"terms": {"field": "job.name"}}}]}}}
@@ -693,6 +813,8 @@ def test_the_vocabulary_request_is_fixed_and_carries_no_value():
 def test_the_build_reads_one_field_at_a_time_in_pages():
     first = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
     build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    build.request()
+    build.feed(_count_reply(len(first) + 1))
     req = build.request()
     assert "after" not in req["params"]["body"]["aggs"][f"{elastic.VOCABULARY_AGG}_0"]["composite"]
     build.feed(_vocab_reply(*first, more=True))
@@ -705,11 +827,14 @@ def test_the_build_reads_one_field_at_a_time_in_pages():
     assert build.field == VOCAB_ORDER[1] and build.pending()
     assert build.progress()["fields_done"] == 1
     while build.pending():
-        build.request()
-        build.feed(_vocab_reply())
+        req = build.request()
+        build.feed(_count_reply(0) if _is_count(req) else _vocab_reply())
     vocab = build.result()
     assert vocab.counts["job.name"] == elastic.VOCABULARY_PAGE + 1
-    assert build.requests == 2 + len(VOCAB_ORDER) - 1
+    # two pages for the field with values, one for each of the others, and
+    # one distinct count each before them
+    assert build.requests == 2 + len(VOCAB_ORDER) - 1 + len(VOCAB_ORDER)
+    assert build.probes == len(VOCAB_ORDER)
     s = _session()
     s.apply_vocabulary("c", vocab)
     assert "harbour nightly" in s.known  # the last page's names are learnt too
@@ -751,6 +876,8 @@ def test_a_page_that_is_not_the_shape_it_was_asked_for_refuses():
     bare string (which is what a terms aggregation returns)."""
     build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
     build.request()
+    build.feed(_count_reply(1))
+    build.request()
     with pytest.raises(elastic.Refused) as e:
         build.feed({"isPartial": False, "isRunning": False, "rawResponse": {
             "timed_out": False, "aggregations": {f"{elastic.VOCABULARY_AGG}_0": {
@@ -758,7 +885,10 @@ def test_a_page_that_is_not_the_shape_it_was_asked_for_refuses():
     assert e.value.code == "vocabulary" and "Harbour" not in e.value.message
 
 
-def test_a_field_over_its_ceiling_abandons_the_build():
+def test_a_field_the_map_lists_over_its_ceiling_abandons_the_build():
+    """A field the site map names in vocabulary.fields: the map asked for
+    that field to be read, and reading most of it is not that. The count
+    refuses it before a single page is asked for."""
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["vocabulary"]["max"] = 2
     cfg = elastic.parse(raw, source="t")
@@ -769,19 +899,75 @@ def test_a_field_over_its_ceiling_abandons_the_build():
     build = elastic.VocabularyBuild(cfg, 0.0, 86400.0)
     build.request()
     with pytest.raises(elastic.Refused) as e:
-        build.feed(_vocab_reply("Oak Creek Holdings", "Fernhill Row", "Marlowe Trust"))
+        build.feed(_count_reply(3))
     assert e.value.code == "vocabulary"
-    assert "job.name has more than 2 distinct values" in e.value.message
-    assert "vocabulary.max" in e.value.message and "Oak Creek" not in e.value.message
+    assert "job.name has about 3 distinct values" in e.value.message
+    # and it says which way out: both of them, naming the field
+    assert "vocabulary.fields" in e.value.message and "vocabulary.max" in e.value.message
     assert "oak creek holdings" not in s.known
 
 
+def test_a_field_in_the_default_set_over_its_ceiling_is_left_out():
+    """The same field where the map has no vocabulary section: the default
+    set is everything learnable, so one id-shaped field must not take the
+    build down with it. It is left out, the rest is read, and the decision
+    is handed back for the caller to save."""
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    del raw["vocabulary"]
+    cfg = elastic.parse(raw, source="t")
+    assert cfg.vocabulary_fields is None
+    build = elastic.VocabularyBuild(dataclasses.replace(cfg, vocabulary_max=2), 0.0, 86400.0)
+    build.request()
+    build.feed(_count_reply(9))                 # job.name, too wide
+    assert build.pending() and build.field == VOCAB_ORDER[1]
+    assert build.dropped == {"job.name": 9}
+    assert build.progress()["over_cap"] == {"job.name": 9}
+    while build.pending():
+        req = build.request()
+        build.feed(_count_reply(1) if _is_count(req) else _vocab_reply("Fernhill Row"))
+    vocab = build.result()
+    assert "job.name" not in vocab.fields       # nothing partial was kept
+    assert vocab.counts["labels.tenant_name"] == 1
+    assert build.take_dropped() == {"job.name": 9}
+    # a build told about it does not ask again, and does not page it
+    again = elastic.VocabularyBuild(dataclasses.replace(cfg, vocabulary_max=2), 0.0, 86400.0,
+                                    over_cap={"job.name": {"count": 9, "at": 0.0}})
+    assert [r.pattern for r in again.rules] == VOCAB_ORDER[1:]
+    assert again.field != "job.name"
+
+
+def test_a_count_near_the_cap_is_read_toward_the_build_finishing():
+    """The count is approximate, so the margin decides what "near the cap"
+    means - and it goes whichever way keeps the build running. A default
+    field just under the cap is left out (the build carries on without it);
+    a listed field just under it is paged, because there "over the cap"
+    means refusing the slice, and the exact page count should be what does
+    that."""
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    near = int(elastic.DEFAULT_VOCABULARY_MAX * (1 - elastic.VOCABULARY_PROBE_MARGIN / 2))
+    listed = elastic.parse(raw, source="t")
+    build = elastic.VocabularyBuild(listed, 0.0, 86400.0)
+    build.request()
+    build.feed(_count_reply(near))              # listed: read it, do not refuse
+    assert build.field == "job.name" and not build.dropped
+    assert not _is_count(build.request())       # the next request is a page
+    del raw["vocabulary"]
+    build = elastic.VocabularyBuild(elastic.parse(raw, source="t"), 0.0, 86400.0)
+    build.request()
+    build.feed(_count_reply(near))              # default: leave it out
+    assert build.dropped == {"job.name": near} and build.field != "job.name"
+
+
 def test_the_ceiling_counts_a_whole_build_not_one_page_of_it():
+    """The exact page-time count is still the backstop: an approximate
+    count under the cap does not license reading past it."""
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["vocabulary"]["max"] = elastic.VOCABULARY_PAGE
     cfg = elastic.parse(raw, source="t")
     full = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
     build = elastic.VocabularyBuild(cfg, 0.0, 86400.0)
+    build.request()
+    build.feed(_count_reply(elastic.VOCABULARY_PAGE))   # the count says it fits
     build.request()
     build.feed(_vocab_reply(*full, more=True))
     build.request()
@@ -796,9 +982,11 @@ def test_a_build_over_its_time_budget_is_abandoned():
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw["vocabulary"]["budget_s"] = 60
     cfg = elastic.parse(raw, source="t")
-    ticks = iter([0.0, 20.0, 40.0, 61.0, 61.0])
+    ticks = iter([0.0, 1.0, 20.0, 40.0, 61.0, 61.0])
     build = elastic.VocabularyBuild(cfg, 0.0, 86400.0, clock=lambda: next(ticks))
     full = [f"Orchard Sweep {i:05d}" for i in range(elastic.VOCABULARY_PAGE)]
+    build.request()
+    build.feed(_count_reply(3 * elastic.VOCABULARY_PAGE))   # 1s: the count
     build.request()
     build.feed(_vocab_reply(*full, more=True))      # 20s
     build.request()
@@ -807,7 +995,7 @@ def test_a_build_over_its_time_budget_is_abandoned():
     with pytest.raises(elastic.Refused) as e:       # 61s: over
         build.feed(_vocab_reply(*full, more=True))
     assert e.value.code == "vocabulary" and "budget_s" in e.value.message
-    assert "3 requests" in e.value.message and "0 of 5 fields" in e.value.message
+    assert "4 requests" in e.value.message and "0 of 5 fields" in e.value.message
 
 
 def test_the_index_saves_the_names_private_to_the_user_and_reloads_them(tmp_path):
@@ -878,12 +1066,31 @@ def test_the_index_report_is_counts_and_state_never_a_name(tmp_path):
         now - CFG.vocabulary_days * 86400.0, now - 2 * 86400.0, 0.0, {}))
     full = index.report("emea", CFG, now=now)
     assert full["state"] == "ready" and full["complete"]
-    stale = index.report("emea", CFG, now=now + elastic.VOCABULARY_REFRESH_S + 1)
+    # past the refresh interval a top-up is due, which is not stale: the
+    # first two days at sign-in take longer than the interval to read
+    due = index.report("emea", CFG, now=now + elastic.VOCABULARY_REFRESH_S + 1)
+    assert due["state"] == "top_up_due" and due["serving"]
+    # stale is a top-up overdue by more than a slice's budget
+    late = now + elastic.VOCABULARY_REFRESH_S + CFG.vocabulary_budget_s + 1
+    stale = index.report("emea", CFG, now=late)
     assert stale["state"] == "stale" and stale["age_s"] > elastic.VOCABULARY_REFRESH_S
+
+
+def test_the_vocab_line_says_top_up_due_and_keeps_stale_for_an_overdue_one():
+    from hider import esbridge
+
+    v = {"fields": {"job.name": 3}, "max": 50000, "covered_days": 2.0, "wanted_days": 30,
+         "serving": True, "age_s": 976.9}
+    due = esbridge.vocabulary_line({**v, "state": "top_up_due"})
+    assert "top-up due (976.9s old)" in due and "stale" not in due
+    stale = esbridge.vocabulary_line({**v, "state": "stale", "refused": "upstream"})
+    assert "stale" in stale and "TOP-UP OVERDUE (upstream)" in stale
 
 
 def test_a_build_is_only_a_vocabulary_once_every_field_is_done():
     build = elastic.VocabularyBuild(CFG, 0.0, 86400.0)
+    build.request()
+    build.feed(_count_reply(1))
     build.request()
     build.feed(_vocab_reply("Harbour Nightly"))
     assert build.pending()

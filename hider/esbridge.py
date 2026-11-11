@@ -625,8 +625,11 @@ class Bridge:
                 "slices, newest first, and a page shown before those are in could leak a "
                 "customer name in message text). Try again shortly; es-smoke's VOCAB line "
                 "shows how far back the cover reaches.")
-        counts = self.scrubber.apply_vocabulary(cluster.name, vocab)
-        report = {**self.index.report(cluster.name, self.config, now=clock()), "fields": counts,
+        over_cap = {f: int(v["count"])
+                    for f, v in self.index.over_cap_fields(cluster.name, clock()).items()}
+        counts = self.scrubber.apply_vocabulary(cluster.name, vocab, over_cap=over_cap)
+        report = {**self.index.report(cluster.name, self.config, now=clock()),
+                  "fields": {f: n for f, n in counts.items() if f not in over_cap},
                   "skipped": dict(self.scrubber.vocabulary_skipped)}
         self.vocabulary[cluster.name] = report
         self._log({"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -861,13 +864,29 @@ def run_case(bridge: Bridge, cluster: str, query: dict, *, show_names: bool = Fa
     return report
 
 
+def _over_cap_note(v: dict) -> str:
+    """The fields a build counted and did not read, with their counts.
+
+    This is the only place a user is told that a real name field is
+    unreadable in message text because it has more distinct values than
+    ``vocabulary.max`` - nothing refuses, nothing else says it, and the
+    names are simply there in the text. Field names and counts.
+    """
+    over = v.get("over_cap") or {}
+    if not over:
+        return ""
+    return (" OVER CAP, NOT READ (readable in text): "
+            + ", ".join(f"{f}~{n}>{v.get('max', '?')}" for f, n in sorted(over.items())))
+
+
 def vocabulary_line(v: dict | None) -> str | None:
     """How close each vocabulary field is to its cap: counts, never values.
 
     ``NOT READ`` names the identifier fields a vocabulary could hold that
-    this site map's ``vocabulary.fields`` leaves out - their values stay
-    readable in message text, which is a choice worth seeing. Field names
-    only; a field is only listed here because the map itself names it.
+    this site map's ``vocabulary.fields`` leaves out, and ``OVER CAP, NOT
+    READ`` the ones a build counted and found too wide to read - their
+    values stay readable in message text, which is a choice worth seeing.
+    Field names and counts only.
     """
     if not v:
         return None
@@ -880,19 +899,30 @@ def vocabulary_line(v: dict | None) -> str | None:
         return (f"VOCAB    {covered}slice {done}/{total} fields, {b['requests']} requests, "
                 f"{b['seconds']:g}s of {b['budget_s']:g}s a slice"
                 + (f", reading {b['field']}" if b.get("field") else "")
-                + (f", values so far {b['values']}" if b.get("values") else ""))
+                + (f", values so far {b['values']}" if b.get("values") else "")
+                + _over_cap_note(v))
     if v.get("state") == "failed":
-        return f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
+        return (f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
+                + _over_cap_note(v))
     if not v.get("fields"):
-        return None if v.get("state") != "building" else "VOCAB    building, no page yet"
-    parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()]
+        if v.get("state") != "building":
+            return ("VOCAB   " + _over_cap_note(v)) if v.get("over_cap") else None
+        return "VOCAB    building, no page yet" + _over_cap_note(v)
+    parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()
+             if f not in (v.get("over_cap") or {})]
     line = "VOCAB    " + " ".join(parts)
     if v.get("covered_days") is not None:
         # the covered range is the one number that says which days a name
         # can be known from at all: a name logged outside it is not known
+        state = {"top_up_due": "top-up due"}.get(v.get("state", "ready"), v.get("state", "ready"))
         line += (f" over the last {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
-                 f"{v.get('state', 'ready')} ({v.get('age_s', 0)}s old)")
-        if v.get("state") == "extending":
+                 f"{state} ({v.get('age_s', 0)}s old)")
+        if v.get("state") == "top_up_due":
+            line += " - cases run; the newest minutes are read next"
+        elif v.get("state") == "stale":
+            line += (" - TOP-UP OVERDUE" + (f" ({v['refused']})" if v.get("refused") else "")
+                     + ": names logged since are not known")
+        elif v.get("state") == "extending":
             line += " - cases run; older days still reading"
         elif not v.get("serving", True):
             line += " - NOT ENOUGH COVER YET: cases are refused"
@@ -902,6 +932,7 @@ def vocabulary_line(v: dict | None) -> str | None:
         line += f" NEAR CAP: {', '.join(v['near_cap'])}"
     if v.get("omitted"):
         line += (f" NOT READ (readable in text): {', '.join(sorted(v['omitted']))}")
+    line += _over_cap_note(v)
     return line
 
 
@@ -1265,7 +1296,11 @@ class Broker:
         if slice_range is None:
             return
         start, until = slice_range
-        self._build = elastic.VocabularyBuild(self.config, start, until)
+        self._build = elastic.VocabularyBuild(
+            self.config, start, until,
+            # fields an earlier slice (or an earlier run) counted and found
+            # over the cap: not counted again, not paged
+            over_cap=self.vocabulary.over_cap_fields(cluster.name, t))
         self._build_cluster = cluster
         self._build_failed.pop(cluster.name, None)
         self._log_vocabulary(cluster.name, "start", self._build.progress())
@@ -1338,11 +1373,14 @@ class Broker:
             self._drop_page()
             build.feed(done)
         except elastic.Refused as e:
+            self._save_over_cap(cluster, build)
             self._end_slice(cluster, e.code, build)
             return True
         except Exception as e:  # a transport fault is the same answer
+            self._save_over_cap(cluster, build)
             self._end_slice(cluster, type(e).__name__, build)
             return True
+        self._save_over_cap(cluster, build)
         if build.pending():
             self._log_vocabulary(cluster.name, "progress", build.progress())
             return True
@@ -1355,6 +1393,21 @@ class Broker:
                               **self.vocabulary.report(cluster.name, self.config, now=clock())})
         self._build = self._build_cluster = None
         return True
+
+    def _save_over_cap(self, cluster: elastic.Cluster, build) -> None:
+        """Save, at once, any field this step found over ``vocabulary.max``.
+
+        At once, and not with the finished slice, because the decision has
+        to survive a slice that fails after it: that is what stops the next
+        attempt spending the same requests on the same field. Field names
+        and counts go to the index and the decision log; never a value.
+        """
+        for field, count in build.take_dropped().items():
+            self.vocabulary.note_over_cap(cluster.name, field, count, clock())
+            self._log_vocabulary(cluster.name, "over_cap",
+                                 {"field": field, "distinct": count,
+                                  "max": self.config.vocabulary_max,
+                                  "read": False})
 
     def _start_due_vocabulary(self) -> bool:
         """Start the next slice for any signed-in cluster that has one due:
@@ -1378,6 +1431,9 @@ class Broker:
             # nothing held and nothing running: say so, or a caller waiting
             # for "ready" waits for ever
             report = {**report, "state": "failed", "refused": self._build_failed[cluster]}
+        elif cluster in self._build_failed and report.get("state") == "top_up_due":
+            # the top-up that was due was tried and failed: that is stale
+            report = {**report, "state": "stale", "refused": self._build_failed[cluster]}
         return report
 
     def _log_vocabulary(self, cluster: str, event: str, body: dict) -> None:

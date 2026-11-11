@@ -401,6 +401,13 @@ Listed with owners in the README's Limitations section and in
   `vocabulary_report()["omitted"]` and on the `VOCAB` line as `NOT READ
   (readable in text)` - field names only. Gate:
   `default_map_names_hidden`.
+  The default set is wide by design, and a site may type an identifier
+  anything it likes, so it can contain a field that is not a name at all
+  (a per-request reference). That is what the per-field distinct count
+  below is for: such a field is counted, left out and reported, rather
+  than paged to the cap and taking the slice - and the build - down with
+  it. `NO_VOCABULARY_TYPES` is still the only thing refused at load; the
+  count is about **width**, not about type.
 
   **The vocabulary is read once per cluster, at sign-in, in one-day
   slices, newest first.** Never inside a case, and never from anything
@@ -428,6 +435,34 @@ Listed with owners in the README's Limitations section and in
     carries the tenant fields on the same document (harvesting the page
     covers it) while about three in four messages naming a job carry no
     job field.
+  - **Every field is counted before it is paged**, one `cardinality`
+    request per field per slice (`VOCABULARY_COUNT_AGG`,
+    `precision_threshold` asked for at the cap). Without it, an id-shaped
+    field in the default set - a per-request reference with a fresh value
+    on nearly every document - was paged to `vocabulary.max` and *then*
+    refused: 51 requests, the slice abandoned, retried, abandoned again,
+    and **no case ever served**. What the count does next depends on who
+    chose the field:
+    - **default set** (no `vocabulary.fields` in the map): the field is
+      left out, the build carries on, and the decision is saved
+      (`VocabularyIndex.note_over_cap`, at once, before the slice is
+      whole, so a slice that fails afterwards does not pay again) for
+      `VOCABULARY_OVER_CAP_S` (a day), after which it is counted again;
+    - **a field the map lists itself**: the slice is refused, as before,
+      with a message naming the field and the two ways out (remove it
+      from `vocabulary.fields`, or raise `vocabulary.max`). A site that
+      named the field asked for it to be read, and reading most of it is
+      not that.
+    A cardinality count is **approximate**, so `VOCABULARY_PROBE_MARGIN`
+    (5%, well above the measured HyperLogLog++ error) decides what "near
+    the cap" means - and it is applied **in whichever direction keeps the
+    build running**: a default field within the margin is treated as over
+    the cap (left out, build carries on), a listed field within it as
+    under (paged, with the exact page-time count deciding, because there
+    "over the cap" means refusing the slice). The exact page-time check
+    stays as the backstop under both, and takes the same two branches.
+    The cost of the count is **one cheap request per kept field per
+    slice** - on the es-eval fixture 150 of the cover's 312 requests.
   - **One step per serve-loop iteration**, not one page:
     `KibanaSession.submit` / `poll_once` / `release` are the three steps
     `search` is made of, and `Broker.pump_vocabulary` does one of them
@@ -446,14 +481,23 @@ Listed with owners in the README's Limitations section and in
     State goes `building` -> `extending` -> `ready`, and the `VOCAB` line
     prints the covered range, the age, `NEAR CAP` at 80% and build
     progress.
-  - **Nothing is learnt from a partial, failed or timed-out read**: an
-    upstream error, a partial or misshapen reply, a field over
-    `vocabulary.max` (50,000) or a slice over its budget abandons that
-    slice (`VocabularyBuild.failed`, `result()` refuses) and leaves the
-    saved vocabulary exactly as it was.
+  - **Nothing is learnt from a partial, failed or timed-out read of a
+    field that is kept**: an upstream error, a partial or misshapen
+    reply, a *listed* field over `vocabulary.max` (50,000) or a slice
+    over its budget abandons that slice (`VocabularyBuild.failed`,
+    `result()` refuses) and leaves the saved vocabulary exactly as it
+    was. A field left out for being over the cap is not a partial read of
+    it: whatever it returned is dropped (`_over_cap` pops its values) and
+    it is absent from the result, not present and short.
   - Logs hold counts, requests, seconds and field names, **never a name**
     (`vocabulary_report`, `VocabularyIndex.report`,
-    `vocabulary.log.jsonl`, the `VOCAB` line). `esbridge.clock` is what
+    `vocabulary.log.jsonl`, the `VOCAB` line) - including the `over_cap`
+    row, which carries the field name, its distinct count and the cap.
+    Every surface that says what the vocabulary holds also says what it
+    **left out and why**: `omitted` (the map's own `vocabulary.fields`
+    leaves it out) and `over_cap` (counted, too wide to read), on the
+    `VOCAB` line as `NOT READ (readable in text)` and `OVER CAP, NOT READ
+    (readable in text): field~count>cap`. `esbridge.clock` is what
     the build range and the staleness check read; it is a module global
     because the harnesses' fixtures sit at `eseval.NOW` rather than
     today, and nothing in the live path replaces it.
@@ -465,10 +509,16 @@ Listed with owners in the README's Limitations section and in
   over a slice) against `WIDE_PAGE_SECONDS` (31-297s over the whole
   range), so a build that stopped slicing fails its budget in the eval
   rather than quietly costing hours: on the es-eval fixture (5 fields,
-  21,751 job names, 30 days) **30 slices, 162 requests and 3,123
-  simulated seconds for the whole cover**, worst slice 127s of 1200s -
-  but only **10 requests and 191 seconds, two slices, before the first
-  case can run**, and 5 requests and 95 seconds for a top-up. On the
+  21,751 job names, 30 days) **30 slices, 312 requests and 3,423
+  simulated seconds for the whole cover**, worst slice 137s of 1200s -
+  but only **20 requests and 211 seconds, two slices, before the first
+  case can run**, and 10 requests and 105 seconds for a top-up. Of those
+  312 requests, **150 are the per-field distinct counts** (`PROBE_SECONDS`,
+  2s each, an assumption stated as one - the claim about the count is its
+  request *count*, which is exact); before the count the same cover was
+  162 requests and 3,123 seconds, which is what the count buys off: a
+  single id-shaped field in the default set cost 51 requests a slice and
+  then failed the slice, every slice, for ever. On the
   shape that motivated slicing (12 name fields, ~10,000 values each) the
   first case is roughly eight minutes after sign-in and the full cover
   about two hours, in the background. If a *day's* page costs two minutes
@@ -488,10 +538,37 @@ Listed with owners in the README's Limitations section and in
   `VOCABULARY_REFRESH_S`; and a failed top-up leaves the bridge serving a
   cover that is complete for its range but stale, reported as `stale`
   with its age rather than refusing, the same risk the ten-minute refresh
-  already accepts.
+  already accepts. **`stale` means overdue, not due**: a cover older
+  than the refresh interval is `top_up_due` (the top-up runs next, and
+  reading the first two days at sign-in always takes longer than the
+  interval, so this is what es-login returns to), and becomes `stale`
+  only past the interval plus one slice budget, or at once when the
+  last top-up failed (`Broker.vocabulary_progress`, with the refusal).
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
+
+  **Declared cost of the cap, new and the sharper one: a real name field
+  with more distinct values than `vocabulary.max` is left unread under
+  the default field set, so its values stay readable in message text.**
+  Before, such a field took the whole slice down and the failure was
+  loud - nothing ran, which nobody can miss. Now the build finishes and
+  the field is simply absent, which is quiet, and **the `VOCAB` line is
+  the only place a user sees it** (`OVER CAP, NOT READ (readable in
+  text): field~count>cap`, from `VocabularyIndex.report`'s `over_cap`,
+  via `Bridge._apply_vocabulary` and `EsScrubber.vocabulary_report`).
+  Nothing refuses because of it: a case runs, the page looks clean, and
+  that field's names are English in the text. The ways out are the two
+  the refusal names - raise `vocabulary.max` (ceiling 200,000; it costs a
+  page per 1,000 values per slice) or, if the site wants the failure
+  rather than the silence, list the field in `vocabulary.fields`, which
+  restores the refusal. A site that does not want the field read at all
+  should list the others, which is reported as `omitted` and is the same
+  cost stated at load time.
+  Two smaller ones: the count is approximate, so a field within 5% of the
+  cap is left out of the default set even if it would have fitted; and a
+  field whose cardinality drops below the cap is still skipped until the
+  decision expires (`VOCABULARY_OVER_CAP_S`, a day).
 
   **Declared miss: a one-word tenant name the skip rules drop stays
   readable.** Many real tenants are one word, and a one-word value on
@@ -672,6 +749,34 @@ Listed with owners in the README's Limitations section and in
   inside level spellings is how `Critical` stops being filterable; and a
   sensitive value under `keep` is a site-map error first, this pass being
   the net under it.
+  **Known values match a keep value whole, unless seeded.** Once the
+  name vocabulary put ~10,000 names into the sweep, a job called
+  `Harborsync` turned the stream `logs-agent.harborsync_events-prod`
+  into `logs-agent.<Job-NN>_events-prod` in `_index`, the dataset and the
+  namespace (6 fields across 3 of 50 hits on one site), and Claude could
+  no longer filter by the dataset. Now a name **learnt from the
+  vocabulary or harvested from a page** replaces a keep value only when
+  it *is* the value (case and outer spaces ignored); a value the human
+  **seeded** (`EsScrubber.seeded_labels`, saved with the case) and
+  anything tier 1 recognises by shape still match anywhere. The same
+  rule holds for terms-bucket keys, `key_as_string` and the hit's
+  `_index`; text and identifier fields are untouched. The pass-3 sweep
+  and the leak check are schema-blind, so `_keep_value` marks its result
+  (`elastic._KeepStr`, removed by `_unmark` after the leak check) and
+  both apply the same rule to it; the leak check still refuses a seeded
+  value inside a keep value, or a known value that is a whole one.
+  **Declared cost: a customer name inside a longer keep value is
+  readable** - an index, dataset or namespace named after a customer
+  (`logs-agent.contoso_events-prod`) shows the name to Claude, and so
+  does any keep field whose value merely contains one. What a site
+  should do: a stream named per customer is a site-map fact, so declare
+  it - map that field as an `identifier` rather than `keep` (it is then
+  labelled whole and filterable by label), and keep such streams out of
+  `indices` if the index name itself must not be seen; for a single
+  case, `--term <name>` seeds it, which hides it inside keep values and
+  index names again. A case saved before seeds were recorded has none,
+  so its seeded values match keep values only whole until re-seeded.
+  Gate: `stream_name_readable_in_keep` (below).
   `es_schema` and the esmcp instructions tell Claude that keep fields
   hold spellings as logged (err/Error/ERROR): aggregate a keep field's
   values before an exact filter, then filter with `in` across the
@@ -703,7 +808,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 26 pass, and a change that cannot keep them passing
+  MCP endpoint; all 28 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -717,11 +822,32 @@ Listed with owners in the README's Limitations section and in
   real `Broker` one step at a time against `SteppedSearchTransport`,
   which hands a page back over as many polls as its cost: a case shown
   off the recent cover while older slices build, refused before it, every
-  ping answered, no step longer than one poll interval). Readability:
+  ping answered, no step longer than one poll interval),
+  `over_cap_field_left_out` (`eseval.run_over_cap_eval`, on
+  `eseval.over_cap_docs`: an invented `request.ref` field with a fresh
+  value on nearly every document, **5,500 distinct in a day against a
+  5,000 cap**, in its own index pattern with its own map, driven through
+  the real `Broker`. **6 requests on that field and then the slice
+  refused before the rule, against 1 distinct count for the whole cover
+  after it** - 51 a slice at the default cap - the build finishes, the
+  first case about a day in the cover is shown with the name hidden
+  (tier 2 off, and the same page with no vocabulary does show the name),
+  the field and its count are on the `VOCAB` line, the build log carries
+  no value, and a map that lists the field in `vocabulary.fields` is
+  still refused with a message naming it). Readability:
   `estate_no_unexpected_readable`, `estate_spellings_unchanged`,
   `ordinary_words_readable`, `keep_leak_closed` (the invented URL in
   `eseval.KEEP_LEAK_VALUE`, shown through a hit and through an
-  aggregation; both leaked before the pass), `keep_values_readable`.
+  aggregation; both leaked before the pass), `keep_values_readable`,
+  `stream_name_readable_in_keep` (`eseval.run_stream_name_eval` on
+  `eseval.stream_name_docs`: three documents in an invented stream
+  `logs-agent.harborsync_events-*`, appended after everything else in an
+  index pattern and map of their own, tier 2 off; the index, dataset and
+  namespace come back as written in hits and as bucket keys, the job is
+  labelled in `job.name`, in both messages and in a keep field holding
+  the whole name. **Keep values changed: 12 of 20 before the rule, 1 of
+  20 after**, the one being the whole-name field; "before" is the
+  `keep_parts_swept` measurement switch, set by nothing in the live path).
   Label use: `label_guessing_refused` - a fresh case on the estate
   guesses a hundred low-numbered labels, **100 of 100 are live labels it
   holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label
@@ -733,7 +859,10 @@ Listed with owners in the README's Limitations section and in
   `mcp_prompt_gate`.
   Fixed documents for the readability checks are appended after the RNG
   stream so nothing existing moves: `UNMARKED_JOBS`, `UNMARKED_NAMES`,
-  `DEFAULT_MAP_*`, `ORDINARY_WORD_JOBS`, and the estate.
+  `DEFAULT_MAP_*`, `ORDINARY_WORD_JOBS`, the estate, `OVER_CAP_*` and,
+  last of all, `STREAM_*` (those two the only ones in index patterns of
+  their own, so no other query, build or count pays for them; they hold
+  no ground truth either - `OVER_CAP_TRUTH` is that gate's own).
 
 ## Where to take questions and findings
 

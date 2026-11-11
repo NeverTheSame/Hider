@@ -207,10 +207,13 @@ def test_the_build_pages_through_the_whole_catalogue_one_field_at_a_time(bulk):
     # One page per thousand names of the widest field, plus one page for
     # each of the other four - but now per slice, and the catalogue is
     # spread over several days, so the floor is the whole-catalogue count
-    # and the ceiling allows a page per field per slice.
+    # and the ceiling allows a distinct count and a page per field per
+    # slice (every field is counted before it is paged).
     pages = -(-counts["job.name"] // elastic.VOCABULARY_PAGE)
     slices = CFG.vocabulary_days
-    assert pages + 4 <= build.requests <= pages + len(CFG.vocabulary_rules) * slices
+    counted = len(CFG.vocabulary_rules) * slices
+    assert pages + 4 + counted <= build.requests <= pages + counted * 2
+    assert build.probes == counted
     s = elastic.EsScrubber(CFG, tier2="none")
     s.apply_vocabulary("stub", vocab)
     assert eseval.bulk_job_name(0).casefold() in s.known
@@ -235,12 +238,14 @@ def test_the_stub_charges_what_a_page_really_costs(bulk):
     assert cover["max_slice_s"] <= CFG.vocabulary_budget_s   # each slice is inside it
     assert not cover["wide_pages"]               # no page asked for a wide range
     assert min(eseval.PAGE_SECONDS) >= 8 and max(eseval.PAGE_SECONDS) <= 35
-    # a top-up reads only what is new, so it costs a page per field
+    # a top-up reads only what is new, so it costs a distinct count and a
+    # page per field
     before = engine.simulated_seconds
     _new, topup = eseval.build_vocabulary(
         CFG, engine, _vocab.covered_until,
         _vocab.covered_until + elastic.VOCABULARY_REFRESH_S)
-    assert topup.requests == len(CFG.vocabulary_rules)
+    assert topup.probes == len(CFG.vocabulary_rules)
+    assert topup.requests == 2 * len(CFG.vocabulary_rules)
     assert engine.simulated_seconds - before < spent
     engine.page_seconds = engine.wide_page_seconds = ()
 
@@ -362,3 +367,17 @@ def test_eval_passes_its_gates_on_the_example_map():
     truth = eseval.generate(docs=300).truth
     blob = json.dumps(r).lower()
     assert not any(v.lower() in blob for v in truth if len(v) > 5)
+
+
+def test_a_job_named_stream_stays_readable_in_its_keep_values():
+    fx = eseval.Fixture(eseval.stream_name_docs(), [], [])
+    r = eseval.run_stream_name_eval(fx)
+    a, b = r["after"], r["before"]
+    assert a["shown"] and a["index_readable"] and a["dataset_readable"]
+    assert a["namespace_readable"] and a["bucket_keys_readable"]
+    assert a["job_field_labelled"] and a["text_labelled"] and a["whole_keep_labelled"]
+    assert a["changed_fields"] == ["service.name"]
+    # the switch reproduces what the vocabulary did before the rule
+    assert {"_index", "data_stream.dataset", "data_stream.namespace"} <= set(b["changed_fields"])
+    assert b["keep_changed"] > a["keep_changed"]
+    assert "Harborsync" not in "".join(eseval._stream_name_lines(r))

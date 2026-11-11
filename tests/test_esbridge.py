@@ -1365,6 +1365,89 @@ def test_a_build_over_the_cap_leaves_the_saved_vocabulary_alone(stub, tmp_path):
     assert e.value.code == "vocabulary_building"
 
 
+def _default_set_config(stub, cap: int) -> elastic.ElasticConfig:
+    """The example map with no vocabulary.fields - the default set - and a
+    cap of the caller's choosing."""
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": stub.url}}
+    raw["vocabulary"] = {"max": cap}
+    return elastic.parse(raw, source="test")
+
+
+def test_a_field_over_the_cap_in_the_default_set_is_left_out_not_fatal(stub, tmp_path):
+    """The default set is every learnable field, so it can hold a field
+    that is not a name at all - an id with a fresh value per document.
+    Paging it to the cap and then refusing abandoned the slice, every
+    slice, and no case ever ran. It is counted, left out, and the build
+    finishes; the names of the other fields are still read."""
+    b = _bridge(stub, tmp_path)
+    counts = b.vocabulary["stub"]["fields"] if b.vocabulary else {}
+    counts = counts or eseval.build_vocabulary(
+        _default_set_config(stub, elastic.MAX_VOCABULARY_MAX), stub.engine)[0].counts
+    widest = max(counts, key=lambda f: counts[f])
+    cfg = _default_set_config(stub, counts[widest] - 1)
+    index = elastic.VocabularyIndex(None)
+    over_cap: dict[str, dict] = {}
+    built, build = eseval.build_vocabulary(cfg, stub.engine, over_cap=over_cap)
+    index.put("stub", built)
+    assert widest not in built.fields          # nothing partial was kept
+    assert over_cap[widest]["count"] == counts[widest]
+    assert built.fields                        # and the rest was read
+    at = esbridge.clock()
+    index.note_over_cap("stub", widest, counts[widest], at)
+    report = index.report("stub", cfg, now=at)
+    assert report["over_cap"] == {widest: counts[widest]}
+    line = esbridge.vocabulary_line(report)
+    assert f"OVER CAP, NOT READ (readable in text): {widest}~{counts[widest]}" in line
+    assert f"{widest}=" not in line            # not reported as read, and not as zero
+    # a case on that bridge runs, with the fields that were read applied
+    bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), b.session,
+                             log_path=tmp_path / "d4.jsonl", index=index)
+    o = bridge.run("stub", {"index": "logs-app-*", "size": 1})
+    assert o.refused is None
+    assert bridge.vocabulary["stub"]["over_cap"] == {widest: counts[widest]}
+
+
+def test_an_over_cap_decision_survives_a_failed_slice_and_a_restart(tmp_path):
+    """Saved as soon as it is found, not with the finished slice: a slice
+    that fails after it must not spend the same fifty requests again. It
+    expires on its own, so raising the cap takes effect without anyone
+    clearing a file."""
+    index = elastic.VocabularyIndex(tmp_path / "es")
+    index.note_over_cap("emea", "request.ref", 120_000, 1000.0)
+    again = elastic.VocabularyIndex(tmp_path / "es")
+    assert again.over_cap_fields("emea", 1000.0) == {"request.ref": {"count": 120_000,
+                                                                    "at": 1000.0}}
+    # a build told about it neither counts nor pages that field
+    build = elastic.VocabularyBuild(CFG0, 0.0, 86400.0,
+                                    over_cap=again.over_cap_fields("emea", 1000.0))
+    assert "request.ref" not in [r.pattern for r in build.rules]
+    # and the decision expires rather than standing for ever
+    later = 1000.0 + elastic.VOCABULARY_OVER_CAP_S + 1
+    assert again.over_cap_fields("emea", later) == {}
+    assert again.report("emea", CFG0, now=later)["over_cap"] == {}
+
+
+def test_the_build_log_names_an_over_cap_field_and_never_a_value(stub, tmp_path):
+    """The one new decision row: the field, its distinct count and the cap.
+    Field names and counts are decisions; a value never is."""
+    cfg = _default_set_config(stub, 2)
+    tmp = tmp_path / "sessions"
+    broker = esbridge.Broker(cfg, lambda: eseval.SimBrowser([]), sessions_dir=tmp)
+    cluster = cfg.cluster("stub")
+    build = elastic.VocabularyBuild(cfg, 0.0, 86400.0)
+    build.request()
+    build.feed({"isPartial": False, "isRunning": False, "rawResponse": {
+        "timed_out": False,
+        "aggregations": {elastic.VOCABULARY_COUNT_AGG: {"value": 9999}}}})
+    broker._save_over_cap(cluster, build)
+    rows = [json.loads(l) for l in (tmp / "vocabulary.log.jsonl").read_text().splitlines()]
+    assert rows[-1]["vocabulary"] == "over_cap"
+    assert rows[-1]["field"] == "job.name" and rows[-1]["distinct"] == 9999
+    assert rows[-1]["max"] == 2 and rows[-1]["read"] is False
+    assert broker.vocabulary.over_cap_fields("stub", esbridge.clock())["job.name"]["count"] == 9999
+
+
 def test_smoke_names_the_learnable_fields_a_site_map_leaves_out(stub, tmp_path, capsys):
     """A site map that lists fewer fields than it could is a choice, and the
     values of the fields it skips stay readable in message text. Names only,

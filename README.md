@@ -806,24 +806,50 @@ recall will never be exactly 100%.
     **sliced by day, newest first**, each slice saved as soon as it is
     whole. On its cluster - the back catalogue plus the realistic estate,
     21,751 job names and 9,555 tenants - the whole 30-day cover is **30
-    slices, 162 requests and 3,123 simulated seconds**, worst slice 127s
+    slices, 312 requests and 3,423 simulated seconds**, worst slice 137s
     of the 1,200s per-slice budget; but a case can run after **two slices,
-    10 requests and 191 seconds**, and the rest is read behind it. Every
+    20 requests and 211 seconds**, and the rest is read behind it. Every
     case reads **nothing**: the one-hour case that used to need its own
     read costs 0 requests. Under the previous per-case design the same
     fixture refused on the first request; under the previous
     whole-range-at-once build it would have spent hours before showing
     anything, which is what the slicing is for.
+    **Every field is counted before it is paged**, and 150 of those 312
+    requests are those counts - one cheap `cardinality` aggregation per
+    field per slice. They are there because the default field set is every
+    identifier a map could list, and a site may type an identifier
+    anything: an id-shaped field with a fresh value on nearly every
+    document (a per-request reference) was paged to `vocabulary.max` and
+    only then refused - 51 requests, the slice abandoned, retried,
+    abandoned again, **and no case ever ran**. Counted first, a field over
+    the cap is never paged. If the site map left the field set to the
+    default, the field is **left out**, the build carries on, and the
+    decision is saved for a day so later slices and restarts do not ask
+    again. If the map lists that field in `vocabulary.fields`, the slice
+    is still refused - the site asked for that field by name, and reading
+    most of it is not that - with a message naming the field and saying to
+    remove it or raise the cap. A cardinality count is approximate, so a
+    field within 5% of the cap is read whichever way keeps the build
+    running: left out of a default set, paged when the map lists it (where
+    the exact page-time count then decides). The es-eval gate
+    `over_cap_field_left_out` measures it on an invented field with 5,500
+    distinct values a day against a 5,000 cap: **6 requests then a refused
+    slice before, 1 count for the whole cover after**, with the first case
+    still served.
     **Caps and progress, as counts:** every build logs values per field
     against the cap, skips by reason, requests and seconds, never a value;
     `es-smoke` prints build progress while it runs and then a `VOCAB` line
-    with the counts, the range covered, its age and `NEAR CAP` at 80%.
-    **Fails closed, and nothing is learnt from a partial read:** an
-    unreadable, partial or misshapen reply, a field over `vocabulary.max`
-    (50,000), or a build past its budget abandons the build and leaves the
-    saved vocabulary exactly as it was, to be retried at the next sign-in
-    or tick; a configured index a cluster lacks reads as no values
-    (`ignore_unavailable`).
+    with the counts, the range covered, its age, `NEAR CAP` at 80% and the
+    fields left out - `NOT READ` for what the map omits, `OVER CAP, NOT
+    READ` with its count for what the build found too wide.
+    **Fails closed, and nothing is learnt from a partial read of a field
+    that is kept:** an unreadable, partial or misshapen reply, a *listed*
+    field over `vocabulary.max` (50,000), or a build past its budget
+    abandons the build and leaves the saved vocabulary exactly as it was,
+    to be retried at the next sign-in or tick; a configured index a
+    cluster lacks reads as no values (`ignore_unavailable`). A field left
+    out for being over the cap is not a partial read of it: what it
+    returned is dropped and the field is absent, never short.
     **Short and ordinary names:** a value made only of log words
     (`Failed`, `Warning`), a stopword (`default`), a value with no letters
     (`2026`), a one-word value shorter than four characters (`HR`, `Ops`)
@@ -871,6 +897,16 @@ recall will never be exactly 100%.
     The earlier design let the case's own time window decide what was
     read, which made a page's cover depend on the window asked for; that
     is gone with the window, and so is the declared miss that went with it.
+    **And the cap's cost, which got quieter rather than smaller: a real
+    name field with more distinct values than `vocabulary.max` is now left
+    unread under the default field set, so its values stay readable in
+    message text.** Before, a field that wide took the whole slice down,
+    which nobody could miss; now the build finishes and the field is
+    simply absent. Nothing refuses, the page looks clean, and **the
+    `VOCAB` line is the only place anyone is told** - which is why it
+    names the field and its count. Raise the cap if the field is worth the
+    pages (one per thousand values per slice), or list the field in
+    `vocabulary.fields` to get the loud failure back.
   - *A keep field is a declaration, and declarations get checked.* "Keep"
     means the site said the field holds nothing sensitive - levels,
     outcomes, counters, timestamps. A real cluster's level field held, among

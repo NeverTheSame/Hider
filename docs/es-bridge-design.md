@@ -558,10 +558,11 @@ Added after the first version:
   `PAGE_SECONDS` (8-35s per field per page over a one-day slice, against
   `WIDE_PAGE_SECONDS` 31-297s over the whole range, which is why the read
   is sliced by day, newest first, and why no serve-loop iteration runs
-  more than one submit-or-poll step): 30 slices, 162 requests and 3,123
+  more than one submit-or-poll step): 30 slices, 312 requests and 3,423
   simulated seconds for the whole cover over the back catalogue and the
-  realistic estate, **10 requests and 191 seconds before the first case
-  can run**, 5 requests and 95 seconds for a top-up,
+  realistic estate (150 of those requests the per-field distinct count
+  below), **20 requests and 211 seconds before the first case
+  can run**, 10 requests and 105 seconds for a top-up,
   0 requests for a case (`window_case_shown`,
   `vocabulary_build_in_budget`, `vocabulary_building_refuses`).
   New declared costs: the first sign-in takes minutes; real names sit on
@@ -591,6 +592,32 @@ Added after the first version:
   visible choice. Declared miss: a one-word tenant name on
   `ORDINARY_NAME_WORDS` or under four characters (`Archive`, `Vault`,
   `Ops`) is still skipped and stays readable - seed it with `--term`.
+- **A field in that default set that is not a name at all, and is wider
+  than the cap.** Widening the default to every learnable field also took
+  in whatever else a site had typed as an identifier. One of them was a
+  per-request reference with a fresh value on nearly every document: the
+  build paged it to `vocabulary.max` (51 requests at the default cap) and
+  only then refused, which abandoned the slice; the slice was retried and
+  failed the same way every time, so **no case ever ran** - and half the
+  slice's requests had gone on that one field. Fixed by counting a field
+  before paging it: one `cardinality` request per field per slice, and a
+  field over the cap is never paged. Who chose the field decides what
+  happens to it - a field in the default set is left out and the build
+  carries on (the decision saved for a day, so later slices and restarts
+  do not ask again), a field the map names in `vocabulary.fields` still
+  refuses the slice, now with a message naming the field and the two ways
+  out. The count is approximate, so the 5% margin is applied whichever
+  way keeps the build running: a default field near the cap is left out,
+  a listed one is paged and the exact page-time count decides. Measured
+  by `over_cap_field_left_out` on `eseval.over_cap_docs` (5,500 distinct
+  values a day against a 5,000 cap, in its own index pattern with its own
+  map, driven through the real `Broker`): 6 requests then a refused slice
+  before, 1 count for the whole cover after, the first case still served
+  and the name still hidden. New declared cost, and a quieter one than it
+  replaces: a **real name field** wider than the cap is now left unread
+  under the default set rather than failing loudly, so its values stay
+  readable in message text, and the `VOCAB` line's `OVER CAP, NOT READ`
+  (field name and count) is the only place anyone is told.
 - **A sensitive value in a keep field.** A real level field held a
   SharePoint personal-site URL among its `info`/`Warning`/`ERR` spellings,
   once a day. A keep field passed through unchanged by declaration, and the

@@ -337,6 +337,13 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
     if estate:
         out.extend(estate_docs(ts, servers))
         out.extend(ordinary_word_docs(ts, servers))
+        # last of all, and in their own index pattern: the oversized
+        # identifier field (see over_cap_docs). No existing query, build or
+        # count touches them.
+        out.extend(over_cap_docs())
+        # after those, in an index pattern of their own: a data stream
+        # named after a job (see stream_name_docs)
+        out.extend(stream_name_docs())
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
@@ -357,6 +364,14 @@ PAGE_SECONDS: tuple[float, ...] = (18.0, 11.0, 27.0, 8.0, 35.0, 14.0, 22.0)
 WIDE_PAGE_SECONDS: tuple[float, ...] = (31.0, 88.0, 142.0, 297.0, 64.0, 210.0, 119.0)
 #: A request whose range is wider than this is charged WIDE_PAGE_SECONDS.
 WIDE_RANGE_S = 2 * 86400.0
+#: What the distinct-count probe before a field is paged costs, in
+#: simulated seconds. A ``cardinality`` aggregation has no paging, no sort
+#: and no values to return, so it is a fraction of a composite page - but
+#: this number is an **assumption**, not a measurement like PAGE_SECONDS: a
+#: quarter of the cheapest measured page. The eval's claim about the probe
+#: is the request *count*, which is exact; the seconds are here so the
+#: report cannot imply the probe is free.
+PROBE_SECONDS = 2.0
 
 #: The estate's back catalogue of job names: how many distinct values one
 #: vocabulary field holds over the retention period on a cluster that is not
@@ -1168,6 +1183,274 @@ def ordinary_word_docs(tenants: list[Tenant], servers: dict[str, list[Server]]) 
     return docs
 
 
+#: An identifier field with a fresh value on almost every document, beside
+#: the name fields a vocabulary is for. This is the shape that stopped the
+#: sliced build finishing at all: with no ``vocabulary`` section every
+#: learnable field is read, so a per-request reference typed REQUEST_REF was
+#: paged to ``vocabulary.max`` and only then refused - fifty-one requests,
+#: the whole slice abandoned, retried, abandoned again, and no case ever
+#: served. All values invented; the documents are appended after the estate
+#: and live in their own index pattern, so nothing above them moves and no
+#: other query or build pays for them.
+#:
+#: The cap here is **5,000, not the default 50,000**, so the fixture is
+#: 5,620 documents rather than 50,000: a site may set any cap, and what the
+#: gate measures - one count instead of a page per thousand values - does
+#: not depend on which one. At the default cap the same field costs 51
+#: requests a slice before the probe and 1 ever after it.
+OVER_CAP_INDEX = "logs-ref-*"
+OVER_CAP_FIELD = "request.ref"
+OVER_CAP_MAX = 5_000
+#: distinct references in the newest day (over the cap) and in the day
+#: before it (the day the case asks about)
+OVER_CAP_REFS = 5_500
+OVER_CAP_REFS_YESTERDAY = 120
+#: the name the case is about, and the job beside it. Multi-word and
+#: invented, so no skip rule drops them and no recognizer has a shape for
+#: them: with tier 2 off, a name hidden in message text can only have come
+#: from the vocabulary.
+OVER_CAP_TENANT = "Wrenfield Quay Holdings"
+OVER_CAP_JOB = "Ledger Reconcile Nightly"
+OVER_CAP_MESSAGE = f"Quota review for {OVER_CAP_TENANT} completed, 3 shares pending"
+OVER_CAP_PHRASE = "shares pending"
+#: the case is about yesterday: inside the second slice, outside the first
+OVER_CAP_RANGE = {"gte": "now-27h", "lte": "now-25h"}
+#: Like the back catalogue and the estate, these documents hold **no**
+#: ground truth, so every existing leak check sees exactly what it saw.
+#: This is the truth for this gate's own check, and nothing else reads it.
+OVER_CAP_TRUTH = {OVER_CAP_TENANT: "ORG_NAME", OVER_CAP_JOB: "JOB_NAME"}
+
+
+def over_cap_ref(i: int) -> str:
+    return f"req-{i:07d}-{'abcdefghjkmnpqrstuvwxyz'[i % 23]}{i % 97:02d}"
+
+
+def over_cap_docs() -> list[Doc]:
+    """The oversized identifier field, the name the case is about, and the
+    message that names it with nothing marking it.
+
+    Positions, not draws, and no ground truth: like ``BULK_JOBS`` these are
+    appended after the RNG stream, so every figure above them is unchanged.
+    """
+    docs: list[Doc] = []
+    for i in range(OVER_CAP_REFS):
+        at = (NOW - timedelta(minutes=1 + (i % 1380))).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc(OVER_CAP_INDEX, {
+            "@timestamp": at,
+            "log": {"level": "info"},
+            "message": "Request accepted, 1 item queued",
+            "request": {"ref": over_cap_ref(i)},
+        }, {}))
+    for i in range(OVER_CAP_REFS_YESTERDAY):
+        at = (NOW - timedelta(hours=25, minutes=1 + i)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        docs.append(Doc(OVER_CAP_INDEX, {
+            "@timestamp": at,
+            "log": {"level": "info"},
+            "message": "Request accepted, 1 item queued",
+            "request": {"ref": over_cap_ref(OVER_CAP_REFS + i)},
+        }, {}))
+    # the message the case finds, naming the tenant with nothing marking it
+    docs.append(Doc(OVER_CAP_INDEX, {
+        "@timestamp": (NOW - timedelta(hours=26)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "log": {"level": "warn"},
+        "message": OVER_CAP_MESSAGE,
+        "request": {"ref": over_cap_ref(OVER_CAP_REFS + OVER_CAP_REFS_YESTERDAY)},
+    }, {}))
+    # and the record that carries the name in its own field, on another
+    # document and outside the hours the case asks for: only the vocabulary
+    # can connect the two
+    docs.append(Doc(OVER_CAP_INDEX, {
+        "@timestamp": (NOW - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "log": {"level": "info"},
+        "message": "Inventory refreshed",
+        "labels": {"tenant_name": OVER_CAP_TENANT},
+        "job": {"name": OVER_CAP_JOB},
+    }, {}))
+    return docs
+
+
+def over_cap_map(*, listed: bool) -> elastic.ElasticConfig:
+    """The invented site map for those documents, through the real parser.
+
+    ``listed`` is the difference the rule turns on: with no
+    ``vocabulary.fields`` the oversized field is in the **default** set and
+    is left out; with the map naming it, the site asked for that field by
+    name and the slice is refused instead.
+    """
+    raw = {
+        "indices": [OVER_CAP_INDEX],
+        "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "vocabulary": {"days": 30, "max": OVER_CAP_MAX, "budget_s": 1200},
+        "fields": {
+            "@timestamp": "keep",
+            "log.level": "keep",
+            "message": "text",
+            "job.name": {"kind": "identifier", "type": "JOB_NAME"},
+            "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+            OVER_CAP_FIELD: {"kind": "identifier", "type": "REQUEST_REF"},
+        },
+    }
+    if listed:
+        raw["vocabulary"]["fields"] = ["job.name", "labels.tenant_name", OVER_CAP_FIELD]
+    return elastic.parse(raw, source="over-cap-fixture")
+
+
+# ---------------------------------------------------------------------------
+# A data stream named after a job
+# ---------------------------------------------------------------------------
+#
+# Once the name vocabulary was applied, every learnt name was matched inside
+# keep values as well as in text, and a stream whose name happens to contain
+# a job's name lost it in its index, dataset and namespace:
+# ``logs-agent.harborsync_events-prod`` came back with the job's label in
+# the middle, so Claude could no longer filter by the dataset (a keep field
+# takes literals, and it only had a label). Now a learnt or harvested name
+# replaces a keep value only when it *is* the value. These documents are
+# appended after everything else, in an index pattern of their own with a
+# map of their own, so no other query, build or count sees them, and they
+# hold no ground truth. All names invented.
+STREAM_JOB = "Harborsync"
+STREAM_INDEX = "logs-agent.harborsync_events-*"
+STREAM_DATASET = "agent.harborsync_events"
+STREAM_NAMESPACE = "harborsync_events-prod"
+STREAM_RANGE = {"gte": "now-6h", "lte": "now"}
+#: the job's own record names it in its field and its text; the other
+#: message names it with nothing marking it, so only the vocabulary hides it
+STREAM_OWN_MESSAGE = f"{STREAM_JOB} finished 3 batches"
+STREAM_TEXT_MESSAGE = f"Retry scheduled for {STREAM_JOB} after a throttle"
+STREAM_PHRASE = "batches"
+STREAM_TEXT_PHRASE = "after a throttle"
+
+
+def stream_name_docs() -> list[Doc]:
+    """Three documents in the job-named stream. Positions, not draws."""
+    base = {"data_stream": {"type": "logs", "dataset": STREAM_DATASET,
+                            "namespace": STREAM_NAMESPACE},
+            "log": {"level": "info"}}
+    at = lambda m: (NOW - timedelta(hours=2, minutes=m)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return [
+        Doc(STREAM_INDEX, {**base, "@timestamp": at(1), "message": STREAM_OWN_MESSAGE,
+                           "job": {"name": STREAM_JOB},
+                           # a keep field that holds the whole name: labelled
+                           "service": {"name": STREAM_JOB}}, {}),
+        Doc(STREAM_INDEX, {**base, "@timestamp": at(2), "message": STREAM_TEXT_MESSAGE,
+                           "service": {"name": "agent"}}, {}),
+        Doc(STREAM_INDEX, {**base, "@timestamp": at(3), "message": "Heartbeat",
+                           "service": {"name": "agent"}}, {}),
+    ]
+
+
+def stream_name_map() -> elastic.ElasticConfig:
+    raw = {
+        "indices": [STREAM_INDEX],
+        "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "fields": {
+            "@timestamp": "keep",
+            "data_stream.*": "keep",
+            "log.level": "keep",
+            "service.name": "keep",
+            "message": "text",
+            "job.name": {"kind": "identifier", "type": "JOB_NAME"},
+        },
+    }
+    return elastic.parse(raw, source="stream-name-fixture")
+
+
+def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
+    """The job-named stream, before and after the keep rule.
+
+    Each run is one fresh case on the same cover: the stream's page, then
+    a terms aggregation over the dataset. "Before" sets
+    ``keep_parts_swept`` (the measurement switch, set by nothing in the
+    live path). Counted: keep values changed (``_index`` and every keep
+    leaf of every hit, and every keep bucket key), and whether the job is
+    still labelled in its own field, in message text and in the keep
+    field that holds the whole name. Tier 2 off, so a name hidden in text
+    can only have come from the vocabulary.
+    """
+    cfg = stream_name_map()
+    engine = StubEngine(fx, (STREAM_INDEX,))
+    vocab, _build = build_vocabulary(cfg, engine)
+    page_q = {"index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 20}
+    agg_q = {"index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 0,
+             "aggs": {"datasets": {"type": "terms", "field": "data_stream.dataset", "size": 10},
+                      "namespaces": {"type": "terms", "field": "data_stream.namespace",
+                                     "size": 10}}}
+    raw_docs = [d.source for d in fx.docs if d.index == STREAM_INDEX]
+    keep_paths = ("data_stream.type", "data_stream.dataset", "data_stream.namespace",
+                  "log.level", "service.name")
+
+    def get(src: dict, path: str) -> Any:
+        for k in path.split("."):
+            src = src.get(k) if isinstance(src, dict) else None
+        return src
+
+    def one(before: bool) -> dict:
+        sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+        sess.scrubber.keep_parts_swept = before
+        r = {"shown": False, "keep_values": 0, "keep_changed": 0, "changed_fields": [],
+             "index_readable": False, "dataset_readable": False, "namespace_readable": False,
+             "bucket_keys_readable": False, "job_field_labelled": False,
+             "text_labelled": False, "whole_keep_labelled": False}
+        out, refused, _dt, _c = sess.call(page_q)
+        if out is None:
+            r["refused"] = refused.code if refused else None
+            return r
+        hits = out["hits"]["hits"]
+        r["shown"] = len(hits) == len(raw_docs)
+        backing = backing_index(STREAM_INDEX)
+        changed: set[str] = set()
+        for h in hits:
+            r["keep_values"] += 1
+            if h["_index"] != backing:
+                r["keep_changed"] += 1
+                changed.add("_index")
+        # match each hit to its raw document by timestamp (a keep field)
+        raw_by_ts = {d["@timestamp"]: d for d in raw_docs}
+        for h in hits:
+            src = h["_source"]
+            rd = raw_by_ts.get(src.get("@timestamp"), {})
+            for p in keep_paths:
+                rv = get(rd, p)
+                if rv is None:
+                    continue
+                r["keep_values"] += 1
+                if get(src, p) != rv:
+                    r["keep_changed"] += 1
+                    changed.add(p)
+        r["index_readable"] = all(h["_index"] == backing for h in hits)
+        r["dataset_readable"] = all(get(h["_source"], "data_stream.dataset") == STREAM_DATASET
+                                    for h in hits)
+        r["namespace_readable"] = all(
+            get(h["_source"], "data_stream.namespace") == STREAM_NAMESPACE for h in hits)
+        label = sess.scrubber.known.get(jsonscrub_norm(STREAM_JOB))
+        own = next((h["_source"] for h in hits
+                    if get(h["_source"], "job.name") is not None), {})
+        r["job_field_labelled"] = bool(label) and get(own, "job.name") == label
+        r["whole_keep_labelled"] = bool(label) and get(own, "service.name") == label
+        msgs = _messages(out)
+        r["text_labelled"] = (bool(label) and not any(STREAM_JOB.casefold() in m.casefold()
+                                                      for m in msgs)
+                              and sum(1 for m in msgs if label in m) == 2)
+        agg, refused, _dt, _c = sess.call(agg_q)
+        if agg is not None:
+            keys = []
+            for name, want in (("datasets", STREAM_DATASET), ("namespaces", STREAM_NAMESPACE)):
+                for b in agg["aggregations"][name]["buckets"]:
+                    r["keep_values"] += 1
+                    keys.append(b["key"] == want)
+                    if b["key"] != want:
+                        r["keep_changed"] += 1
+                        changed.add(f"<bucket>.{name}")
+            r["bucket_keys_readable"] = bool(keys) and all(keys)
+        r["changed_fields"] = sorted(changed)
+        return r
+
+    return {"before": one(True), "after": one(False)}
+
+
 # ---------------------------------------------------------------------------
 # A small Elasticsearch, enough for the grammar
 # ---------------------------------------------------------------------------
@@ -1306,6 +1589,8 @@ class StubEngine:
         #: how many pages were charged at the wide rate: a build that is
         #: slicing properly has none
         self.wide_pages = 0
+        #: distinct-count probes the vocabulary build asked for, by field
+        self.probe_requests: dict[str, int] = {}
         self._range_s: float | None = None
 
     # -- matching ----------------------------------------------------------
@@ -1473,6 +1758,13 @@ class StubEngine:
                                       "max_score": None,
                                       "hits": [self._hit(index, i, flat, inc) for i, flat in sel]}}
             elif atype == "cardinality":
+                if self.page_seconds and name == elastic.VOCABULARY_COUNT_AGG:
+                    # the vocabulary's distinct-count probe, charged so the
+                    # report shows what it costs rather than implying it is
+                    # free (see PROBE_SECONDS)
+                    self.simulated_seconds += PROBE_SECONDS
+                    self.probe_requests[a["field"]] = \
+                        self.probe_requests.get(a["field"], 0) + 1
                 out[name] = {"value": len({r[1].get(a["field"]) for r in rows
                                            if r[1].get(a["field"]) is not None})}
             elif atype == "percentiles":
@@ -1920,7 +2212,8 @@ def unmarked_phrases() -> list[str]:
 
 
 def build_slice(config: elastic.ElasticConfig, engine: StubEngine,
-                covered_from: float, covered_until: float,
+                covered_from: float, covered_until: float, *,
+                over_cap: dict[str, dict] | None = None, probe: bool = True,
                 ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
     """One slice, driven to completion in one call.
 
@@ -1928,19 +2221,30 @@ def build_slice(config: elastic.ElasticConfig, engine: StubEngine,
     or ``wide_page_seconds`` when the range is wide) and the build's clock
     reads that, so a slice costs what a real one would without the eval
     waiting for it.
+
+    ``over_cap`` is the caller's record of the fields already found too wide
+    to read, mutated here as the slice finds more - the broker keeps the
+    same record in its vocabulary index. ``probe`` off is the measurement
+    switch: the build pages every field straight away, as it did before the
+    distinct count existed.
     """
     build = elastic.VocabularyBuild(config, covered_from, covered_until,
-                                    clock=lambda: engine.simulated_seconds)
+                                    clock=lambda: engine.simulated_seconds,
+                                    over_cap=over_cap, probe=probe)
     while build.pending():
         vq = build.request()["params"]
         build.feed({"isPartial": False, "isRunning": False,
                     "rawResponse": engine.search(vq["index"], vq["body"],
                                                  ignore_unavailable=vq["ignore_unavailable"])})
+        if over_cap is not None:
+            for field, count in build.take_dropped().items():
+                over_cap[field] = {"count": count, "at": NOW.timestamp()}
     return build.result(), build
 
 
 def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
                      covered_from: float | None = None, covered_until: float | None = None,
+                     *, over_cap: dict[str, dict] | None = None,
                      ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
     """The whole cover, slice by slice, as the broker builds it over many
     serve-loop iterations - driven to completion in one call here.
@@ -1953,26 +2257,37 @@ def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
     until = NOW.timestamp() if covered_until is None else covered_until
     held: elastic.ClusterVocabulary | None = None
     last: elastic.VocabularyBuild | None = None
-    requests = 0
+    requests = probes = 0
+    # one record for the whole cover, as the broker's index is: a field
+    # found over the cap in the first slice is not counted again in the
+    # twenty-nine after it. The caller's own dict when it passes one, so a
+    # caller can read the decisions out as the broker reads its index.
+    seen_over_cap: dict[str, dict] = {} if over_cap is None else over_cap
     if covered_from is not None:
         # an explicit range: one slice of exactly that width (what a top-up
         # over the refresh window is)
-        vocab, build = build_slice(config, engine, covered_from, until)
+        vocab, build = build_slice(config, engine, covered_from, until,
+                                   over_cap=seen_over_cap)
         return vocab, build
     while True:
         nxt = elastic.next_vocabulary_slice(config, held, until)
         if nxt is None:
             break
-        vocab, last = build_slice(config, engine, *nxt)
+        vocab, last = build_slice(config, engine, *nxt, over_cap=seen_over_cap)
         requests += last.requests
+        probes += last.probes
         held = vocab if held is None else held.merge(vocab)
     if held is None or last is None:    # nothing to read
-        return build_slice(config, engine, until - config.vocabulary_days * 86400.0, until)
+        return build_slice(config, engine, until - config.vocabulary_days * 86400.0, until,
+                           over_cap=seen_over_cap)
     last.requests = requests            # the cover's cost, not the last slice's
+    last.probes = probes
+    last.remembered = {f: int(v["count"]) for f, v in seen_over_cap.items()}
     return held, last
 
 
-def build_cover(config: elastic.ElasticConfig, engine: StubEngine,
+def build_cover(config: elastic.ElasticConfig, engine: StubEngine, *,
+                over_cap: dict[str, dict] | None = None,
                 ) -> tuple[elastic.ClusterVocabulary, dict]:
     """Every slice of the cover, newest first, with what each one cost.
 
@@ -1983,20 +2298,23 @@ def build_cover(config: elastic.ElasticConfig, engine: StubEngine,
     """
     until = NOW.timestamp()
     held: elastic.ClusterVocabulary | None = None
-    report = {"slices": 0, "requests": 0, "seconds": 0.0, "max_slice_s": 0.0,
+    report = {"slices": 0, "requests": 0, "probes": 0, "seconds": 0.0, "max_slice_s": 0.0,
               "serving_after_slices": None, "serving_requests": 0, "serving_seconds": 0.0,
-              "budget_s": config.vocabulary_budget_s, "wide_pages": 0}
+              "budget_s": config.vocabulary_budget_s, "wide_pages": 0, "over_cap": {}}
+    seen_over_cap: dict[str, dict] = {} if over_cap is None else over_cap
     before_all = engine.simulated_seconds
     while True:
         nxt = elastic.next_vocabulary_slice(config, held, until)
         if nxt is None:
             break
         before = engine.simulated_seconds
-        vocab, build = build_slice(config, engine, *nxt)
+        vocab, build = build_slice(config, engine, *nxt, over_cap=seen_over_cap)
         held = vocab if held is None else held.merge(vocab)
         took = engine.simulated_seconds - before
         report["slices"] += 1
         report["requests"] += build.requests
+        report["probes"] += build.probes
+        report["over_cap"] = {f: int(v["count"]) for f, v in seen_over_cap.items()}
         report["max_slice_s"] = round(max(report["max_slice_s"], took), 1)
         if report["serving_after_slices"] is None and held.serves(config, until):
             report["serving_after_slices"] = report["slices"]
@@ -2013,7 +2331,8 @@ def learn_vocabulary(scrubber: elastic.EsScrubber, engine: StubEngine,
     """Build and apply in one step, for a caller that only wants the names
     known (tests, es-eval sessions outside the bridge)."""
     vocab, build = build_vocabulary(scrubber.config, engine)
-    return scrubber.apply_vocabulary(cluster, vocab), build.requests
+    return (scrubber.apply_vocabulary(cluster, vocab, over_cap=dict(build.remembered)),
+            build.requests)
 
 
 class EngineSession:
@@ -2129,6 +2448,141 @@ class SteppedSearchTransport:
             return {"id": sid, "isRunning": True, "isPartial": True}
         return {"id": sid, "isRunning": False, "isPartial": False,
                 "rawResponse": held["result"]}
+
+
+def run_over_cap_eval(fx: Fixture, *, tier2: str = "none") -> dict:
+    """An identifier field with more distinct values than ``vocabulary.max``,
+    in the default field set, on the real broker.
+
+    The shape that stopped the build finishing: with no ``vocabulary``
+    section every learnable field is read, and one per-request reference
+    with a fresh value on nearly every document was paged to the cap and
+    only then refused - so the slice failed, was retried, failed the same
+    way, and no case ever ran. What this measures:
+
+    * **what the oversized field costs**, before and after. "Before" is the
+      build with ``probe=False`` (the measurement switch, set by nothing in
+      the live path) on the map that still refuses, which is what every map
+      did before the rule: the requests spent paging that field to the cap,
+      and then the slice refused - once a slice, every slice, for ever.
+      "After" is one distinct count, once for the whole cover;
+    * **the first case is still served** - on a cover built with the field
+      left out, about a day the first slice does not reach, with tier 2
+      **off**, so a name hidden in message text can only have come from the
+      vocabulary;
+    * **the report names the field**, with its count, on the VOCAB line and
+      in the bridge's vocabulary report - the only place a user is told
+      that field's values stay readable in message text;
+    * **a map that lists the field itself is still refused**, with a
+      message naming it and the two ways out.
+    """
+    from . import esbridge
+
+    cluster = elastic.Cluster("stub", "https://kibana-stub.example.net")
+    cfg = over_cap_map(listed=False)
+    engine = StubEngine(fx, (OVER_CAP_INDEX,))
+    engine.page_seconds = PAGE_SECONDS
+    engine.wide_page_seconds = WIDE_PAGE_SECONDS
+    out: dict = {
+        "field": OVER_CAP_FIELD, "max": cfg.vocabulary_max, "distinct": OVER_CAP_REFS,
+        "fields_default": [r.pattern for r in cfg.vocabulary_rules],
+        "before_requests": 0, "before_refused": None, "before_pages_at_default_cap": 0,
+        "after_requests": 0, "after_probes": 0, "after_probes_all": 0, "slices": 0,
+        "left_out": {}, "names_read": {}, "logged_values": 0,
+        "case_shown": False, "case_refused": None, "case_leaks": [], "case_part_leak": False,
+        "readable_without_vocabulary": False,
+        "reported_on_vocab_line": False, "vocab_line": "",
+        "listed_refused": None, "listed_message_names_field": False,
+        "listed_message_says_how": False,
+    }
+    # -- before: no distinct count, so the field is paged to the cap -------
+    # on the map that still refuses, which is what every map did before the
+    # rule: page to the cap, then abandon the slice
+    build = elastic.VocabularyBuild(over_cap_map(listed=True),
+                                    NOW.timestamp() - 86400.0, NOW.timestamp(),
+                                    clock=lambda: engine.simulated_seconds, probe=False)
+    try:
+        while build.pending():
+            vq = build.request()["params"]
+            if build.field == OVER_CAP_FIELD:
+                out["before_requests"] += 1
+            build.feed({"isPartial": False, "isRunning": False,
+                        "rawResponse": engine.search(vq["index"], vq["body"],
+                                                     ignore_unavailable=True)})
+    except elastic.Refused as e:
+        out["before_refused"] = e.code
+    # the same field at the default cap, which is what a site actually runs
+    out["before_pages_at_default_cap"] = \
+        elastic.DEFAULT_VOCABULARY_MAX // elastic.VOCABULARY_PAGE + 1
+
+    # -- after: the real broker, a serve-loop step at a time ---------------
+    transport = SteppedSearchTransport(engine)
+    tmp = Path(tempfile.mkdtemp(prefix="hider-es-eval-overcap-"))
+    saved_clock = esbridge.clock
+    esbridge.clock = lambda: NOW.timestamp()
+    before_requests = len(engine.requests)
+    query = {"index": OVER_CAP_INDEX, "time_range": OVER_CAP_RANGE, "size": 20,
+             "filters": [{"field": "message", "op": "phrase", "value": OVER_CAP_PHRASE}]}
+    try:
+        broker = esbridge.Broker(cfg, lambda: transport, poll_interval=0.0, sessions_dir=tmp)
+        broker.open()
+        broker.start_vocabulary(cluster)
+        steps = 0
+        while steps < 4000 and broker.pump_vocabulary():
+            steps += 1
+            held = broker.vocabulary.get("stub")
+            if held is not None and held.serves(cfg, NOW.timestamp()):
+                break
+        out["after_requests"] = len(engine.requests) - before_requests
+        out["slices"] = sum(1 for r in broker._build_log if r["vocabulary"] == "slice")
+        # on the oversized field: one count, for the whole cover. The rest
+        # are the kept fields' own counts, one each per slice.
+        out["after_probes"] = engine.probe_requests.get(OVER_CAP_FIELD, 0)
+        out["after_probes_all"] = sum(engine.probe_requests.values())
+        out["left_out"] = {f: int(v["count"]) for f, v in
+                           broker.vocabulary.over_cap_fields("stub", NOW.timestamp()).items()}
+        # the decision log carries the field name and the count, never a value
+        rows = [json.dumps(r, sort_keys=True) for r in broker._build_log]
+        out["logged_values"] = sum(1 for r in rows if OVER_CAP_TENANT in r
+                                   or over_cap_ref(0) in r)
+        bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2),
+                                 EngineSession(engine), index=broker.vocabulary)
+        try:
+            page = bridge.run("stub", query)
+            out["case_shown"] = bool(page.hits_shown)
+            out["case_leaks"] = _leaks(page.output, OVER_CAP_TRUTH)
+            out["case_part_leak"] = bool(name_part_leaks(
+                _messages(page.output), OVER_CAP_PHRASE, OVER_CAP_TENANT))
+        except elastic.Refused as e:
+            out["case_refused"] = e.code
+        report = bridge.vocabulary.get("stub") or {}
+        out["names_read"] = dict(report.get("fields") or {})
+        line = esbridge.vocabulary_line(report) or ""
+        out["vocab_line"] = line
+        out["reported_on_vocab_line"] = (
+            OVER_CAP_FIELD in line and str(OVER_CAP_REFS) in line
+            and "OVER CAP" in line and OVER_CAP_TENANT not in line)
+    finally:
+        esbridge.clock = saved_clock
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # The same page with no vocabulary at all: the name is readable, which
+    # is what makes "the vocabulary hid it" a measurement rather than a
+    # claim (tier 2 is off, and nothing else has a shape for the name).
+    bare = Session(cfg, engine, tier2=tier2, vocabulary=None)
+    page, _refused, _dt, _c = bare.call(query)
+    out["readable_without_vocabulary"] = bool(page is not None and _leaks(page, OVER_CAP_TRUTH))
+
+    # -- a map that lists the field itself: refused, as before -------------
+    listed = over_cap_map(listed=True)
+    try:
+        build_slice(listed, engine, NOW.timestamp() - 86400.0, NOW.timestamp())
+    except elastic.Refused as e:
+        out["listed_refused"] = e.code
+        out["listed_message_names_field"] = OVER_CAP_FIELD in e.message
+        out["listed_message_says_how"] = ("vocabulary.fields" in e.message
+                                          and "vocabulary.max" in e.message)
+    return out
 
 
 def run_slice_eval(config: elastic.ElasticConfig, fx: Fixture, engine: StubEngine, *,
@@ -2387,10 +2841,10 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
         deadline = time.monotonic() + 300.0
         while time.monotonic() < deadline:
             vocab_state = control.call("vocabulary", cluster="stub")["vocabulary"]
-            if vocab_state.get("state") in ("ready", "stale"):
+            if vocab_state.get("state") in ("ready", "top_up_due", "stale"):
                 break
             time.sleep(0.005)
-        vocabulary_ready = vocab_state.get("state") in ("ready", "stale")
+        vocabulary_ready = vocab_state.get("state") in ("ready", "top_up_due", "stale")
         # what the human seeds: the tenant the case is about, and the two
         # labels the oracle cases are written against (esquery: <Org-01>,
         # ctr-amer-s01, <Tenant-01>)
@@ -3064,6 +3518,17 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # being read, and the broker answers between every step.
     slices = run_slice_eval(cfg, fx, engine, tier2=tier2)
 
+    # An identifier field with more distinct values than the cap, in the
+    # default field set: counted once, left out, and the build carries on.
+    # Its own map, its own index pattern and its own engine, so nothing
+    # above it moves.
+    over_cap = run_over_cap_eval(fx, tier2="none")
+
+    # A data stream named after a job: the name stays readable inside the
+    # stream's keep values and is still hidden where it is the whole value.
+    # Its own map, index pattern and engine, like the over-cap gate.
+    stream_name = run_stream_name_eval(fx, tier2="none")
+
     # A site map with no vocabulary section at all, which is what a site has
     # before anyone writes one. The default decides what is read, and a
     # one-hour case names a tenant and a resource whose own fields are on
@@ -3228,6 +3693,11 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # Field coverage.
     paths: dict[str, int] = {}
     for d in fx.docs:
+        # documents in an index this map does not list are not this map's
+        # coverage: the oversized-field fixture has its own index pattern
+        # and its own map (see over_cap_docs)
+        if not cfg.index_allowed(d.index):
+            continue
         for p in flatten(d.source):
             paths[p] = paths.get(p, 0) + 1
     coverage = {"keep": [], "identifier": [], "text": [], "unlisted": []}
@@ -3267,6 +3737,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "window_case": window_case,
         "building_case": building,
         "slices": slices,
+        "over_cap": over_cap,
+        "stream_name": stream_name,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -3370,6 +3842,37 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and slices["still_building_older"]
             and slices["pings"] == slices["pings_answered"] > 0
             and slices["max_step_s"] <= slices["poll_interval_s"],
+        # An identifier field over vocabulary.max, in the default field
+        # set: counted once rather than paged to the cap, left out, the
+        # build finishes, the first case about a day in the cover is still
+        # served with the name hidden, and the field and its count are
+        # named on the VOCAB line (no value anywhere). A map that lists the
+        # field itself is still refused, with a message naming it.
+        "over_cap_field_left_out":
+            over_cap["before_refused"] == "vocabulary"
+            and over_cap["before_requests"] > over_cap["after_probes"] == 1
+            and over_cap["left_out"] == {OVER_CAP_FIELD: OVER_CAP_REFS}
+            and over_cap["names_read"].get("labels.tenant_name")
+            and OVER_CAP_FIELD not in over_cap["names_read"]
+            and over_cap["case_shown"] and not over_cap["case_refused"]
+            and not over_cap["case_leaks"] and not over_cap["case_part_leak"]
+            and over_cap["readable_without_vocabulary"]
+            and over_cap["reported_on_vocab_line"]
+            and over_cap["logged_values"] == 0
+            and over_cap["listed_refused"] == "vocabulary"
+            and over_cap["listed_message_names_field"]
+            and over_cap["listed_message_says_how"],
+        # A data stream named after a job: index, dataset and namespace
+        # readable in hits and as bucket keys; the job still labelled in its
+        # own field, in message text and in a keep field holding the whole
+        # name; and before the rule the stream's keep values did change.
+        "stream_name_readable_in_keep":
+            (a := stream_name["after"])["shown"]
+            and a["index_readable"] and a["dataset_readable"] and a["namespace_readable"]
+            and a["bucket_keys_readable"]
+            and a["job_field_labelled"] and a["text_labelled"] and a["whole_keep_labelled"]
+            and a["changed_fields"] == ["service.name"]
+            and stream_name["before"]["keep_changed"] > a["keep_changed"],
         # a case before the build finishes is refused, not shown
         "vocabulary_building_refuses":
             building["refused"] == "vocabulary_building" and not building["shown"],
@@ -3466,6 +3969,55 @@ def _slice_lines(s: dict | None) -> list[str]:
     ]
 
 
+def _stream_name_lines(o: dict | None) -> list[str]:
+    """Keep values changed in the job-named stream, before and after the
+    keep rule. Field names and counts only."""
+    if not o:
+        return []
+    b, a = o["before"], o["after"]
+    return [
+        f"job-named stream keep values changed {b['keep_changed']}/{b['keep_values']} before "
+        f"the keep rule ({', '.join(b['changed_fields']) or 'none'}), "
+        f"{a['keep_changed']}/{a['keep_values']} after ({', '.join(a['changed_fields']) or 'none'}); "
+        f"index, dataset, namespace readable: {a['index_readable']}, {a['dataset_readable']}, "
+        f"{a['namespace_readable']}; bucket keys readable: {a['bucket_keys_readable']}; job "
+        f"labelled in its field {a['job_field_labelled']}, in text {a['text_labelled']}, "
+        f"as a whole keep value {a['whole_keep_labelled']}",
+    ]
+
+
+def _over_cap_lines(o: dict | None) -> list[str]:
+    """What an identifier field wider than the cap costs, and what is said
+    about it. Field names and counts; the fixture's own names never appear
+    here, and the whole point of the section is the last line."""
+    if not o:
+        return []
+    return [
+        f"over-cap field    {o['field']} has {o['distinct']} distinct values in a day against a "
+        f"{o['max']} cap, in the default field set {o['fields_default']}: "
+        f"{o['before_requests']} requests on it and then the slice refused with "
+        f"{o['before_refused'] or 'NOTHING'} before the rule (at the default "
+        f"{elastic.DEFAULT_VOCABULARY_MAX} cap, {o['before_pages_at_default_cap']} a slice, "
+        f"every slice, for ever); {o['after_probes']} distinct count after it, for the whole "
+        f"cover ({o['after_probes_all']} counts in all, one per kept field per slice)",
+        f"  and the build   finished {o['slices']} slices in {o['after_requests']} requests; "
+        f"names read {o['names_read'] or 'none'}; the first case about a day in the cover is "
+        f"{'shown' if o['case_shown'] else 'NOT SHOWN'}"
+        + (f" (refused {o['case_refused']})" if o["case_refused"] else "")
+        + f", {len(o['case_leaks'])} leaks, "
+        f"{'a word of the name readable' if o['case_part_leak'] else 'name hidden'} "
+        f"(tier 2 off, and the same page with no vocabulary "
+        f"{'does show the name' if o['readable_without_vocabulary'] else 'HIDES IT ANYWAY'}, "
+        f"so the vocabulary is what hid it); {o['logged_values']} values in the build log",
+        f"  listed instead  a map naming {o['field']} in vocabulary.fields is still refused "
+        f"with {o['listed_refused'] or 'NOTHING'}, message names the field: "
+        f"{o['listed_message_names_field']}, says how to fix it: {o['listed_message_says_how']}",
+        f"  declared cost   {o['left_out'] or 'nothing'} left out of the vocabulary, so its "
+        f"values stay readable in message text; this is the only place a user is told: "
+        f"{o['vocab_line'] or 'NOTHING SAID'}",
+    ]
+
+
 def _estate_lines(e: dict | None) -> list[str]:
     """The realistic-estate section: one line per shape class, then the
     skip-rule totals, the declared miss and the spelling check."""
@@ -3550,7 +4102,9 @@ def format_report(r: dict) -> str:
         f"before the build  a case is {r['building_case']['refused'] or 'NOT REFUSED'}, "
         f"{'no page shown' if not r['building_case']['shown'] else 'A PAGE WAS SHOWN'}",
         f"vocabulary build  {b['slices']} one-day slices, newest first: {b['requests']} "
-        f"requests and {b['simulated_s']}s simulated for the whole {b['covered_days']}d cover, "
+        f"requests ({b['probes']} of them the distinct count every field is given before it is "
+        f"paged, at {PROBE_SECONDS:g}s assumed each) and {b['simulated_s']}s simulated for the "
+        f"whole {b['covered_days']}d cover, "
         f"worst slice {b['max_slice_s']}s of the {b['budget_s']:g}s per-slice budget, "
         f"{b['wide_pages']} pages charged at the wide-range rate "
         f"({r['vocabulary']['page']} values a page, one field a page, a page over a slice "
@@ -3561,6 +4115,8 @@ def format_report(r: dict) -> str:
         f"simulated, after {b['serving_after_slices']} slices: what someone signing in waits "
         f"for before a case can run; the rest of the cover is read behind them",
         *_slice_lines(r.get("slices")),
+        *_over_cap_lines(r.get("over_cap")),
+        *_stream_name_lines(r.get("stream_name")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "

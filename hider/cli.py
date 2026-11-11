@@ -391,10 +391,20 @@ def _es_smoke_stub(args: argparse.Namespace, size: int) -> int:
             cluster = cfg.cluster("stub")
             build = elastic.VocabularyBuild(
                 cfg, esbridge.clock() - cfg.vocabulary_days * 86400.0, esbridge.clock())
+
+            def _over_cap() -> dict:
+                """Fields counted and left out, for the progress line. The
+                stub index has no directory, so this is in memory only."""
+                return {"max": cfg.vocabulary_max,
+                        "over_cap": {f: int(v["count"]) for f, v in
+                                     index.over_cap_fields("stub", esbridge.clock()).items()}}
+
             try:
                 while build.pending():
                     build.feed(session.search(cluster, build.request()))
-                    print(esbridge.vocabulary_line({"building": build.progress()}),
+                    for field, count in build.take_dropped().items():
+                        index.note_over_cap("stub", field, count, esbridge.clock())
+                    print(esbridge.vocabulary_line({"building": build.progress(), **_over_cap()}),
                           file=sys.stderr)
                 index.put("stub", build.result())
             except elastic.Refused as e:
@@ -732,7 +742,7 @@ def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
         line = esbridge.vocabulary_line(state)
         if line:
             print(line, file=sys.stderr)
-        if state.get("state") == "extending":
+        if state.get("state") in {"extending", "top_up_due"}:
             print("the recent days are in, so cases can run now; the bridge keeps reading "
                   "further back on its own. A name logged only in a day not yet covered is "
                   "not known until it is - the VOCAB line shows how far back the cover goes.",

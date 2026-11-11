@@ -355,6 +355,10 @@ class JsonScrubber:
         #: matching known values in text is one dict lookup per word instead
         #: of a regex alternation that has to be recompiled as values arrive
         self._index: dict[str, list[tuple[str, int]]] = {}
+        #: when set, :meth:`_find_known` matches a known value *inside* a
+        #: longer string only if its label is in this set (the elastic keep
+        #: rule: only seeded values match a part of a keep value)
+        self._known_only: set[str] | None = None
         #: label -> value for names that are ordinary English words
         #: (:data:`ORDINARY_NAME_WORDS`): labelled in their own field,
         #: hidden in text only inside the record whose own field holds
@@ -553,6 +557,8 @@ class JsonScrubber:
                 hits.append((m.start(), m.end(), w))
         for tok in _TOKEN.finditer(text):
             for v, off in self._index.get(tok.group(0).casefold(), ()):
+                if self._known_only is not None and self.known.get(v) not in self._known_only:
+                    continue
                 a = tok.start() - off
                 b = a + len(v)
                 if a < 0 or b > len(text):

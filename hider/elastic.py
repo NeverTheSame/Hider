@@ -149,6 +149,29 @@ VOCABULARY_RETRY_S = 60.0
 VOCABULARY_AGG = "hider_vocabulary"
 #: The one composite source name in a vocabulary aggregation.
 VOCABULARY_SOURCE = "v"
+#: The distinct-count probe each field gets before it is paged: one
+#: ``cardinality`` aggregation, one request, no paging and no sort.
+VOCABULARY_COUNT_AGG = "hider_vocabulary_n"
+#: Elasticsearch's ceiling on ``precision_threshold``. Below it a
+#: cardinality count is near enough exact; above it the error is a fraction
+#: of a percent. Asked for at the cap, so the answer is at its most accurate
+#: exactly where the decision is made.
+VOCABULARY_PRECISION_CEILING = 40_000
+#: How far a cardinality count is assumed to be out, as a share of itself.
+#: Elasticsearch's cardinality is approximate (HyperLogLog++); measured
+#: error is under 2% at the default precision and a fraction of a percent
+#: near the threshold, so 5% is a margin, not an estimate. It is applied in
+#: whichever direction **keeps the build running**: a field within the
+#: margin of the cap is treated as over it when the field set is the default
+#: (left out, the build carries on) and as under it when the site map lists
+#: the field itself (paged, with the exact page-time count deciding, because
+#: there the answer to "over the cap" is to refuse the slice).
+VOCABULARY_PROBE_MARGIN = 0.05
+#: How long an "over the cap" decision stands before the field is probed
+#: again. A day: long enough that one cover's thirty slices and any restart
+#: within the day ask once, short enough that raising the cap or fixing the
+#: field takes effect the next day without clearing anything by hand.
+VOCABULARY_OVER_CAP_S = 86400.0
 #: A field at or above this share of its cap is reported as near it.
 VOCABULARY_NEAR_CAP = 0.8
 #: Identifier types a site may not read as a vocabulary, and why: one value
@@ -728,6 +751,13 @@ class EsScrubber(jsonscrub.JsonScrubber):
         #: reach and count every customer on the cluster, which it could
         #: not do before the vocabulary existed.
         self.shown: set[str] = set()
+        #: Labels the human seeded. The only known values that replace a
+        #: *part* of a keep value; see :meth:`_keep_value`.
+        self.seeded_labels: set[str] = set()
+        #: Measurement switch for es-eval's "before" figure: every known
+        #: value matches anywhere in a keep value, as before the keep rule.
+        #: Set by nothing in the live path.
+        self.keep_parts_swept = False
         # ``readable_words`` and the ``ordinary_words_case_wide`` measurement
         # switch are inherited from JsonScrubber: one shared rule, two ways
         # of deciding which values it covers (the site map here, key
@@ -758,6 +788,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
         self._vocabulary_at: dict[str, float] = {}
         self.vocabulary_counts: dict[str, int] = {}
         self.vocabulary_skipped: dict[str, int] = {}
+        #: fields the build counted and did not read, field -> distinct
+        #: count. Their values stay readable in message text.
+        self.vocabulary_over_cap: dict[str, int] = {}
         self._meta = {k: _parse_rule(k, v, "meta") for k, v in META_RULES.items()}
         for t in self.terms:
             if not (t.endswith("*") and len(t) > 2):
@@ -834,6 +867,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 rule = r
                 break
         label = self.label_for(rule, value)
+        # a seeded value matches anywhere in a keep value; a learnt one only
+        # as the whole value (see _keep_value)
+        self.seeded_labels.add(label)
         # the human is given this label to hand to Claude, so it counts as
         # shown: it is the one label a case starts with
         self.shown.add(label)
@@ -936,12 +972,18 @@ class EsScrubber(jsonscrub.JsonScrubber):
     # holds counts only.
 
     def apply_vocabulary(self, cluster: str, vocab: "ClusterVocabulary",
-                         now: float | None = None) -> dict[str, int]:
+                         now: float | None = None,
+                         over_cap: dict[str, int] | None = None) -> dict[str, int]:
         """Make every name the index holds for ``cluster`` a known value.
 
         Local work only: the read happened once, for the whole bridge. The
         skip rules below decide what is safe to register.
+
+        ``over_cap`` names the fields the build counted and did not read,
+        with their counts, so this case's own report can say which fields
+        stay readable in message text and why.
         """
+        self.vocabulary_over_cap = dict(over_cap or {})
         return self._learn_vocabulary(cluster, vocab.fields, now=now,
                                       covers=(vocab.covered_from, vocab.covered_until))
 
@@ -1002,12 +1044,17 @@ class EsScrubber(jsonscrub.JsonScrubber):
 
     def vocabulary_report(self) -> dict:
         """Counts only: per field, values returned against the cap, plus the
-        field names a vocabulary could hold that this map does not read."""
+        field names a vocabulary could hold that this case does not know -
+        left out by the map (``omitted``) or too wide to read
+        (``over_cap``, with the count that decided it)."""
         cap = self.config.vocabulary_max
-        return {"fields": dict(self.vocabulary_counts), "max": cap,
+        over_cap = dict(self.vocabulary_over_cap)
+        return {"fields": {f: n for f, n in self.vocabulary_counts.items() if f not in over_cap},
+                "max": cap,
                 "near_cap": sorted(f for f, n in self.vocabulary_counts.items()
-                                   if n >= VOCABULARY_NEAR_CAP * cap),
+                                   if n >= VOCABULARY_NEAR_CAP * cap and f not in over_cap),
                 "skipped": dict(self.vocabulary_skipped),
+                "over_cap": over_cap,
                 "omitted": list(self.config.vocabulary_omitted)}
 
     # -- the response ------------------------------------------------------
@@ -1082,6 +1129,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
         leaks = self.leak_check(out)
         if leaks:
             raise self._refuse("leak", "response withheld: a known value survived redaction")
+        out = self._unmark(out)
         # This page is about to go to Claude, so every label in it is one
         # the case may use from now on. After the leak check: a page that
         # is refused was never shown and teaches no label.
@@ -1183,7 +1231,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
             return self._rewrite_hit_inner(hit)
 
     def _rewrite_hit_inner(self, hit: dict) -> dict:
-        out: dict[str, Any] = {"_index": hit["_index"]}
+        out: dict[str, Any] = {"_index": _keep_mark(hit["_index"])}
         if "_id" in hit and hit["_id"] is not None:
             out["_id"] = self.label_for(self._meta["_id"], str(hit["_id"]))
         if "_score" in hit:
@@ -1251,21 +1299,93 @@ class EsScrubber(jsonscrub.JsonScrubber):
         "Keep" means the site declared the field non-sensitive, but a real
         level field held a SharePoint personal-site URL among its info/warn
         spellings, and a keep value reaches Claude both in hits and as a
-        bucket key. So every string keep value gets the shaped pass a text
-        field gets - tier 1 and the known-value sweep, never tier 2 - and a
-        match is replaced the way it would be in a message. An ordinary
-        value matches nothing and comes back exactly as written, so
-        filtering by it still works; a value tier 1 does claim is labelled,
-        at the declared cost that filtering by it now needs a label its
-        field cannot take. Numbers, booleans and time-shaped strings are
-        returned untouched (nothing sensitive fits in ``_TIME_SHAPED``, and
-        every hit carries a timestamp, so skipping them is most of the cost).
+        bucket key. So every string keep value gets tier 1 (never tier 2),
+        and a match is replaced the way it would be in a message. Numbers,
+        booleans and time-shaped strings are returned untouched (nothing
+        sensitive fits in ``_TIME_SHAPED``, and every hit carries a
+        timestamp, so skipping them is most of the cost).
+
+        **Known values are matched narrowly here.** A name learnt from the
+        vocabulary or harvested off a page replaces a keep value only when
+        it *is* the value (ignoring case and outer spaces), never a part of
+        a longer one: with ~10k vocabulary names in the sweep, a job called
+        Harborsync turned ``logs-agent.harborsync_events-prod`` into
+        ``logs-agent.<Job-03>_events-prod`` in the index, dataset and
+        namespace, and Claude could no longer filter by the dataset. A
+        value the human **seeded** still matches anywhere, as does anything
+        tier 1 recognises by shape. Declared cost: a customer name inside a
+        longer keep value (an index named after a customer) is readable.
+
+        The result is marked (:class:`_KeepStr`) so the pass-3 sweep and
+        the leak check apply the same rule; :meth:`_unmark` drops the mark.
         """
         if not isinstance(value, str) or _TIME_SHAPED.fullmatch(value):
             return value
         if len(value) > self.config.max_text_chars:
             value = value[: self.config.max_text_chars] + " [truncated]"
-        return self._scrub_text(value, shaped_only=True)
+        whole = self._keep_whole(value)
+        if whole is not None:
+            return whole
+        self._known_only = self._keep_only()
+        try:
+            out = self._scrub_text(value, shaped_only=True)
+        finally:
+            self._known_only = None
+        return out if out in self.mapping else _keep_mark(out)
+
+    def _keep_only(self) -> set[str] | None:
+        """The labels allowed to match inside a keep value: the seeded ones."""
+        return None if self.keep_parts_swept else self.seeded_labels
+
+    def _keep_whole(self, value: str) -> str | None:
+        """The label for a keep value that is wholly a known value, else None."""
+        n = jsonscrub._norm(value)
+        if n in self.known and n not in jsonscrub._STOPWORDS \
+                and self.known[n] not in self.readable_words:
+            return self.known[n]
+        return None
+
+    @classmethod
+    def _unmark(cls, node: Any) -> Any:
+        if isinstance(node, _KeepStr):
+            return str.__str__(node)
+        if isinstance(node, dict):
+            return {k: cls._unmark(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [cls._unmark(v) for v in node]
+        return node
+
+    def leak_check(self, out: Any) -> list[str]:
+        """As the file scrubber's, with a keep value checked by the keep
+        rule: a learnt value inside a longer keep value is readable by
+        declaration, not a leak; a seeded one is."""
+        leaked: set[str] = set()
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if not jsonscrub._PLAIN_KEY.match(str(k)):
+                        walk(k)
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+            elif isinstance(node, _KeepStr):
+                if self._keep_whole(node) is not None:
+                    leaked.add(self._keep_whole(node))
+                self._known_only = self._keep_only()
+                try:
+                    hits = self._find_known(str.__str__(node))
+                finally:
+                    self._known_only = None
+                for _, _, v in hits:
+                    leaked.add(self.known[v])
+            elif isinstance(node, (str, int, float)) and not isinstance(node, bool):
+                for _, _, v in self._find_known(str(node)):
+                    leaked.add(self.known[v])
+
+        walk(out)
+        return sorted(leaked)
 
     # -- aggregations ------------------------------------------------------
 
@@ -1366,6 +1486,17 @@ class EsScrubber(jsonscrub.JsonScrubber):
             return {k: self._sweep(v) for k, v in node.items()}
         if isinstance(node, list):
             return [self._sweep(v) for v in node]
+        if isinstance(node, _KeepStr):
+            # a keep value: the whole-value rule of _keep_value, again with
+            # whatever pass 2 learnt
+            whole = self._keep_whole(node)
+            if whole is not None:
+                return whole
+            self._known_only = self._keep_only()
+            try:
+                return _keep_mark(self._substitute(str.__str__(node)))
+            finally:
+                self._known_only = None
         if isinstance(node, str):
             if node in self.mapping:
                 return node
@@ -1400,6 +1531,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
             "types": self.types,
             # labels only, no values: which of them the case has been shown
             "shown": sorted(self.shown),
+            # labels only: which values the human seeded (they match inside
+            # a keep value; learnt ones only as the whole value)
+            "seeded": sorted(self.seeded_labels),
             # labels only: which of them are ordinary words, labelled in
             # their own field and readable in text everywhere else
             "readable_words": sorted(self.readable_words),
@@ -1434,6 +1568,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
         # that a restored old case must see a label on a page again (one
         # query) or have its term re-seeded before using it.
         s.shown = {lab for lab in raw.get("shown") or () if lab in s.mapping}
+        # A case saved before seeds were recorded has none: its seeded
+        # values then match a keep value only whole, like a learnt one.
+        s.seeded_labels = {lab for lab in raw.get("seeded") or () if lab in s.mapping}
         # Which labels are ordinary words, labelled in their own field and
         # readable in text everywhere else. A case saved **before** this was
         # recorded has them indexed for the case-wide sweep, as it was saved;
@@ -1551,6 +1688,13 @@ class VocabularyIndex:
     def __init__(self, directory: str | Path | None) -> None:
         self.directory = Path(directory) if directory is not None else None
         self.clusters: dict[str, ClusterVocabulary] = {}
+        #: cluster -> field -> ``{"count": n, "at": t}``: the fields a build
+        #: found over ``vocabulary.max`` and therefore did not read. Saved
+        #: beside the names and **not** inside a :class:`ClusterVocabulary`,
+        #: because the decision has to outlive a slice that fails after it:
+        #: that is what stops the next slice spending the same fifty
+        #: requests. Counts and field names, never a value.
+        self.over_cap: dict[str, dict[str, dict]] = {}
         self.load()
 
     @property
@@ -1564,6 +1708,22 @@ class VocabularyIndex:
         held = self.clusters.get(cluster)
         self.clusters[cluster] = vocab if held is None else held.merge(vocab)
         self.save()
+
+    def note_over_cap(self, cluster: str, field: str, count: int, now: float) -> None:
+        """Remember that ``field`` has more distinct values than the cap, so
+        the next slice neither counts nor pages it. Saved at once, before
+        the slice it was found in is whole: a slice that fails afterwards
+        must not cost the same fifty requests again."""
+        self.over_cap.setdefault(cluster, {})[field] = {"count": int(count), "at": float(now)}
+        self.save()
+
+    def over_cap_fields(self, cluster: str, now: float) -> dict[str, dict]:
+        """The over-the-cap decisions still standing for a cluster. They
+        expire after :data:`VOCABULARY_OVER_CAP_S` so a cap raised, or a
+        field that stops being id-shaped, takes effect on its own."""
+        held = self.over_cap.get(cluster) or {}
+        return {f: v for f, v in held.items()
+                if now - float(v.get("at", 0.0)) < VOCABULARY_OVER_CAP_S}
 
     def load(self) -> None:
         path = self.path
@@ -1579,6 +1739,15 @@ class VocabularyIndex:
             vocab = ClusterVocabulary.from_json(entry)
             if vocab is not None:
                 self.clusters[str(name)] = vocab
+        for name, entry in (raw.get("over_cap") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            kept = {str(f): {"count": int(v.get("count", 0)), "at": float(v.get("at", 0.0))}
+                    for f, v in entry.items()
+                    if isinstance(v, dict) and isinstance(v.get("count"), (int, float))
+                    and isinstance(v.get("at"), (int, float))}
+            if kept:
+                self.over_cap[str(name)] = kept
 
     def save(self) -> None:
         path = self.path
@@ -1586,7 +1755,8 @@ class VocabularyIndex:
             return
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         body = {"schema": self.SCHEMA,
-                "clusters": {n: v.to_json() for n, v in self.clusters.items()}}
+                "clusters": {n: v.to_json() for n, v in self.clusters.items()},
+                "over_cap": {n: v for n, v in self.over_cap.items() if v}}
         tmp = path.with_suffix(".tmp")
         old = os.umask(0o077)
         try:
@@ -1598,9 +1768,18 @@ class VocabularyIndex:
 
     def report(self, cluster: str, config: ElasticConfig,
                now: float | None = None) -> dict:
-        """Counts and coverage for the log and the VOCAB line, never a name."""
+        """Counts and coverage for the log and the VOCAB line, never a name.
+
+        Two kinds of field are named as left out, with the reason each
+        time: ``omitted``, which the site map's own ``vocabulary.fields``
+        leaves out, and ``over_cap``, which a build counted and found too
+        wide to read. Both are field names, and ``over_cap`` carries the
+        count that decided it. Their values stay readable in message text,
+        which is the whole reason they are reported at all.
+        """
         vocab = self.clusters.get(cluster)
         t = time.time() if now is None else now
+        over_cap = {f: int(v["count"]) for f, v in self.over_cap_fields(cluster, t).items()}
         if vocab is None:
             # Nothing to read is not the same as not having read it yet: a
             # site map with no learnable field (or one that lists none) is
@@ -1610,7 +1789,8 @@ class VocabularyIndex:
             return {"state": "ready" if nothing_to_read else "building",
                     "serving": nothing_to_read, "complete": nothing_to_read,
                     "fields": {}, "max": config.vocabulary_max,
-                    "near_cap": [], "skipped": {}, "omitted": list(config.vocabulary_omitted)}
+                    "near_cap": [], "skipped": {}, "over_cap": over_cap,
+                    "omitted": list(config.vocabulary_omitted)}
         counts = vocab.counts
         cap = config.vocabulary_max
         serving = vocab.serves(config, t)
@@ -1618,8 +1798,17 @@ class VocabularyIndex:
         if not serving:
             # read something, but not far enough back yet to answer a case
             state = "building"
-        elif t - vocab.covered_until > VOCABULARY_REFRESH_S:
+        elif t - vocab.covered_until > VOCABULARY_REFRESH_S + config.vocabulary_budget_s:
+            # a top-up is overdue by more than one slice's budget: it is not
+            # running, or it is failing. The bridge also says stale at once
+            # when the last top-up failed (Broker.vocabulary_progress).
             state = "stale"
+        elif t - vocab.covered_until > VOCABULARY_REFRESH_S:
+            # The newest minutes are due a top-up, and one runs next
+            # (next_vocabulary_slice puts it first). Nothing is wrong yet:
+            # reading the first two days at sign-in takes longer than the
+            # refresh interval, so this is the state es-login returns to.
+            state = "top_up_due"
         elif not complete:
             # serving cases while the older slices are still being read
             state = "extending"
@@ -1630,6 +1819,7 @@ class VocabularyIndex:
             "fields": counts, "max": cap,
             "near_cap": sorted(f for f, n in counts.items() if n >= VOCABULARY_NEAR_CAP * cap),
             "skipped": {},
+            "over_cap": over_cap,
             "omitted": list(config.vocabulary_omitted),
             "covered_days": round(vocab.covered_days(t), 2),
             "wanted_days": config.vocabulary_days,
@@ -1682,13 +1872,35 @@ class VocabularyBuild:
     not. If a build is interrupted, the valuable half is the part already
     done.
 
+    **Every field is counted before it is paged.** One ``cardinality``
+    request per field per slice (no paging, no sort) says roughly how many
+    distinct values the field has in the slice, and a field over
+    ``vocabulary.max`` is never paged. Without it, an id-shaped field - a
+    per-request reference, say, with a fresh value on almost every document
+    - was paged to the cap and *then* refused, which cost fifty-one
+    requests and failed the whole slice; the slice was retried and failed
+    the same way for ever, so no case ever ran. What happens to the field
+    now depends on who chose it:
+
+    * **the default field set** (no ``vocabulary.fields`` in the site map):
+      the field is left out, the build carries on with the rest, and the
+      decision is saved (``dropped``) so later slices and restarts do not
+      ask again for :data:`VOCABULARY_OVER_CAP_S`. The cost is stated: that
+      field's values stay readable in message text, and the VOCAB line is
+      where a site sees it;
+    * **a field the map lists itself**: the slice is refused, as before,
+      with a message naming the field and saying to remove it or raise the
+      cap. A site that named the field asked for it to be read, and reading
+      most of it is not that.
+
     **Nothing is learnt from a partial read.** A field is committed to the
     build only when its last page has come back; a slice is committed to
     the index only when every field is done. An upstream error, a partial
-    or misshapen reply, a field over ``vocabulary.max``, or the slice over
-    ``vocabulary.budget_s`` leaves the index exactly as it was - including
-    every slice already saved, which is the point of slicing: one bad day
-    does not cost the twenty-nine good ones.
+    or misshapen reply, a listed field over ``vocabulary.max``, or the
+    slice over ``vocabulary.budget_s`` leaves the index exactly as it was -
+    including every slice already saved, which is the point of slicing: one
+    bad day does not cost the twenty-nine good ones. A field left out is
+    not a partial read of it: nothing it returned is kept.
 
     One instance covers one slice (:func:`next_vocabulary_slice` decides
     which), so the budget below is per slice, and ``requests`` and
@@ -1696,19 +1908,35 @@ class VocabularyBuild:
     """
 
     def __init__(self, config: ElasticConfig, covered_from: float, covered_until: float, *,
-                 clock=None) -> None:
+                 clock=None, over_cap: dict[str, Any] | None = None, probe: bool = True) -> None:
         self.config = config
         self.covered_from = covered_from
         self.covered_until = covered_until
+        #: fields already known to be over the cap, from an earlier slice or
+        #: an earlier run: field -> the count that decided it. They are not
+        #: probed and not paged.
+        self.remembered: dict[str, int] = {
+            f: int((v or {}).get("count", 0)) for f, v in (over_cap or {}).items()}
         #: job names first: see the class docstring
-        self.rules = sorted(config.vocabulary_rules,
-                            key=lambda r: (r.type != "JOB_NAME", r.pattern))
+        self.rules = [r for r in sorted(config.vocabulary_rules,
+                                        key=lambda r: (r.type != "JOB_NAME", r.pattern))
+                      if r.pattern not in self.remembered]
         self.values: dict[str, list[str]] = {r.pattern: [] for r in self.rules}
+        #: fields this slice found over the cap: field -> the count that
+        #: decided it. The broker saves these, so the next slice skips them.
+        self.dropped: dict[str, int] = {}
         self._clock = clock if clock is not None else time.monotonic
         self._t0 = self._clock()
         self._at = 0                      # index of the field being read
         self._after: dict | None = None   # composite after_key for that field
+        #: measurement switch, set by nothing in the live path: with it off
+        #: a field is paged straight away, which is what the build did
+        #: before the probe existed. ``es-eval`` uses it for the "before"
+        #: half of the oversized-field figure.
+        self._probe = probe
+        self._counting = probe            # the next request for this field is the probe
         self.requests = 0
+        self.probes = 0
         self.seconds = 0.0
         self.failed: str | None = None
 
@@ -1723,24 +1951,50 @@ class VocabularyBuild:
 
     def progress(self) -> dict:
         """Counts only, for the decision log and the VOCAB line."""
-        return {"fields_done": self._at, "fields_total": len(self.rules),
-                "field": self.field, "values": {f: len(v) for f, v in self.values.items() if v},
-                "requests": self.requests, "seconds": round(self.seconds, 1),
-                "budget_s": self.config.vocabulary_budget_s}
+        out = {"fields_done": self._at, "fields_total": len(self.rules),
+               "field": self.field, "values": {f: len(v) for f, v in self.values.items() if v},
+               "requests": self.requests, "probes": self.probes,
+               "seconds": round(self.seconds, 1),
+               "budget_s": self.config.vocabulary_budget_s}
+        # field names and counts, never a value
+        if self.dropped:
+            out["over_cap"] = dict(self.dropped)
+        if self.remembered:
+            out["over_cap_remembered"] = dict(self.remembered)
+        return out
+
+    def take_dropped(self) -> dict[str, int]:
+        """Fields found over the cap since this was last called, for the
+        caller to save. Names and counts."""
+        out, self.dropped = dict(self.dropped), {}
+        self.remembered.update(out)
+        return out
 
     # -- driving -----------------------------------------------------------
 
     def request(self) -> dict:
-        """The next page: one composite aggregation over one field, with an
-        ``exists`` filter on it. No input from Claude, no value in it."""
+        """The next request for the field being read: its distinct count if
+        it has not been counted yet, otherwise its next page. One field,
+        one ``exists`` filter, no input from Claude and no value in it."""
         rule = self.rules[self._at]
         self.requests += 1
-        comp: dict[str, Any] = {
-            "size": VOCABULARY_PAGE,
-            "sources": [{VOCABULARY_SOURCE: {"terms": {"field": rule.pattern}}}],
-        }
-        if self._after is not None:
-            comp["after"] = self._after
+        if self._counting:
+            self.probes += 1
+            # precision_threshold at the cap (ES's own ceiling above that):
+            # the count is at its most accurate exactly where the decision
+            # is made, and it is one request with no paging behind it
+            agg: dict[str, Any] = {VOCABULARY_COUNT_AGG: {"cardinality": {
+                "field": rule.pattern,
+                "precision_threshold": min(VOCABULARY_PRECISION_CEILING,
+                                           max(1, self.config.vocabulary_max))}}}
+        else:
+            comp: dict[str, Any] = {
+                "size": VOCABULARY_PAGE,
+                "sources": [{VOCABULARY_SOURCE: {"terms": {"field": rule.pattern}}}],
+            }
+            if self._after is not None:
+                comp["after"] = self._after
+            agg = {f"{VOCABULARY_AGG}_0": {"composite": comp}}
         # ignore_unavailable: a configured pattern one cluster does not have
         # (no traces in EMEA) reads as no names, not as a failed build
         return {"params": {"index": ",".join(self.config.indices), "ignore_unavailable": True,
@@ -1751,13 +2005,27 @@ class VocabularyBuild:
                                                     "lte": _iso(self.covered_until)}}},
                 {"exists": {"field": rule.pattern}},
             ]}},
-            "aggs": {f"{VOCABULARY_AGG}_0": {"composite": comp}},
+            "aggs": agg,
         }}}
 
     def feed(self, raw: Any) -> None:
-        """Take one page. Raises :class:`Refused`; the index is untouched
-        until :meth:`commit`."""
+        """Take one reply - a distinct count or a page. Raises
+        :class:`Refused`; the index is untouched until the slice is whole."""
         rule = self.rules[self._at]
+        aggs = self._aggregations(raw)
+        if self._counting:
+            self._take_count(rule, aggs)
+        else:
+            self._take_page(rule, aggs)
+        self.seconds = self._clock() - self._t0
+        if self.pending() and self.seconds > self.config.vocabulary_budget_s:
+            raise self._fail("vocabulary", (
+                f"reading one slice of the name vocabulary passed "
+                f"{self.config.vocabulary_budget_s:g}s (vocabulary.budget_s, which is per "
+                f"slice) after {self.requests} requests and "
+                f"{self._at} of {len(self.rules)} fields"))
+
+    def _aggregations(self, raw: Any) -> dict:
         klass = error_class(raw) if isinstance(raw, dict) else None
         if klass is not None:
             raise self._fail("upstream_error", f"upstream error: {klass}")
@@ -1769,6 +2037,54 @@ class VocabularyBuild:
         aggs = body.get("aggregations") if isinstance(body, dict) else None
         if not isinstance(aggs, dict) or body.get("timed_out") is True:
             raise self._fail("vocabulary", "the name vocabulary reply was incomplete")
+        return aggs
+
+    def _next_field(self) -> None:
+        self._at += 1
+        self._after = None
+        self._counting = self._probe
+
+    def _take_count(self, rule: FieldRule, aggs: dict) -> None:
+        """One distinct count. Over the cap, the field is never paged."""
+        node = aggs.get(VOCABULARY_COUNT_AGG)
+        value = node.get("value") if isinstance(node, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise self._fail("vocabulary", "the name vocabulary count was not the shape it "
+                                           "was asked for")
+        count = int(value)
+        cap = self.config.vocabulary_max
+        listed = self.config.vocabulary_fields is not None
+        # The count is approximate, so the margin decides what "near the
+        # cap" means - and it is applied in whichever direction keeps the
+        # build running. A default field within the margin is left out (the
+        # build carries on); a listed field within it is paged, because
+        # there "over the cap" means refusing the slice and the exact
+        # page-time count should be what does that.
+        over = count * (1 - VOCABULARY_PROBE_MARGIN) > cap if listed \
+            else count * (1 + VOCABULARY_PROBE_MARGIN) > cap
+        if over:
+            self._over_cap(rule, count, approximate=True)
+            return
+        self._counting = False
+
+    def _over_cap(self, rule: FieldRule, count: int, *, approximate: bool) -> None:
+        """A field with more distinct values than ``vocabulary.max``."""
+        cap = self.config.vocabulary_max
+        about = f"about {count}" if approximate else f"more than {cap}"
+        if self.config.vocabulary_fields is not None:
+            # the map asked for this field by name: reading most of it is
+            # not what it asked for
+            raise self._fail("vocabulary", (
+                f"{rule.pattern} has {about} distinct values in the range read, over the "
+                f"vocabulary.max cap of {cap}, and the site map lists {rule.pattern} in "
+                f"vocabulary.fields; remove it from vocabulary.fields (its values then stay "
+                f"readable in message text) or raise vocabulary.max"))
+        # the default field set: leave it out, carry on, and remember it
+        self.dropped[rule.pattern] = count
+        self.values.pop(rule.pattern, None)
+        self._next_field()
+
+    def _take_page(self, rule: FieldRule, aggs: dict) -> None:
         agg = aggs.get(f"{VOCABULARY_AGG}_0")
         buckets = agg.get("buckets") if isinstance(agg, dict) else None
         if not isinstance(buckets, list):
@@ -1782,23 +2098,16 @@ class VocabularyBuild:
                                                "it was asked for")
             got.append(value)
         if len(got) > self.config.vocabulary_max:
-            raise self._fail("vocabulary", (
-                f"{rule.pattern} has more than {self.config.vocabulary_max} distinct values "
-                f"in the range read (the cap is vocabulary.max); raise it or shorten "
-                "vocabulary.days in the site map"))
+            # the exact count, and the backstop under the approximate one:
+            # a field the probe put under the cap, or a probe that was
+            # never asked for, is still never read past it
+            self._over_cap(rule, len(got), approximate=False)
+            return
         after = agg.get("after_key")
         if len(buckets) < VOCABULARY_PAGE or not isinstance(after, dict):
-            self._at += 1            # this field is read whole
-            self._after = None
+            self._next_field()       # this field is read whole
         else:
             self._after = after
-        self.seconds = self._clock() - self._t0
-        if self.pending() and self.seconds > self.config.vocabulary_budget_s:
-            raise self._fail("vocabulary", (
-                f"reading one slice of the name vocabulary passed "
-                f"{self.config.vocabulary_budget_s:g}s (vocabulary.budget_s, which is per "
-                f"slice) after {self.requests} requests and "
-                f"{self._at} of {len(self.rules)} fields"))
 
     def _fail(self, code: str, message: str) -> Refused:
         self.failed = code
@@ -1834,6 +2143,19 @@ def log_vocabulary_only(value: Any) -> bool:
 
 
 _DROP = object()
+
+
+class _KeepStr(str):
+    """A string in a keep position (a keep-field leaf, a keep bucket key,
+    a hit's ``_index``), marked between the rewrite and the leak check so
+    the sweep and the check apply the keep rule. Never leaves the
+    scrubber: :meth:`EsScrubber._unmark` turns it back into a str."""
+
+    __slots__ = ()
+
+
+def _keep_mark(value: Any) -> Any:
+    return _KeepStr(value) if isinstance(value, str) else value
 
 
 def _sub_aggs(bucket: dict) -> dict:
