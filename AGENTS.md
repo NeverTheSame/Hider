@@ -809,10 +809,25 @@ Listed with owners in the README's Limitations section and in
   `max_buckets` buckets is usable afterwards, so the reachable set grows
   with ordinary work, and the cap is those two numbers. A keep value with
   a learnt name inside it is still a name shown to Claude; the rule only
-  decides whether it may be typed back. And the bridge compiles a query
-  before applying the cluster vocabulary to a fresh case, so a case's very
-  first query is gated against what it has learnt so far, which before
-  that apply is only its seeds (pre-existing, unchanged here).
+  decides whether it may be typed back.
+  **A case's first query is gated like every other.** `Bridge.run`
+  compiled before it applied the cluster vocabulary, so a fresh case's
+  first query was gated against its seeds only: a learnt job name inside
+  a dataset literal ran and returned a count. Now the order is compile
+  (a query the grammar refuses on its own keeps its declared code
+  whether the vocabulary is ready, building or absent), apply (local, no
+  request, once per case per cluster; `vocabulary_building` until it
+  serves), compile again if that call is the one that applied it, then
+  the probe and the request. The first query with a learnt name in a keep
+  literal is refused `known_value` with the words a later query gets,
+  and nothing reaches Kibana. Cost: a case's first query compiles twice;
+  and while the vocabulary is building, a literal carrying a learnt name
+  is refused as `vocabulary_building` like any well-formed query, not as
+  `known_value` - the bridge cannot know the name yet, and that order
+  sends nothing and says nothing about the guess. A bridge with no index
+  is unchanged. Test: `test_esbridge.py`
+  `test_a_fresh_cases_first_query_is_gated_against_the_cluster_vocabulary`;
+  the stream gate runs on the real `Bridge` (`eseval.BridgeCase`).
   `es_schema` and the esmcp instructions tell Claude that keep fields
   hold spellings as logged (err/Error/ERROR): aggregate a keep field's
   values before an exact filter, then filter with `in` across the

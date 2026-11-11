@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hider import elastic, esbridge, eseval
+from hider.jsonscrub import _norm as jsonscrub_norm
 
 CFG0 = elastic.load(elastic.EXAMPLE)
 
@@ -1305,6 +1306,55 @@ def test_a_built_vocabulary_is_applied_once_per_case_and_logged_as_counts(stub, 
     blob = json.dumps(rows)
     for job, _message, _phrase in eseval.UNMARKED_JOBS:
         assert job not in blob
+
+
+def test_a_fresh_cases_first_query_is_gated_against_the_cluster_vocabulary(stub, tmp_path):
+    """A case with no seed, shown nothing, whose very first query puts a
+    learnt job name inside a keep literal: refused as known_value with the
+    words any later query gets, and nothing reaches Kibana."""
+    b = _bridge(stub, tmp_path)
+    job = eseval.UNMARKED_JOBS[0][0]
+    q = {"index": "logs-app-*", "size": 0,
+         "filters": [{"field": "data_stream.dataset", "op": "eq",
+                      "value": f"agent.{job.lower()}_events"}]}
+    n = len(stub.engine.requests)
+    with pytest.raises(elastic.Refused) as first:
+        b.run("stub", q)
+    assert first.value.code == "known_value"
+    assert len(stub.engine.requests) == n
+    assert jsonscrub_norm(job) in b.scrubber.known      # the vocabulary was applied
+    with pytest.raises(elastic.Refused) as later:
+        b.run("stub", q)
+    assert (later.value.code, later.value.message) == (first.value.code, first.value.message)
+    assert len(stub.engine.requests) == n
+
+
+@pytest.mark.parametrize("vocabulary", [True, False, None])
+def test_a_query_the_grammar_refuses_keeps_its_code_whatever_the_vocabulary(
+        stub, tmp_path, vocabulary):
+    """Ready, building or no index at all: an oracle case refuses with its
+    declared code, and no request is sent."""
+    from hider import esquery
+
+    b = _bridge(stub, tmp_path, vocabulary=bool(vocabulary))
+    if vocabulary is None:
+        b.index = None
+    # the seeds the oracle cases are written against (esquery's test session)
+    b.scrubber.seed("Contoso Holdings")
+    b.scrubber.seed("ctr-amer-042", "SERVER_NAME")
+    b.scrubber.label_for(b.config.rule("labels.tenant_id"), "3f2a9c4e-1b7d-4e8a-9c2f-6d5b4a3e2f10")
+    b.scrubber.mark_shown({"x": "<Tenant-01>"})
+    n = len(stub.engine.requests)
+    for case in esquery.ORACLE_CASES:
+        if case.name == "learnt-name-in-keep-literal-never-shown" and vocabulary is not True:
+            # no cluster vocabulary held: the name is not known, so the
+            # literal is well-formed (refused as vocabulary_building, or with
+            # no index it would run) - its own test is the first-query one
+            continue
+        with pytest.raises(elastic.Refused) as e:
+            b.run("stub", case.query)
+        assert e.value.code == case.code, case.name
+    assert len(stub.engine.requests) == n
 
 
 def test_an_unmarked_job_name_is_labelled_on_the_first_live_page(stub, tmp_path, fixture):

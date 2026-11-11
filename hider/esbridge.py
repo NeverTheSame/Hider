@@ -570,11 +570,22 @@ class Bridge:
         with self._lock:
             try:
                 cluster = self.cluster(cluster_name)
+                # Compile first: a query the grammar refuses on its own keeps
+                # its declared code whether the vocabulary is ready, building
+                # or absent, and is refused before anything else happens.
                 compiled = esquery.compile_query(query, self.config, self.scrubber)
+                # Then the vocabulary (local, no request, once per case per
+                # cluster; refuses vocabulary_building until it serves). If
+                # this call is the one that applied it, compile again, so the
+                # first query is gated against the cluster's names exactly as
+                # every later one is - a learnt name in a keep literal is
+                # refused here, with the same words, before any request.
+                if self._apply_vocabulary(cluster):
+                    compiled = esquery.compile_query(query, self.config, self.scrubber)
                 row.update(_describe(query, compiled))
+                # the probe only for a query that will be sent
                 if probe:
                     self.session.probe(cluster)
-                self._apply_vocabulary(cluster)
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
                 envelope = self.session.search(cluster, compiled.body)
@@ -602,7 +613,7 @@ class Bridge:
                 self._log(row)
         return outcome
 
-    def _apply_vocabulary(self, cluster: elastic.Cluster) -> None:
+    def _apply_vocabulary(self, cluster: elastic.Cluster) -> bool:
         """Give this case the names the bridge already read for the cluster.
 
         No request: the build happened on the bridge's serve loop, a day's
@@ -612,10 +623,11 @@ class Bridge:
         slices are still being read, because waiting for the whole
         retention period is hours. A name logged only in a day not yet
         covered is not known - the VOCAB line is where the covered range
-        is visible. Logged as counts, never a name.
+        is visible. Logged as counts, never a name. True if this call
+        applied it (the caller then gates the query again).
         """
         if self.index is None or self.scrubber.vocabulary_applied(cluster.name):
-            return
+            return False
         vocab = self.index.get(cluster.name)
         if vocab is None or not vocab.serves(self.config, clock()):
             raise elastic.Refused(
@@ -634,6 +646,7 @@ class Bridge:
         self.vocabulary[cluster.name] = report
         self._log({"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                    "cluster": cluster.name, "vocabulary": "applied", **report})
+        return True
 
     def _log(self, row: dict) -> None:
         if self.log_path is None:

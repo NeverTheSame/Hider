@@ -1370,6 +1370,10 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
     field that holds the whole name. Tier 2 off, so a name hidden in text
     can only have come from the vocabulary.
 
+    Every call goes through the real ``esbridge.Bridge`` (:class:`BridgeCase`),
+    so the vocabulary is applied the way the live path applies it: by the
+    case's first query, which is then gated against it.
+
     Then the other half - a readable value has to be usable: the dataset
     literal, typed by a fresh case that was never shown it, is refused as
     ``known_value``; typed by the case that was shown the page, it runs and
@@ -1395,7 +1399,7 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
         return src
 
     def one(before: bool) -> dict:
-        sess = Session(cfg, engine, tier2=tier2, vocabulary=vocab)
+        sess = BridgeCase(cfg, engine, vocab, tier2=tier2)
         sess.scrubber.keep_parts_swept = before
         r = {"shown": False, "keep_values": 0, "keep_changed": 0, "changed_fields": [],
              "index_readable": False, "dataset_readable": False, "namespace_readable": False,
@@ -1403,10 +1407,6 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
              "text_labelled": False, "whole_keep_labelled": False,
              "filter_unshown_refused": None, "filter_shown_hits": 0,
              "filter_shown_requests": 0, "whole_name_refused": None}
-        # the Session applies the vocabulary after compiling a call (as the
-        # bridge does); the literal gate has to know the name before the
-        # first query, so apply it first
-        sess.scrubber.apply_vocabulary("stub", vocab)
         dataset_q = {"index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 20,
                      "filters": [{"field": "data_stream.dataset", "op": "eq",
                                   "value": STREAM_DATASET}]}
@@ -2385,6 +2385,34 @@ class EngineSession:
                 "rawResponse": self.engine.search(
                     params["index"], params["body"],
                     ignore_unavailable=params.get("ignore_unavailable", False))}
+
+
+class BridgeCase:
+    """One case on the real :class:`esbridge.Bridge`, over the stub engine,
+    with a built vocabulary held by the bridge's index - the live order of
+    compile, apply, gate again, send. Same ``call`` shape as :class:`Session`."""
+
+    def __init__(self, config: elastic.ElasticConfig, engine: StubEngine,
+                 vocabulary: elastic.ClusterVocabulary, *, tier2: str) -> None:
+        from . import esbridge
+
+        index = elastic.VocabularyIndex(None)
+        index.put("stub", vocabulary)
+        self.scrubber = elastic.EsScrubber(config, tier2=tier2)
+        self.bridge = esbridge.Bridge(config, self.scrubber, EngineSession(engine), index=index)
+
+    def call(self, query: dict) -> tuple[dict | None, elastic.Refused | None, float, None]:
+        from . import esbridge
+
+        t0 = time.perf_counter()
+        saved = esbridge.clock
+        esbridge.clock = lambda: NOW.timestamp()
+        try:
+            return self.bridge.run("stub", query).output, None, time.perf_counter() - t0, None
+        except elastic.Refused as e:
+            return None, e, time.perf_counter() - t0, None
+        finally:
+            esbridge.clock = saved
 
 
 def cold_bridge_refusal(config: elastic.ElasticConfig, engine: StubEngine, *,
