@@ -312,12 +312,22 @@ class _Compiler:
         self._gate_literal(rest, what="phrase")
         return "".join(out)
 
-    def _gate_literal(self, text: str, *, what: str) -> None:
+    def _gate_literal(self, text: str, *, what: str, keep: bool = False) -> None:
         """Refuse a literal Claude should not possess: a mapped value or a
-        value shaped like an identifier."""
+        value shaped like an identifier.
+
+        ``keep`` marks an ``eq``/``in`` literal on a keep field. A keep value
+        is shown as written even when a learnt name sits inside it (an index
+        named after a job), so such a literal is accepted **only when this
+        case has been shown that exact keep value** on a page
+        (:meth:`elastic.EsScrubber.keep_literal_shown`). Everything else is
+        refused with the same code and the same words - a refusal must not
+        tell a guess from a value never shown.
+        """
         if not text.strip():
             return
-        if self.session._find_known(text):
+        if self.session._find_known(text) and not (
+                keep and self.session.keep_literal_shown(text)):
             raise self.refuse("known_value", f"{what}: contains a value this case has "
                                              "already pseudonymised; use its label")
         for rule, rx in self.session._shape_rx:
@@ -437,7 +447,7 @@ class _Compiler:
                 if isinstance(v, str):
                     if any(c in v for c in "*?"):
                         raise self.refuse("pattern_query", f"{what}: wildcards are not allowed")
-                    self._gate_literal(v, what=what)
+                    self._gate_literal(v, what=what, keep=rule.kind == "keep")
                 out.append(v)
         if op == "eq":
             return {"term": {name: out[0]}}
@@ -712,6 +722,20 @@ def compile_query(q: Any, config: elastic.ElasticConfig, session: elastic.EsScru
 
 
 @dataclass(frozen=True)
+class ShownKeepCase:
+    """A keep literal that is refused until the case has been shown the
+    keep value it carries, and accepted after. ``shown`` is the page value
+    (field path and value) that has to come back first; ``code`` is the
+    refusal before it does."""
+
+    name: str
+    why: str
+    query: dict
+    shown: tuple[str, str]
+    code: str
+
+
+@dataclass(frozen=True)
 class OracleCase:
     name: str
     why: str
@@ -727,9 +751,30 @@ _SERVER = "agent.name"
 _TENANT = "labels.tenant_name"
 _TENANT_ID = "labels.tenant_id"
 
+#: A one-word name the oracle session has **learnt** - from a page or the
+#: vocabulary, not seeded, and never shown inside a keep value. It is the
+#: first of ``eseval.DEFAULT_MAP_ONE_WORD``, which the es-eval vocabulary
+#: reads from ``labels.tenant_name``, so the eval's sessions know it too
+#: (pinned by a test in ``test_eseval.py``).
+ORACLE_LEARNT = "Thornbury"
+
 #: Written against ``templates/elastic.example.json``. A test compiles every
 #: one with a session that has issued ``<Org-01>`` (ORG_NAME),
-#: ``ctr-amer-s01`` (SERVER_NAME) and ``<Tenant-01>`` (TENANT_ID).
+#: ``ctr-amer-s01`` (SERVER_NAME) and ``<Tenant-01>`` (TENANT_ID), and has
+#: learnt :data:`ORACLE_LEARNT` (ORG_NAME) without being shown it in a
+#: keep value.
+#: The other half of the keep-literal rule: the same literal, accepted once
+#: the case has been shown the value. Each is refused like its oracle case
+#: until the page in ``shown`` has come back.
+SHOWN_KEEP_CASES: tuple[ShownKeepCase, ...] = (
+    ShownKeepCase("learnt-name-in-keep-literal-shown",
+                  "the dataset of a stream named after a learnt name, after a page showed it",
+                  {"index": _IDX, "filters": [{"field": "data_stream.dataset", "op": "eq",
+                                               "value": f"agent.{ORACLE_LEARNT.lower()}_events"}]},
+                  ("data_stream.dataset", f"agent.{ORACLE_LEARNT.lower()}_events"),
+                  "known_value"),
+)
+
 ORACLE_CASES: tuple[OracleCase, ...] = (
     OracleCase("raw-dsl-query", "a raw query clause bypasses every rule below",
                {"index": _IDX, "query": {"wildcard": {_TENANT: "c*"}}}, "raw_dsl"),
@@ -801,6 +846,16 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
     OracleCase("server-literal-in-phrase", "a real server name typed into a phrase",
                {"index": _IDX, "filters": [{"field": "message", "op": "phrase",
                                             "value": "restarting ctr-emea-017"}]}, "shaped_literal"),
+    # A keep value containing a learnt name is shown as written (an index
+    # named after a job), and a literal on a keep field may carry it - but
+    # only once this case has been shown that exact value on a page. Typed
+    # before that it is a guess at a name confirmed by a hit count, and the
+    # refusal is the one a never-shown value gets, word for word.
+    OracleCase("learnt-name-in-keep-literal-never-shown",
+               "a keep literal containing a learnt name this case was never shown",
+               {"index": _IDX, "filters": [{"field": "data_stream.dataset", "op": "eq",
+                                            "value": f"agent.{ORACLE_LEARNT.lower()}_events"}]},
+               "known_value"),
     OracleCase("email-literal-on-keep", "an email typed as a literal on a keep field",
                {"index": _IDX, "filters": [{"field": "data_stream.dataset", "op": "eq",
                                             "value": "anna.novak@litware.com"}]}, "shaped_literal"),

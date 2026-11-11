@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from hider import elastic, esquery
+from hider import elastic, eseval, esquery
 
 CFG = elastic.load(elastic.EXAMPLE)
 
@@ -16,13 +16,26 @@ def _session() -> elastic.EsScrubber:
     server, one tenant GUID - all three **shown** to the case, since a
     label may only be used in a query after the case has seen it. The two
     seeds are shown by being seeded; the GUID stands for one that came
-    back on a page, so it is marked the way a page marks it."""
+    back on a page, so it is marked the way a page marks it. It has also
+    **learnt** one name (``ORACLE_LEARNT``, as the vocabulary or a page
+    would teach it): not seeded, and never shown inside a keep value."""
     s = elastic.EsScrubber(CFG, tier2="none")
     assert s.seed("Contoso Holdings") == "<Org-01>"
     assert s.seed("ctr-amer-042", "SERVER_NAME") == "ctr-amer-s01"
     assert s.label_for(CFG.rule("labels.tenant_id"), "3f2a9c4e-1b7d-4e8a-9c2f-6d5b4a3e2f10") == "<Tenant-01>"
     s.mark_shown({"hits": [{"labels": {"tenant_id": "<Tenant-01>"}}]})
+    s.label_for(CFG.rule("labels.tenant_name"), esquery.ORACLE_LEARNT)
     return s
+
+
+def _page(s: elastic.EsScrubber, source: dict, index: str = "logs-app-*") -> dict:
+    """One hit through the real scrubber, so whatever it shows is marked the
+    way a page marks it."""
+    raw = {"hits": {"total": {"value": 1, "relation": "eq"},
+                    "hits": [{"_index": eseval.backing_index(index), "_id": "k1",
+                              "_source": {"@timestamp": "2026-08-20T10:00:00.000Z", **source}}]}}
+    return s.scrub_response({"id": "s1", "isPartial": False, "isRunning": False,
+                             "rawResponse": raw}, elastic.Plan(index)).output
 
 
 def _compile(q: dict, s: elastic.EsScrubber | None = None) -> esquery.Compiled:
@@ -40,6 +53,89 @@ def test_every_oracle_case_is_refused_with_its_declared_code(case):
     # the refusal names the rule, never a value
     for v in ("Contoso", "ctr-amer-042", "3f2a9c4e"):
         assert v not in e.value.message
+
+
+# -- a keep literal carrying a learnt name: refused until shown -------------
+
+
+@pytest.mark.parametrize("case", esquery.SHOWN_KEEP_CASES,
+                         ids=[c.name for c in esquery.SHOWN_KEEP_CASES])
+def test_a_keep_literal_with_a_learnt_name_is_accepted_only_after_the_value_was_shown(case):
+    s = _session()
+    with pytest.raises(elastic.Refused) as e:
+        _compile(case.query, s)
+    assert e.value.code == case.code
+    path, value = case.shown
+    out = _page(s, {"data_stream": {"dataset": value}, "message": "ok"})
+    assert out["hits"]["hits"][0]["_source"]["data_stream"]["dataset"] == value
+    compiled = _compile(case.query, s)
+    assert value in json.dumps(compiled.body)
+
+
+def test_the_shown_keep_value_is_matched_whole_ignoring_case_and_outer_spaces():
+    s = _session()
+    value = f"agent.{esquery.ORACLE_LEARNT.lower()}_events"
+    _page(s, {"data_stream": {"dataset": value}, "message": "ok"})
+    _compile({"index": "logs-app-*", "filters": [
+        {"field": "data_stream.dataset", "op": "in", "value": [f"  {value.upper()} "]}]}, s)
+    # a longer or shorter literal around the same name is a new guess
+    for guess in (f"{value}-prod", value.split("_")[0]):
+        with pytest.raises(elastic.Refused) as e:
+            _compile({"index": "logs-app-*", "filters": [
+                {"field": "data_stream.dataset", "op": "eq", "value": guess}]}, s)
+        assert e.value.code == "known_value"
+
+
+def test_shown_and_never_shown_keep_literals_refuse_with_the_same_words():
+    """What stays refused after a page: a seeded value inside a shown keep
+    value, a keep value that is itself a learnt name, a learnt name in a
+    text phrase, and a range bound - each with the words a never-shown
+    literal gets, so the refusal is not the oracle."""
+    s = _session()
+    learnt = esquery.ORACLE_LEARNT.lower()
+    with pytest.raises(elastic.Refused) as never:
+        _compile({"index": "logs-app-*", "filters": [
+            {"field": "data_stream.dataset", "op": "eq", "value": f"agent.{learnt}_events"}]}, s)
+    out = _page(s, {"data_stream": {"dataset": "agent.contoso holdings_events",
+                                    "namespace": esquery.ORACLE_LEARNT},
+                    "message": "ok"})
+    ds = out["hits"]["hits"][0]["_source"]["data_stream"]
+    assert ds["dataset"] == "agent.<Org-01>_events" and ds["namespace"] == s.known[learnt]
+    refused = []
+    for q in (
+        # the seeded tenant inside a keep value: shown only as its label
+        {"field": "data_stream.dataset", "op": "eq", "value": "agent.contoso holdings_events"},
+        # the learnt name as the whole keep value: shown only as its label
+        {"field": "data_stream.namespace", "op": "eq", "value": esquery.ORACLE_LEARNT},
+        # the learnt name in a text phrase
+        {"field": "message", "op": "phrase", "value": f"agent.{learnt}_events"},
+        # a range bound on a keep field
+        {"field": "data_stream.dataset", "op": "range", "value": {"gte": f"agent.{learnt}"}},
+    ):
+        with pytest.raises(elastic.Refused) as e:
+            _compile({"index": "logs-app-*", "filters": [q]}, s)
+        refused.append((e.value.code, e.value.message.split(":", 1)[1]))
+    assert {r[0] for r in refused} == {"known_value"}
+    assert {r[1] for r in refused} == {never.value.message.split(":", 1)[1]}
+    assert esquery.ORACLE_LEARNT.lower() not in never.value.message.lower()
+
+
+def test_a_shown_keep_value_is_saved_with_the_case_and_an_old_case_has_none(tmp_path):
+    s = _session()
+    value = f"agent.{esquery.ORACLE_LEARNT.lower()}_events"
+    _page(s, {"data_stream": {"dataset": value}, "message": "ok"})
+    s.save_session(tmp_path)
+    r = elastic.EsScrubber.load_session(tmp_path, CFG, tier2="none")
+    q = {"index": "logs-app-*", "filters": [{"field": "data_stream.dataset", "op": "eq",
+                                             "value": value}]}
+    assert value in json.dumps(_compile(q, r).body)
+    saved = json.loads((tmp_path / "session.json").read_text())
+    del saved["shown_keep"]
+    (tmp_path / "session.json").write_text(json.dumps(saved))
+    old = elastic.EsScrubber.load_session(tmp_path, CFG, tier2="none")
+    with pytest.raises(elastic.Refused) as e:
+        _compile(q, old)
+    assert e.value.code == "known_value"
 
 
 def test_oracle_cases_cover_every_refusal_code_the_compiler_has():

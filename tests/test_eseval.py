@@ -381,3 +381,15 @@ def test_a_job_named_stream_stays_readable_in_its_keep_values():
     assert {"_index", "data_stream.dataset", "data_stream.namespace"} <= set(b["changed_fields"])
     assert b["keep_changed"] > a["keep_changed"]
     assert "Harborsync" not in "".join(eseval._stream_name_lines(r))
+
+
+def test_the_oracle_learnt_name_is_one_the_eval_vocabulary_reads():
+    """The oracle session learns ORACLE_LEARNT by hand; the eval's sessions
+    and the MCP case know it from the vocabulary, which reads it from the
+    default-map record's tenant field. It must be a one-word name no skip
+    rule drops, or the oracle case would compile in es-eval."""
+    from hider import elastic, esquery
+
+    assert esquery.ORACLE_LEARNT == eseval.DEFAULT_MAP_ONE_WORD[0]
+    assert elastic.EsScrubber.vocabulary_skip(esquery.ORACLE_LEARNT) is None
+    assert " " not in esquery.ORACLE_LEARNT

@@ -754,6 +754,11 @@ class EsScrubber(jsonscrub.JsonScrubber):
         #: Labels the human seeded. The only known values that replace a
         #: *part* of a keep value; see :meth:`_keep_value`.
         self.seeded_labels: set[str] = set()
+        #: Keep values this case has been **shown** (normalised: case and
+        #: spacing folded), recorded at the same point as :attr:`shown`. A
+        #: keep literal containing a learnt name is accepted in a query only
+        #: for one of these; see :meth:`keep_literal_shown`.
+        self.shown_keep: set[str] = set()
         #: Measurement switch for es-eval's "before" figure: every known
         #: value matches anywhere in a keep value, as before the keep rule.
         #: Set by nothing in the live path.
@@ -906,20 +911,35 @@ class EsScrubber(jsonscrub.JsonScrubber):
     #: find the ones inside a message.
     _LABEL_SHAPES = re.compile(r"<[^<>\s\"]{1,80}>|(?<![\w.-])[A-Za-z0-9][\w.-]*-s\d+")
 
+    def keep_literal_shown(self, text: str) -> bool:
+        """Whether a keep literal that contains a known value may still be
+        used: this case was shown exactly that keep value (case and outer
+        spaces ignored), the value is not itself a known value, and nothing
+        in it is seeded. The caller refuses otherwise, with the same words
+        as for a value never shown."""
+        n = jsonscrub._norm(text)
+        if n not in self.shown_keep or n in self.known:
+            return False
+        return all(self.known[v] not in self.seeded_labels for _, _, v in self._find_known(text))
+
     def mark_shown(self, output: Any) -> None:
-        """Mark every label carried by something Claude is about to see.
+        """Mark every label - and every keep value - carried by something
+        Claude is about to see.
 
         One pass over the finished output rather than a hook in each
         rewrite path, so a label cannot reach Claude by a route that
         forgot to mark it: whatever is in the output is shown. Bucket keys
         and identifier leaves are whole strings; a message carries labels
-        inside it.
+        inside it. Runs on the still-marked output, so a keep value
+        (:class:`_KeepStr`: a keep leaf, a keep bucket key, ``_index``) is
+        recorded as one this case may now use as a literal.
         """
-        if not self.mapping:
-            return
-
         def walk(node: Any) -> None:
             if isinstance(node, str):
+                if isinstance(node, _KeepStr):
+                    self.shown_keep.add(jsonscrub._norm(node))
+                if not self.mapping:
+                    return
                 if node in self.mapping:
                     self.shown.add(node)
                     return
@@ -1129,11 +1149,12 @@ class EsScrubber(jsonscrub.JsonScrubber):
         leaks = self.leak_check(out)
         if leaks:
             raise self._refuse("leak", "response withheld: a known value survived redaction")
-        out = self._unmark(out)
-        # This page is about to go to Claude, so every label in it is one
-        # the case may use from now on. After the leak check: a page that
-        # is refused was never shown and teaches no label.
+        # This page is about to go to Claude, so every label in it - and
+        # every keep value - is one the case may use from now on. After the
+        # leak check: a page that is refused was never shown and teaches no
+        # label. Before _unmark, which is what tells a keep value apart.
         self.mark_shown(out)
+        out = self._unmark(out)
         stats = {
             "hits": len(rows),
             "mapped_values": len(self.mapping),
@@ -1534,6 +1555,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
             # labels only: which values the human seeded (they match inside
             # a keep value; learnt ones only as the whole value)
             "seeded": sorted(self.seeded_labels),
+            # keep values this case was shown (they are values, which is
+            # why they are in this file and nowhere else)
+            "shown_keep": sorted(self.shown_keep),
             # labels only: which of them are ordinary words, labelled in
             # their own field and readable in text everywhere else
             "readable_words": sorted(self.readable_words),
@@ -1571,6 +1595,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
         # A case saved before seeds were recorded has none: its seeded
         # values then match a keep value only whole, like a learnt one.
         s.seeded_labels = {lab for lab in raw.get("seeded") or () if lab in s.mapping}
+        # A case saved before keep values were recorded starts with none: a
+        # keep literal it could use must come back on a page again.
+        s.shown_keep = {str(v) for v in raw.get("shown_keep") or ()}
         # Which labels are ordinary words, labelled in their own field and
         # readable in text everywhere else. A case saved **before** this was
         # recorded has them indexed for the case-wide sweep, as it was saved;

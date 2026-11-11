@@ -1369,6 +1369,13 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
     still labelled in its own field, in message text and in the keep
     field that holds the whole name. Tier 2 off, so a name hidden in text
     can only have come from the vocabulary.
+
+    Then the other half - a readable value has to be usable: the dataset
+    literal, typed by a fresh case that was never shown it, is refused as
+    ``known_value``; typed by the case that was shown the page, it runs and
+    returns the stream's hits; the whole name typed as the keep field that
+    held it stays refused even for that case (it was shown only as a
+    label).
     """
     cfg = stream_name_map()
     engine = StubEngine(fx, (STREAM_INDEX,))
@@ -1393,7 +1400,21 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
         r = {"shown": False, "keep_values": 0, "keep_changed": 0, "changed_fields": [],
              "index_readable": False, "dataset_readable": False, "namespace_readable": False,
              "bucket_keys_readable": False, "job_field_labelled": False,
-             "text_labelled": False, "whole_keep_labelled": False}
+             "text_labelled": False, "whole_keep_labelled": False,
+             "filter_unshown_refused": None, "filter_shown_hits": 0,
+             "filter_shown_requests": 0, "whole_name_refused": None}
+        # the Session applies the vocabulary after compiling a call (as the
+        # bridge does); the literal gate has to know the name before the
+        # first query, so apply it first
+        sess.scrubber.apply_vocabulary("stub", vocab)
+        dataset_q = {"index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 20,
+                     "filters": [{"field": "data_stream.dataset", "op": "eq",
+                                  "value": STREAM_DATASET}]}
+        # never shown the value: a guess, refused before any request
+        requests_before = len(engine.requests)
+        _out, refused, _dt, _c = sess.call(dataset_q)
+        r["filter_unshown_refused"] = refused.code if refused else None
+        r["filter_unshown_requests"] = len(engine.requests) - requests_before
         out, refused, _dt, _c = sess.call(page_q)
         if out is None:
             r["refused"] = refused.code if refused else None
@@ -1446,6 +1467,18 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
                         changed.add(f"<bucket>.{name}")
             r["bucket_keys_readable"] = bool(keys) and all(keys)
         r["changed_fields"] = sorted(changed)
+        # shown the page: the dataset literal runs and finds the stream
+        requests_before = len(engine.requests)
+        hit, refused, _dt, _c = sess.call(dataset_q)
+        r["filter_shown_requests"] = len(engine.requests) - requests_before
+        r["filter_shown_hits"] = ((hit or {}).get("hits", {}).get("total") or {}).get("value", 0) \
+            if refused is None else 0
+        r["filter_shown_refused"] = refused.code if refused else None
+        # the whole name, which came back only as a label, is still refused
+        _out, refused, _dt, _c = sess.call({
+            "index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 20,
+            "filters": [{"field": "service.name", "op": "eq", "value": STREAM_JOB}]})
+        r["whole_name_refused"] = refused.code if refused else None
         return r
 
     return {"before": one(True), "after": one(False)}
@@ -3872,7 +3905,14 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and a["bucket_keys_readable"]
             and a["job_field_labelled"] and a["text_labelled"] and a["whole_keep_labelled"]
             and a["changed_fields"] == ["service.name"]
-            and stream_name["before"]["keep_changed"] > a["keep_changed"],
+            and stream_name["before"]["keep_changed"] > a["keep_changed"]
+            # readable means usable: the dataset literal is refused until
+            # the page showed it, then finds the stream; the whole name is
+            # refused still
+            and a["filter_unshown_refused"] == "known_value"
+            and a["filter_unshown_requests"] == 0
+            and a["filter_shown_hits"] == len(stream_name_docs())
+            and a["whole_name_refused"] == "known_value",
         # a case before the build finishes is refused, not shown
         "vocabulary_building_refuses":
             building["refused"] == "vocabulary_building" and not building["shown"],
@@ -3983,6 +4023,11 @@ def _stream_name_lines(o: dict | None) -> list[str]:
         f"{a['namespace_readable']}; bucket keys readable: {a['bucket_keys_readable']}; job "
         f"labelled in its field {a['job_field_labelled']}, in text {a['text_labelled']}, "
         f"as a whole keep value {a['whole_keep_labelled']}",
+        f"  dataset literal never shown: {a['filter_unshown_refused'] or 'COMPILED'} "
+        f"({a.get('filter_unshown_requests', 0)} requests); after the page showed it: "
+        f"{a['filter_shown_hits']} hits"
+        + (f" (refused {a['filter_shown_refused']})" if a.get("filter_shown_refused") else "")
+        + f"; the whole name as a keep literal: {a['whole_name_refused'] or 'COMPILED'}",
     ]
 
 

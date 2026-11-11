@@ -777,6 +777,42 @@ Listed with owners in the README's Limitations section and in
   index names again. A case saved before seeds were recorded has none,
   so its seeded values match keep values only whole until re-seeded.
   Gate: `stream_name_readable_in_keep` (below).
+  **A keep literal that contains a learnt name may be used only after the
+  case has been shown that exact keep value.** Readable was not usable:
+  `esquery._gate_literal` refused any literal containing a known value,
+  so the dataset above came back as written and a filter on it was
+  refused with `known_value`. Widening the gate to whole-value matching
+  would have opened a new channel - a guessed name inside a dataset
+  literal, confirmed by a hit count - so instead `EsScrubber.shown_keep`
+  records every keep value a page showed (a hit's keep leaf, a terms
+  bucket key or `key_as_string`, `_index`), at the one point `shown`
+  records labels: `mark_shown`, after the leak check and before
+  `_unmark`, which is what still tells a keep value apart. Saved in
+  `session.json` (values, so in that file and nowhere else) and
+  restored with the case; a case saved before this starts with none and
+  must see the value on a page again. An `eq`/`in` literal on a keep
+  field passes the gate (`EsScrubber.keep_literal_shown`) when it *is* a
+  shown keep value (case and outer spaces ignored), is not itself a known
+  value, and contains no seeded value. Everything else is refused with
+  the same code and the same words as today, so the refusal cannot tell a
+  guess from a value never shown: a keep literal with a learnt name that
+  was not shown, a seeded value anywhere, a value that is itself a whole
+  learnt name (shown only as its label), tier 1 shapes, every text phrase
+  and every range bound. Oracle cases, written first:
+  `learnt-name-in-keep-literal-never-shown` (`known_value`; the oracle
+  session learns `esquery.ORACLE_LEARNT` the way a page would, not
+  seeded, and the es-eval sessions and the MCP case know the same name
+  from the vocabulary) and `esquery.SHOWN_KEEP_CASES`, the same literal
+  accepted once the page in `shown` has come back.
+  **What stays open**, as with labels: a wide query collects shown keep
+  values - every index, dataset and level on a page of `max_hits` hits or
+  `max_buckets` buckets is usable afterwards, so the reachable set grows
+  with ordinary work, and the cap is those two numbers. A keep value with
+  a learnt name inside it is still a name shown to Claude; the rule only
+  decides whether it may be typed back. And the bridge compiles a query
+  before applying the cluster vocabulary to a fresh case, so a case's very
+  first query is gated against what it has learnt so far, which before
+  that apply is only its seeds (pre-existing, unchanged here).
   `es_schema` and the esmcp instructions tell Claude that keep fields
   hold spellings as logged (err/Error/ERROR): aggregate a keep field's
   values before an exact filter, then filter with `in` across the
@@ -847,7 +883,11 @@ Listed with owners in the README's Limitations section and in
   labelled in `job.name`, in both messages and in a keep field holding
   the whole name. **Keep values changed: 12 of 20 before the rule, 1 of
   20 after**, the one being the whole-name field; "before" is the
-  `keep_parts_swept` measurement switch, set by nothing in the live path).
+  `keep_parts_swept` measurement switch, set by nothing in the live path.
+  Then the dataset literal: refused as `known_value` with **0 requests**
+  by a fresh case never shown it, **3 hits** - the whole stream - for the
+  case the page showed it to, and the whole job name typed as the keep
+  field that held it refused still).
   Label use: `label_guessing_refused` - a fresh case on the estate
   guesses a hundred low-numbered labels, **100 of 100 are live labels it
   holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label
