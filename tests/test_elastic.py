@@ -1483,3 +1483,16 @@ def test_a_case_saved_before_this_rule_stops_hiding_the_word(tmp_path):
     back = elastic.EsScrubber.load_session(d, CFG, tier2="none")
     assert set(back.readable_words) == set(s.readable_words)
     assert "Backup" in back._scrub_text("Backup window opened")
+
+
+@pytest.mark.parametrize("value,ok", [(0, True), (150, True), (2000, True), (2001, False),
+                                      (-1, False), (True, False), ("150", False)])
+def test_phrase_budget_is_a_bounded_site_map_setting(value, ok):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["phrase_budget"] = value
+    if ok:
+        assert elastic.parse(raw, source="t").phrase_budget == value
+    else:
+        with pytest.raises(elastic.ConfigError):
+            elastic.parse(raw, source="t")
+    assert elastic.load(elastic.EXAMPLE).phrase_budget == elastic.DEFAULT_PHRASE_BUDGET

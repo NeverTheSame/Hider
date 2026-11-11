@@ -217,6 +217,9 @@ class Compiled:
     #: text phrases as Claude wrote them (labels, not values), for the log
     text_queries: list[str] = field(default_factory=list)
     labels_used: list[str] = field(default_factory=list)
+    #: plain-word (field, phrase key) pairs this query would add to the
+    #: case's spent set; the caller spends them just before sending
+    new_phrases: frozenset = frozenset()
 
 
 class _Compiler:
@@ -231,6 +234,9 @@ class _Compiler:
         self.text_queries: list[str] = []
         #: distinct (field, phrase) pairs, for the per-query phrase cap
         self.phrases: set[tuple[str, str]] = set()
+        #: the subset that carry plain words (not only labels): what the
+        #: per-case budget charges
+        self.plain_phrases: set[tuple[str, str]] = set()
         self.labels_used: list[str] = []
         self._tier1 = pipeline.RegexTier()
         self._label_rx = None
@@ -413,6 +419,8 @@ class _Compiler:
             resolved = self._resolve_text(v)
             self.text_queries.append(v)
             self.phrases.add((name, _phrase_key(v)))
+            if _LABEL_SHAPES.sub(" ", v).strip():
+                self.plain_phrases.add((name, _phrase_key(v)))
             return {"match_phrase": {name: resolved}}
         if rule.kind == "text":
             raise self.refuse("field_not_queryable", f"{what}: text fields take phrase only")
@@ -495,6 +503,22 @@ class _Compiler:
                 f"the query has {n} distinct phrases"
                 + (f" ({uses} uses)" if uses != n else "")
                 + f" across its filters and aggregations; the cap is {cap} per query"))
+
+    def check_budget(self) -> frozenset:
+        """The per-case ``phrase_budget``: distinct plain-word phrases over
+        all the case's queries. Run last, so a query refused for any other
+        reason spends nothing. Depends only on how many phrases are new to
+        the case and how many it has spent - never on what a phrase would
+        match - and the message carries the numbers, never a phrase."""
+        spent = self.session.phrases_spent
+        new = frozenset(self.plain_phrases - spent)
+        budget = self.cfg.phrase_budget
+        if budget and new and len(spent) + len(new) > budget:
+            raise self.refuse("phrase_budget", (
+                f"this case has used {len(spent)} of its {budget} distinct text phrases and "
+                f"the query adds {len(new)} new ones; phrases already used, and phrases "
+                f"made only of labels, cost nothing"))
+        return new
 
     def check_histogram(self, fname: str, interval: str, *, what: str) -> None:
         """Refuse a histogram whose bucket count can overrun the cap, before
@@ -676,6 +700,7 @@ class _Compiler:
         sort = self.sort(q.get("sort")) if size else []
         agg_body, agg_plans = self.aggs(q.get("aggs"))
         self.check_phrases()
+        new_phrases = self.check_budget()
         body: dict[str, Any] = {
             "size": size,
             "track_total_hits": True,
@@ -690,7 +715,10 @@ class _Compiler:
             body["aggs"] = agg_body
         plan = elastic.Plan(index, agg_plans, size)
         return Compiled({"params": {"index": index, "body": body}}, plan,
-                        list(self.text_queries), list(self.labels_used))
+                        list(self.text_queries), list(self.labels_used), new_phrases)
+
+
+_LABEL_SHAPES = elastic.EsScrubber._LABEL_SHAPES
 
 
 def _phrase_key(v: str) -> str:

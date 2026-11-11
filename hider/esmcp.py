@@ -334,6 +334,14 @@ def schema_payload(config: elastic.ElasticConfig, case: Case) -> dict:
         "seeded": case.seeded,
         "labels": {lab: labels[lab] for lab in listed},
         "labels_total": len(labels),
+        # counts only: distinct plain-word phrases this case has used on
+        # text fields, against the per-case budget (max_phrases is per query)
+        **case.scrubber.phrase_report(),
+        "phrase_budget_rule": (
+            "every distinct phrase with plain words, per field, ignoring case and spacing, "
+            "spends one from phrase_budget for the whole case; reusing a phrase and phrases "
+            "made only of labels are free; a query that would exceed it is refused with "
+            "phrase_budget and spends nothing; a sent query is never refunded"),
     }
     out["kinds"] = {
         "keep": "passed through; filter, range, sort and aggregate freely. Values are "

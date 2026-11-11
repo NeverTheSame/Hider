@@ -329,9 +329,37 @@ Listed with owners in the README's Limitations section and in
   field, ignoring case and spacing: a phrase reused across buckets is one
   guess, which is also why the zero-hit check, built only from a query's
   own filters, always fits the cap of the query it checks.
-  What the cap does **not** close, all declared: guesses across queries
-  (`max_phrases` is per query, queries are unlimited and there is no
-  per-case budget; the log and `es-eval` count them, nothing stops them);
+  **Guesses across queries are capped per case** by `phrase_budget`
+  (site map, default 150, ceiling 2000, 0 turns it off): the distinct
+  plain-word phrases a case has used on text fields, distinct as for
+  `max_phrases` (per field, case and spacing ignored), kept in
+  `EsScrubber.phrases_spent` and saved with the case (in `session.json`,
+  beside its other values; a case saved before this starts at zero, since
+  what it used was never recorded). A phrase already used and a phrase
+  made only of labels cost nothing. `_Compiler.check_budget` runs last in
+  `compile`, so a query refused for any other reason spends nothing, and
+  refuses `phrase_budget` before any request with a message that depends
+  only on the counts. Phrases are **spent when a query is about to be
+  sent** (`Bridge.run`, after the vocabulary is applied and the query
+  re-gated, before the probe) and **never refunded**: whether a page is
+  withheld after the search (leak, size cap) can depend on what the
+  phrase matched, so a refund would make that guess free; a query refused
+  before sending (grammar, vocabulary building) spends nothing because
+  that refusal cannot depend on a match. The cost of no refund: an
+  upstream failure or a withheld page still uses the phrases, and a long
+  legitimate case re-running after an outage pays twice only for phrases
+  it does not reuse verbatim. Why 150: an investigation finds its messages
+  with a few phrases per question - an error text, a step name, a label
+  with a verb - and a case of a few dozen questions uses tens, not
+  hundreds, while 150 is under one twentieth of the 4,000 counts in the
+  guessing run below. The cost: a long case that keeps varying its
+  wording runs out and is refused; the fix is reusing phrases (free), a
+  new case, or the site raising the value. `es_schema` gives Claude the
+  count, the budget and the rule; the decision log rows and es-smoke's
+  `PHRASES` line carry counts only. Gate: `phrase_budget_holds`.
+  What the caps do **not** close, all declared: guesses within the
+  budget (150 distinct guesses per case are still possible, and a new
+  case starts again - the budget is per case, not per human);
   combinations of the allowed phrases (a `filters` aggregation can still
   count up to `max_buckets` co-occurrences, so the cap bounds the
   vocabulary per query, not the number of counts); literals on `keep`
@@ -859,7 +887,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 28 pass, and a change that cannot keep them passing
+  MCP endpoint; all 29 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -903,6 +931,14 @@ Listed with owners in the README's Limitations section and in
   by a fresh case never shown it, **3 hits** - the whole stream - for the
   case the page showed it to, and the whole job name typed as the keep
   field that held it refused still).
+  `phrase_budget_holds` (`eseval.run_phrase_budget_eval`, on the stream
+  fixture through the real `Bridge`): 500 queries of 8 candidate names
+  each, one in ten a phrase that does match. **4,000 phrase uses (3,601
+  distinct) reached Kibana with no budget; 160 (145 distinct) with the
+  default**, the other 480 queries refused `phrase_budget` with 0
+  requests and one refusal shape whether the batch held the matching
+  phrase or not, and a reused and a label-only phrase still run once the
+  case is spent out.
   Label use: `label_guessing_refused` - a fresh case on the estate
   guesses a hundred low-numbered labels, **100 of 100 are live labels it
   holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label

@@ -147,6 +147,10 @@ def test_oracle_cases_cover_every_refusal_code_the_compiler_has():
     # codes that only a malformed (not adversarial) request can reach
     structural = {"bad_query", "bad_filter", "bad_sort", "bad_value", "field_not_queryable",
                   "unknown_field", "bad_agg", "size_cap", "raw_dsl", "bad_index", "pattern_query"}
+    # phrase_budget depends on what the case spent before, so no single
+    # query on a fresh session can reach it: it is measured by the tests
+    # below and by es-eval's phrase_budget_holds gate
+    structural.add("phrase_budget")
     assert codes - declared - structural == set(), "a refusal rule without an adversarial case"
     assert codes >= declared
 
@@ -634,3 +638,83 @@ def test_a_case_saved_before_this_rule_starts_with_nothing_shown(tmp_path):
     assert back.shown == set()
     assert back.resolve_label("<Org-01>") is not None  # unmasking still works
     assert back.shown_label("<Org-01>") is None
+
+
+# -- the per-case phrase budget ---------------------------------------------
+
+
+def _budget_session(budget: int) -> elastic.EsScrubber:
+    import dataclasses
+    return elastic.EsScrubber(dataclasses.replace(CFG, phrase_budget=budget), tier2="none")
+
+
+def _send(s: elastic.EsScrubber, *phrases: str) -> esquery.Compiled:
+    c = esquery.compile_query({"index": "logs-app-*", "filters": [
+        {"field": "message", "op": "phrase", "value": p} for p in phrases]}, s.config, s)
+    s.spend_phrases(c.new_phrases)      # what the bridge does before sending
+    return c
+
+
+def test_the_budget_counts_distinct_plain_phrases_and_refuses_past_it():
+    s = _budget_session(5)
+    _send(s, "alpha one", "beta two", "gamma three")
+    # case and spacing alike are one phrase, and a used phrase is free
+    _send(s, "ALPHA   one", "beta two")
+    assert s.phrase_report() == {"phrases_used": 3, "phrase_budget": 5, "phrases_left": 2}
+    n = len(s.phrases_spent)
+    with pytest.raises(elastic.Refused) as e:
+        _send(s, "delta", "epsilon", "zeta")
+    assert e.value.code == "phrase_budget" and "3 of its 5" in e.value.message
+    assert len(s.phrases_spent) == n            # a refused query spends nothing
+    for word in ("delta", "epsilon", "zeta"):
+        assert word not in e.value.message
+    _send(s, "delta", "epsilon")                # exactly to the budget
+    with pytest.raises(elastic.Refused):
+        _send(s, "eta")
+    _send(s, "alpha one")                       # reuse still runs when spent out
+
+
+def test_a_label_only_phrase_costs_nothing():
+    s = _budget_session(1)
+    label = s.seed("Contoso Holdings")
+    _send(s, label, f"  {label} ")
+    assert s.phrase_report()["phrases_used"] == 0
+    _send(s, f"{label} failed")                 # words beside a label do cost
+    assert s.phrase_report()["phrases_used"] == 1
+
+
+def test_the_refusal_is_the_same_whatever_the_phrase_would_match():
+    msgs = set()
+    for guess in ("Contoso Holdings failed", "Nobody Atall failed"):
+        s = _budget_session(1)
+        _send(s, "first")
+        with pytest.raises(elastic.Refused) as e:
+            _send(s, guess.split()[1])
+        msgs.add((e.value.code, e.value.message))
+    assert len(msgs) == 1
+
+
+def test_another_refusal_spends_nothing_and_zero_turns_the_budget_off():
+    s = _budget_session(2)
+    with pytest.raises(elastic.Refused) as e:
+        _send(s, "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+    assert e.value.code == "size_cap"
+    assert s.phrase_report()["phrases_used"] == 0
+    off = _budget_session(0)
+    for i in range(30):
+        _send(off, f"word{i}")
+    assert off.phrase_report() == {"phrases_used": 30, "phrase_budget": None, "phrases_left": None}
+
+
+def test_spent_phrases_are_saved_and_an_old_case_starts_at_zero(tmp_path):
+    s = _budget_session(3)
+    _send(s, "one", "two")
+    s.save_session(tmp_path)
+    r = elastic.EsScrubber.load_session(tmp_path, s.config, tier2="none")
+    assert r.phrase_report()["phrases_used"] == 2
+    _send(r, "one", "three")                    # "one" free after restore
+    saved = json.loads((tmp_path / "session.json").read_text())
+    del saved["phrases_spent"]
+    (tmp_path / "session.json").write_text(json.dumps(saved))
+    old = elastic.EsScrubber.load_session(tmp_path, s.config, tier2="none")
+    assert old.phrase_report()["phrases_used"] == 0

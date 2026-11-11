@@ -583,6 +583,12 @@ class Bridge:
                 if self._apply_vocabulary(cluster):
                     compiled = esquery.compile_query(query, self.config, self.scrubber)
                 row.update(_describe(query, compiled))
+                # Every check has passed and the query will be sent: charge
+                # its new phrases now, before the probe and the request, and
+                # never refund them - a page withheld after the search (a
+                # leak, a size cap) can depend on what the phrase matched,
+                # so a refund would make that guess free.
+                self.scrubber.spend_phrases(compiled.new_phrases)
                 # the probe only for a query that will be sent
                 if probe:
                     self.session.probe(cluster)
@@ -609,6 +615,8 @@ class Bridge:
             finally:
                 outcome.seconds = round(time.perf_counter() - t0, 3)
                 row["seconds"] = outcome.seconds
+                # counts only: where the case stands against its budget
+                row.update(self.scrubber.phrase_report())
                 self.outcomes.append(outcome)
                 self._log(row)
         return outcome
@@ -858,7 +866,8 @@ def run_case(bridge: Bridge, cluster: str, query: dict, *, show_names: bool = Fa
         o = bridge.run(cluster, query)
     except elastic.Refused as e:
         return {"refused": {"code": e.code, "message": e.message},
-                "vocabulary": bridge.vocabulary.get(cluster)}
+                "vocabulary": bridge.vocabulary.get(cluster),
+                "phrases": bridge.scrubber.phrase_report()}
     s = bridge.scrubber
     # Names that are ordinary words: labelled in their own field, readable
     # as English on every other document. The label and the field it came
@@ -871,6 +880,7 @@ def run_case(bridge: Bridge, cluster: str, query: dict, *, show_names: bool = Fa
               "hits_shown": o.hits_shown, "seconds": o.seconds,
               "labels_issued": len(s.mapping), "dropped": sorted(s.dropped),
               "readable_words": readable,
+              "phrases": s.phrase_report(),
               "vocabulary": bridge.vocabulary.get(cluster)}
     if show_names:
         report["readable_names"] = sorted(s.readable_words.values())
@@ -1021,15 +1031,28 @@ def _probe_findings(probe: dict) -> list[str]:
     return out
 
 
+def phrase_line(p: dict | None) -> str | None:
+    """Where the case stands against its phrase budget. Counts only."""
+    if not p:
+        return None
+    if p.get("phrase_budget") is None:
+        return f"PHRASES  {p['phrases_used']} distinct text phrases used (no per-case budget)"
+    return (f"PHRASES  {p['phrases_used']}/{p['phrase_budget']} distinct text phrases used "
+            f"this case, {p['phrases_left']} left")
+
+
 def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) -> int:
     """Decisions only. Exit code 0 on a clean page, 2 on a refusal, 3 when a
     filtered query had nothing to search (EMPTY: zero hits that mean nothing)."""
     refused = report.get("refused")
     vline = vocabulary_line(report.get("vocabulary"))
+    pline = phrase_line(report.get("phrases"))
     if refused:
         print(f"REFUSED  cluster={cluster} code={refused['code']}: {refused['message']}")
         if vline:
             print(vline)
+        if pline:
+            print(pline, file=sys.stderr)
         return 2
     tr = query.get("time_range") or {}
     output = report.get("output") or {}
@@ -1072,6 +1095,8 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
         if names:
             # only when the operator asked for them by flag
             print(f"          names: {', '.join(names)}", file=sys.stderr)
+    if pline:
+        print(pline, file=sys.stderr)
     if vline:
         print(vline)
     if show:

@@ -2387,6 +2387,74 @@ class EngineSession:
                     ignore_unavailable=params.get("ignore_unavailable", False))}
 
 
+#: The guessing run the per-case phrase budget exists to stop: 500 queries,
+#: each with 8 different candidate names as phrases on the message field.
+#: Candidates are invented; one in ten is a phrase that does match a message
+#: in the stream fixture (and is not a known value, so the literal gate lets
+#: it through), so a refusal that depended on a match would show up as a
+#: second refusal shape.
+BUDGET_QUERIES = 500
+
+
+def budget_candidate(i: int) -> str:
+    return STREAM_TEXT_PHRASE if i % 10 == 3 else f"Candor{i:05d} Holdings"
+
+
+def run_phrase_budget_eval(fx: Fixture, *, tier2: str = "none") -> dict:
+    """The guessing run on the real Bridge, budget off (before) and at the
+    default (after). Counted: phrases that reached Kibana, queries refused
+    with phrase_budget and requests they sent, whether the refusal words
+    differ between a batch holding a real name and one that does not, and
+    that a used phrase and a label-only phrase still run once spent out."""
+    cfg_on = stream_name_map()
+    cfg_off = dataclasses.replace(cfg_on, phrase_budget=0)
+    engine = StubEngine(fx, (STREAM_INDEX,))
+    vocab, _b = build_vocabulary(cfg_on, engine)
+
+    def attack(cfg) -> dict:
+        case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+        r = {"queries": BUDGET_QUERIES, "sent": 0, "phrases_reached": 0,
+             "refused_budget": 0, "refused_requests": 0, "other_refusals": 0,
+             "messages": set(), "first_refused_at": None}
+        for q in range(BUDGET_QUERIES):
+            phrases = [budget_candidate(q * 8 + k) for k in range(8)]
+            before = len(engine.requests)
+            _out, refused, _dt, _c = case.call({
+                "index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 0,
+                "aggs": {"g": {"type": "filters", "filters": {
+                    f"p{k}": [{"field": "message", "op": "phrase", "value": p}]
+                    for k, p in enumerate(phrases)}}}})
+            if refused is None:
+                r["sent"] += 1
+                r["phrases_reached"] += 8
+            elif refused.code == "phrase_budget":
+                r["refused_budget"] += 1
+                r["refused_requests"] += len(engine.requests) - before
+                # the words minus the counts: one shape, whatever the batch held
+                r["messages"].add(re.sub(r"\d+", "N", refused.message))
+                r["first_refused_at"] = r["first_refused_at"] if r["first_refused_at"] \
+                    is not None else q
+            else:
+                r["other_refusals"] += 1
+        r["report"] = case.scrubber.phrase_report()
+        r["message_shapes"] = len(r.pop("messages"))
+        # spent out: a phrase already used, and a label-only phrase, still run
+        used = budget_candidate(0)
+        _o, refused, _dt, _c = case.call({"index": STREAM_INDEX, "time_range": STREAM_RANGE,
+                                          "size": 0, "filters": [
+                                              {"field": "message", "op": "phrase", "value": used}]})
+        r["reuse_runs"] = refused is None
+        label = case.scrubber.known.get(jsonscrub_norm(STREAM_JOB))
+        case.scrubber.shown.add(label)      # as if a page had shown it
+        _o, refused, _dt, _c = case.call({"index": STREAM_INDEX, "time_range": STREAM_RANGE,
+                                          "size": 0, "filters": [
+                                              {"field": "message", "op": "phrase", "value": label}]})
+        r["label_only_runs"] = refused is None
+        return r
+
+    return {"budget": cfg_on.phrase_budget, "before": attack(cfg_off), "after": attack(cfg_on)}
+
+
 class BridgeCase:
     """One case on the real :class:`esbridge.Bridge`, over the stub engine,
     with a built vocabulary held by the bridge's index - the live order of
@@ -2765,6 +2833,8 @@ class Session:
             if self.vocabulary is not None and not self.scrubber.vocabulary_applied("stub"):
                 self.scrubber.apply_vocabulary("stub", self.vocabulary)
                 self.vocabulary_applied += 1
+            # as the bridge does: a query about to be sent spends its phrases
+            self.scrubber.spend_phrases(compiled.new_phrases)
             raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
             envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}
             out = self.scrubber.scrub_response(envelope, compiled.plan).output
@@ -3590,6 +3660,9 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # Its own map, index pattern and engine, like the over-cap gate.
     stream_name = run_stream_name_eval(fx, tier2="none")
 
+    # The per-case phrase budget against a guessing run, on the real Bridge.
+    phrase_budget = run_phrase_budget_eval(fx, tier2="none")
+
     # A site map with no vocabulary section at all, which is what a site has
     # before anyone writes one. The default decides what is read, and a
     # one-hour case names a tenant and a resource whose own fields are on
@@ -3800,6 +3873,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "slices": slices,
         "over_cap": over_cap,
         "stream_name": stream_name,
+        "phrase_budget": phrase_budget,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -3941,6 +4015,18 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and a["filter_unshown_requests"] == 0
             and a["filter_shown_hits"] == len(stream_name_docs())
             and a["whole_name_refused"] == "known_value",
+        # The guessing run: before, every phrase reaches Kibana; after, no
+        # more than the budget does, every query past it refused with
+        # phrase_budget and no request, one refusal shape whatever the batch
+        # held, and reuse and label-only phrases still run.
+        "phrase_budget_holds":
+            phrase_budget["before"]["sent"] == BUDGET_QUERIES
+            and (pa := phrase_budget["after"])["report"]["phrases_used"]
+            <= phrase_budget["budget"]
+            and pa["refused_budget"] == BUDGET_QUERIES - pa["sent"] > 0
+            and pa["refused_requests"] == 0 and pa["other_refusals"] == 0
+            and pa["message_shapes"] == 1
+            and pa["reuse_runs"] and pa["label_only_runs"],
         # a case before the build finishes is refused, not shown
         "vocabulary_building_refuses":
             building["refused"] == "vocabulary_building" and not building["shown"],
@@ -4035,6 +4121,22 @@ def _slice_lines(s: dict | None) -> list[str]:
         f"{s['poll_interval_s']:g}s poll interval; {s['pings_answered']}/{s['pings']} pings "
         f"answered mid-build (es-login's progress and es-logout's stop are these)",
     ]
+
+
+def _phrase_budget_lines(o: dict | None) -> list[str]:
+    """The guessing run, before and after the per-case budget. Counts only."""
+    if not o:
+        return []
+    b, a = o["before"], o["after"]
+    return [f"phrase budget    {a['queries']} queries of 8 candidate names: "
+            f"{b['phrases_reached']} phrase uses ({b['report']['phrases_used']} distinct) "
+            f"reached Kibana with no budget, {a['phrases_reached']} "
+            f"({a['report']['phrases_used']} distinct) with the default {o['budget']}; "
+            f"{a['refused_budget']} "
+            f"queries refused phrase_budget from query {a['first_refused_at']}, "
+            f"{a['refused_requests']} requests, {a['message_shapes']} refusal shape(s); "
+            f"reused phrase runs {a['reuse_runs']}, label-only phrase runs "
+            f"{a['label_only_runs']}"]
 
 
 def _stream_name_lines(o: dict | None) -> list[str]:
@@ -4190,6 +4292,7 @@ def format_report(r: dict) -> str:
         *_slice_lines(r.get("slices")),
         *_over_cap_lines(r.get("over_cap")),
         *_stream_name_lines(r.get("stream_name")),
+        *_phrase_budget_lines(r.get("phrase_budget")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "

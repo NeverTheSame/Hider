@@ -98,6 +98,10 @@ DEFAULT_MAX_TEXT_CHARS = 20_000
 #: guessed words. The ceiling keeps a site from configuring that back in.
 DEFAULT_MAX_PHRASES = 8
 MAX_PHRASES_CEILING = 16
+#: Distinct plain-word phrases one **case** may use on text fields, over all
+#: its queries (``max_phrases`` is per query). 0 turns the budget off.
+DEFAULT_PHRASE_BUDGET = 150
+PHRASE_BUDGET_CEILING = 2000
 DEFAULT_POLL_TIMEOUT_S = 120
 MAX_POLL_TIMEOUT_S = 600
 #: The name vocabulary (:class:`VocabularyBuild`, :class:`VocabularyIndex`).
@@ -290,6 +294,7 @@ class ElasticConfig:
     profile_dir: str = ""
     poll_timeout_s: float = DEFAULT_POLL_TIMEOUT_S
     max_phrases: int = DEFAULT_MAX_PHRASES
+    phrase_budget: int = DEFAULT_PHRASE_BUDGET
     #: identifier fields read as a vocabulary; None: the site map did not
     #: say, so every field that *could* be read (:attr:`learnable_rules`)
     vocabulary_fields: tuple[str, ...] | None = None
@@ -388,6 +393,7 @@ class ElasticConfig:
             "max_hits": self.max_hits,
             "max_buckets": self.max_buckets,
             "max_phrases": self.max_phrases,
+            "phrase_budget": self.phrase_budget,
             "clusters": [c.name for c in self.clusters],
         }
 
@@ -531,7 +537,7 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
         raise ConfigError(f"{source}: top level must be an object")
     allowed = {"_comment", "indices", "fields", "time_field", "max_hits", "max_buckets",
                "max_text_chars", "clusters", "profile_dir", "poll_timeout_s",
-               "max_phrases", "vocabulary"}
+               "max_phrases", "phrase_budget", "vocabulary"}
     unknown = set(raw) - allowed
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
@@ -567,9 +573,14 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
             or not 0 <= phrases <= MAX_PHRASES_CEILING:
         raise ConfigError(f"{source}: max_phrases must be an integer, 0..{MAX_PHRASES_CEILING} "
                           "(0 turns text queries off)")
+    budget = raw.get("phrase_budget", DEFAULT_PHRASE_BUDGET)
+    if isinstance(budget, bool) or not isinstance(budget, int) \
+            or not 0 <= budget <= PHRASE_BUDGET_CEILING:
+        raise ConfigError(f"{source}: phrase_budget must be an integer, 0..{PHRASE_BUDGET_CEILING} "
+                          "(0 turns the per-case budget off)")
     cfg = ElasticConfig(tuple(indices), rules, time_field, source=source, clusters=clusters,
                         profile_dir=profile_dir, poll_timeout_s=float(poll),
-                        max_phrases=phrases, **caps)
+                        max_phrases=phrases, phrase_budget=budget, **caps)
     tf = cfg.rule(time_field)
     if tf is None or tf.kind != "keep":
         raise ConfigError(f"{source}: time_field {time_field!r} must be listed as keep")
@@ -759,6 +770,10 @@ class EsScrubber(jsonscrub.JsonScrubber):
         #: keep literal containing a learnt name is accepted in a query only
         #: for one of these; see :meth:`keep_literal_shown`.
         self.shown_keep: set[str] = set()
+        #: (field, phrase key) of every plain-word phrase this case has
+        #: spent, for the per-case ``phrase_budget``. Spent when a query is
+        #: about to be sent (:meth:`spend_phrases`), never refunded.
+        self.phrases_spent: set[tuple[str, str]] = set()
         #: Measurement switch for es-eval's "before" figure: every known
         #: value matches anywhere in a keep value, as before the keep rule.
         #: Set by nothing in the live path.
@@ -910,6 +925,21 @@ class EsScrubber(jsonscrub.JsonScrubber):
     #: string that is a label is matched directly, so this only has to
     #: find the ones inside a message.
     _LABEL_SHAPES = re.compile(r"<[^<>\s\"]{1,80}>|(?<![\w.-])[A-Za-z0-9][\w.-]*-s\d+")
+
+    def spend_phrases(self, phrases: Any) -> None:
+        """Charge a compiled query's new phrases to the case. Called once
+        the query has passed every check and is about to be sent; not
+        refunded if the request then fails or the page is withheld, since
+        whether a page is withheld can depend on what the phrase matched."""
+        self.phrases_spent.update(phrases)
+
+    def phrase_report(self) -> dict:
+        """Counts only, never a phrase: for the decision log, es-smoke and
+        es_schema."""
+        budget = self.config.phrase_budget
+        used = len(self.phrases_spent)
+        return {"phrases_used": used, "phrase_budget": budget or None,
+                "phrases_left": max(0, budget - used) if budget else None}
 
     def keep_literal_shown(self, text: str) -> bool:
         """Whether a keep literal that contains a known value may still be
@@ -1558,6 +1588,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
             # keep values this case was shown (they are values, which is
             # why they are in this file and nowhere else)
             "shown_keep": sorted(self.shown_keep),
+            # phrases this case spent against phrase_budget, as typed
+            # (normalised) - what Claude wrote, kept with the case's values
+            "phrases_spent": sorted([f, k] for f, k in self.phrases_spent),
             # labels only: which of them are ordinary words, labelled in
             # their own field and readable in text everywhere else
             "readable_words": sorted(self.readable_words),
@@ -1598,6 +1631,10 @@ class EsScrubber(jsonscrub.JsonScrubber):
         # A case saved before keep values were recorded starts with none: a
         # keep literal it could use must come back on a page again.
         s.shown_keep = {str(v) for v in raw.get("shown_keep") or ()}
+        # A case saved before the phrase budget starts at zero spent: what
+        # it used was never recorded, and guessing a count would be worse.
+        s.phrases_spent = {(str(p[0]), str(p[1])) for p in raw.get("phrases_spent") or ()
+                           if isinstance(p, (list, tuple)) and len(p) == 2}
         # Which labels are ordinary words, labelled in their own field and
         # readable in text everywhere else. A case saved **before** this was
         # recorded has them indexed for the case-wide sweep, as it was saved;

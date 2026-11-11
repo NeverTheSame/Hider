@@ -1537,3 +1537,37 @@ def test_the_words_come_back_only_when_the_operator_asks(stub, tmp_path, fixture
     report = esbridge.run_case(b, "stub", {"index": "logs-app-*", "size": 1}, show_names=True)
     assert "Backup" in report["readable_names"]
     assert "Backup" not in (tmp_path / "decisions.jsonl").read_text()
+
+
+def test_the_log_and_smoke_show_phrase_counts_never_a_phrase(stub, tmp_path, capsys):
+    b = _bridge(stub, tmp_path)
+    q = {"index": "logs-worker-*", "size": 1, "time_range": {"gte": "now-6h", "lte": "now"},
+         "filters": [{"field": "message", "op": "phrase", "value": "quarzelt wibbly"}]}
+    report = esbridge.run_case(b, "stub", q)
+    assert report["phrases"]["phrases_used"] == 1
+    esbridge.print_smoke("stub", q, report)
+    err = capsys.readouterr().err
+    assert f"PHRASES  1/{b.config.phrase_budget} distinct text phrases used" in err
+    row = json.loads((tmp_path / "decisions.jsonl").read_text().splitlines()[-1])
+    assert row["phrases_used"] == 1 and row["phrase_budget"] == b.config.phrase_budget
+    # the decision log carries the phrase as typed already (text_queries,
+    # pre-existing); the budget fields themselves are counts
+    assert {k: row[k] for k in ("phrases_used", "phrase_budget", "phrases_left")} == \
+        b.scrubber.phrase_report()
+
+
+def test_a_query_refused_after_compiling_still_spends_and_a_refused_one_does_not(stub, tmp_path):
+    """No refund once a query is about to be sent; nothing spent for a
+    query the bridge refuses before that (here: vocabulary still building)."""
+    b = _bridge(stub, tmp_path, vocabulary=False)
+    q = {"index": "logs-worker-*", "size": 1,
+         "filters": [{"field": "message", "op": "phrase", "value": "quarzelt wibbly"}]}
+    with pytest.raises(elastic.Refused):
+        b.run("stub", q)
+    assert b.scrubber.phrase_report()["phrases_used"] == 0
+    b = _bridge(stub, tmp_path)
+    b.session.search = lambda *a, **k: (_ for _ in ()).throw(
+        elastic.Refused("unreachable", "kibana request failed"))
+    with pytest.raises(elastic.Refused):
+        b.run("stub", q)
+    assert b.scrubber.phrase_report()["phrases_used"] == 1
