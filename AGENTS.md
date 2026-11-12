@@ -65,7 +65,7 @@ design conversation, not a code change.
 | Eval metrics or gates | `hider/evaluate.py` (recall, precision, adversarial, injection), `hider/utility.py` (answer accuracy raw vs redacted) |
 | JSON exports and the web UI | `hider/jsonscrub.py`, `hider/webserver.py` (single-file page, stdlib server), `hider/research.py` (Claude Code bridge) |
 | Site-specific patterns | Never in the repo. `templates/profile.example.json` and `HIDER_PROFILE`; see `hider/profiles.py` |
-| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log), `hider/esmcp.py` (the MCP server inside the broker: cases and tokens, the four tools, transport guards, the Claude Code launch). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
+| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esreview.py` (`es-review`: a case read back from its decision log), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log), `hider/esmcp.py` (the MCP server inside the broker: cases and tokens, the four tools, transport guards, the Claude Code launch). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
 
 ## Running things
 
@@ -85,6 +85,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
                                                  # then build the name vocabulary: minutes on a large estate
 .venv/bin/python -m hider es-research --case c1 --term "<customer>"   # Claude Code, bridge tools only
 .venv/bin/python -m hider es-research --stub --case demo --prompt "..."  # the same on a synthetic Kibana
+.venv/bin/python -m hider es-review --case c1    # read a case back: numbers, phrase spend, probing signals (human-only)
 .venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
 ```
 
@@ -571,7 +572,23 @@ Listed with owners in the README's Limitations section and in
   reading the first two days at sign-in always takes longer than the
   interval, so this is what es-login returns to), and becomes `stale`
   only past the interval plus one slice budget, or at once when the
-  last top-up failed (`Broker.vocabulary_progress`, with the refusal).
+  last top-up failed. **Overdue is measured on this bridge's clock**:
+  `VocabularyIndex.report` used to charge the cover's age alone, so a
+  bridge restarted a day after the last one said `stale, TOP-UP OVERDUE`
+  on its first page while the top-up had just started. The broker now
+  tells the index when it started (`started_at`), which clusters have a
+  slice in flight (`in_progress`) and whose last slice failed (`failed`),
+  all runtime-only and never saved; the state is `top_up_due` while a
+  top-up is running (`topping_up`, the line says `top-up running`) or has
+  not yet had a slice budget of this bridge's time, and `stale` once it
+  has, or at once after a failure (with the refusal). `age_s` and the
+  line's age stay honest - from the end of the cover - and the line says
+  that names logged since the cover ended are not known until the top-up
+  finishes. A bare index with no broker (tests, es-eval sessions) keeps
+  the age-alone rule. Cost: a bridge restarted after a week of downtime
+  reports `top-up due` for up to twenty minutes while its catch-up slice
+  runs, and serves cases that whole time with a week of names unknown -
+  which it also did before, under a word that made it look like a fault.
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
@@ -684,6 +701,59 @@ Listed with owners in the README's Limitations section and in
   (pinned by a test). Contents unchanged.
   Tier 2 may still label such a word in free text on its own judgement:
   unchanged, and left for later.
+
+  **A case can be read back** (`es-review --case NAME`, `hider/esreview.py`)
+  from its decision log and saved session, because the log recorded a
+  great deal per query and nothing read it: after a session nobody could
+  tell an investigation from a case spent probing without reading the
+  JSONL. The command is **human-only** (no MCP tool, nothing the
+  es-research session can call or read), **read-only** (it writes
+  nothing), prints **counts, labels, codes, field names and Claude's own
+  typed phrases** by default and the values behind labels only under
+  `--show-values` (the same explicit ask as es-smoke's
+  `--show-readable-names`), reports a missing or unreadable log as **no
+  review** with a non-zero exit and never as a clean case, and reviews a
+  log written before it existed with each gap marked `not recorded`.
+  It shows the numbers (queries by tool, pages shown, hits, refusals by
+  code, labels and keep values the case ended up able to use from
+  `session.json` or the log's running totals, labels issued) and the
+  phrase spend against the budget, then five signals, each with its
+  evidence and a note on what an innocent case looks like; the
+  thresholds sit together at the top of the module:
+  - `label_guessing`: 3+ `unknown_label` refusals, or a run of 3+
+    consecutive label numbers among the labels typed (innocent: 0-2, a
+    typo or a label off an older page);
+  - `zero_hit_phrases`: 5+ name-shaped phrases (one to three capitalised
+    words, no digits) that found nothing, or 20+ phrases with half
+    finding nothing (innocent: a handful of lower-case error fragments
+    while narrowing);
+  - `phrase_budget_pressure`: any `phrase_budget` refusal, or 80% of the
+    budget spent (innocent: tens of phrases and no refusal);
+  - `wide_collection`: one **aggregation** that made 20+ labels or keep
+    values usable - pages of hits are not counted, since a page of
+    events carries a handful of labels per event and reading events is
+    the job (innocent: a terms over servers or levels, about ten keys);
+  - `literal_probing`: 3+ `known_value`/`literal_identifier`/
+    `shaped_literal` refusals, with the fields (innocent: 0-1, a value
+    typed back before it was shown, then corrected to the label).
+  Three fields were added to the decision log for it, all counts or
+  Claude's own words: `new_labels`/`new_keep_values` (how many a page made
+  usable) with the running totals `labels_usable`/`keep_values_usable`,
+  and `zero_hit_phrases` (the typed phrases whose filter or `filters`
+  bucket matched nothing - already in `text_queries`, so the log holds
+  nothing it did not). Gate: `review_flags_guessing` - the guessing run
+  from `phrase_budget_holds` is flagged (`zero_hit_phrases` and
+  `phrase_budget_pressure`), an ordinary investigation on the fixture
+  (page by tenant label, servers and levels aggregated, a server label
+  off that page used next, two error fragments searched, a histogram) is
+  not and has no refusal, a case directory with no log is `missing` with
+  no verdict, and the default output of both carries no planted value.
+  Declared limits: the signals read the shape of what Claude typed, not
+  its intent, so a long and clumsy investigation can trip
+  `zero_hit_phrases` and a case about many tenants can trip
+  `wide_collection` - the innocent note under each flag is there to be
+  read; and a bridge not restarted since this change writes none of the
+  new fields, which the review then marks rather than infers.
 
   **Every run says which names stayed readable**, because a clean verdict
   looks identical whether or not it happened, and nobody can seed a name
@@ -887,7 +957,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 29 pass, and a change that cannot keep them passing
+  MCP endpoint; all 30 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -939,6 +1009,8 @@ Listed with owners in the README's Limitations section and in
   requests and one refusal shape whether the batch held the matching
   phrase or not, and a reused and a label-only phrase still run once the
   case is spent out.
+  `review_flags_guessing` (`eseval.run_review_eval`, see "A case can be
+  read back" above).
   Label use: `label_guessing_refused` - a fresh case on the estate
   guesses a hundred low-numbered labels, **100 of 100 are live labels it
   holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label

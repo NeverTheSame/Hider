@@ -2450,9 +2450,75 @@ def run_phrase_budget_eval(fx: Fixture, *, tier2: str = "none") -> dict:
                                           "size": 0, "filters": [
                                               {"field": "message", "op": "phrase", "value": label}]})
         r["label_only_runs"] = refused is None
+        r["case_dir"] = str(case.save())
         return r
 
     return {"budget": cfg_on.phrase_budget, "before": attack(cfg_off), "after": attack(cfg_on)}
+
+
+def run_review_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
+                    vocab: elastic.ClusterVocabulary, fx: Fixture, guessing_dir: str, *,
+                    tier2: str) -> dict:
+    """es-review over two cases: the guessing run from the phrase-budget
+    gate, and an ordinary investigation on the fixture - a case about one
+    tenant that pages its events, aggregates servers and levels, filters by
+    a server label it was shown, searches two error fragments and counts.
+    The first must be flagged, the second must not, and a directory with no
+    log must be reported as no review rather than as clean.
+    """
+    from . import esreview
+
+    cfg = dataclasses.replace(
+        cfg, clusters=(elastic.Cluster("stub", "https://kibana-stub.example.net"),))
+    case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+    tenant = fx.tenants[0]
+    label = case.scrubber.seed(tenant.name)
+    tr = {"gte": "now-6h", "lte": "now"}
+    by_case = [{"field": "labels.tenant_name", "op": "eq", "value": label}]
+    calls = [
+        {"index": "logs-app-*", "time_range": tr, "size": 20, "filters": by_case},
+        {"index": "logs-app-*", "time_range": tr, "size": 0, "filters": by_case,
+         "aggs": {"srv": {"type": "terms", "field": "agent.name", "size": 10},
+                  "lvl": {"type": "terms", "field": "log.level", "size": 10}}},
+        {"index": "logs-app-*", "time_range": tr, "size": 10,
+         "filters": [{"field": "message", "op": "phrase", "value": "throttled by sharepoint"}]},
+        {"index": "logs-worker-*", "time_range": tr, "size": 10,
+         "filters": [{"field": "message", "op": "phrase", "value": "finished with warnings"}]},
+        {"index": "logs-app-*", "time_range": tr, "size": 0, "filters": by_case,
+         "aggs": {"h": {"type": "date_histogram", "field": cfg.time_field, "interval": "1h"}}},
+    ]
+    refusals = 0
+    for q in calls:
+        out, refused, _dt, _c = case.call(q)
+        refusals += refused is not None
+        if out is not None and "srv" in (out.get("aggregations") or {}):
+            # a server label off the page, used in the next query
+            keys = [b["key"] for b in out["aggregations"]["srv"]["buckets"]]
+            if keys:
+                _o, refused2, _dt, _c = case.call({
+                    "index": "logs-app-*", "time_range": tr, "size": 0,
+                    "filters": [{"field": "agent.name", "op": "eq", "value": keys[0]}]})
+                refusals += refused2 is not None
+    ordinary_dir = case.save()
+    ordinary = esreview.review(ordinary_dir)
+    guessing = esreview.review(guessing_dir)
+    missing = esreview.review(Path(tempfile.mkdtemp(prefix="hider-es-eval-nolog-")))
+    # the default output carries no value from either case
+    blob = "\n".join(esreview.format_review(ordinary) + esreview.format_review(guessing))
+    values_leaked = [v for v in (tenant.name, *(d.source.get("job", {}).get("name", "")
+                                                 for d in fx.docs[:50]))
+                     if v and v in blob]
+    return {
+        "ordinary": {"queries": ordinary["numbers"].get("queries"), "refusals": refusals,
+                     "verdict": ordinary["verdict"], "flagged": ordinary["flagged"],
+                     "log_status": ordinary["log_status"]},
+        "guessing": {"queries": guessing["numbers"].get("queries"),
+                     "verdict": guessing["verdict"], "flagged": guessing["flagged"],
+                     "log_status": guessing["log_status"],
+                     "zero_hit": guessing["numbers"].get("text_phrases_zero_hit")},
+        "missing": {"log_status": missing["log_status"], "verdict": missing["verdict"]},
+        "values_in_default_output": len(values_leaked),
+    }
 
 
 class BridgeCase:
@@ -2467,7 +2533,15 @@ class BridgeCase:
         index = elastic.VocabularyIndex(None)
         index.put("stub", vocabulary)
         self.scrubber = elastic.EsScrubber(config, tier2=tier2)
-        self.bridge = esbridge.Bridge(config, self.scrubber, EngineSession(engine), index=index)
+        #: a case directory of its own, with the decision log a real case
+        #: writes, so es-review can read the case back
+        self.directory = Path(tempfile.mkdtemp(prefix="hider-es-eval-case-"))
+        self.bridge = esbridge.Bridge(config, self.scrubber, EngineSession(engine),
+                                      log_path=self.directory / "decisions.jsonl", index=index)
+
+    def save(self) -> Path:
+        self.scrubber.save_session(self.directory)
+        return self.directory
 
     def call(self, query: dict) -> tuple[dict | None, elastic.Refused | None, float, None]:
         from . import esbridge
@@ -3663,6 +3737,10 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # The per-case phrase budget against a guessing run, on the real Bridge.
     phrase_budget = run_phrase_budget_eval(fx, tier2="none")
 
+    # es-review over that guessing run and over an ordinary investigation.
+    review = run_review_eval(cfg, engine, vocab, fx, phrase_budget["after"]["case_dir"],
+                             tier2=tier2)
+
     # A site map with no vocabulary section at all, which is what a site has
     # before anyone writes one. The default decides what is read, and a
     # one-hour case names a tenant and a resource whose own fields are on
@@ -3874,6 +3952,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "over_cap": over_cap,
         "stream_name": stream_name,
         "phrase_budget": phrase_budget,
+        "review": review,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -4027,6 +4106,19 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and pa["refused_requests"] == 0 and pa["other_refusals"] == 0
             and pa["message_shapes"] == 1
             and pa["reuse_runs"] and pa["label_only_runs"],
+        # es-review flags the guessing run and not an ordinary investigation,
+        # reports a missing log as no review (never clean), and prints no
+        # value by default
+        "review_flags_guessing":
+            review["guessing"]["verdict"] == "flagged"
+            and ("zero_hit_phrases" in review["guessing"]["flagged"]
+                 or "phrase_budget_pressure" in review["guessing"]["flagged"])
+            and review["ordinary"]["verdict"] == "nothing flagged"
+            and review["ordinary"]["refusals"] == 0
+            and review["ordinary"]["log_status"] == "ok"
+            and review["missing"]["log_status"] == "missing"
+            and review["missing"]["verdict"] is None
+            and review["values_in_default_output"] == 0,
         # a case before the build finishes is refused, not shown
         "vocabulary_building_refuses":
             building["refused"] == "vocabulary_building" and not building["shown"],
@@ -4121,6 +4213,17 @@ def _slice_lines(s: dict | None) -> list[str]:
         f"{s['poll_interval_s']:g}s poll interval; {s['pings_answered']}/{s['pings']} pings "
         f"answered mid-build (es-login's progress and es-logout's stop are these)",
     ]
+
+
+def _review_lines(o: dict | None) -> list[str]:
+    if not o:
+        return []
+    g, n = o["guessing"], o["ordinary"]
+    return [f"es-review        guessing run ({g['queries']} queries, {g['zero_hit']} zero-hit "
+            f"phrases): {g['verdict']} {g['flagged']}; ordinary investigation ({n['queries']} "
+            f"queries, {n['refusals']} refusals): {n['verdict']} {n['flagged']}; a case with no "
+            f"log: {o['missing']['log_status']}, verdict {o['missing']['verdict']}; values in the "
+            f"default output: {o['values_in_default_output']}"]
 
 
 def _phrase_budget_lines(o: dict | None) -> list[str]:
@@ -4293,6 +4396,7 @@ def format_report(r: dict) -> str:
         *_over_cap_lines(r.get("over_cap")),
         *_stream_name_lines(r.get("stream_name")),
         *_phrase_budget_lines(r.get("phrase_budget")),
+        *_review_lines(r.get("review")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "

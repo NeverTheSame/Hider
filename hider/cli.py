@@ -550,6 +550,23 @@ def _cmd_es_research(args: argparse.Namespace) -> int:
     return _es_research(args, esbridge.BrokerClient(sock, timeout=60), elastic.SESSIONS, cfg)
 
 
+def _cmd_es_review(args: argparse.Namespace) -> int:
+    """Review one case from its decision log and saved session: human-only,
+    read-only, counts and labels by default. Exit 0 when nothing is flagged,
+    1 when something is, 2 when there is no log to review."""
+    from . import elastic, esreview
+
+    base = Path(args.sessions_dir) if args.sessions_dir else elastic.SESSIONS
+    report = esreview.review(base / args.case, show_values=args.show_values)
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print("\n".join(esreview.format_review(report)))
+    if report["log_status"] != "ok":
+        return 2
+    return 1 if report["flagged"] else 0
+
+
 def _es_research(args: argparse.Namespace, client, sessions_dir: Path, cfg) -> int:
     import subprocess
 
@@ -1096,6 +1113,17 @@ def main(argv: list[str] | None = None) -> int:
     lg.add_argument("--profile-dir")
     lg.add_argument("--timeout", type=float, default=600.0)
     lg.set_defaults(fn=_cmd_es_login)
+
+    rv = sub.add_parser("es-review", help="review what an es-research case did, from its "
+                                          "decision log: queries, refusals, phrase spend and "
+                                          "signals of probing; read-only, for a human")
+    rv.add_argument("--case", required=True, help="the case name (out/es/<case>)")
+    rv.add_argument("--sessions-dir", help="where the cases live (default out/es)")
+    rv.add_argument("--show-values", action="store_true",
+                    help="print the real values behind labels the case used or guessed. Off by "
+                         "default: counts, labels, codes and field names only")
+    rv.add_argument("--json", action="store_true", help="the full report as JSON")
+    rv.set_defaults(fn=_cmd_es_review)
 
     lo = sub.add_parser("es-logout", help="stop the bridge; its Chrome and every Kibana session "
                                           "in it end")

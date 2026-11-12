@@ -1083,6 +1083,9 @@ def test_the_vocab_line_says_top_up_due_and_keeps_stale_for_an_overdue_one():
          "serving": True, "age_s": 976.9}
     due = esbridge.vocabulary_line({**v, "state": "top_up_due"})
     assert "top-up due (976.9s old)" in due and "stale" not in due
+    assert "not known until the top-up finishes" in due
+    running = esbridge.vocabulary_line({**v, "state": "top_up_due", "topping_up": True})
+    assert "top-up running (976.9s old)" in running
     stale = esbridge.vocabulary_line({**v, "state": "stale", "refused": "upstream"})
     assert "stale" in stale and "TOP-UP OVERDUE (upstream)" in stale
 
@@ -1496,3 +1499,33 @@ def test_phrase_budget_is_a_bounded_site_map_setting(value, ok):
         with pytest.raises(elastic.ConfigError):
             elastic.parse(raw, source="t")
     assert elastic.load(elastic.EXAMPLE).phrase_budget == elastic.DEFAULT_PHRASE_BUDGET
+
+
+def test_a_restarted_bridge_is_not_charged_for_the_time_it_was_down():
+    """The cover is a day old when the bridge comes back; the top-up is due,
+    then running, and overdue only once it has had a budget's worth of this
+    bridge's time - or failed."""
+    index = elastic.VocabularyIndex(None)
+    now = eseval.NOW.timestamp()
+    index.put("emea", elastic.ClusterVocabulary(
+        now - 86400.0 - CFG.vocabulary_days * 86400.0, now - 86400.0, 0.0, {}))
+    # no bridge start known (a bare index): age alone decides, as before
+    assert index.report("emea", CFG, now=now)["state"] == "stale"
+    index.started_at = now - 60.0          # the bridge came up a minute ago
+    r = index.report("emea", CFG, now=now)
+    assert r["state"] == "top_up_due" and r["serving"] and not r["topping_up"]
+    assert r["age_s"] > 86000              # the age stays honest
+    index.in_progress.add("emea")
+    r = index.report("emea", CFG, now=now + 300)
+    assert r["state"] == "top_up_due" and r["topping_up"]
+    index.in_progress.discard("emea")
+    # a budget's worth of this bridge's time and still no top-up: overdue
+    late = index.started_at + elastic.VOCABULARY_REFRESH_S + CFG.vocabulary_budget_s + 1
+    assert index.report("emea", CFG, now=late)["state"] == "stale"
+    # a failed top-up is stale at once, with the reason
+    index.failed["emea"] = "upstream"
+    r = index.report("emea", CFG, now=now + 300)
+    assert r["state"] == "stale" and r["refused"] == "upstream"
+    # ...until a retry is running
+    index.in_progress.add("emea")
+    assert index.report("emea", CFG, now=now + 400)["state"] == "top_up_due"

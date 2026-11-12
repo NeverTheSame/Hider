@@ -1759,6 +1759,14 @@ class VocabularyIndex:
         #: that is what stops the next slice spending the same fifty
         #: requests. Counts and field names, never a value.
         self.over_cap: dict[str, dict[str, dict]] = {}
+        #: Runtime only, set by the broker, never saved: when this bridge
+        #: started, which clusters have a top-up or slice in flight, and
+        #: which cluster's last slice failed and why. The state line reads
+        #: them so a bridge is not charged for the time it was not running
+        #: (see :meth:`report`).
+        self.started_at: float | None = None
+        self.in_progress: set[str] = set()
+        self.failed: dict[str, str] = {}
         self.load()
 
     @property
@@ -1859,27 +1867,38 @@ class VocabularyIndex:
         cap = config.vocabulary_max
         serving = vocab.serves(config, t)
         complete = vocab.complete(config, t)
+        # Overdue is measured from when the top-up could have started on
+        # *this* bridge: the end of the cover, or the bridge's start if that
+        # is later. A bridge restarted a day after the last one holds a cover
+        # a day old, and its first top-up is due, not overdue - the age it is
+        # charged for is time it was not running. The age itself (age_s) is
+        # still the honest one, from the end of the cover.
+        chance = vocab.covered_until if self.started_at is None \
+            else max(vocab.covered_until, self.started_at)
+        topping_up = cluster in self.in_progress
+        failed = self.failed.get(cluster)
         if not serving:
             # read something, but not far enough back yet to answer a case
             state = "building"
-        elif t - vocab.covered_until > VOCABULARY_REFRESH_S + config.vocabulary_budget_s:
-            # a top-up is overdue by more than one slice's budget: it is not
-            # running, or it is failing. The bridge also says stale at once
-            # when the last top-up failed (Broker.vocabulary_progress).
-            state = "stale"
-        elif t - vocab.covered_until > VOCABULARY_REFRESH_S:
-            # The newest minutes are due a top-up, and one runs next
-            # (next_vocabulary_slice puts it first). Nothing is wrong yet:
-            # reading the first two days at sign-in takes longer than the
-            # refresh interval, so this is the state es-login returns to.
+        elif t - vocab.covered_until <= VOCABULARY_REFRESH_S:
+            state = "ready" if complete else "extending"
+        elif topping_up:
+            # the top-up is running: names logged since the cover ended are
+            # not known yet, and nothing is wrong
             state = "top_up_due"
-        elif not complete:
-            # serving cases while the older slices are still being read
-            state = "extending"
+        elif failed is not None or t - chance > VOCABULARY_REFRESH_S + config.vocabulary_budget_s:
+            # the top-up had its chance on this bridge and did not finish,
+            # or its last attempt failed
+            state = "stale"
         else:
-            state = "ready"
-        return {
+            # due, and a slice starts next (next_vocabulary_slice puts the
+            # newest end first). Nothing is wrong yet: reading the first two
+            # days at sign-in takes longer than the refresh interval, so this
+            # is the state es-login returns to.
+            state = "top_up_due"
+        out = {
             "state": state, "serving": serving, "complete": complete,
+            "topping_up": topping_up,
             "fields": counts, "max": cap,
             "near_cap": sorted(f for f, n in counts.items() if n >= VOCABULARY_NEAR_CAP * cap),
             "skipped": {},
@@ -1889,6 +1908,9 @@ class VocabularyIndex:
             "wanted_days": config.vocabulary_days,
             "age_s": round(max(0.0, t - vocab.covered_until), 1),
         }
+        if state == "stale" and failed is not None:
+            out["refused"] = failed
+        return out
 
 
 def next_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",

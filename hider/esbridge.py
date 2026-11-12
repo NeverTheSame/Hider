@@ -568,6 +568,10 @@ class Bridge:
             row["tool"] = tool
         outcome = Outcome(row["cluster"], None, None, 0.0)
         with self._lock:
+            # what the case could use before this query: the page's growth
+            # of both sets goes to the log as counts (es-review reads them)
+            labels_before = len(self.scrubber.shown)
+            keep_before = len(self.scrubber.shown_keep)
             try:
                 cluster = self.cluster(cluster_name)
                 # Compile first: a query the grammar refuses on its own keeps
@@ -602,7 +606,17 @@ class Bridge:
                 outcome.hits_shown = len(scrubbed.output.get("hits", {}).get("hits", []))
                 outcome.text_queries = len(compiled.text_queries)
                 row.update({"hits_total": outcome.hits_total, "hits_shown": outcome.hits_shown,
-                            "dropped_fields": scrubbed.stats.get("dropped_fields", 0)})
+                            "dropped_fields": scrubbed.stats.get("dropped_fields", 0),
+                            # how many labels and keep values this page made
+                            # usable, and the running totals: counts only
+                            "new_labels": len(self.scrubber.shown) - labels_before,
+                            "new_keep_values": len(self.scrubber.shown_keep) - keep_before,
+                            "labels_usable": len(self.scrubber.shown),
+                            "keep_values_usable": len(self.scrubber.shown_keep),
+                            # the typed phrases whose filter or bucket found
+                            # nothing: Claude's own words, already in
+                            # text_queries, so the log holds nothing new
+                            "zero_hit_phrases": _zero_hit_phrases(query, scrubbed.output)})
             except elastic.Refused as e:
                 outcome.refused = e.code
                 row["refused"] = e.code
@@ -662,6 +676,41 @@ class Bridge:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _phrases_of(filters: Any) -> list[str]:
+    return [f["value"] for f in filters or [] if isinstance(f, dict)
+            and f.get("op") == "phrase" and isinstance(f.get("value"), str)]
+
+
+def _zero_hit_phrases(query: dict, output: dict) -> list[str]:
+    """The phrases in this query whose filter (the page) or whose bucket (a
+    filters aggregation, at any depth under filters aggregations) matched
+    nothing. What a guess that failed looks like in the log; a count of
+    them per case is what es-review reads."""
+    out: list[str] = []
+    total = (output.get("hits") or {}).get("total") or {}
+    if isinstance(total, dict) and total.get("value") == 0:
+        out.extend(_phrases_of(query.get("filters")))
+
+    def walk(specs: Any, node: Any) -> None:
+        if not isinstance(specs, dict) or not isinstance(node, dict):
+            return
+        for name, spec in specs.items():
+            if not isinstance(spec, dict) or spec.get("type") != "filters":
+                continue
+            buckets = (node.get(name) or {}).get("buckets")
+            if not isinstance(buckets, dict):
+                continue
+            for bname, flt in (spec.get("filters") or {}).items():
+                b = buckets.get(bname)
+                if isinstance(b, dict) and b.get("doc_count") == 0:
+                    out.extend(_phrases_of(flt))
+                if isinstance(b, dict):
+                    walk(spec.get("aggs"), b)
+
+    walk(query.get("aggs"), output.get("aggregations") or {})
+    return out
 
 
 def _describe(query: dict, compiled: esquery.Compiled) -> dict:
@@ -937,11 +986,14 @@ def vocabulary_line(v: dict | None) -> str | None:
     if v.get("covered_days") is not None:
         # the covered range is the one number that says which days a name
         # can be known from at all: a name logged outside it is not known
-        state = {"top_up_due": "top-up due"}.get(v.get("state", "ready"), v.get("state", "ready"))
+        state = v.get("state", "ready")
+        if state == "top_up_due":
+            state = "top-up running" if v.get("topping_up") else "top-up due"
         line += (f" over the last {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
                  f"{state} ({v.get('age_s', 0)}s old)")
         if v.get("state") == "top_up_due":
-            line += " - cases run; the newest minutes are read next"
+            line += (" - cases run; names logged since the cover ended are not known until "
+                     "the top-up finishes")
         elif v.get("state") == "stale":
             line += (" - TOP-UP OVERDUE" + (f" ({v['refused']})" if v.get("refused") else "")
                      + ": names logged since are not known")
@@ -1201,6 +1253,8 @@ class Broker:
         #: per cluster on sign-in and topped up on the serve loop; see
         #: _pump_vocabulary.
         self.vocabulary = elastic.VocabularyIndex(self.sessions_dir)
+        # a top-up is overdue only once it has had its chance on this bridge
+        self.vocabulary.started_at = clock()
         self._build: elastic.VocabularyBuild | None = None
         self._build_cluster: elastic.Cluster | None = None
         #: why the last build for a cluster stopped, if it did. A waiting
@@ -1341,6 +1395,8 @@ class Broker:
             over_cap=self.vocabulary.over_cap_fields(cluster.name, t))
         self._build_cluster = cluster
         self._build_failed.pop(cluster.name, None)
+        self.vocabulary.failed.pop(cluster.name, None)
+        self.vocabulary.in_progress.add(cluster.name)
         self._log_vocabulary(cluster.name, "start", self._build.progress())
 
     def _end_slice(self, cluster: elastic.Cluster, code: str, build) -> None:
@@ -1348,6 +1404,8 @@ class Broker:
         by earlier slices stays saved, and this one is retried later."""
         self._log_vocabulary(cluster.name, "failed", {**build.progress(), "refused": code})
         self._build_failed[cluster.name] = code
+        self.vocabulary.failed[cluster.name] = code
+        self.vocabulary.in_progress.discard(cluster.name)
         self._retry_at[cluster.name] = clock() + elastic.VOCABULARY_RETRY_S
         self._drop_page()
         self._build = self._build_cluster = None
@@ -1426,6 +1484,8 @@ class Broker:
         # next slice. A restart resumes from here rather than starting over.
         self.vocabulary.put(cluster.name, build.result())
         self._build_failed.pop(cluster.name, None)
+        self.vocabulary.failed.pop(cluster.name, None)
+        self.vocabulary.in_progress.discard(cluster.name)
         self._log_vocabulary(cluster.name, "slice",
                              {**build.progress(),
                               **self.vocabulary.report(cluster.name, self.config, now=clock())})
@@ -1469,9 +1529,8 @@ class Broker:
             # nothing held and nothing running: say so, or a caller waiting
             # for "ready" waits for ever
             report = {**report, "state": "failed", "refused": self._build_failed[cluster]}
-        elif cluster in self._build_failed and report.get("state") == "top_up_due":
-            # the top-up that was due was tried and failed: that is stale
-            report = {**report, "state": "stale", "refused": self._build_failed[cluster]}
+        # a failed top-up reads as stale from the index itself (its failed
+        # map), so the page's VOCAB line and this report agree
         return report
 
     def _log_vocabulary(self, cluster: str, event: str, body: dict) -> None:

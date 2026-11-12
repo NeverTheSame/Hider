@@ -1571,3 +1571,33 @@ def test_a_query_refused_after_compiling_still_spends_and_a_refused_one_does_not
     with pytest.raises(elastic.Refused):
         b.run("stub", q)
     assert b.scrubber.phrase_report()["phrases_used"] == 1
+
+
+def test_es_review_reads_a_real_case_back(stub, tmp_path):
+    """The decision log a bridge writes is what es-review reads: the counts
+    match what the bridge did, and the new per-page fields are present."""
+    from hider import esreview
+
+    b = _bridge(stub, tmp_path)
+    label = b.scrubber.seed("Contoso Holdings")
+    tr = {"gte": "now-6h", "lte": "now"}
+    b.run("stub", {"index": "logs-app-*", "time_range": tr, "size": 5})
+    b.run("stub", {"index": "logs-app-*", "time_range": tr, "size": 0, "aggs": {
+        "srv": {"type": "terms", "field": "agent.name", "size": 5}}})
+    with pytest.raises(elastic.Refused):
+        b.run("stub", {"index": "logs-app-*", "time_range": tr, "size": 1, "filters": [
+            {"field": "labels.tenant_name", "op": "eq", "value": "<Org-999977>"}]})
+    b.run("stub", {"index": "logs-worker-*", "time_range": tr, "size": 1, "filters": [
+        {"field": "message", "op": "phrase", "value": "quarzelt wibbly"}]})
+    b.scrubber.save_session(tmp_path)
+    r = esreview.review(tmp_path)
+    n = r["numbers"]
+    assert n["queries"] == 4 and n["refusals"] == {"unknown_label": 1}
+    assert n["text_phrases_zero_hit"] == 1 and n["phrases_used"] == 1
+    assert n["labels_usable"] == len(b.scrubber.shown) and n["labels_usable"] > 1
+    assert r["verdict"] == "nothing flagged"
+    rows = [json.loads(l) for l in (tmp_path / "decisions.jsonl").read_text().splitlines()]
+    page = next(x for x in rows if x.get("size") == 5)
+    assert page["new_labels"] > 0 and page["labels_usable"] == page["new_labels"] + 1
+    assert rows[-1]["zero_hit_phrases"] == ["quarzelt wibbly"]
+    assert label not in json.dumps(r) or "Contoso" not in json.dumps(r)

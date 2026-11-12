@@ -525,6 +525,7 @@ python -m hider es-login --cluster emea               # starts the bridge, you s
 python -m hider es-research --case c1 --term "<the customer>"            # interactive Claude Code
 python -m hider es-research --case c1 --prompt "<question>" --model haiku  # one headless question
 python -m hider unmask answer.md --mapping out/es/c1/session.json        # labels back to values
+python -m hider es-review --case c1                   # what the case did: queries, refusals, phrase spend, probing signals
 python -m hider es-logout                             # stops the bridge; the Kibana session ends
 python -m hider es-research --stub --case demo --term "Contoso Group" --prompt "..."  # synthetic, nothing live
 ```
