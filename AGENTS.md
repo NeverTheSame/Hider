@@ -690,6 +690,95 @@ Listed with owners in the README's Limitations section and in
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
 
+  **The cover is kept per field.** It was one range for the cluster
+  (`covered_from`/`covered_until`), and `merge` took the widest, so a
+  field that started being read after a cover existed was claimed for
+  days it was never read: a site with a 30-day cover of `job.name` adds
+  `labels.tenant_name` to `vocabulary.fields`, the next sign-in reads
+  the new field for the ten-minute top-up only, the VOCAB line said
+  `labels.tenant_name=3/50000 over the last 30d, ready`, and a case about
+  last week showed a tenant in message text that no slice had read. The
+  second route was a default-set field left out as over the cap, counted
+  again a day later, under it, and read from then on with its earlier
+  days unread. Now `ClusterVocabulary.covers` holds **one range per
+  field**, the saved file (schema `v2`) writes only those, `merge` and
+  `VocabularyIndex.put` apply the no-hole rule **per field** (a slice
+  that does not touch a field's cover replaces that field alone), and
+  the cluster-level figures (`covered_days`, the line's `every field
+  over the last Nd`) are what *every* field of the read set covers, with
+  a field's own days beside its count when they differ. The **read set**
+  (`VocabularyIndex.read_set`) is the map's vocabulary fields minus the
+  ones over the cap; `serves` requires every field in it to meet the
+  first-build rule on its own cover (`VOCABULARY_SERVE_DAYS`, inside the
+  gap bound), `behind` is any field in it past the bound.
+  **Backfill**: `plan_vocabulary_slice` computes each field's want by the
+  one-range rules against its own cover (nothing: the newest day; end
+  older than the refresh: one slice forward; else one day back), picks
+  one - fields that do not serve first, then top-ups due, then
+  extension, and within a class the latest end first - and reads
+  together the fields that share it. Fields with identical covers always
+  share a slice, so **an unchanged field set gets exactly the slices and
+  request counts it had**. A field lacking cover is read on slices of its
+  own, newest first; the fields that already have cover are not re-read.
+  A forward slice carries every field whose cover ends before it, so one
+  top-up realigns a backfilled field with the rest: that is those
+  fields' next top-up brought forward, not an extra read. **Cost of a
+  backfill**: that field's first build - a count and a page per 1,000
+  values per slice over `vocabulary.days` slices - and nothing else;
+  cases are refused until the field has two recent days (as for a first
+  build) and run while its older days are read. Visible everywhere a
+  user waits: the VOCAB line, es-login and the `vocabulary_building`
+  refusal carry `BACKFILLING <field> covers Nd, K one-day slices left
+  before it serves and M to the full cover, reading A to B (running |
+  next | last attempt failed)` - field names, counts and ranges, nothing
+  about a query (`VocabularyIndex.backfill`, `esbridge._backfill_note`).
+  **A field that leaves the set** (taken out of `vocabulary.fields`, or
+  counted over the cap after being read) **keeps its names**: they are
+  still applied under the field's own identifier rule (hiding a name
+  already read is the safe direction), its cover stops growing, nothing
+  waits for it, and it expires with its cover after `vocabulary.days`
+  like any other. Reported as `frozen` (field -> its range) in
+  `VocabularyIndex.report` and `EsScrubber.vocabulary_report`, and on the
+  line as `NOT READ NOW (names read before still hidden): field A to B`.
+  Cost: a site that removed a field to make its words readable keeps
+  seeing them hidden until that cover expires (or the file is deleted),
+  and the protection is partial and shrinking, which is why the range
+  is printed. A field whose rule is gone from the map is not applied. A
+  returning over-cap field is read **forward from its own cover** before
+  any case runs, like a cluster that was down for the same time; in the
+  common case that is the top-up every other field is due for by then.
+  **A file saved before this** (`hider.es-vocabulary.v1`, one range, no
+  per-field record) **is not trusted**: it may hold a field read for a
+  few hours and claimed for thirty days, and the file alone cannot say
+  which. Dropped on load (`VocabularyIndex.untrusted`, logged by the
+  broker as `untrusted` with field names and counts), the over-cap
+  decisions kept (dated, they expire on their own), and the next sign-in
+  pays a **first build**: two slices before the first case, the rest in
+  the background - on the es-eval fixture 20 requests and 211 simulated
+  seconds, about eight minutes on the motivating shape. Keeping the
+  names without a cover would hide nothing a case could see, since no
+  case is served until every field is read again.
+  Gate: `field_added_backfilled` (`eseval.run_added_field_eval`, on
+  `eseval.added_docs`, 3,000 job names and 1,500 tenant names over 30
+  days plus a tenant named in text a week ago, in their own index
+  pattern and maps, appended last of all; the real `Broker` on
+  `SteppedSearchTransport`). Before (`merge(one_range=True)`, the
+  measurement switch): the new field claims 30d after a ten-minute
+  top-up, state `ready`, the week-old tenant readable on a page. After:
+  read 0.01d, state `building`, **17 refusals, all `vocabulary_building`,
+  0 requests from the case**, the field named with slices left 2 then 1;
+  served after **2 slices, 4 requests, 53 simulated seconds**; the whole
+  backfill **30 slices, 60 requests, 649 simulated seconds, worst slice
+  37s of 1200s, 0 wide pages, 0 requests on `job.name`**; the name hidden
+  once its day is read, no value in the build log or on any line. The
+  declared window of a first build holds for a backfill too: between
+  serving and the slice that reads its day, the week-old name is
+  readable, and the per-field range on the line is where that shows.
+  Unit cases: `test_esbridge.py`
+  `test_a_field_added_to_an_existing_cover_is_not_claimed_covered_for_days_it_was_not_read`,
+  and in `test_elastic.py` the frozen field, the over-cap route and the
+  untrusted v1 file.
+
   **Declared cost of the cap, new and the sharper one: a real name field
   with more distinct values than `vocabulary.max` is left unread under
   the default field set, so its values stay readable in message text.**
@@ -1054,7 +1143,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 32 pass, and a change that cannot keep them passing
+  MCP endpoint; all 33 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the

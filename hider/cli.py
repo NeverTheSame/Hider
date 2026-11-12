@@ -478,8 +478,11 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
             return 1
         if state.get("state") == "building" and not state.get("serving"):
             print(f"the name vocabulary for {cluster.name} does not yet cover the last "
-                  f"{elastic.VOCABULARY_SERVE_DAYS} days; cases will be refused until it "
-                  "does. The bridge keeps reading - run es-login again to see the progress.")
+                  f"{elastic.VOCABULARY_SERVE_DAYS} days for every field it reads; cases will "
+                  "be refused until it does"
+                  + (f": {esbridge._backfill_note(state['backfill'])}" if state.get("backfill")
+                     else "")
+                  + ". The bridge keeps reading - run es-login again to see the progress.")
             return 1
         return 0
     print(f"timed out: cluster {cluster.name} did not reach Kibana; run es-login again")

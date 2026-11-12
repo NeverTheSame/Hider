@@ -1726,3 +1726,76 @@ def test_a_gap_slice_that_fails_keeps_what_landed_and_is_retried(tmp_path):
     assert broker.pump_vocabulary() and broker._build is not None
     assert broker._build.covered_from == saved.covered_until
     esbridge.clock = eseval.NOW.timestamp
+
+
+# -- a field added to an existing cover ------------------------------------------
+
+def test_a_field_added_to_an_existing_cover_is_not_claimed_covered_for_days_it_was_not_read(tmp_path):
+    """The site read job.name only and holds a 30-day cover. It adds
+    labels.tenant_name, the bridge signs in, and the top-up reads the new
+    field for ten minutes only. A tenant named in message text a week ago
+    was never read: the case must be refused until the new field has its
+    recent days, nothing may claim the field covered for the saved range,
+    and the fields that already had cover are not read again."""
+    engine = eseval.StubEngine(eseval.Fixture(eseval.added_docs(), [], []), (eseval.ADDED_INDEX,))
+    now = eseval.NOW.timestamp()
+    before = eseval.added_map(tenant=False)
+    after = eseval.added_map(tenant=True)
+    index = elastic.VocabularyIndex(tmp_path / "es")
+    index.started_at = now - 60.0
+    old, _b = eseval.build_vocabulary(before, engine, now - 30 * 86400.0, now - 600.0)
+    index.put("stub", old)
+    # the ten-minute top-up under the new map reads both fields
+    top, _b = eseval.build_vocabulary(after, engine, now - 600.0, now)
+    index.put("stub", top)
+    held = index.get("stub")
+    # the saved record says what each field was read for: the new field
+    # ten minutes, the old one thirty days
+    assert held.cover("labels.tenant_name") == (now - 600.0, now)
+    assert held.cover("job.name") == (now - 30 * 86400.0, now)
+    rep = index.report("stub", after, now=now)
+    assert not rep["serving"] and rep["state"] == "building"
+    assert rep["covers"]["labels.tenant_name"][0] == elastic._iso(now - 600.0)
+    assert "labels.tenant_name" in rep["backfill"]
+    line = esbridge.vocabulary_line(rep)
+    assert "labels.tenant_name" in line and "BACKFILL" in line.upper()
+    assert eseval.ADDED_TENANT not in json.dumps(rep) and eseval.ADDED_TENANT not in line
+    b = esbridge.Bridge(after, elastic.EsScrubber(after, tier2="none"), eseval.EngineSession(engine),
+                        log_path=tmp_path / "d.jsonl", index=index)
+    n = len(engine.requests)
+    with pytest.raises(elastic.Refused) as e:
+        b.run("stub", eseval.ADDED_QUERY)
+    assert e.value.code == "vocabulary_building"
+    assert "labels.tenant_name" in e.value.message and "2" in e.value.message
+    assert eseval.ADDED_TENANT not in e.value.message
+    assert len(engine.requests) == n                    # nothing sent
+    # the backfill reads the new field only, one day behind the ten
+    # minutes it has, then the next day; the old field is not in the slice
+    plan = index.next_slice("stub", after, now)
+    assert plan.fields == ("labels.tenant_name",) and plan.kind == "back"
+    assert plan.until == now - 600.0 and plan.start == now - 600.0 - 86400.0
+    by_field = lambda: sum(1 for r in engine.requests[n:]
+                           if "job.name" in json.dumps(r["body"]["query"]))
+    for _ in range(elastic.VOCABULARY_SERVE_DAYS):
+        plan = index.next_slice("stub", after, now)
+        got, _b = eseval.build_slice(after, engine, plan.start, plan.until, fields=plan.fields)
+        index.put("stub", got)
+    assert by_field() == 0
+    assert index.report("stub", after, now=now)["serving"]
+    # two recent days serve, as a first build does; the name from a week
+    # ago is hidden only once the backfill reaches that day, which the
+    # VOCAB line's per-field range makes visible
+    o = b.run("stub", eseval.ADDED_QUERY)
+    assert o.hits_shown >= 1
+    line = esbridge.vocabulary_line(index.report("stub", after, now=now))
+    assert "labels.tenant_name" in line and "extending" in line
+    # read the rest of the backfill: the week-old day lands, the name hides
+    while (plan := index.next_slice("stub", after, now)) is not None:
+        assert plan.fields == ("labels.tenant_name",)
+        got, _b = eseval.build_slice(after, engine, plan.start, plan.until, fields=plan.fields)
+        index.put("stub", got)
+    assert by_field() == 0
+    o = b.run("stub", eseval.ADDED_QUERY)
+    assert o.hits_shown >= 1 and eseval.ADDED_TENANT not in json.dumps(o.output)
+    assert index.get("stub").cover("labels.tenant_name") == index.get("stub").cover("job.name")
+    assert index.report("stub", after, now=now)["state"] == "ready"

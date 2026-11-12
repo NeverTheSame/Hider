@@ -401,3 +401,21 @@ def test_the_gap_gate_measures_the_leak_and_its_close():
     assert r["requests_while_refused"] == 0 and r["top_up_first"]
     assert r["shown_after"] and r["hidden_after"] and r["ten_minutes_serves"]
     assert eseval.GAP_TENANT not in r["line"]
+
+
+def test_the_added_field_gate_measures_the_claim_and_the_backfill():
+    r = eseval.run_added_field_eval()
+    b, a = r["before"], r["after"]
+    assert b["readable"] and b["serving"] and b["claimed_days"] >= eseval.ADDED_DAYS - 1
+    assert a["read_days"] < 1.0 and a["state_before"] == "building"
+    assert a["refusals"] > 0 and a["refused_codes"] == ["vocabulary_building"]
+    assert a["case_requests_while_refused"] == 0 and a["message_names_field"]
+    assert a["first_slices_left"] == elastic.VOCABULARY_SERVE_DAYS and a["slices_left_decreasing"]
+    assert a["serving_slices"] == elastic.VOCABULARY_SERVE_DAYS and a["shown_mid"]
+    # the field that had cover is not read again; the new one pays a first build
+    assert a["job_requests"] == 0 and a["tenant_requests"] == a["requests"] > 0
+    assert a["slices"] == eseval.ADDED_DAYS and a["failed_slices"] == 0 and a["wide_pages"] == 0
+    assert a["new_field_complete"] and a["state_after"] == "ready"
+    assert a["shown_after"] and a["hidden_after"] and a["log_values"] == 0
+    assert "BACKFILLING labels.tenant_name" in a["line_before"]
+    assert eseval.ADDED_TENANT not in "".join(eseval._added_lines(r))

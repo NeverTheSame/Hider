@@ -347,6 +347,9 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
         # last of all, in their own pattern: a tenant first logged in the
         # gap after a saved cover (see gap_docs)
         out.extend(gap_docs())
+        # and after those, in their own pattern and maps: a field added to
+        # an existing cover (see added_docs)
+        out.extend(added_docs())
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
@@ -1625,6 +1628,279 @@ def gap_map() -> elastic.ElasticConfig:
     }, source="gap-fixture")
 
 
+# -- a field added to an existing cover ----------------------------------------
+#: A site map that read ``job.name`` only, with a 30-day cover saved, then
+#: lists ``labels.tenant_name`` too. Under a one-range cover the new field
+#: is read for the ten-minute top-up only and then reported covered for
+#: thirty days; a tenant named in message text last week was never read
+#: and is plain text on a page today. Own index pattern and own maps, so
+#: no other query, build or count pays for these documents.
+ADDED_INDEX = "logs-added-*"
+ADDED_TENANT = "Marlow Ridge Fisheries"
+ADDED_MESSAGE = f"Contract renewal filed for {ADDED_TENANT}, 2 sites affected"
+ADDED_PHRASE = "sites affected"
+ADDED_QUERY = {"index": ADDED_INDEX, "time_range": {"gte": "now-8d", "lte": "now-6d"},
+               "size": 20, "filters": [{"field": "message", "op": "phrase", "value": ADDED_PHRASE}]}
+#: a tenant the top-up does read, so the new field is not empty
+ADDED_RECENT_TENANT = "Quenby Lantern Stores"
+#: job names and tenant names spread evenly over the thirty days, one
+#: document each, so every slice of either field is about one page
+ADDED_JOBS = 3_000
+ADDED_TENANTS = 1_500
+ADDED_DAYS = 30
+
+
+def added_job(i: int) -> str:
+    return f"Marlbrook Sweep {i:05d}"
+
+
+def added_tenant(i: int) -> str:
+    return f"Addenby Holdings {i:04d}"
+
+
+def added_docs() -> list[Doc]:
+    at = lambda h: (NOW - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    span_h = ADDED_DAYS * 24.0 - 1.0
+    return [
+        # the tenant's own record a week ago, and the message naming it
+        Doc(ADDED_INDEX, {"@timestamp": at(24 * 7 + 2), "log": {"level": "info"},
+                          "message": "Inventory refreshed",
+                          "labels": {"tenant_name": ADDED_TENANT}}, {}),
+        Doc(ADDED_INDEX, {"@timestamp": at(24 * 7), "log": {"level": "warn"},
+                          "message": ADDED_MESSAGE,
+                          "labels": {"tenant_name": added_tenant(3)}}, {}),
+        Doc(ADDED_INDEX, {"@timestamp": at(0.1), "log": {"level": "info"},
+                          "message": "Inventory refreshed",
+                          "labels": {"tenant_name": ADDED_RECENT_TENANT}}, {}),
+    ] + [
+        Doc(ADDED_INDEX, {"@timestamp": at(0.5 + i * span_h / ADDED_JOBS),
+                          "log": {"level": "info"}, "message": "Run finished",
+                          "job": {"name": added_job(i)}}, {})
+        for i in range(ADDED_JOBS)
+    ] + [
+        Doc(ADDED_INDEX, {"@timestamp": at(0.7 + i * span_h / ADDED_TENANTS),
+                          "log": {"level": "info"}, "message": "Inventory refreshed",
+                          "labels": {"tenant_name": added_tenant(i)}}, {})
+        for i in range(ADDED_TENANTS)
+    ]
+
+
+def added_map(*, tenant: bool) -> elastic.ElasticConfig:
+    """The site map before (``job.name`` only) and after the site adds
+    ``labels.tenant_name`` to ``vocabulary.fields``."""
+    fields = ["job.name"] + (["labels.tenant_name"] if tenant else [])
+    return elastic.parse({
+        "indices": [ADDED_INDEX], "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "fields": {"@timestamp": "keep", "log.level": "keep", "message": "text",
+                   "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+                   "job.name": {"kind": "identifier", "type": "JOB_NAME"}},
+        "vocabulary": {"fields": fields, "days": ADDED_DAYS},
+    }, source="added-fixture")
+
+
+def run_added_field_eval(*, tier2: str = "none", max_steps: int = 20_000) -> dict:
+    """A field added to a saved 30-day cover, on the real broker.
+
+    Before: the one-range merge (``ClusterVocabulary.merge(one_range=True)``,
+    the measurement switch) folds the ten-minute top-up that first read
+    the new field into the cluster's range, the report says the field is
+    covered for thirty days and ``ready``, and the tenant named in message
+    text a week ago - never read for that field - is plain text on a page.
+    After: the per-field cover says ten minutes; every case is refused
+    with ``vocabulary_building`` naming the field and the slices left
+    (0 requests from the case); the broker backfills that field alone,
+    newest day first, and the field that already had cover costs no
+    request; the case is served after the two recent days, as a first
+    build is; the name is hidden once the backfill reaches its day; and the
+    whole backfill is reported in requests and simulated seconds.
+    """
+    from . import esbridge
+
+    before_map = added_map(tenant=False)
+    after_map = added_map(tenant=True)
+    cluster = elastic.Cluster("stub", "https://kibana-stub.example.net")
+    fx = Fixture(added_docs(), [], [])
+    engine = StubEngine(fx, (ADDED_INDEX,))
+    engine.page_seconds = PAGE_SECONDS
+    engine.wide_page_seconds = WIDE_PAGE_SECONDS
+    now = NOW.timestamp()
+    ten_min_ago = now - 600.0
+    out: dict = {"days": ADDED_DAYS, "budget_s": after_map.vocabulary_budget_s,
+                 "before": {}, "after": {}}
+    # the saved cover: thirty one-day slices of job.name under the old map
+    held: elastic.ClusterVocabulary | None = None
+    while (nxt := elastic.next_vocabulary_slice(before_map, held, ten_min_ago)) is not None:
+        got, _b = build_slice(before_map, engine, *nxt)
+        held = got if held is None else held.merge(got)
+    assert held is not None
+    old = held
+    out["cover_requests"] = len(engine.requests)
+    # the ten-minute top-up under the new map reads both fields
+    top, _b = build_slice(after_map, engine, ten_min_ago, now)
+
+    # -- before: one range for the cluster ----------------------------------
+    one_range = old.merge(top, one_range=True)
+    i0 = elastic.VocabularyIndex(None)
+    i0.started_at = now - 60.0
+    i0.put("stub", one_range)
+    rep0 = i0.report("stub", after_map, now=now)
+    c0 = one_range.cover("labels.tenant_name") or (now, now)
+    b0 = esbridge.Bridge(after_map, elastic.EsScrubber(after_map, tier2=tier2),
+                         EngineSession(engine), index=i0)
+    saved_clock = esbridge.clock
+    esbridge.clock = lambda: now
+    try:
+        try:
+            o0 = b0.run("stub", ADDED_QUERY)
+            readable = ADDED_TENANT in " ".join(_messages(o0.output))
+            refused0 = None
+        except elastic.Refused as e:
+            readable, refused0 = False, e.code
+        out["before"] = {"state": rep0["state"], "serving": rep0["serving"],
+                         "claimed_days": round((c0[1] - c0[0]) / 86400.0, 1),
+                         "readable": readable, "refused": refused0,
+                         "line": esbridge.vocabulary_line(rep0) or ""}
+
+        # -- after: per-field covers on the real broker ----------------------
+        transport = SteppedSearchTransport(engine)
+        tmp = Path(tempfile.mkdtemp(prefix="hider-es-eval-added-"))
+        a: dict = {"read_days": 0.0, "state_before": "", "refusals": 0, "refused_codes": set(),
+                   "case_requests_while_refused": 0, "slices_left_seen": [],
+                   "message_names_field": False, "message_has_value": False,
+                   "serving_slices": 0, "serving_requests": 0, "serving_seconds": 0.0,
+                   "job_requests": 0, "tenant_requests": 0, "shown_mid": False,
+                   "readable_mid": None, "slices": 0, "requests": 0, "seconds": 0.0,
+                   "max_slice_s": 0.0, "wide_pages": 0, "failed_slices": 0, "steps": 0,
+                   "shown_after": False, "hidden_after": False, "new_field_complete": False,
+                   "state_after": "", "log_values": 0, "line_before": "", "line_mid": "",
+                   "line_after": ""}
+        broker = esbridge.Broker(after_map, lambda: transport, poll_interval=0.0, sessions_dir=tmp)
+        broker.open()
+        broker.vocabulary.put("stub", old)
+        broker.vocabulary.put("stub", top)
+        held = broker.vocabulary.get("stub")
+        c1 = held.cover("labels.tenant_name") or (now, now)
+        a["read_days"] = round((c1[1] - c1[0]) / 86400.0, 2)
+        rep1 = broker.vocabulary.report("stub", after_map, now=now)
+        a["state_before"] = rep1["state"]
+        a["line_before"] = esbridge.vocabulary_line(broker.vocabulary_progress("stub")) or ""
+        bridge = esbridge.Bridge(after_map, elastic.EsScrubber(after_map, tier2=tier2),
+                                 EngineSession(engine), index=broker.vocabulary)
+        r1, s1, w1 = len(engine.requests), engine.simulated_seconds, engine.wide_pages
+
+        def field_requests(field: str) -> int:
+            return sum(1 for r in engine.requests[r1:]
+                       if any(f.get("exists", {}).get("field") == field
+                              for f in r["body"].get("query", {}).get("bool", {}).get("filter", [])))
+
+        slice_seconds: list[float] = []
+        slice_start = engine.simulated_seconds
+        last_slices = 0
+        serving_at: int | None = None
+        broker.start_vocabulary(cluster)
+        while a["steps"] < max_steps:
+            if broker.vocabulary.serves("stub", after_map, now) and serving_at is None:
+                serving_at = last_slices
+                a["serving_slices"] = last_slices
+                a["serving_requests"] = len(engine.requests) - r1
+                a["serving_seconds"] = round(engine.simulated_seconds - s1, 1)
+                a["line_mid"] = esbridge.vocabulary_line(broker.vocabulary_progress("stub")) or ""
+                try:
+                    o = bridge.run("stub", ADDED_QUERY)
+                    a["shown_mid"] = o.hits_shown >= 1
+                    # the week-old day is not read for the new field yet:
+                    # the declared window of a first build, reported
+                    a["readable_mid"] = ADDED_TENANT in " ".join(_messages(o.output))
+                except elastic.Refused as e:
+                    a["refused_mid"] = e.code
+            if serving_at is None:
+                n = len(engine.requests)
+                try:
+                    bridge.run("stub", ADDED_QUERY)
+                    a["served_early"] = True
+                except elastic.Refused as e:
+                    a["refusals"] += 1
+                    a["refused_codes"].add(e.code)
+                    a["case_requests_while_refused"] += len(engine.requests) - n
+                    m = re.search(r"labels\.tenant_name covers [\d.]+d, (\d+) one-day slices "
+                                  r"left before it serves and (\d+) to the full cover", e.message)
+                    if m:
+                        a["slices_left_seen"].append(int(m.group(1)))
+                        a["message_names_field"] = True
+                    a["message_has_value"] = a["message_has_value"] or ADDED_TENANT in e.message
+            if not broker.pump_vocabulary():
+                break
+            a["steps"] += 1
+            done = sum(1 for r in broker._build_log if r["vocabulary"] == "slice")
+            if done > last_slices:
+                slice_seconds.append(engine.simulated_seconds - slice_start)
+                slice_start = engine.simulated_seconds
+                last_slices = done
+        a["refused_codes"] = sorted(a["refused_codes"])
+        a["slices"] = last_slices
+        a["failed_slices"] = sum(1 for r in broker._build_log if r["vocabulary"] == "failed")
+        a["seconds"] = round(engine.simulated_seconds - s1, 1)
+        a["max_slice_s"] = round(max(slice_seconds), 1) if slice_seconds else 0.0
+        a["wide_pages"] = engine.wide_pages - w1
+        a["job_requests"] = field_requests("job.name")
+        a["tenant_requests"] = field_requests("labels.tenant_name")
+        # the build's requests: the case's own page requests are not its cost
+        a["requests"] = a["job_requests"] + a["tenant_requests"]
+        a["slices_left_decreasing"] = bool(a["slices_left_seen"]) and a["slices_left_seen"] == sorted(
+            a["slices_left_seen"], reverse=True)
+        a["first_slices_left"] = a["slices_left_seen"][0] if a["slices_left_seen"] else None
+        held = broker.vocabulary.get("stub")
+        # the new field reaches the whole of vocabulary.days on its own
+        # cover (the old field's reaches ten minutes further back: it was
+        # built ten minutes earlier, and nothing re-reads it)
+        a["new_field_complete"] = held is not None and \
+            held.complete(after_map, now, ("labels.tenant_name",))
+        a["one_range_per_field"] = held is not None and all(
+            isinstance(c, tuple) and len(c) == 2 for c in held.covers.values())
+        rep2 = broker.vocabulary.report("stub", after_map, now=now)
+        a["state_after"] = rep2["state"]
+        a["line_after"] = esbridge.vocabulary_line(broker.vocabulary_progress("stub")) or ""
+        try:
+            o = bridge.run("stub", ADDED_QUERY)
+            a["shown_after"] = o.hits_shown >= 1
+            a["hidden_after"] = ADDED_TENANT not in json.dumps(o.output) \
+                and ADDED_PHRASE in " ".join(_messages(o.output))
+        except elastic.Refused as e:
+            a["refused_after"] = e.code
+        planted = (ADDED_TENANT, added_tenant(3), added_job(7), ADDED_RECENT_TENANT)
+        a["log_values"] = sum(1 for r in broker._build_log
+                              if any(v in json.dumps(r) for v in planted))
+        a["log_values"] += sum(1 for v in planted
+                               if v in a["line_before"] + a["line_mid"] + a["line_after"]
+                               or v in out["before"]["line"])
+    finally:
+        esbridge.clock = saved_clock
+    out["after"] = a
+    return out
+
+
+def _added_lines(o: dict | None) -> list[str]:
+    if not o:
+        return []
+    b, a = o["before"], o["after"]
+    return [f"field added to a {o['days']}d cover  one-range merge: the new field claimed "
+            f"{b['claimed_days']}d after a ten-minute top-up, state {b['state']}, the week-old "
+            f"tenant readable on a page {b['readable']}; per-field: read {a['read_days']}d, state "
+            f"{a['state_before']}, {a['refusals']} refusals {a['refused_codes']} with "
+            f"{a['case_requests_while_refused']} requests from the case, the field named "
+            f"{a['message_names_field']}, slices left {a.get('first_slices_left')} first and "
+            f"decreasing {a.get('slices_left_decreasing')}; served after {a['serving_slices']} "
+            f"slices, {a['serving_requests']} requests, {a['serving_seconds']}s (week-old name "
+            f"still readable until its day is read: {a['readable_mid']}); whole backfill "
+            f"{a['slices']} slices ({a['failed_slices']} failed), {a['requests']} requests, "
+            f"{a['seconds']}s, worst slice {a['max_slice_s']}s, {a['wide_pages']} wide pages; "
+            f"requests on the field that had cover {a['job_requests']}, on the new field "
+            f"{a['tenant_requests']}; after: the new field complete {a['new_field_complete']}, state "
+            f"{a['state_after']}, shown {a['shown_after']}, name hidden {a['hidden_after']}; "
+            f"values in the build log or lines {a['log_values']}"]
+
+
 def run_catch_up_eval(*, tier2: str = "none", max_steps: int = 20_000) -> dict:
     """The catch-up after a week down, with the stub charging the slice
     rate over a day and the wide rate over anything wider.
@@ -2522,6 +2798,7 @@ def unmarked_phrases() -> list[str]:
 def build_slice(config: elastic.ElasticConfig, engine: StubEngine,
                 covered_from: float, covered_until: float, *,
                 over_cap: dict[str, dict] | None = None, probe: bool = True,
+                fields: Iterable[str] | None = None,
                 ) -> tuple[elastic.ClusterVocabulary, elastic.VocabularyBuild]:
     """One slice, driven to completion in one call.
 
@@ -2538,7 +2815,7 @@ def build_slice(config: elastic.ElasticConfig, engine: StubEngine,
     """
     build = elastic.VocabularyBuild(config, covered_from, covered_until,
                                     clock=lambda: engine.simulated_seconds,
-                                    over_cap=over_cap, probe=probe)
+                                    over_cap=over_cap, probe=probe, fields=fields)
     while build.pending():
         vq = build.request()["params"]
         build.feed({"isPartial": False, "isRunning": False,
@@ -4015,6 +4292,9 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # es-review over that guessing run and over an ordinary investigation.
     gap = run_gap_eval(tier2="none")
     catch_up = run_catch_up_eval(tier2="none")
+    # A field added to a saved cover: own documents, own maps, the real
+    # broker backfilling that field alone.
+    added_field = run_added_field_eval(tier2="none")
     review = run_review_eval(cfg, engine, vocab, fx, phrase_budget["after"]["case_dir"],
                              tier2=tier2)
 
@@ -4232,6 +4512,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "review": review,
         "gap": gap,
         "catch_up": catch_up,
+        "added_field": added_field,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -4412,6 +4693,30 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and ca["refusals_while_behind"] > 0 and ca["message_names_slices"]
             and ca["first_slices_left"] == GAP_DAYS and ca["slices_left_decreasing"]
             and ca["shown_after"] and ca["hidden_after"] and ca["log_values"] == 0,
+        # A field added to a 30-day cover: under one range it claimed the
+        # whole cover and the week-old tenant was readable; per field it is
+        # read for ten minutes, every case is refused naming the field with
+        # a true, decreasing slices-left count and no request, the broker
+        # backfills that field alone (no request on the field that had
+        # cover), serves after two slices, and hides the name once the
+        # backfill reaches its day.
+        "field_added_backfilled":
+            (ab := added_field["before"])["readable"] and ab["serving"]
+            and ab["claimed_days"] >= added_field["days"] - 1
+            and (aa := added_field["after"])["read_days"] < 1.0
+            and aa["state_before"] == "building"
+            and aa["refusals"] > 0 and aa["refused_codes"] == ["vocabulary_building"]
+            and aa["case_requests_while_refused"] == 0 and not aa.get("served_early")
+            and aa["message_names_field"] and not aa["message_has_value"]
+            and aa["first_slices_left"] == elastic.VOCABULARY_SERVE_DAYS
+            and aa["slices_left_decreasing"]
+            and aa["serving_slices"] == elastic.VOCABULARY_SERVE_DAYS and aa["shown_mid"]
+            and aa["job_requests"] == 0 and aa["tenant_requests"] > 0
+            and aa["failed_slices"] == 0 and aa["wide_pages"] == 0
+            and aa["max_slice_s"] < added_field["budget_s"]
+            and aa["new_field_complete"] and aa["one_range_per_field"]
+            and aa["state_after"] == "ready"
+            and aa["shown_after"] and aa["hidden_after"] and aa["log_values"] == 0,
         "review_flags_guessing":
             review["guessing"]["verdict"] == "flagged"
             and ("zero_hit_phrases" in review["guessing"]["flagged"]
@@ -4702,6 +5007,7 @@ def format_report(r: dict) -> str:
         *_review_lines(r.get("review")),
         *_gap_lines(r.get("gap")),
         *_catch_up_lines(r.get("catch_up")),
+        *_added_lines(r.get("added_field")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "

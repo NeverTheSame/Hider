@@ -1014,14 +1014,24 @@ def test_the_index_saves_the_names_private_to_the_user_and_reloads_them(tmp_path
     assert held is not None and held.counts["job.name"] == 2
     assert held.covered_from == built.covered_from and held.covered_until == built.covered_until
     assert again.get("amer") is None
-    # a second read folds in: the range widens, values are not duplicated
+    # a second read folds in: values are not duplicated, and the cover
+    # grows **for the field that was read** - the others keep their own
+    # range, and the cluster's range is what every field covers
     later = elastic.ClusterVocabulary(built.covered_until, built.covered_until + 600.0,
                                       0.0, {"job.name": ["Harbour Nightly", "Kittiwake"]})
     again.put("emea", later)
     merged = again.get("emea")
     assert merged.counts["job.name"] == 3
+    assert merged.cover("job.name") == (built.covered_from, later.covered_until)
+    assert merged.cover("labels.tenant_name") == (built.covered_from, built.covered_until)
     assert merged.covered_from == built.covered_from
-    assert merged.covered_until == later.covered_until
+    assert merged.covered_until == built.covered_until
+    # the saved file records a range per field and no range for the cluster
+    saved = json.loads(path.read_text())
+    assert saved["schema"] == elastic.VocabularyIndex.SCHEMA
+    entry = saved["clusters"]["emea"]
+    assert "covered_from" not in entry and "covered_until" not in entry
+    assert entry["covers"]["job.name"] == [built.covered_from, later.covered_until]
 
 
 def test_an_unreadable_or_foreign_vocabulary_file_is_ignored_not_trusted(tmp_path):
@@ -1046,6 +1056,13 @@ def test_a_site_with_no_learnable_field_is_ready_not_for_ever_building(tmp_path)
     assert elastic.VocabularyIndex(tmp_path / "es").report("emea", CFG)["state"] == "building"
 
 
+def _cover(cfg, start: float, until: float) -> elastic.ClusterVocabulary:
+    """A slice that read every vocabulary field of ``cfg`` over a range and
+    found nothing: it covers the range for each of them."""
+    return elastic.ClusterVocabulary(start, until, 0.0,
+                                     {r.pattern: [] for r in cfg.vocabulary_rules})
+
+
 def test_the_index_report_is_counts_and_state_never_a_name(tmp_path):
     index = elastic.VocabularyIndex(tmp_path / "es")
     assert index.report("emea", CFG)["state"] == "building"
@@ -1056,14 +1073,16 @@ def test_the_index_report_is_counts_and_state_never_a_name(tmp_path):
     r = index.report("emea", CFG, now=now)
     assert r["state"] == "building" and not r["serving"] and r["fields"]["job.name"] == 1
     assert "Harbour" not in json.dumps(r)
-    # two days is, and the state says the rest is still coming
+    # two days is, and the state says the rest is still coming. A slice
+    # covers the fields it read: one with no fields covers nothing
     index.put("emea", elastic.ClusterVocabulary(now - 2 * 86400.0, now - 86400.0, 0.0, {}))
+    assert not index.report("emea", CFG, now=now)["serving"]
+    index.put("emea", _cover(CFG, now - 2 * 86400.0, now - 86400.0))
     r = index.report("emea", CFG, now=now)
     assert r["state"] == "extending" and r["serving"] and not r["complete"]
     assert r["covered_days"] == 2.0 and r["wanted_days"] == CFG.vocabulary_days
     # the whole of vocabulary.days is "ready"
-    index.put("emea", elastic.ClusterVocabulary(
-        now - CFG.vocabulary_days * 86400.0, now - 2 * 86400.0, 0.0, {}))
+    index.put("emea", _cover(CFG, now - CFG.vocabulary_days * 86400.0, now - 2 * 86400.0))
     full = index.report("emea", CFG, now=now)
     assert full["state"] == "ready" and full["complete"]
     # past the refresh interval a top-up is due, which is not stale: the
@@ -1509,8 +1528,7 @@ def test_a_restarted_bridge_is_not_charged_for_the_time_it_was_down():
     index = elastic.VocabularyIndex(None)
     now = eseval.NOW.timestamp()
     ends = now - 2400.0
-    index.put("emea", elastic.ClusterVocabulary(
-        ends - CFG.vocabulary_days * 86400.0, ends, 0.0, {}))
+    index.put("emea", _cover(CFG, ends - CFG.vocabulary_days * 86400.0, ends))
     # no bridge start known (a bare index): age alone decides, as before
     assert index.report("emea", CFG, now=now)["state"] == "stale"
     index.started_at = now - 60.0          # the bridge came up a minute ago
@@ -1535,14 +1553,21 @@ def test_a_restarted_bridge_is_not_charged_for_the_time_it_was_down():
     assert r["state"] == "catching_up" and not r["serving"] and r["gap"]
 
 
+def _one_field() -> elastic.ElasticConfig:
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"] = {"fields": ["job.name"]}
+    return elastic.parse(raw, source="t")
+
+
 def test_a_saved_cover_never_claims_a_range_with_a_hole():
+    cfg = _one_field()
     index = elastic.VocabularyIndex(None)
     now = eseval.NOW.timestamp()
     d = 86400.0
     assert index.put("c", elastic.ClusterVocabulary(now - 10 * d, now - 7 * d, 0.0,
                                                     {"job.name": ["a"]})) == "new"
     # the next slice forward from the cover's end: one day, contiguous
-    assert elastic.next_vocabulary_slice(CFG, index.get("c"), now) == (now - 7 * d, now - 6 * d)
+    assert elastic.next_vocabulary_slice(cfg, index.get("c"), now) == (now - 7 * d, now - 6 * d)
     assert index.put("c", elastic.ClusterVocabulary(now - 7 * d, now - 6 * d, 0.0,
                                                     {"job.name": ["b"]})) == "merged"
     assert (index.get("c").covered_from, index.get("c").covered_until) == (now - 10 * d, now - 6 * d)
@@ -1551,10 +1576,20 @@ def test_a_saved_cover_never_claims_a_range_with_a_hole():
                                                     {"job.name": ["c"]})) == "replaced"
     assert index.get("c").covered_from == now - d and index.get("c").fields == {"job.name": ["c"]}
     # a ten-minute top-up is one short slice, as before
-    assert elastic.next_vocabulary_slice(CFG, index.get("c"), now + 900) == (now, now + 900)
+    assert elastic.next_vocabulary_slice(cfg, index.get("c"), now + 900) == (now, now + 900)
+    # the rule is per field: a slice for another field that does not touch
+    # its own cover replaces that field only
+    assert index.put("c", elastic.ClusterVocabulary(now - 3 * d, now - 2 * d, 0.0,
+                                                    {"labels.tenant_name": ["t"]})) == "merged"
+    assert index.put("c", elastic.ClusterVocabulary(now - d, now, 0.0,
+                                                    {"labels.tenant_name": ["u"]})) == "replaced"
+    held = index.get("c")
+    assert held.cover("job.name") == (now - d, now) and held.fields["job.name"] == ["c"]
+    assert held.cover("labels.tenant_name") == (now - d, now) and held.fields["labels.tenant_name"] == ["u"]
 
 
 def test_an_expired_cover_is_dropped_and_the_build_starts_fresh():
+    CFG = _one_field()          # one field, so its cover is the cluster's
     index = elastic.VocabularyIndex(None)
     now = eseval.NOW.timestamp()
     d = 86400.0
@@ -1564,7 +1599,7 @@ def test_an_expired_cover_is_dropped_and_the_build_starts_fresh():
     cu = index.catch_up("c", CFG, now)
     assert cu["expired"] and cu["slices_left"] == elastic.VOCABULARY_SERVE_DAYS
     assert elastic.next_vocabulary_slice(CFG, old, now) == (now - d, now)
-    assert index.drop_expired("c", CFG, now) is old and index.get("c") is None
+    assert index.drop_expired("c", CFG, now) == {"job.name": 1} and index.get("c") is None
     assert index.drop_expired("c", CFG, now) is None
     # a cover that only partly fell out of the window is kept and read forward
     part = elastic.ClusterVocabulary(now - 40 * d, now - 5 * d, 0.0, {"job.name": ["y"]})
@@ -1576,3 +1611,120 @@ def test_an_expired_cover_is_dropped_and_the_build_starts_fresh():
     index.catch_up_from["c"] = now - 7 * d
     assert index.catch_up("c", CFG, now)["slices_total"] == 7
     assert "y" not in json.dumps(index.catch_up("c", CFG, now))
+
+
+# -- covers are kept per field --------------------------------------------------
+
+def test_a_field_that_leaves_the_set_keeps_its_names_frozen_and_is_reported(tmp_path):
+    """Removed from vocabulary.fields (or over the cap after being read):
+    the names already read stay known - hiding more is the safe direction -
+    the cover stops growing, nothing waits for the field, and every surface
+    says so with the field's own range. It expires with its cover like any
+    other field."""
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    both = elastic.parse({**json.loads(elastic.EXAMPLE.read_text()),
+                          "vocabulary": {"fields": ["job.name", "labels.tenant_name"]}}, source="t")
+    only = _one_field()
+    index = elastic.VocabularyIndex(tmp_path / "es")
+    index.started_at = now - 60.0
+    index.put("emea", elastic.ClusterVocabulary(
+        now - 30 * d, now, 0.0, {"job.name": ["Harbour Nightly"],
+                                 "labels.tenant_name": ["Thornbury Estates"]}))
+    # the site takes the tenant field out: nothing to read for it, and
+    # nothing waited for
+    assert index.read_set("emea", only, now) == ("job.name",)
+    assert index.next_slice("emea", only, now) is None
+    r = index.report("emea", only, now=now)
+    assert r["state"] == "ready" and r["serving"]
+    assert list(r["fields"]) == ["job.name"]
+    assert r["frozen"] == {"labels.tenant_name": [elastic._iso(now - 30 * d), elastic._iso(now)]}
+    assert "labels.tenant_name" in r["omitted"]
+    from hider import esbridge
+    line = esbridge.vocabulary_line(r)
+    assert "NOT READ NOW (names read before still hidden): labels.tenant_name" in line
+    assert "Thornbury" not in line and "Thornbury" not in json.dumps(r)
+    # the names are still applied under the field's own rule
+    s = elastic.EsScrubber(only, tier2="none")
+    s.apply_vocabulary("emea", index.get("emea"))
+    assert "thornbury estates" in s.known and "labels.tenant_name" in s.vocabulary_report()["frozen"]
+    assert "labels.tenant_name" not in s.vocabulary_report()["fields"]
+    # a week on, with job.name topped up, the frozen field is a week
+    # behind the bound: still not waited for
+    index.put("emea", elastic.ClusterVocabulary(now, now + 7 * d, 0.0, {"job.name": []}))
+    assert index.report("emea", only, now=now + 7 * d + 1)["state"] == "ready"
+    # listed again: its cover is a week behind, so it is caught up forward
+    # before any case runs, like a cluster that was down a week
+    assert index.next_slice("emea", both, now + 7 * d + 1).fields == ("labels.tenant_name",)
+    assert index.report("emea", both, now=now + 7 * d + 1)["state"] == "catching_up"
+    # past vocabulary.days, the frozen field expires like any other
+    assert index.drop_expired("emea", only, now + 31 * d) == {"labels.tenant_name": 1}
+    assert index.get("emea").fields == {"job.name": ["Harbour Nightly"]}
+
+
+def test_a_default_set_field_over_the_cap_after_being_read_is_frozen_not_claimed(tmp_path):
+    """The second route: a default-set field read for a day, then counted
+    over the cap. It leaves the read set with the day it has; cases are
+    served on the other fields; and when the decision expires it is read
+    forward from its own cover, never claimed for the days in between."""
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    del raw["vocabulary"]
+    cfg = elastic.parse(raw, source="t")
+    index = elastic.VocabularyIndex(tmp_path / "es")
+    index.started_at = now - 60.0
+    index.put("emea", _cover(cfg, now - 30 * d, now))
+    index.note_over_cap("emea", "labels.site_name", 70_000, now)
+    assert "labels.site_name" not in index.read_set("emea", cfg, now)
+    r = index.report("emea", cfg, now=now)
+    assert r["serving"] and r["over_cap"] == {"labels.site_name": 70_000}
+    assert "labels.site_name" in r["frozen"] and "labels.site_name" not in r["fields"]
+    # a day later the decision has expired and the field is read again:
+    # forward from where its own cover ends, in the top-up every other
+    # field is due for by then (one slice, as a top-up always was)
+    later = now + elastic.VOCABULARY_OVER_CAP_S + 1
+    assert "labels.site_name" in index.read_set("emea", cfg, later)
+    plan = index.next_slice("emea", cfg, later)
+    assert "labels.site_name" in plan.fields and plan.kind == "forward"
+    assert plan.start == now and plan.until == now + d
+    # had the others been topped up a minute earlier, the forward slice
+    # still starts where its own cover ends and carries them along for the
+    # minute they are short: that is their next top-up, brought forward,
+    # not an extra read - and it leaves every field ending together
+    index.put("emea", elastic.ClusterVocabulary(
+        now, later - 60.0, 0.0,
+        {r.pattern: [] for r in cfg.vocabulary_rules if r.pattern != "labels.site_name"}))
+    plan = index.next_slice("emea", cfg, later)
+    assert "labels.site_name" in plan.fields and plan.kind == "forward"
+    assert plan.start == now and plan.until == now + d
+    index.put("emea", elastic.ClusterVocabulary(now, now + d, 0.0, {f: [] for f in plan.fields}))
+    assert len({c[1] for c in index.get("emea").covers.values()}) == 1
+    assert index.report("emea", cfg, now=later)["covers_days"]["labels.site_name"] == 31.0
+
+
+def test_a_vocabulary_file_with_one_range_is_not_trusted(tmp_path):
+    """Saved before covers were kept per field: one range, no way to tell
+    which field was read for all of it. Dropped, with field names and
+    counts left for the broker's log; a first build follows."""
+    d = tmp_path / "es"
+    d.mkdir(mode=0o700)
+    (d / elastic.VocabularyIndex.FILENAME).write_text(json.dumps({
+        "schema": elastic.VocabularyIndex.SCHEMA_V1,
+        "clusters": {"emea": {"covered_from": 0.0, "covered_until": 30 * 86400.0,
+                              "fields": {"job.name": ["Harbour Nightly"],
+                                         "labels.tenant_name": ["Thornbury Estates", "Quillon AG"]}}},
+        "over_cap": {"emea": {"labels.site_name": {"count": 70_000, "at": 1.0}}}}))
+    index = elastic.VocabularyIndex(d)
+    assert index.clusters == {}
+    assert index.untrusted["emea"] == {"schema": elastic.VocabularyIndex.SCHEMA_V1,
+                                       "fields": {"job.name": 1, "labels.tenant_name": 2},
+                                       "covered_days": 30.0}
+    assert "Thornbury" not in json.dumps(index.untrusted)
+    assert index.over_cap["emea"]["labels.site_name"]["count"] == 70_000   # dated, kept
+    assert index.report("emea", CFG, now=1.0)["state"] == "building"
+    assert elastic.next_vocabulary_slice(CFG, None, 1.0) is not None       # a first build
+    # the next save rewrites the file in the new schema
+    index.save()
+    assert json.loads((d / elastic.VocabularyIndex.FILENAME).read_text())["schema"] \
+        == elastic.VocabularyIndex.SCHEMA

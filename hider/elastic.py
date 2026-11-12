@@ -65,7 +65,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import entities, jsonscrub, localcfg, paths, pipeline, pseudonym
 
@@ -816,8 +816,10 @@ class EsScrubber(jsonscrub.JsonScrubber):
         #: read, and the last read's counts (values per field, skipped by
         #: reason): counts only, for the log and the site's view of its caps
         self._vocab_rules = list(config.vocabulary_rules)
-        self._vocabulary_at: dict[str, float] = {}
+        #: cluster -> (when applied, the per-field covers applied)
+        self._vocabulary_at: dict[str, tuple] = {}
         self.vocabulary_counts: dict[str, int] = {}
+        self.vocabulary_covers: dict[str, tuple[float, float]] = {}
         self.vocabulary_skipped: dict[str, int] = {}
         #: fields the build counted and did not read, field -> distinct
         #: count. Their values stay readable in message text.
@@ -1045,8 +1047,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
         stay readable in message text and why.
         """
         self.vocabulary_over_cap = dict(over_cap or {})
-        return self._learn_vocabulary(cluster, vocab.fields, now=now,
-                                      covers=(vocab.covered_from, vocab.covered_until))
+        return self._learn_vocabulary(cluster, vocab.fields, now=now, covers=vocab.covers)
 
     def vocabulary_applied(self, cluster: str) -> bool:
         return not self._vocab_rules or cluster in self._vocabulary_at
@@ -1075,14 +1076,28 @@ class EsScrubber(jsonscrub.JsonScrubber):
 
     def _learn_vocabulary(self, cluster: str, values: dict[str, list[str]],
                           now: float | None = None,
-                          covers: tuple[float | None, float | None] | None = None
+                          covers: dict[str, tuple[float, float]] | None = None
                           ) -> dict[str, int]:
         """Make every name a build returned a known value. Called by
-        :meth:`apply_vocabulary`, never from a transport."""
+        :meth:`apply_vocabulary`, never from a transport.
+
+        A field the index holds that the map no longer reads (taken out of
+        ``vocabulary.fields``, or counted over the cap) is applied too, under
+        its own identifier rule, as long as the map still has one: hiding a
+        name already read is the safe direction, and the report says the
+        field is ``frozen`` so nobody takes it for protection that grows.
+        A field with no identifier rule left in the map is skipped."""
         counts: dict[str, int] = {}
         skipped: dict[str, int] = {}
         learnt: list[tuple[FieldRule, str]] = []
-        for rule in self._vocab_rules:
+        rules = list(self._vocab_rules)
+        reading = {r.pattern for r in rules}
+        for f in values:
+            r = self.config.rule(f) if f not in reading else None
+            if r is not None and r.kind == "identifier" and not r.is_glob \
+                    and r.shape is None and r.type not in NO_VOCABULARY_TYPES:
+                rules.append(r)
+        for rule in rules:
             got = values.get(rule.pattern, [])
             counts[rule.pattern] = len(got)
             for key in got:
@@ -1098,8 +1113,8 @@ class EsScrubber(jsonscrub.JsonScrubber):
             core = jsonscrub._LEGAL_SUFFIX.sub("", key.strip())
             self.label_for(rule, key, parts=core == key.strip() or not self.vocabulary_skip(core))
         at = time.monotonic() if now is None else now
-        lo, hi = covers if covers is not None else (None, None)
-        self._vocabulary_at[cluster] = (at, lo, hi)
+        self.vocabulary_covers = dict(covers or {})
+        self._vocabulary_at[cluster] = (at, dict(self.vocabulary_covers))
         self.vocabulary_counts, self.vocabulary_skipped = counts, skipped
         return counts
 
@@ -1110,12 +1125,21 @@ class EsScrubber(jsonscrub.JsonScrubber):
         (``over_cap``, with the count that decided it)."""
         cap = self.config.vocabulary_max
         over_cap = dict(self.vocabulary_over_cap)
-        return {"fields": {f: n for f, n in self.vocabulary_counts.items() if f not in over_cap},
+        reading = {r.pattern for r in self._vocab_rules} - set(over_cap)
+        covers = dict(self.vocabulary_covers)
+        return {"fields": {f: n for f, n in self.vocabulary_counts.items() if f in reading},
                 "max": cap,
                 "near_cap": sorted(f for f, n in self.vocabulary_counts.items()
-                                   if n >= VOCABULARY_NEAR_CAP * cap and f not in over_cap),
+                                   if n >= VOCABULARY_NEAR_CAP * cap and f in reading),
                 "skipped": dict(self.vocabulary_skipped),
                 "over_cap": over_cap,
+                # each field's own range, and the fields applied from a
+                # cover that no longer grows (left out of the map's list or
+                # over the cap after being read): names kept, protection
+                # reaching only as far as the range says
+                "covers": {f: [_iso(a), _iso(b)] for f, (a, b) in covers.items()},
+                "frozen": {f: [_iso(a), _iso(b)] for f, (a, b) in covers.items()
+                           if f not in reading},
                 "omitted": list(self.config.vocabulary_omitted)}
 
     # -- the response ------------------------------------------------------
@@ -1671,6 +1695,28 @@ class EsScrubber(jsonscrub.JsonScrubber):
         return s
 
 
+@dataclass(frozen=True)
+class VocabularySlice:
+    """What the build reads next: one range, and the fields read over it.
+
+    ``kind`` says why: ``first`` (a field with no cover at all, read newest
+    day first as a first build is), ``forward`` (a top-up or catch-up from
+    the end of a cover) or ``back`` (one more day behind a cover). Fields
+    whose covers are identical always share a slice, which is what keeps
+    an unchanged field set on exactly the slices and request counts it had
+    before covers were kept per field.
+    """
+
+    start: float
+    until: float
+    fields: tuple[str, ...]
+    kind: str
+
+    @property
+    def range(self) -> tuple[float, float]:
+        return (self.start, self.until)
+
+
 @dataclass
 class ClusterVocabulary:
     """What one cluster's name vocabulary holds, and what it covers.
@@ -1679,12 +1725,39 @@ class ClusterVocabulary:
     These are **real customer names**, so this object is only ever written
     to the vocabulary file (0600 under the sessions directory, gitignored)
     and never to a log, a report or anything Claude sees.
+
+    **The cover is kept per field** (``covers``: field -> one range, no
+    hole). It used to be one range for the cluster, and merging took the
+    widest: a field that started being read after a cover existed - a
+    field the site added to ``vocabulary.fields``, or a default-set field
+    counted over the cap one day and under it the next - was read for the
+    ten-minute top-up and then reported covered for thirty days, so a name
+    in that field from last week was plain text in message text under a
+    ``ready`` status. Now nothing claims a field covered for a day it was
+    not read: not this object, not the saved file, not a report.
+    ``covered_from`` / ``covered_until`` on a slice result are the range
+    the slice read; on a held (merged) vocabulary they are the range
+    **every** held field covers, derived from ``covers``, and the per-field
+    record is what the planner, the gates and the reports read.
     """
 
     covered_from: float
     covered_until: float
     built_at: float = 0.0
     fields: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    covers: dict[str, tuple[float, float]] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.covers:
+            # a slice result: every field it read was read over its range
+            self.covers = {f: (self.covered_from, self.covered_until) for f in self.fields}
+            return
+        self.covers = {f: (float(a), float(b)) for f, (a, b) in self.covers.items()}
+        for f in self.fields:
+            self.covers.setdefault(f, (self.covered_from, self.covered_until))
+        # the range every held field covers; the record is ``covers``
+        self.covered_from = max(a for a, _ in self.covers.values())
+        self.covered_until = min(b for _, b in self.covers.values())
 
     @property
     def counts(self) -> dict[str, int]:
@@ -1693,63 +1766,140 @@ class ClusterVocabulary:
     def total(self) -> int:
         return sum(len(v) for v in self.fields.values())
 
-    def merge(self, other: "ClusterVocabulary") -> "ClusterVocabulary":
-        """Fold a top-up into what is already known, keeping order and
-        dropping values already held."""
+    def cover(self, field: str) -> tuple[float, float] | None:
+        """The one range this field was read over, or None."""
+        return self.covers.get(field)
+
+    def until_over(self, read: Iterable[str]) -> float | None:
+        """Where the cover ends for the fields in ``read`` that have one:
+        the earliest end, which is where a top-up or catch-up starts."""
+        ends = [self.covers[f][1] for f in read if f in self.covers]
+        return min(ends) if ends else None
+
+    def merge(self, other: "ClusterVocabulary", *, one_range: bool = False) -> "ClusterVocabulary":
+        """Fold a slice into what is already known, **per field**: a slice
+        that touches a field's cover extends it (values added once, order
+        kept); one that does not **replaces** that field's values and
+        cover, because a field's saved cover never claims a range with a
+        hole in it. A field only one side holds is carried.
+
+        ``one_range`` is a measurement switch, set by nothing in the live
+        path: every field's cover becomes the widest range either side
+        held, which is what the one-range merge did. ``es-eval`` uses it
+        for the "before" half of the added-field figure.
+        """
         fields = {f: list(v) for f, v in self.fields.items()}
+        covers = dict(self.covers)
         for f, values in other.fields.items():
-            have = set(fields.setdefault(f, []))
-            fields[f] += [v for v in values if v not in have and not have.add(v)]
-        return ClusterVocabulary(min(self.covered_from, other.covered_from),
-                                 max(self.covered_until, other.covered_until),
-                                 other.built_at or self.built_at, fields)
+            oc = other.covers.get(f, (other.covered_from, other.covered_until))
+            hc = covers.get(f)
+            if hc is not None and oc[0] <= hc[1] + 1.0 and oc[1] >= hc[0] - 1.0:
+                have = set(fields.setdefault(f, []))
+                fields[f] += [v for v in values if v not in have and not have.add(v)]
+                covers[f] = (min(hc[0], oc[0]), max(hc[1], oc[1]))
+            else:
+                fields[f] = list(values)
+                covers[f] = oc
+        lo = min(self.covered_from, other.covered_from)
+        hi = max(self.covered_until, other.covered_until)
+        if one_range:
+            covers = {f: (lo, hi) for f in covers}
+        return ClusterVocabulary(lo, hi, other.built_at or self.built_at, fields, covers)
 
-    def covered_days(self, now: float) -> float:
-        """How far back the cover reaches from ``now``, in days. What the
-        VOCAB line shows and the only thing a user can use to know whether
-        a name from a given day can be known at all."""
-        return max(0.0, (self.covered_until - self.covered_from) / 86400.0)
+    def replaces(self, other: "ClusterVocabulary") -> bool:
+        """Whether folding ``other`` in would replace any field's cover
+        rather than extend it (see :meth:`merge`)."""
+        for f in other.fields:
+            hc, oc = self.covers.get(f), other.covers.get(f, (other.covered_from, other.covered_until))
+            if hc is not None and not (oc[0] <= hc[1] + 1.0 and oc[1] >= hc[0] - 1.0):
+                return True
+        return False
 
-    def serves(self, config: "ElasticConfig", now: float) -> bool:
+    def _read(self, config: "ElasticConfig", read: Iterable[str] | None) -> tuple[str, ...]:
+        return tuple(read) if read is not None else tuple(r.pattern for r in config.vocabulary_rules)
+
+    def covered_days(self, now: float, read: Iterable[str] | None = None) -> float:
+        """How many days **every** field in ``read`` (default: every field
+        held) is covered for: the least of the per-field covers, and zero
+        if one of them has no cover at all. What the VOCAB line shows as
+        the cluster's figure; the per-field figures sit beside it."""
+        fields = tuple(read) if read is not None else tuple(self.covers)
+        if not fields:
+            return max(0.0, (self.covered_until - self.covered_from) / 86400.0)
+        days = []
+        for f in fields:
+            c = self.covers.get(f)
+            if c is None:
+                return 0.0
+            days.append(max(0.0, (c[1] - c[0]) / 86400.0))
+        return min(days)
+
+    def field_serves(self, field: str, config: "ElasticConfig", now: float) -> bool:
+        """The first-build rule, for one field: its cover reaches back
+        :data:`VOCABULARY_SERVE_DAYS` and its end is inside the gap bound."""
+        c = self.covers.get(field)
+        if c is None:
+            return False
+        want = min(VOCABULARY_SERVE_DAYS * 86400.0, config.vocabulary_days * 86400.0)
+        return c[1] - c[0] >= want - 1.0 and now - c[1] <= vocabulary_max_gap(config)
+
+    def serves(self, config: "ElasticConfig", now: float,
+               read: Iterable[str] | None = None) -> bool:
         """Whether a case may be served from this cover.
 
-        The recent slices are enough: they are what a case asks about, and
-        waiting for the whole retention period means waiting hours. A name
-        logged only in a day not yet covered is **not known** until the
-        build reaches it - stated in AGENTS.md and visible on the VOCAB
-        line as the covered range.
+        **Every field in ``read``** (default: every vocabulary field of the
+        map; the index passes the read set, which leaves out fields over
+        the cap) must meet the rule a first build meets: the recent
+        :data:`VOCABULARY_SERVE_DAYS` covered, and the end inside
+        :func:`vocabulary_max_gap`. The recent slices are enough: they are
+        what a case asks about, and waiting for the whole retention period
+        means waiting hours. A name logged only in a day not yet covered
+        for its field is **not known** until the build reaches it - stated
+        in AGENTS.md and visible on the VOCAB line as each field's range.
         """
-        want = min(VOCABULARY_SERVE_DAYS * 86400.0, config.vocabulary_days * 86400.0)
-        # How far back the cover reaches, and how far behind now its end
-        # is. A cover a few minutes behind is served (stale past the
-        # refresh, with its age on the VOCAB line) - the trade the
-        # ten-minute refresh accepted. Past vocabulary_max_gap it is not: a
-        # name first logged in the gap has never been read, and no time
-        # range a query names can keep it off a page (see AGENTS.md).
-        return (self.covered_until - self.covered_from >= want - 1.0
-                and not self.behind(config, now))
+        return all(self.field_serves(f, config, now) for f in self._read(config, read))
 
-    def behind(self, config: "ElasticConfig", now: float) -> bool:
-        """The cover ends further back than :func:`vocabulary_max_gap`."""
-        return now - self.covered_until > vocabulary_max_gap(config)
+    def behind(self, config: "ElasticConfig", now: float,
+               read: Iterable[str] | None = None) -> bool:
+        """Some field in ``read`` has a cover that ends further back than
+        :func:`vocabulary_max_gap`. A field with no cover is not behind, it
+        is backfilled (see :func:`plan_vocabulary_slice`)."""
+        bound = vocabulary_max_gap(config)
+        return any(f in self.covers and now - self.covers[f][1] > bound
+                   for f in self._read(config, read))
 
-    def complete(self, config: "ElasticConfig", now: float) -> bool:
-        """Whether the cover reaches the whole of ``vocabulary.days``."""
-        return self.covered_from <= now - config.vocabulary_days * 86400.0 + 1.0
+    def complete(self, config: "ElasticConfig", now: float,
+                 read: Iterable[str] | None = None) -> bool:
+        """Whether every field in ``read`` reaches the whole of
+        ``vocabulary.days``."""
+        oldest = now - config.vocabulary_days * 86400.0 + 1.0
+        return all(f in self.covers and self.covers[f][0] <= oldest
+                   for f in self._read(config, read))
 
     def to_json(self) -> dict:
-        return {"covered_from": self.covered_from, "covered_until": self.covered_until,
-                "built_at": self.built_at, "fields": self.fields}
+        # per-field covers only: a cluster-level range would be a claim
+        # about fields it was not read for
+        return {"built_at": self.built_at, "fields": self.fields,
+                "covers": {f: [a, b] for f, (a, b) in self.covers.items()}}
 
     @classmethod
     def from_json(cls, raw: Any) -> "ClusterVocabulary | None":
         if not isinstance(raw, dict):
             return None
         try:
+            covers = {str(f): (float(c[0]), float(c[1]))
+                      for f, c in (raw.get("covers") or {}).items()
+                      if isinstance(c, (list, tuple)) and len(c) == 2}
+            # a field with values but no cover is a claim with nothing
+            # behind it: dropped rather than guessed
             fields = {str(f): [v for v in vs if isinstance(v, str)]
-                      for f, vs in (raw.get("fields") or {}).items() if isinstance(vs, list)}
-            return cls(float(raw["covered_from"]), float(raw["covered_until"]),
-                       float(raw.get("built_at") or 0.0), fields)
+                      for f, vs in (raw.get("fields") or {}).items()
+                      if isinstance(vs, list) and str(f) in covers}
+            if not covers:
+                return None
+            lo = min(a for a, _ in covers.values())
+            hi = max(b for _, b in covers.values())
+            return cls(lo, hi, float(raw.get("built_at") or 0.0), fields, covers)
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -1762,10 +1912,22 @@ class VocabularyIndex:
     names, so it lives under the sessions directory (gitignored), its
     directory is 0700 and the file is 0600, and nothing else in the system
     reads it - a log line, a report or a reply to Claude carries counts.
+
+    **A file written before covers were kept per field (schema v1) is not
+    trusted.** It holds one range for the cluster and cannot say which
+    field was read for all of it and which for a few hours; trusting the
+    range for every field is exactly the claim that left a name readable
+    under ``ready``, and no part of it can be told safe from the file
+    alone. It is dropped on load (``untrusted`` carries field names and
+    counts for the broker's log) and the next sign-in pays a first build:
+    two slices before the first case, the rest behind it - the cost a
+    first bridge paid.
     """
 
     FILENAME = "vocabulary.json"
-    SCHEMA = "hider.es-vocabulary.v1"
+    SCHEMA = "hider.es-vocabulary.v2"
+    #: one range per cluster, no per-field record: never loaded
+    SCHEMA_V1 = "hider.es-vocabulary.v1"
 
     def __init__(self, directory: str | Path | None) -> None:
         self.directory = Path(directory) if directory is not None else None
@@ -1778,16 +1940,21 @@ class VocabularyIndex:
         #: requests. Counts and field names, never a value.
         self.over_cap: dict[str, dict[str, dict]] = {}
         #: Runtime only, set by the broker, never saved: when this bridge
-        #: started, which clusters have a top-up or slice in flight, and
-        #: which cluster's last slice failed and why. The state line reads
-        #: them so a bridge is not charged for the time it was not running
-        #: (see :meth:`report`).
+        #: started, which clusters have a top-up or slice in flight (and
+        #: which fields that slice reads), and which cluster's last slice
+        #: failed and why. The state line reads them so a bridge is not
+        #: charged for the time it was not running (see :meth:`report`).
         self.started_at: float | None = None
         self.in_progress: set[str] = set()
+        self.building: dict[str, tuple[str, ...]] = {}
         self.failed: dict[str, str] = {}
         #: cluster -> where the cover ended when this bridge found it behind
         #: the bound: what "slices total" on the progress line counts from
         self.catch_up_from: dict[str, float] = {}
+        #: cluster -> ``{"fields": {field: count}, "schema": ...}`` for a
+        #: saved file this index refused to trust (see the class docstring);
+        #: the broker logs and clears it. Counts and names of fields only.
+        self.untrusted: dict[str, dict] = {}
         self.load()
 
     @property
@@ -1797,62 +1964,132 @@ class VocabularyIndex:
     def get(self, cluster: str) -> ClusterVocabulary | None:
         return self.clusters.get(cluster)
 
+    def read_set(self, cluster: str, config: ElasticConfig, now: float) -> tuple[str, ...]:
+        """The fields the build reads for a cluster right now: the map's
+        vocabulary fields minus the ones counted over the cap. A field that
+        leaves this set keeps the names it was read for (see
+        :meth:`report`, ``frozen``) and is neither read nor waited for."""
+        over = self.over_cap_fields(cluster, now)
+        return tuple(r.pattern for r in config.vocabulary_rules if r.pattern not in over)
+
+    def serves(self, cluster: str, config: ElasticConfig, now: float) -> bool:
+        read = self.read_set(cluster, config, now)
+        held = self.clusters.get(cluster)
+        if not read:
+            return True
+        return held is not None and held.serves(config, now, read)
+
+    def next_slice(self, cluster: str, config: ElasticConfig, now: float) -> VocabularySlice | None:
+        """What the build reads next for a cluster, over its read set."""
+        return plan_vocabulary_slice(config, self.clusters.get(cluster), now,
+                                     self.read_set(cluster, config, now))
+
     def put(self, cluster: str, vocab: ClusterVocabulary) -> str:
-        """Fold a finished slice in. ``merged`` when it touches the held
-        cover, ``new`` when nothing was held, ``replaced`` when it does not
-        touch it - the held cover is dropped rather than bridged, because a
-        saved cover never claims a range with a hole in it."""
+        """Fold a finished slice in, field by field. ``merged`` when every
+        field it read touches that field's held cover, ``new`` when nothing
+        was held, ``replaced`` when some field's cover did not touch - that
+        field's held cover is dropped rather than bridged, because a saved
+        cover never claims a range with a hole in it."""
         held = self.clusters.get(cluster)
         if held is None:
             self.clusters[cluster] = vocab
             how = "new"
-        elif vocab.covered_from <= held.covered_until + 1.0 \
-                and vocab.covered_until >= held.covered_from - 1.0:
-            self.clusters[cluster] = held.merge(vocab)
-            how = "merged"
         else:
-            self.clusters[cluster] = vocab
-            how = "replaced"
+            how = "replaced" if held.replaces(vocab) else "merged"
+            self.clusters[cluster] = held.merge(vocab)
         self.save()
         return how
 
-    def drop_expired(self, cluster: str, config: ElasticConfig, now: float) -> ClusterVocabulary | None:
-        """Drop a cover that ends before ``vocabulary.days`` reaches: every
-        day it covers is one nobody asks about, and reading forward from it
-        would spend slices on those days before any case could run. The
-        build then starts as a first build does (newest day first, cases
-        after two). Returns what was dropped, for the log's counts."""
+    def drop_expired(self, cluster: str, config: ElasticConfig, now: float) -> dict[str, int] | None:
+        """Drop every field whose cover ends before ``vocabulary.days``
+        reaches: every day it covers is one nobody asks about, and reading
+        forward from it would spend slices on those days before any case
+        could run. Such a field is then built as a first build is (newest
+        day first). Returns the dropped fields with their value counts, for
+        the log, or None. A cluster left with no field is dropped whole."""
         held = self.clusters.get(cluster)
-        if held is None or held.covered_until >= now - config.vocabulary_days * 86400.0:
+        if held is None:
             return None
-        del self.clusters[cluster]
-        self.catch_up_from.pop(cluster, None)
+        oldest = now - config.vocabulary_days * 86400.0
+        gone = {f: len(held.fields.get(f, [])) for f, (_a, b) in held.covers.items() if b < oldest}
+        if not gone:
+            return None
+        covers = {f: c for f, c in held.covers.items() if f not in gone}
+        if not covers:
+            del self.clusters[cluster]
+            self.catch_up_from.pop(cluster, None)
+        else:
+            self.clusters[cluster] = ClusterVocabulary(
+                held.covered_from, held.covered_until, held.built_at,
+                {f: v for f, v in held.fields.items() if f not in gone}, covers)
         self.save()
-        return held
+        return gone
 
     def catch_up(self, cluster: str, config: ElasticConfig, now: float) -> dict | None:
         """Where the catch-up stands, for the VOCAB line, es-login and the
-        refusal: counts and ranges only. None when the cover is not behind
-        the bound. The numbers are what the broker will do next: slices of
-        ``VOCABULARY_SLICE_S`` forward from the cover's end, or a fresh first
-        build when the cover has expired."""
+        refusal: counts and ranges only. None when no field of the read set
+        is behind the bound. The numbers are what the broker will do next:
+        slices of ``VOCABULARY_SLICE_S`` forward from the earliest end
+        among the fields behind, or a fresh first build when the cover has
+        expired."""
         held = self.clusters.get(cluster)
-        if held is None or not held.behind(config, now):
+        read = self.read_set(cluster, config, now)
+        if held is None or not held.behind(config, now, read):
             return None
+        bound = vocabulary_max_gap(config)
+        behind = [f for f in read if f in held.covers and now - held.covers[f][1] > bound]
+        until = min(held.covers[f][1] for f in behind)
         oldest = now - config.vocabulary_days * 86400.0
-        if held.covered_until < oldest:
+        if until < oldest:
             days = min(VOCABULARY_SERVE_DAYS, config.vocabulary_days)
             first = next_vocabulary_slice(config, None, now) or (now, now)
             return {"expired": True, "slices_left": days, "slices_total": days,
+                    "fields": behind,
                     "reading": [_iso(first[0]), _iso(first[1])],
                     "running": cluster in self.in_progress, "failed": self.failed.get(cluster)}
-        left = max(1, math.ceil((now - held.covered_until - 1.0) / VOCABULARY_SLICE_S))
-        since = self.catch_up_from.get(cluster, held.covered_until)
+        left = max(1, math.ceil((now - until - 1.0) / VOCABULARY_SLICE_S))
+        since = self.catch_up_from.get(cluster, until)
         total = max(left, math.ceil((now - since - 1.0) / VOCABULARY_SLICE_S))
-        nxt = next_vocabulary_slice(config, held, now) or (held.covered_until, now)
+        nxt = (until, min(now, until + VOCABULARY_SLICE_S))
         return {"expired": False, "slices_left": left, "slices_total": total,
+                "fields": behind,
                 "reading": [_iso(nxt[0]), _iso(nxt[1])],
-                "running": cluster in self.in_progress, "failed": self.failed.get(cluster)}
+                "running": cluster in self.in_progress
+                and any(f in self.building.get(cluster, ()) for f in behind),
+                "failed": self.failed.get(cluster)}
+
+    def backfill(self, cluster: str, config: ElasticConfig, now: float) -> dict[str, dict]:
+        """The fields of the read set that do not yet meet the serving rule
+        on their own cover and are not behind the bound (those are the
+        catch-up's): field -> how many days it covers, how many one-day
+        slices are left before it serves and before it reaches
+        ``vocabulary.days``, the range read next for it, and whether that
+        slice is running, next, or failed and retrying. Field names, counts
+        and ranges only; nothing here depends on any query."""
+        held = self.clusters.get(cluster)
+        read = self.read_set(cluster, config, now)
+        want = min(VOCABULARY_SERVE_DAYS, config.vocabulary_days) * 86400.0
+        full = config.vocabulary_days * 86400.0
+        bound = vocabulary_max_gap(config)
+        out: dict[str, dict] = {}
+        for f in read:
+            c = held.cover(f) if held is not None else None
+            if c is not None and now - c[1] > bound:
+                continue            # the catch-up's, not the backfill's
+            if c is not None and c[1] - c[0] >= want - 1.0:
+                continue            # serves on its own
+            covered = 0.0 if c is None else max(0.0, c[1] - c[0])
+            plan = plan_vocabulary_slice(config, held, now, (f,))
+            rng = plan.range if plan is not None else (now, now)
+            out[f] = {
+                "covered_days": round(covered / 86400.0, 2),
+                "slices_left": max(0, math.ceil((want - covered - 1.0) / VOCABULARY_SLICE_S)),
+                "slices_total": max(0, math.ceil((full - covered - 1.0) / VOCABULARY_SLICE_S)),
+                "reading": [_iso(rng[0]), _iso(rng[1])],
+                "running": cluster in self.in_progress and f in self.building.get(cluster, ()),
+                "failed": self.failed.get(cluster),
+            }
+        return out
 
     def note_over_cap(self, cluster: str, field: str, count: int, now: float) -> None:
         """Remember that ``field`` has more distinct values than the cap, so
@@ -1878,12 +2115,30 @@ class VocabularyIndex:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return  # unreadable or half-written: rebuild rather than guess
-        if not isinstance(raw, dict) or raw.get("schema") != self.SCHEMA:
+        if not isinstance(raw, dict):
             return
-        for name, entry in (raw.get("clusters") or {}).items():
-            vocab = ClusterVocabulary.from_json(entry)
-            if vocab is not None:
-                self.clusters[str(name)] = vocab
+        schema = raw.get("schema")
+        if schema == self.SCHEMA_V1:
+            # one range, no per-field record: see the class docstring. The
+            # over-cap decisions are kept - they are dated and expire on
+            # their own - and the names go with the cover they came under.
+            for name, entry in (raw.get("clusters") or {}).items():
+                if isinstance(entry, dict):
+                    fields = entry.get("fields") or {}
+                    self.untrusted[str(name)] = {
+                        "schema": schema,
+                        "fields": {str(f): len(v) for f, v in fields.items()
+                                   if isinstance(v, list)},
+                        "covered_days": round(max(0.0, (
+                            float(entry.get("covered_until") or 0.0)
+                            - float(entry.get("covered_from") or 0.0)) / 86400.0), 2)}
+        elif schema == self.SCHEMA:
+            for name, entry in (raw.get("clusters") or {}).items():
+                vocab = ClusterVocabulary.from_json(entry)
+                if vocab is not None:
+                    self.clusters[str(name)] = vocab
+        else:
+            return
         for name, entry in (raw.get("over_cap") or {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -1915,60 +2170,79 @@ class VocabularyIndex:
                now: float | None = None) -> dict:
         """Counts and coverage for the log and the VOCAB line, never a name.
 
-        Two kinds of field are named as left out, with the reason each
+        ``covers`` gives each held field its own range, and ``covered_days``
+        is the days **every** field of the read set covers; nothing here
+        claims a field covered for a day it was not read. ``backfill``
+        names the fields of the read set still short of the serving rule,
+        with slices left and the range being read.
+
+        Three kinds of field are named as left out, with the reason each
         time: ``omitted``, which the site map's own ``vocabulary.fields``
-        leaves out, and ``over_cap``, which a build counted and found too
-        wide to read. Both are field names, and ``over_cap`` carries the
-        count that decided it. Their values stay readable in message text,
+        leaves out; ``over_cap``, which a build counted and found too wide
+        to read (with the count that decided it); and ``frozen``, a field
+        of either kind that *was* read before it left the set - its names
+        are kept and still hidden, its cover no longer grows, and the range
+        says how far that protection reaches. Field names, counts and
+        ranges only. Their later values stay readable in message text,
         which is the whole reason they are reported at all.
         """
         vocab = self.clusters.get(cluster)
         t = time.time() if now is None else now
         over_cap = {f: int(v["count"]) for f, v in self.over_cap_fields(cluster, t).items()}
+        read = self.read_set(cluster, config, t)
         if vocab is None:
             # Nothing to read is not the same as not having read it yet: a
-            # site map with no learnable field (or one that lists none) is
-            # ready at once, or every case would wait for a build that is
-            # never going to start.
-            nothing_to_read = not config.vocabulary_rules
+            # site map with no learnable field (or one that lists none, or
+            # whose every field is over the cap) is ready at once, or every
+            # case would wait for a build that is never going to start.
+            nothing_to_read = not read
             return {"state": "ready" if nothing_to_read else "building",
                     "serving": nothing_to_read, "complete": nothing_to_read,
-                    "fields": {}, "max": config.vocabulary_max,
+                    "fields": {}, "covers": {}, "frozen": {}, "max": config.vocabulary_max,
                     "near_cap": [], "skipped": {}, "over_cap": over_cap,
-                    "omitted": list(config.vocabulary_omitted)}
-        counts = vocab.counts
+                    "omitted": list(config.vocabulary_omitted),
+                    "backfill": self.backfill(cluster, config, t) if read else {},
+                    "catch_up": None, "gap": None}
+        counts = {f: n for f, n in vocab.counts.items() if f in read}
+        frozen = {f: [_iso(a), _iso(b)] for f, (a, b) in vocab.covers.items() if f not in read}
         cap = config.vocabulary_max
-        serving = vocab.serves(config, t)
-        complete = vocab.complete(config, t)
+        serving = not read or vocab.serves(config, t, read)
+        complete = not read or vocab.complete(config, t, read)
+        behind = vocab.behind(config, t, read)
+        until = vocab.until_over(read)
+        age = 0.0 if until is None else max(0.0, t - until)
         # Overdue is measured from when the top-up could have started on
         # *this* bridge: the end of the cover, or the bridge's start if that
         # is later. A bridge restarted a day after the last one holds a cover
         # a day old, and its first top-up is due, not overdue - the age it is
         # charged for is time it was not running. The age itself (age_s) is
         # still the honest one, from the end of the cover.
-        chance = vocab.covered_until if self.started_at is None \
-            else max(vocab.covered_until, self.started_at)
+        chance = until if self.started_at is None or until is None \
+            else max(until, self.started_at)
         topping_up = cluster in self.in_progress
         failed = self.failed.get(cluster)
-        if not serving and vocab.behind(config, t):
-            # the cover ends too far back: cases wait for the top-up that
-            # reads the gap (next_vocabulary_slice puts it first)
+        backfill = self.backfill(cluster, config, t)
+        if not serving and behind:
+            # some field's cover ends too far back: cases wait for the
+            # top-up that reads the gap (plan_vocabulary_slice puts it first)
             state = "catching_up"
         elif not serving:
-            # read something, but not far enough back yet to answer a case
+            # read something, but not far enough back yet to answer a case:
+            # a first build, or a field being backfilled (``backfill``)
             state = "building"
-        elif t - vocab.covered_until <= VOCABULARY_REFRESH_S:
+        elif age <= VOCABULARY_REFRESH_S:
             state = "ready" if complete else "extending"
         elif topping_up:
             # the top-up is running: names logged since the cover ended are
             # not known yet, and nothing is wrong
             state = "top_up_due"
-        elif failed is not None or t - chance > VOCABULARY_REFRESH_S + config.vocabulary_budget_s:
+        elif failed is not None or (chance is not None
+                                    and t - chance > VOCABULARY_REFRESH_S + config.vocabulary_budget_s):
             # the top-up had its chance on this bridge and did not finish,
             # or its last attempt failed
             state = "stale"
         else:
-            # due, and a slice starts next (next_vocabulary_slice puts the
+            # due, and a slice starts next (plan_vocabulary_slice puts the
             # newest end first). Nothing is wrong yet: reading the first two
             # days at sign-in takes longer than the refresh interval, so this
             # is the state es-login returns to.
@@ -1977,56 +2251,118 @@ class VocabularyIndex:
             "state": state, "serving": serving, "complete": complete,
             "topping_up": topping_up,
             "fields": counts, "max": cap,
+            "covers": {f: [_iso(a), _iso(b)] for f, (a, b) in vocab.covers.items()},
+            "covers_days": {f: round(max(0.0, (b - a) / 86400.0), 2)
+                            for f, (a, b) in vocab.covers.items()},
+            "frozen": frozen,
             "near_cap": sorted(f for f, n in counts.items() if n >= VOCABULARY_NEAR_CAP * cap),
             "skipped": {},
             "over_cap": over_cap,
             "omitted": list(config.vocabulary_omitted),
-            "covered_days": round(vocab.covered_days(t), 2),
+            "covered_days": round(vocab.covered_days(t, read), 2),
             "wanted_days": config.vocabulary_days,
-            "age_s": round(max(0.0, t - vocab.covered_until), 1),
+            "age_s": round(age, 1),
             "max_gap_s": vocabulary_max_gap(config),
             # the range the top-up has to read before cases run again, and
             # how it will be read: slices left and total, the one being read
-            "gap": ([_iso(vocab.covered_until), _iso(t)] if vocab.behind(config, t) else None),
+            "gap": ([_iso(until), _iso(t)] if behind and until is not None else None),
             "catch_up": self.catch_up(cluster, config, t),
+            "backfill": backfill,
+            "building_fields": list(self.building.get(cluster, ())),
         }
         if state == "stale" and failed is not None:
             out["refused"] = failed
         return out
 
 
-def next_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",
-                          now: float) -> tuple[float, float] | None:
-    """The next one-day slice to read for a cluster, or None if the cover
-    is complete and fresh.
+def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",
+                          now: float, read: Iterable[str] | None = None
+                          ) -> VocabularySlice | None:
+    """The next one-day slice to read for a cluster, **per field**, or None
+    if every field in ``read`` is complete and fresh.
 
-    Newest first, and contiguous: the slice is either the gap between what
-    is covered and now (a top-up, which is also the very first slice when
-    nothing is held), or the day immediately before the oldest day covered.
-    Contiguity is what lets the saved cover stay a single range, and what
-    makes a restart resume rather than start over - whatever was saved
-    before the bridge stopped is still covered.
+    Each field wants, by its own cover, exactly what the one-range rule
+    wanted for the cluster: nothing held (or a cover fallen out of
+    ``vocabulary.days``) - the newest day, as a first build; an end older
+    than the refresh - one slice **forward** from that end (a top-up, or
+    the catch-up after a gap); otherwise one more day **behind** its
+    start, until it reaches ``vocabulary.days``. Then one want is chosen
+    and the fields that share it are read together:
+
+    * fields that do not yet serve a case (no cover, too little of it, or
+      behind the gap bound) come first, since they are what refuses every
+      case; then top-ups due; then extension backwards;
+    * within a class, the latest end first, then the latest start: what a
+      case asks about is recent, so a new field's first two days are read
+      before anyone's older days;
+    * a **forward** slice is shared by every field whose cover touches it
+      and ends before it does - so one top-up realigns a field backfilled
+      minutes earlier with the rest, at the cost of re-reading those
+      minutes for that field once, which is no more than any field pays
+      for any top-up; a **first** or **back** slice is shared by the
+      fields that want exactly that range.
+
+    Fields with identical covers therefore always share a slice, and an
+    unchanged field set gets exactly the slices (and request counts) the
+    one-range rule gave it. A field added to an existing cover is read on
+    slices of its own, newest first, and the fields that already have
+    cover are not read again: the backfill costs that field a first
+    build's requests (a count and a page per 1,000 values per slice, over
+    ``vocabulary.days`` slices) and nothing else. Cases are refused until
+    it has :data:`VOCABULARY_SERVE_DAYS`, as for a first build, and run
+    while its older days are still being read.
     """
-    if not config.vocabulary_rules:
+    fields_read = tuple(read) if read is not None \
+        else tuple(r.pattern for r in config.vocabulary_rules)
+    if not fields_read:
         return None
     oldest = now - config.vocabulary_days * 86400.0
-    if held is None or held.covered_until < oldest:
-        # nothing held, or a cover that has fallen out of vocabulary.days
-        # entirely (the broker drops it before this slice is saved: reading
-        # forward from it would read days nobody asks about, and reading
-        # from ``oldest`` would leave a hole)
-        return (max(oldest, now - VOCABULARY_SLICE_S), now)
-    if now - held.covered_until >= VOCABULARY_REFRESH_S:
-        # The newest end first, **forward from the cover's end**, one slice
-        # at a time: a gap wider than a slice (a bridge down for a week) is
-        # read as whole slices, each with its own budget and saved as it
-        # lands, so a failure or a restart resumes rather than re-reading,
-        # and the saved cover is always one range with no hole. A ten-minute
-        # top-up is one short slice, as before.
-        return (held.covered_until, min(now, held.covered_until + VOCABULARY_SLICE_S))
-    if held.covered_from > oldest + 1.0:
-        return (max(oldest, held.covered_from - VOCABULARY_SLICE_S), held.covered_from)
-    return None
+    bound = vocabulary_max_gap(config)
+    want = min(VOCABULARY_SERVE_DAYS * 86400.0, config.vocabulary_days * 86400.0)
+    cands: list[tuple[int, str, float, float, str]] = []
+    for f in fields_read:
+        c = held.cover(f) if held is not None else None
+        if c is None or c[1] < oldest:
+            # nothing held, or a cover that has fallen out of vocabulary.days
+            # entirely (the broker drops it before this slice is saved:
+            # reading forward from it would read days nobody asks about,
+            # and reading from ``oldest`` would leave a hole)
+            cands.append((0, f, max(oldest, now - VOCABULARY_SLICE_S), now, "first"))
+        elif now - c[1] >= VOCABULARY_REFRESH_S:
+            # The newest end first, **forward from the cover's end**, one
+            # slice at a time: a gap wider than a slice (a bridge down for a
+            # week) is read as whole slices, each with its own budget and
+            # saved as it lands, so a failure or a restart resumes rather
+            # than re-reading, and the saved cover is always one range with
+            # no hole. A ten-minute top-up is one short slice, as before.
+            serving = c[1] - c[0] >= want - 1.0 and now - c[1] <= bound
+            cands.append((0 if not serving else 1, f, c[1],
+                          min(now, c[1] + VOCABULARY_SLICE_S), "forward"))
+        elif c[0] > oldest + 1.0:
+            serving = c[1] - c[0] >= want - 1.0
+            cands.append((0 if not serving else 2, f,
+                          max(oldest, c[0] - VOCABULARY_SLICE_S), c[0], "back"))
+    if not cands:
+        return None
+    _cls, _f, start, until, kind = min(cands, key=lambda c: (c[0], -c[3], -c[2], c[1]))
+    if kind == "forward":
+        fields = tuple(f for f in fields_read
+                       if held is not None and (c := held.cover(f)) is not None
+                       and c[1] < until - 1.0 and c[1] >= start - 1.0)
+    else:
+        fields = tuple(c[1] for c in cands if (c[2], c[3], c[4]) == (start, until, kind))
+    return VocabularySlice(start, until, fields, kind)
+
+
+def next_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",
+                          now: float) -> tuple[float, float] | None:
+    """The range of the next slice over every vocabulary field of the map
+    (see :func:`plan_vocabulary_slice`), or None if the cover is complete
+    and fresh. The index's :meth:`VocabularyIndex.next_slice` is the one
+    the broker uses: it knows the read set."""
+    plan = plan_vocabulary_slice(config, held, now)
+    return None if plan is None else plan.range
+
 
 
 class VocabularyBuild:
@@ -2085,10 +2421,15 @@ class VocabularyBuild:
     """
 
     def __init__(self, config: ElasticConfig, covered_from: float, covered_until: float, *,
-                 clock=None, over_cap: dict[str, Any] | None = None, probe: bool = True) -> None:
+                 clock=None, over_cap: dict[str, Any] | None = None, probe: bool = True,
+                 fields: Iterable[str] | None = None) -> None:
         self.config = config
         self.covered_from = covered_from
         self.covered_until = covered_until
+        #: the fields this slice reads (``plan_vocabulary_slice`` decides);
+        #: None: every vocabulary field of the map. The result covers
+        #: exactly the fields read, and no other.
+        self.only = None if fields is None else frozenset(fields)
         #: fields already known to be over the cap, from an earlier slice or
         #: an earlier run: field -> the count that decided it. They are not
         #: probed and not paged.
@@ -2097,7 +2438,8 @@ class VocabularyBuild:
         #: job names first: see the class docstring
         self.rules = [r for r in sorted(config.vocabulary_rules,
                                         key=lambda r: (r.type != "JOB_NAME", r.pattern))
-                      if r.pattern not in self.remembered]
+                      if r.pattern not in self.remembered
+                      and (self.only is None or r.pattern in self.only)]
         self.values: dict[str, list[str]] = {r.pattern: [] for r in self.rules}
         #: fields this slice found over the cap: field -> the count that
         #: decided it. The broker saves these, so the next slice skips them.
@@ -2129,6 +2471,8 @@ class VocabularyBuild:
     def progress(self) -> dict:
         """Counts only, for the decision log and the VOCAB line."""
         out = {"fields_done": self._at, "fields_total": len(self.rules),
+               "fields": [r.pattern for r in self.rules],
+               "range": [_iso(self.covered_from), _iso(self.covered_until)],
                "field": self.field, "values": {f: len(v) for f, v in self.values.items() if v},
                "requests": self.requests, "probes": self.probes,
                "seconds": round(self.seconds, 1),

@@ -842,7 +842,26 @@ recall will never be exactly 100%.
     `es-smoke` prints build progress while it runs and then a `VOCAB` line
     with the counts, the range covered, its age, `NEAR CAP` at 80% and the
     fields left out - `NOT READ` for what the map omits, `OVER CAP, NOT
-    READ` with its count for what the build found too wide.
+    READ` with its count for what the build found too wide, `NOT READ
+    NOW` with its range for a field read under an earlier field set whose
+    names are kept but no longer topped up.
+    **The cover is kept per field.** It was one range for the cluster, so
+    a field added to `vocabulary.fields` after a 30-day cover existed was
+    read for the ten-minute top-up and then claimed for thirty days, and a
+    tenant named in text a week earlier was readable under `ready`. Now
+    each field has its own range, the saved file holds nothing else, a
+    case is served only when every field read meets the first-build rule,
+    and a field short of cover is **backfilled** on slices of its own,
+    newest first, without re-reading the fields that have it; the `VOCAB`
+    line, es-login and the refusal name the field and the slices left.
+    `field_added_backfilled` measures it: before, the new field claimed
+    30 days and the week-old name was readable; after, **17 refusals with
+    0 requests from the case, served after 2 slices (4 requests, 53
+    simulated seconds), the whole backfill 30 slices, 60 requests and 649
+    simulated seconds with 0 requests on the field that already had
+    cover**, and the name hidden once its day is read. A vocabulary file
+    saved before this (one range, no per-field record) is not trusted and
+    the next sign-in pays a first build.
     **Fails closed, and nothing is learnt from a partial read of a field
     that is kept:** an unreadable, partial or misshapen reply, a *listed*
     field over `vocabulary.max` (50,000), or a build past its budget

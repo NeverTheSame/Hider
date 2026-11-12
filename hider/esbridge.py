@@ -652,36 +652,44 @@ class Bridge:
             return False
         vocab = self.index.get(cluster.name)
         t = clock()
+        read = self.index.read_set(cluster.name, self.config, t)
         if self.scrubber._vocab_rules and vocab is not None \
-                and vocab.behind(self.config, t):
+                and vocab.behind(self.config, t, read):
             # every query, not only a case's first: the gap is a property of
-            # the cover now, and an open case is refused the same way
-            gap_h = (t - vocab.covered_until) / 3600.0
+            # the cover now, and an open case is refused the same way. The
+            # end is the earliest end among the fields behind: field names
+            # and ranges, nothing about this query.
             cu = self.index.catch_up(cluster.name, self.config, t) or {}
+            bound = elastic.vocabulary_max_gap(self.config)
+            ends = min(vocab.covers[f][1] for f in read
+                       if f in vocab.covers and t - vocab.covers[f][1] > bound)
+            gap_h = (t - ends) / 3600.0
             raise elastic.Refused(
                 "vocabulary_building",
                 "response withheld: the name vocabulary for this cluster ends "
-                f"{gap_h:.1f}h ago, past the {elastic.vocabulary_max_gap(self.config) / 3600.0:.1f}h "
-                "bound, so a name first logged since then has not been read and could be plain "
-                "text on this page. Waiting for the top-up that reads "
-                f"{elastic._iso(vocab.covered_until)} to now: " + _catch_up_note(cu)
+                f"{gap_h:.1f}h ago for {', '.join(cu.get('fields') or read)}, past the "
+                f"{bound / 3600.0:.1f}h bound, so a name first logged since then has not been "
+                "read and could be plain text on this page. Waiting for the top-up that reads "
+                f"{elastic._iso(ends)} to now: " + _catch_up_note(cu)
                 + "; es-smoke's VOCAB line shows its progress.")
         applied = self.scrubber._vocabulary_at.get(cluster.name)
-        if applied is not None and (vocab is None or applied[2] is None
-                                    or applied[2] >= vocab.covered_until):
-            # this case already holds this cover; a newer one (a top-up
-            # since) is applied again below, locally, before the page
+        if applied is not None and (vocab is None or applied[1] == vocab.covers):
+            # this case already holds exactly this cover; a newer one (a
+            # top-up or a backfill slice since) is applied again below,
+            # locally, before the page
             return False
         if not self.scrubber._vocab_rules:
             return False
-        if vocab is None or not vocab.serves(self.config, t):
+        if read and (vocab is None or not vocab.serves(self.config, t, read)):
             raise elastic.Refused(
                 "vocabulary_building",
                 "response withheld: the name vocabulary for this cluster does not yet cover "
-                f"the last {elastic.VOCABULARY_SERVE_DAYS} days (it is read in one-day "
-                "slices, newest first, and a page shown before those are in could leak a "
-                "customer name in message text). Try again shortly; es-smoke's VOCAB line "
-                "shows how far back the cover reaches.")
+                f"the last {elastic.VOCABULARY_SERVE_DAYS} days for every field it reads (it "
+                "is read in one-day slices, newest first, and a page shown before those are "
+                "in could leak a customer name in message text). "
+                + _backfill_note(self.index.backfill(cluster.name, self.config, t))
+                + ". Try again shortly; es-smoke's VOCAB line shows how far back each "
+                "field's cover reaches.")
         over_cap = {f: int(v["count"])
                     for f, v in self.index.over_cap_fields(cluster.name, clock()).items()}
         counts = self.scrubber.apply_vocabulary(cluster.name, vocab, over_cap=over_cap)
@@ -974,6 +982,36 @@ def _over_cap_note(v: dict) -> str:
             + ", ".join(f"{f}~{n}>{v.get('max', '?')}" for f, n in sorted(over.items())))
 
 
+def _backfill_note(bf: dict | None) -> str:
+    """The fields still short of the serving rule, each with the days it
+    covers, the slices left before it serves (and before the whole of
+    ``vocabulary.days``), the range read next and whether that slice is
+    running: field names, counts and ranges only. Nothing in it depends on
+    a query, so a refusal carrying it says nothing about a guess."""
+    if not bf:
+        return "waiting for the next slice"
+    parts = []
+    for f, b in sorted(bf.items()):
+        rng = b.get("reading") or ["?", "?"]
+        state = ("running" if b.get("running") else
+                 f"last attempt failed ({b['failed']}), retrying" if b.get("failed") else "next")
+        parts.append(f"{f} covers {b['covered_days']}d, {b['slices_left']} one-day slices "
+                     f"left before it serves and {b['slices_total']} to the full cover, "
+                     f"reading {rng[0]} to {rng[1]} ({state})")
+    return "BACKFILLING " + "; ".join(parts)
+
+
+def _frozen_note(v: dict) -> str:
+    """Fields read under an earlier field set and no longer read: their
+    names are kept and still hidden, as far as the range says, and nothing
+    logged since is known. Field names and ranges."""
+    frozen = v.get("frozen") or {}
+    if not frozen:
+        return ""
+    return (" NOT READ NOW (names read before still hidden): "
+            + ", ".join(f"{f} {a} to {b}" for f, (a, b) in sorted(frozen.items())))
+
+
 def _catch_up_note(cu: dict | None) -> str:
     """Slices left and the range being read: counts and ranges only."""
     if not cu:
@@ -983,6 +1021,8 @@ def _catch_up_note(cu: dict | None) -> str:
                 f"reads {cu['slices_left']} one-day slices first")
     else:
         head = f"{cu['slices_left']} of {cu['slices_total']} one-day slices left"
+        if cu.get("fields"):
+            head += f" for {', '.join(cu['fields'])}"
     rng = cu.get("reading") or ["?", "?"]
     state = ("running" if cu.get("running") else
              f"last attempt failed ({cu['failed']}), retrying" if cu.get("failed") else "next")
@@ -1012,7 +1052,10 @@ def vocabulary_line(v: dict | None) -> str | None:
                 + (f", values so far {b['values']}" if b.get("values") else "")
                 + (f"; CATCHING UP, cases refused: {_catch_up_note(v['catch_up'])}"
                    if v.get("catch_up") else "")
-                + _over_cap_note(v))
+                + (f"; {_backfill_note(v['backfill'])}"
+                   + ("" if v.get("serving") else ", cases refused")
+                   if v.get("backfill") else "")
+                + _over_cap_note(v) + _frozen_note(v))
     if v.get("state") == "failed":
         return (f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
                 + _over_cap_note(v))
@@ -1020,8 +1063,13 @@ def vocabulary_line(v: dict | None) -> str | None:
         if v.get("state") != "building":
             return ("VOCAB   " + _over_cap_note(v)) if v.get("over_cap") else None
         return "VOCAB    building, no page yet" + _over_cap_note(v)
-    parts = [f"{f}={n}/{v['max']}" for f, n in v["fields"].items()
-             if f not in (v.get("over_cap") or {})]
+    # a field whose own cover differs from the cluster figure shows its
+    # own days beside its count: the cluster figure is what every field
+    # covers, and nothing claims a field covered for days it was not read
+    days = v.get("covers_days") or {}
+    parts = [f"{f}={n}/{v['max']}"
+             + (f" ({days[f]}d)" if f in days and days[f] != v.get("covered_days") else "")
+             for f, n in v["fields"].items() if f not in (v.get("over_cap") or {})]
     line = "VOCAB    " + " ".join(parts)
     if v.get("covered_days") is not None:
         # the covered range is the one number that says which days a name
@@ -1029,7 +1077,7 @@ def vocabulary_line(v: dict | None) -> str | None:
         state = v.get("state", "ready")
         if state == "top_up_due":
             state = "top-up running" if v.get("topping_up") else "top-up due"
-        line += (f" over the last {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
+        line += (f" every field over the last {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
                  f"{state} ({v.get('age_s', 0)}s old)")
         if v.get("state") == "catching_up":
             gap = v.get("gap") or ["?", "now"]
@@ -1044,15 +1092,19 @@ def vocabulary_line(v: dict | None) -> str | None:
                      + ": names logged since are not known")
         elif v.get("state") == "extending":
             line += " - cases run; older days still reading"
+            if v.get("backfill"):
+                line += ": " + _backfill_note(v["backfill"])
         elif not v.get("serving", True) and v.get("state") != "catching_up":
             line += " - NOT ENOUGH COVER YET: cases are refused"
+            if v.get("backfill"):
+                line += ": " + _backfill_note(v["backfill"])
     if v.get("skipped"):
         line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
     if v.get("near_cap"):
         line += f" NEAR CAP: {', '.join(v['near_cap'])}"
     if v.get("omitted"):
         line += (f" NOT READ (readable in text): {', '.join(sorted(v['omitted']))}")
-    line += _over_cap_note(v)
+    line += _over_cap_note(v) + _frozen_note(v)
     return line
 
 
@@ -1428,33 +1480,45 @@ class Broker:
         t = clock() if now is None else now
         if t < self._retry_at.get(cluster.name, 0.0):
             return  # a slice failed moments ago; do not spin on it
+        untrusted = self.vocabulary.untrusted.pop(cluster.name, None)
+        if untrusted is not None:
+            # a one-range file from before covers were kept per field: not
+            # trusted, dropped, and a first build starts. Field names and
+            # counts only.
+            self._log_vocabulary(cluster.name, "untrusted", {
+                **untrusted, "read": False,
+                "why": "saved with one range for the cluster and no per-field record"})
         dropped = self.vocabulary.drop_expired(cluster.name, self.config, t)
         if dropped is not None:
-            # counts and days only, never a name
+            # field names and counts only, never a name
             self._log_vocabulary(cluster.name, "expired", {
-                "covered_days": round(dropped.covered_days(t), 2),
-                "ended_days_ago": round((t - dropped.covered_until) / 86400.0, 2),
-                "values": dropped.total()})
+                "fields": dropped, "values": sum(dropped.values())})
         held = self.vocabulary.get(cluster.name)
-        if held is not None and held.behind(self.config, t):
-            self.vocabulary.catch_up_from.setdefault(cluster.name, held.covered_until)
+        read = self.vocabulary.read_set(cluster.name, self.config, t)
+        if held is not None and held.behind(self.config, t, read):
+            bound = elastic.vocabulary_max_gap(self.config)
+            ends = min(held.covers[f][1] for f in read
+                       if f in held.covers and t - held.covers[f][1] > bound)
+            self.vocabulary.catch_up_from.setdefault(cluster.name, ends)
         elif held is not None:
             self.vocabulary.catch_up_from.pop(cluster.name, None)
-        slice_range = elastic.next_vocabulary_slice(
-            self.config, self.vocabulary.get(cluster.name), t)
-        if slice_range is None:
+        plan = self.vocabulary.next_slice(cluster.name, self.config, t)
+        if plan is None:
             return
-        start, until = slice_range
         self._build = elastic.VocabularyBuild(
-            self.config, start, until,
+            self.config, plan.start, plan.until,
             # fields an earlier slice (or an earlier run) counted and found
             # over the cap: not counted again, not paged
-            over_cap=self.vocabulary.over_cap_fields(cluster.name, t))
+            over_cap=self.vocabulary.over_cap_fields(cluster.name, t),
+            # the fields this slice is for: a field being backfilled reads
+            # on its own, the ones that already have cover are not re-read
+            fields=plan.fields)
         self._build_cluster = cluster
         self._build_failed.pop(cluster.name, None)
         self.vocabulary.failed.pop(cluster.name, None)
         self.vocabulary.in_progress.add(cluster.name)
-        self._log_vocabulary(cluster.name, "start", self._build.progress())
+        self.vocabulary.building[cluster.name] = plan.fields
+        self._log_vocabulary(cluster.name, "start", {**self._build.progress(), "kind": plan.kind})
 
     def _end_slice(self, cluster: elastic.Cluster, code: str, build) -> None:
         """A slice that failed teaches the index nothing. Everything saved
@@ -1463,6 +1527,7 @@ class Broker:
         self._build_failed[cluster.name] = code
         self.vocabulary.failed[cluster.name] = code
         self.vocabulary.in_progress.discard(cluster.name)
+        self.vocabulary.building.pop(cluster.name, None)
         self._retry_at[cluster.name] = clock() + elastic.VOCABULARY_RETRY_S
         self._drop_page()
         self._build = self._build_cluster = None
@@ -1543,6 +1608,7 @@ class Broker:
         self._build_failed.pop(cluster.name, None)
         self.vocabulary.failed.pop(cluster.name, None)
         self.vocabulary.in_progress.discard(cluster.name)
+        self.vocabulary.building.pop(cluster.name, None)
         self._log_vocabulary(cluster.name, "slice",
                              {**build.progress(), "saved_as": how,
                               **self.vocabulary.report(cluster.name, self.config, now=clock())})
@@ -1569,8 +1635,8 @@ class Broker:
         a top-up, or another day of cover to reach back for. True if one
         started."""
         for cluster in self._signed_in:
-            if elastic.next_vocabulary_slice(
-                    self.config, self.vocabulary.get(cluster.name), clock()) is not None:
+            if self.vocabulary.untrusted.get(cluster.name) is not None \
+                    or self.vocabulary.next_slice(cluster.name, self.config, clock()) is not None:
                 self.start_vocabulary(cluster)
                 return self._build is not None
         return False
