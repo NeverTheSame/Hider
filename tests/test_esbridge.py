@@ -1601,3 +1601,68 @@ def test_es_review_reads_a_real_case_back(stub, tmp_path):
     assert page["new_labels"] > 0 and page["labels_usable"] == page["new_labels"] + 1
     assert rows[-1]["zero_hit_phrases"] == ["quarzelt wibbly"]
     assert label not in json.dumps(r) or "Contoso" not in json.dumps(r)
+
+
+# -- a saved cover that ended days ago -----------------------------------------
+
+def _gap_engine():
+    """One tenant first logged inside the gap: its own record a day ago and
+    a message naming it with nothing marking it."""
+    return eseval.StubEngine(eseval.Fixture(eseval.gap_docs(), [], []), (eseval.GAP_INDEX,))
+
+
+def _gap_bridge(engine, tmp_path, cover_ends_ago_s: float):
+    cfg = eseval.gap_map()
+    now = eseval.NOW.timestamp()
+    index = elastic.VocabularyIndex(None)
+    index.started_at = now - 60.0
+    held, _b = eseval.build_vocabulary(cfg, engine, now - cover_ends_ago_s - 3 * 86400.0,
+                                       now - cover_ends_ago_s)
+    index.put("stub", held)
+    b = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), eseval.EngineSession(engine),
+                        log_path=tmp_path / "d.jsonl", index=index)
+    return b, index, cfg
+
+
+def test_a_name_first_logged_in_the_gap_is_not_shown_until_the_top_up_reads_it(tmp_path):
+    engine = _gap_engine()
+    b, index, cfg = _gap_bridge(engine, tmp_path, 7 * 86400.0)
+    n = len(engine.requests)
+    with pytest.raises(elastic.Refused) as e:
+        b.run("stub", eseval.GAP_QUERY)
+    assert e.value.code == "vocabulary_building"
+    assert "not been read" in e.value.message and eseval.GAP_TENANT not in e.value.message
+    assert len(engine.requests) == n                    # nothing sent
+    # the top-up reads the gap; the same open case is now shown, name hidden
+    now = eseval.NOW.timestamp()
+    gap, _b = eseval.build_vocabulary(cfg, engine, index.get("stub").covered_until, now)
+    index.put("stub", gap)
+    o = b.run("stub", eseval.GAP_QUERY)
+    assert o.hits_shown >= 1 and eseval.GAP_TENANT not in json.dumps(o.output)
+
+
+def test_a_ten_minute_gap_and_a_failed_top_up_within_the_bound_still_serve(tmp_path):
+    engine = _gap_engine()
+    b, index, cfg = _gap_bridge(engine, tmp_path, 600.0)
+    b.run("stub", eseval.GAP_QUERY)                      # ten minutes behind: as today
+    b, index, cfg = _gap_bridge(engine, tmp_path, 900.0)
+    index.failed["stub"] = "upstream"
+    r = index.report("stub", cfg, now=eseval.NOW.timestamp())
+    assert r["state"] == "stale" and r["serving"]
+    b.run("stub", eseval.GAP_QUERY)
+
+
+def test_an_open_case_picks_up_a_top_up_before_its_next_page(tmp_path):
+    """A case that applied the cover before the gap name was read must not
+    keep its old copy: the next query re-applies the newer cover."""
+    engine = _gap_engine()
+    now = eseval.NOW.timestamp()
+    b, index, cfg = _gap_bridge(engine, tmp_path, 2 * 86400.0 - 3600.0)
+    # the cover is within the bound as of a clock two days back
+    esbridge.clock = lambda: now - 2 * 86400.0 + 1800.0
+    b.run("stub", {**eseval.GAP_QUERY, "time_range": {"gte": "now-30d", "lte": "now"}})
+    esbridge.clock = eseval.NOW.timestamp
+    gap, _b = eseval.build_vocabulary(cfg, engine, index.get("stub").covered_until, now)
+    index.put("stub", gap)
+    o = b.run("stub", eseval.GAP_QUERY)
+    assert eseval.GAP_TENANT not in json.dumps(o.output)

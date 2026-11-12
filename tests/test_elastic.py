@@ -1502,30 +1502,34 @@ def test_phrase_budget_is_a_bounded_site_map_setting(value, ok):
 
 
 def test_a_restarted_bridge_is_not_charged_for_the_time_it_was_down():
-    """The cover is a day old when the bridge comes back; the top-up is due,
-    then running, and overdue only once it has had a budget's worth of this
-    bridge's time - or failed."""
+    """Within the gap bound: the cover is forty minutes old when the bridge
+    comes back; the top-up is due, then running, and overdue only once it
+    has had a budget's worth of this bridge's time - or failed. Past the
+    bound (a day) the state is catching_up and nothing is served."""
     index = elastic.VocabularyIndex(None)
     now = eseval.NOW.timestamp()
+    ends = now - 2400.0
     index.put("emea", elastic.ClusterVocabulary(
-        now - 86400.0 - CFG.vocabulary_days * 86400.0, now - 86400.0, 0.0, {}))
+        ends - CFG.vocabulary_days * 86400.0, ends, 0.0, {}))
     # no bridge start known (a bare index): age alone decides, as before
     assert index.report("emea", CFG, now=now)["state"] == "stale"
     index.started_at = now - 60.0          # the bridge came up a minute ago
     r = index.report("emea", CFG, now=now)
     assert r["state"] == "top_up_due" and r["serving"] and not r["topping_up"]
-    assert r["age_s"] > 86000              # the age stays honest
+    assert r["age_s"] == 2400.0            # the age stays honest
     index.in_progress.add("emea")
     r = index.report("emea", CFG, now=now + 300)
     assert r["state"] == "top_up_due" and r["topping_up"]
     index.in_progress.discard("emea")
-    # a budget's worth of this bridge's time and still no top-up: overdue
-    late = index.started_at + elastic.VOCABULARY_REFRESH_S + CFG.vocabulary_budget_s + 1
-    assert index.report("emea", CFG, now=late)["state"] == "stale"
-    # a failed top-up is stale at once, with the reason
+    # running all along and still no top-up: overdue, still serving
+    index.started_at = ends
+    r = index.report("emea", CFG, now=now)
+    assert r["state"] == "stale" and r["serving"]
+    # a failed top-up is stale at once, with the reason, and serves
+    index.started_at = now - 60.0
     index.failed["emea"] = "upstream"
-    r = index.report("emea", CFG, now=now + 300)
-    assert r["state"] == "stale" and r["refused"] == "upstream"
-    # ...until a retry is running
-    index.in_progress.add("emea")
-    assert index.report("emea", CFG, now=now + 400)["state"] == "top_up_due"
+    r = index.report("emea", CFG, now=now)
+    assert r["state"] == "stale" and r["refused"] == "upstream" and r["serving"]
+    # a day behind: past the bound, catching up, not serving, the gap named
+    r = index.report("emea", CFG, now=now + 86400.0)
+    assert r["state"] == "catching_up" and not r["serving"] and r["gap"]

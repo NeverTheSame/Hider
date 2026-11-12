@@ -344,6 +344,9 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
         # after those, in an index pattern of their own: a data stream
         # named after a job (see stream_name_docs)
         out.extend(stream_name_docs())
+        # last of all, in their own pattern: a tenant first logged in the
+        # gap after a saved cover (see gap_docs)
+        out.extend(gap_docs())
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
@@ -1482,6 +1485,123 @@ def run_stream_name_eval(fx: Fixture, *, tier2: str = "none") -> dict:
         return r
 
     return {"before": one(True), "after": one(False)}
+
+
+# ---------------------------------------------------------------------------
+# A name first logged in the gap after a saved cover
+# ---------------------------------------------------------------------------
+#
+# A bridge restarted days after the last one holds a cover that ends days
+# ago. A tenant onboarded in between has never been read, so its name is
+# plain English in message text. Fixed documents, appended after everything
+# else, in an index pattern and map of their own; no ground truth.
+GAP_INDEX = "logs-gap-*"
+GAP_TENANT = "Harbor Ridge Quarries"
+GAP_MESSAGE = f"Onboarding checks passed for {GAP_TENANT}, 4 sites mapped"
+GAP_QUERY = {"index": GAP_INDEX, "time_range": {"gte": "now-2d", "lte": "now"}, "size": 20,
+             "filters": [{"field": "message", "op": "phrase", "value": "sites mapped"}]}
+#: an older tenant the saved cover did read, so the cover has something in it
+GAP_OLD_TENANT = "Wexcombe Lantern Freight"
+
+
+def gap_docs() -> list[Doc]:
+    at = lambda h: (NOW - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return [
+        Doc(GAP_INDEX, {"@timestamp": at(24 * 9), "log": {"level": "info"},
+                        "message": "Inventory refreshed",
+                        "labels": {"tenant_name": GAP_OLD_TENANT}}, {}),
+        # the gap tenant's own record, a day ago, and the message naming it
+        Doc(GAP_INDEX, {"@timestamp": at(24), "log": {"level": "info"},
+                        "message": "Inventory refreshed",
+                        "labels": {"tenant_name": GAP_TENANT}}, {}),
+        Doc(GAP_INDEX, {"@timestamp": at(20), "log": {"level": "warn"},
+                        "message": GAP_MESSAGE,
+                        "labels": {"tenant_name": GAP_OLD_TENANT}}, {}),
+    ]
+
+
+def run_gap_eval(*, tier2: str = "none") -> dict:
+    """A cover saved a week ago, a tenant first logged in the gap, on the
+    real Bridge. Measured: what the same page shows with the old cover
+    applied and no gate (the leak this closes), that the gated bridge
+    refuses with no request, that the top-up the broker would run first is
+    the gap itself, that after it the open case is shown with the name
+    hidden, and that a ten-minute gap serves."""
+    from . import esbridge
+
+    cfg = gap_map()
+    fx = Fixture(gap_docs(), [], [])
+    engine = StubEngine(fx, (GAP_INDEX,))
+    now = NOW.timestamp()
+    out: dict = {"gap_h": 168.0, "bound_h": elastic.vocabulary_max_gap(cfg) / 3600.0}
+    old, _b = build_vocabulary(cfg, engine, now - 10 * 86400.0, now - 7 * 86400.0)
+    # without the gate: the old cover applied, the page as it was shown
+    sess = Session(cfg, engine, tier2=tier2, vocabulary=old)
+    page, _r, _dt, _c = sess.call(GAP_QUERY)
+    out["readable_without_gate"] = GAP_TENANT in " ".join(_messages(page))
+    index = elastic.VocabularyIndex(None)
+    index.started_at = now - 60.0
+    index.put("stub", old)
+    saved = esbridge.clock
+    esbridge.clock = lambda: now
+    try:
+        b = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2), EngineSession(engine),
+                            index=index)
+        n = len(engine.requests)
+        try:
+            b.run("stub", GAP_QUERY)
+            out["refused"] = None
+        except elastic.Refused as e:
+            out["refused"] = e.code
+            out["message_names_gap"] = "not been read" in e.message and "to now" in e.message
+            out["message_has_value"] = GAP_TENANT in e.message
+        out["requests_while_refused"] = len(engine.requests) - n
+        rep = index.report("stub", cfg, now=now)
+        out["state"] = rep["state"]
+        out["line"] = esbridge.vocabulary_line(rep) or ""
+        nxt = elastic.next_vocabulary_slice(cfg, index.get("stub"), now)
+        out["top_up_first"] = nxt == (index.get("stub").covered_until, now)
+        top, _b = build_vocabulary(cfg, engine, *nxt)
+        index.put("stub", top)
+        o = b.run("stub", GAP_QUERY)
+        msgs = " ".join(_messages(o.output))
+        out["shown_after"] = o.hits_shown >= 1
+        out["hidden_after"] = GAP_TENANT not in json.dumps(o.output) and "sites mapped" in msgs
+        # ten minutes behind: as today
+        recent, _b = build_vocabulary(cfg, engine, now - 3 * 86400.0, now - 600.0)
+        i2 = elastic.VocabularyIndex(None)
+        i2.started_at = now - 86400.0
+        i2.put("stub", recent)
+        b2 = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2), EngineSession(engine),
+                             index=i2)
+        b2.run("stub", GAP_QUERY)
+        out["ten_minutes_serves"] = True
+    except elastic.Refused as e:
+        out.setdefault("ten_minutes_serves", False)
+        out["error"] = e.code
+    finally:
+        esbridge.clock = saved
+    return out
+
+
+def _gap_lines(o: dict | None) -> list[str]:
+    if not o:
+        return []
+    return [f"gap after a saved cover  {o['gap_h']:.0f}h behind against a {o['bound_h']:.1f}h "
+            f"bound: the gap tenant readable without the gate {o['readable_without_gate']}; "
+            f"refused {o.get('refused')} with {o.get('requests_while_refused')} requests, state "
+            f"{o.get('state')}; the top-up reads the gap first {o.get('top_up_first')}; after it "
+            f"shown {o.get('shown_after')}, name hidden {o.get('hidden_after')}; ten minutes "
+            f"behind serves {o.get('ten_minutes_serves')}"]
+
+
+def gap_map() -> elastic.ElasticConfig:
+    return elastic.parse({
+        "indices": [GAP_INDEX], "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "fields": {"@timestamp": "keep", "log.level": "keep", "message": "text",
+                   "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"}},
+    }, source="gap-fixture")
 
 
 # ---------------------------------------------------------------------------
@@ -3738,6 +3858,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     phrase_budget = run_phrase_budget_eval(fx, tier2="none")
 
     # es-review over that guessing run and over an ordinary investigation.
+    gap = run_gap_eval(tier2="none")
     review = run_review_eval(cfg, engine, vocab, fx, phrase_budget["after"]["case_dir"],
                              tier2=tier2)
 
@@ -3953,6 +4074,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "stream_name": stream_name,
         "phrase_budget": phrase_budget,
         "review": review,
+        "gap": gap,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -4109,6 +4231,15 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # es-review flags the guessing run and not an ordinary investigation,
         # reports a missing log as no review (never clean), and prints no
         # value by default
+        # A cover saved a week ago: the gap tenant would have been readable,
+        # is refused with no request until the top-up (run first) reads the
+        # gap, then shown hidden on the same open case; ten minutes serves.
+        "gap_fails_closed":
+            gap["readable_without_gate"] and gap.get("refused") == "vocabulary_building"
+            and gap.get("requests_while_refused") == 0 and gap.get("state") == "catching_up"
+            and gap.get("message_names_gap") and not gap.get("message_has_value")
+            and gap.get("top_up_first") and gap.get("shown_after") and gap.get("hidden_after")
+            and gap.get("ten_minutes_serves"),
         "review_flags_guessing":
             review["guessing"]["verdict"] == "flagged"
             and ("zero_hit_phrases" in review["guessing"]["flagged"]
@@ -4397,6 +4528,7 @@ def format_report(r: dict) -> str:
         *_stream_name_lines(r.get("stream_name")),
         *_phrase_budget_lines(r.get("phrase_budget")),
         *_review_lines(r.get("review")),
+        *_gap_lines(r.get("gap")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "

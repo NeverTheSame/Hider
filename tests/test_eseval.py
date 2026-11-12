@@ -393,3 +393,11 @@ def test_the_oracle_learnt_name_is_one_the_eval_vocabulary_reads():
     assert esquery.ORACLE_LEARNT == eseval.DEFAULT_MAP_ONE_WORD[0]
     assert elastic.EsScrubber.vocabulary_skip(esquery.ORACLE_LEARNT) is None
     assert " " not in esquery.ORACLE_LEARNT
+
+
+def test_the_gap_gate_measures_the_leak_and_its_close():
+    r = eseval.run_gap_eval()
+    assert r["readable_without_gate"] and r["refused"] == "vocabulary_building"
+    assert r["requests_while_refused"] == 0 and r["top_up_first"]
+    assert r["shown_after"] and r["hidden_after"] and r["ten_minutes_serves"]
+    assert eseval.GAP_TENANT not in r["line"]

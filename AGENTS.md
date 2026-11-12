@@ -589,6 +589,48 @@ Listed with owners in the README's Limitations section and in
   reports `top-up due` for up to twenty minutes while its catch-up slice
   runs, and serves cases that whole time with a week of names unknown -
   which it also did before, under a word that made it look like a fault.
+  **Past a bound the gap fails closed.** `ClusterVocabulary.serves`
+  checked only how many days the cover spans, never how recent its end
+  is, so a bridge restarted a week after the last one served cases off a
+  cover a week old: a tenant onboarded in between had never been read and
+  was plain text in message text. Now a cover whose end is more than
+  `vocabulary_max_gap` behind now (`VOCABULARY_MAX_GAP_S`, an hour, or one
+  refresh plus one slice budget if the site's budget makes that longer) is
+  `catching_up`: **every query of every case** - an open one too - is
+  refused `vocabulary_building` before any request, with a message giving
+  the gap in hours, the bound and the range the top-up must read (no
+  value, nothing about a guess; the code's meaning, "the vocabulary does
+  not yet cover what a page could carry", is the right one). The VOCAB
+  line says `CATCHING UP` with the same range, and es-login waits through
+  it and says what it is waiting for. A constant rather than a site-map
+  setting because a site that raised it would be choosing to leak; it
+  scales with `budget_s` so a site that needs long slices is not refused
+  during an ordinary slow top-up. Within the bound nothing changes: ten
+  minutes behind serves as before, a failed top-up is `stale` and serves.
+  **Simple rule, not a time-range one**, because a narrow rule could not be
+  shown safe. Routes checked: a query with no time range covers all time;
+  a range ending before the gap still returns documents whose message
+  names a tenant first logged in the gap (ingest delay, a back-dated
+  `@timestamp`, a message about a future onboarding), and the vocabulary
+  is read by `@timestamp`, so such a name was never in any slice; a
+  `top_hits` under an aggregation and a `filters` bucket reach the same
+  documents. **The open-case route** was a second leak: a case applied the
+  cover once and never again, so a top-up never reached it; the bridge
+  now re-applies (locally, no request) whenever the index holds a newer
+  cover than the case does. Order: `next_vocabulary_slice` already reads
+  the newest end first, from the cover's end to now, so the gap is the
+  first top-up and cases run as soon as it is whole; left as it was.
+  **Cost** to a user who restarts the bridge every morning: the overnight
+  gap is hours, so every case is refused for as long as that one top-up
+  takes - a page per 1,000 values per field over the whole gap; on a
+  cluster where a day's page is 8-35s that is minutes. **Known risk, not
+  changed** (slice width is out of scope): the catch-up is one read from
+  the cover's end to now, however wide, so after a long downtime it is
+  charged the wide-range rate and may exceed `vocabulary.budget_s`; then
+  it fails, retries, and cases stay refused. The way out today is a fresh
+  `out/es/vocabulary.json` (delete it and sign in again) or a larger
+  `budget_s`. Gate: `gap_fails_closed` on `eseval.gap_docs` (own index
+  pattern and map, appended last).
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
@@ -957,7 +999,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 30 pass, and a change that cannot keep them passing
+  MCP endpoint; all 31 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -1010,7 +1052,12 @@ Listed with owners in the README's Limitations section and in
   phrase or not, and a reused and a label-only phrase still run once the
   case is spent out.
   `review_flags_guessing` (`eseval.run_review_eval`, see "A case can be
-  read back" above).
+  read back" above). `gap_fails_closed` (`eseval.run_gap_eval`, on
+  `eseval.gap_docs`: a cover ending a week ago against the one-hour
+  bound; the gap tenant is readable on that page with the gate off, is
+  refused with 0 requests and `catching_up` with it on, the first top-up
+  is the gap itself, after it the same open case is shown with the name
+  hidden, and a cover ten minutes behind serves).
   Label use: `label_guessing_refused` - a fresh case on the estate
   guesses a hundred low-numbered labels, **100 of 100 are live labels it
   holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label
@@ -1022,8 +1069,8 @@ Listed with owners in the README's Limitations section and in
   `mcp_prompt_gate`.
   Fixed documents for the readability checks are appended after the RNG
   stream so nothing existing moves: `UNMARKED_JOBS`, `UNMARKED_NAMES`,
-  `DEFAULT_MAP_*`, `ORDINARY_WORD_JOBS`, the estate, `OVER_CAP_*` and,
-  last of all, `STREAM_*` (those two the only ones in index patterns of
+  `DEFAULT_MAP_*`, `ORDINARY_WORD_JOBS`, the estate, `OVER_CAP_*`,
+  `STREAM_*` and, last of all, `GAP_*` (the last three the only ones in index patterns of
   their own, so no other query, build or count pays for them; they hold
   no ground truth either - `OVER_CAP_TRUTH` is that gate's own).
 

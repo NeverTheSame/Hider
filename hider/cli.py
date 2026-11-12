@@ -470,6 +470,11 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
               "finishes.", file=sys.stderr)
         state = _wait_for_vocabulary(
             esbridge.BrokerClient(sock, timeout=60), cluster.name)
+        if state.get("state") == "catching_up":
+            print(f"the saved name vocabulary for {cluster.name} ends {state.get('age_s', 0) / 3600:.1f}h "
+                  f"ago; cases are refused until the top-up reads {(state.get('gap') or ['?'])[0]} "
+                  "to now. The bridge keeps reading - run es-login again to see the progress.")
+            return 1
         if state.get("state") == "building" and not state.get("serving"):
             print(f"the name vocabulary for {cluster.name} does not yet cover the last "
                   f"{elastic.VOCABULARY_SERVE_DAYS} days; cases will be refused until it "
@@ -745,7 +750,7 @@ def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
     # when the whole of vocabulary.days is in: that is hours on a real
     # estate, and the older slices keep building behind the case.
     # "failed" ends it as surely, or a caller would wait out the timeout.
-    while (state is None or (state.get("state") == "building"
+    while (state is None or (state.get("state") in ("building", "catching_up")
                              and not state.get("serving"))) \
             and time.monotonic() < deadline:
         line = esbridge.vocabulary_line(state) if state else None

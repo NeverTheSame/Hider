@@ -135,6 +135,16 @@ VOCABULARY_PAGE = 1_000
 DEFAULT_VOCABULARY_BUDGET_S = 1200.0
 MAX_VOCABULARY_BUDGET_S = 7200.0
 VOCABULARY_REFRESH_S = 600.0
+#: How far the end of the cover may fall behind now before a case is
+#: refused: past it, a name first logged in the gap has never been read and
+#: would be plain text on a page. An hour, or one refresh plus one slice
+#: budget if a site's budget makes that longer - so a top-up that is merely
+#: slow, or one failure inside it, still serves (as stale).
+VOCABULARY_MAX_GAP_S = 3600.0
+
+
+def vocabulary_max_gap(config: "ElasticConfig") -> float:
+    return max(VOCABULARY_MAX_GAP_S, VOCABULARY_REFRESH_S + config.vocabulary_budget_s)
 #: How much of the time range one slice of a build covers. One day, newest
 #: first, for two measured reasons. **Cost**: a composite page over a
 #: 30-day range was measured at 31 to 297 seconds against 8 to 35 for the
@@ -1709,11 +1719,18 @@ class ClusterVocabulary:
         line as the covered range.
         """
         want = min(VOCABULARY_SERVE_DAYS * 86400.0, config.vocabulary_days * 86400.0)
-        # How far back the cover reaches, not how fresh it is: a stale
-        # cover is still served (with its age on the VOCAB line), which is
-        # the trade the ten-minute refresh already accepted. ``now`` is
-        # here because what counts as enough depends on the site map.
-        return self.covered_until - self.covered_from >= want - 1.0
+        # How far back the cover reaches, and how far behind now its end
+        # is. A cover a few minutes behind is served (stale past the
+        # refresh, with its age on the VOCAB line) - the trade the
+        # ten-minute refresh accepted. Past vocabulary_max_gap it is not: a
+        # name first logged in the gap has never been read, and no time
+        # range a query names can keep it off a page (see AGENTS.md).
+        return (self.covered_until - self.covered_from >= want - 1.0
+                and not self.behind(config, now))
+
+    def behind(self, config: "ElasticConfig", now: float) -> bool:
+        """The cover ends further back than :func:`vocabulary_max_gap`."""
+        return now - self.covered_until > vocabulary_max_gap(config)
 
     def complete(self, config: "ElasticConfig", now: float) -> bool:
         """Whether the cover reaches the whole of ``vocabulary.days``."""
@@ -1877,7 +1894,11 @@ class VocabularyIndex:
             else max(vocab.covered_until, self.started_at)
         topping_up = cluster in self.in_progress
         failed = self.failed.get(cluster)
-        if not serving:
+        if not serving and vocab.behind(config, t):
+            # the cover ends too far back: cases wait for the top-up that
+            # reads the gap (next_vocabulary_slice puts it first)
+            state = "catching_up"
+        elif not serving:
             # read something, but not far enough back yet to answer a case
             state = "building"
         elif t - vocab.covered_until <= VOCABULARY_REFRESH_S:
@@ -1907,6 +1928,9 @@ class VocabularyIndex:
             "covered_days": round(vocab.covered_days(t), 2),
             "wanted_days": config.vocabulary_days,
             "age_s": round(max(0.0, t - vocab.covered_until), 1),
+            "max_gap_s": vocabulary_max_gap(config),
+            # the range the top-up has to read before cases run again
+            "gap": ([_iso(vocab.covered_until), _iso(t)] if vocab.behind(config, t) else None),
         }
         if state == "stale" and failed is not None:
             out["refused"] = failed

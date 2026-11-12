@@ -648,10 +648,34 @@ class Bridge:
         is visible. Logged as counts, never a name. True if this call
         applied it (the caller then gates the query again).
         """
-        if self.index is None or self.scrubber.vocabulary_applied(cluster.name):
+        if self.index is None:
             return False
         vocab = self.index.get(cluster.name)
-        if vocab is None or not vocab.serves(self.config, clock()):
+        t = clock()
+        if self.scrubber._vocab_rules and vocab is not None \
+                and vocab.behind(self.config, t):
+            # every query, not only a case's first: the gap is a property of
+            # the cover now, and an open case is refused the same way
+            gap_h = (t - vocab.covered_until) / 3600.0
+            prog = (self.index.in_progress and cluster.name in self.index.in_progress)
+            raise elastic.Refused(
+                "vocabulary_building",
+                "response withheld: the name vocabulary for this cluster ends "
+                f"{gap_h:.1f}h ago, past the {elastic.vocabulary_max_gap(self.config) / 3600.0:.1f}h "
+                "bound, so a name first logged since then has not been read and could be plain "
+                "text on this page. Waiting for the top-up that reads "
+                f"{elastic._iso(vocab.covered_until)} to now"
+                + (" (running)" if prog else " (next to run)")
+                + "; es-smoke's VOCAB line shows its progress.")
+        applied = self.scrubber._vocabulary_at.get(cluster.name)
+        if applied is not None and (vocab is None or applied[2] is None
+                                    or applied[2] >= vocab.covered_until):
+            # this case already holds this cover; a newer one (a top-up
+            # since) is applied again below, locally, before the page
+            return False
+        if not self.scrubber._vocab_rules:
+            return False
+        if vocab is None or not vocab.serves(self.config, t):
             raise elastic.Refused(
                 "vocabulary_building",
                 "response withheld: the name vocabulary for this cluster does not yet cover "
@@ -991,6 +1015,11 @@ def vocabulary_line(v: dict | None) -> str | None:
             state = "top-up running" if v.get("topping_up") else "top-up due"
         line += (f" over the last {v['covered_days']}d of {v.get('wanted_days', '?')}d, "
                  f"{state} ({v.get('age_s', 0)}s old)")
+        if v.get("state") == "catching_up":
+            gap = v.get("gap") or ["?", "now"]
+            line += (f" - CATCHING UP: cases refused until the top-up reads {gap[0]} to now "
+                     f"({v.get('age_s', 0) / 3600.0:.1f}h, bound "
+                     f"{v.get('max_gap_s', 0) / 3600.0:.1f}h)")
         if v.get("state") == "top_up_due":
             line += (" - cases run; names logged since the cover ended are not known until "
                      "the top-up finishes")
@@ -999,7 +1028,7 @@ def vocabulary_line(v: dict | None) -> str | None:
                      + ": names logged since are not known")
         elif v.get("state") == "extending":
             line += " - cases run; older days still reading"
-        elif not v.get("serving", True):
+        elif not v.get("serving", True) and v.get("state") != "catching_up":
             line += " - NOT ENOUGH COVER YET: cases are refused"
     if v.get("skipped"):
         line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
