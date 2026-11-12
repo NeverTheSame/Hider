@@ -473,7 +473,8 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
         if state.get("state") == "catching_up":
             print(f"the saved name vocabulary for {cluster.name} ends {state.get('age_s', 0) / 3600:.1f}h "
                   f"ago; cases are refused until the top-up reads {(state.get('gap') or ['?'])[0]} "
-                  "to now. The bridge keeps reading - run es-login again to see the progress.")
+                  f"to now: {esbridge._catch_up_note(state.get('catch_up'))}. The bridge keeps "
+                  "reading, one day a slice - run es-login again to see the progress.")
             return 1
         if state.get("state") == "building" and not state.get("serving"):
             print(f"the name vocabulary for {cluster.name} does not yet cover the last "

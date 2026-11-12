@@ -57,6 +57,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import json
+import math
 import os
 import re
 import time
@@ -1784,6 +1785,9 @@ class VocabularyIndex:
         self.started_at: float | None = None
         self.in_progress: set[str] = set()
         self.failed: dict[str, str] = {}
+        #: cluster -> where the cover ended when this bridge found it behind
+        #: the bound: what "slices total" on the progress line counts from
+        self.catch_up_from: dict[str, float] = {}
         self.load()
 
     @property
@@ -1793,10 +1797,62 @@ class VocabularyIndex:
     def get(self, cluster: str) -> ClusterVocabulary | None:
         return self.clusters.get(cluster)
 
-    def put(self, cluster: str, vocab: ClusterVocabulary) -> None:
+    def put(self, cluster: str, vocab: ClusterVocabulary) -> str:
+        """Fold a finished slice in. ``merged`` when it touches the held
+        cover, ``new`` when nothing was held, ``replaced`` when it does not
+        touch it - the held cover is dropped rather than bridged, because a
+        saved cover never claims a range with a hole in it."""
         held = self.clusters.get(cluster)
-        self.clusters[cluster] = vocab if held is None else held.merge(vocab)
+        if held is None:
+            self.clusters[cluster] = vocab
+            how = "new"
+        elif vocab.covered_from <= held.covered_until + 1.0 \
+                and vocab.covered_until >= held.covered_from - 1.0:
+            self.clusters[cluster] = held.merge(vocab)
+            how = "merged"
+        else:
+            self.clusters[cluster] = vocab
+            how = "replaced"
         self.save()
+        return how
+
+    def drop_expired(self, cluster: str, config: ElasticConfig, now: float) -> ClusterVocabulary | None:
+        """Drop a cover that ends before ``vocabulary.days`` reaches: every
+        day it covers is one nobody asks about, and reading forward from it
+        would spend slices on those days before any case could run. The
+        build then starts as a first build does (newest day first, cases
+        after two). Returns what was dropped, for the log's counts."""
+        held = self.clusters.get(cluster)
+        if held is None or held.covered_until >= now - config.vocabulary_days * 86400.0:
+            return None
+        del self.clusters[cluster]
+        self.catch_up_from.pop(cluster, None)
+        self.save()
+        return held
+
+    def catch_up(self, cluster: str, config: ElasticConfig, now: float) -> dict | None:
+        """Where the catch-up stands, for the VOCAB line, es-login and the
+        refusal: counts and ranges only. None when the cover is not behind
+        the bound. The numbers are what the broker will do next: slices of
+        ``VOCABULARY_SLICE_S`` forward from the cover's end, or a fresh first
+        build when the cover has expired."""
+        held = self.clusters.get(cluster)
+        if held is None or not held.behind(config, now):
+            return None
+        oldest = now - config.vocabulary_days * 86400.0
+        if held.covered_until < oldest:
+            days = min(VOCABULARY_SERVE_DAYS, config.vocabulary_days)
+            first = next_vocabulary_slice(config, None, now) or (now, now)
+            return {"expired": True, "slices_left": days, "slices_total": days,
+                    "reading": [_iso(first[0]), _iso(first[1])],
+                    "running": cluster in self.in_progress, "failed": self.failed.get(cluster)}
+        left = max(1, math.ceil((now - held.covered_until - 1.0) / VOCABULARY_SLICE_S))
+        since = self.catch_up_from.get(cluster, held.covered_until)
+        total = max(left, math.ceil((now - since - 1.0) / VOCABULARY_SLICE_S))
+        nxt = next_vocabulary_slice(config, held, now) or (held.covered_until, now)
+        return {"expired": False, "slices_left": left, "slices_total": total,
+                "reading": [_iso(nxt[0]), _iso(nxt[1])],
+                "running": cluster in self.in_progress, "failed": self.failed.get(cluster)}
 
     def note_over_cap(self, cluster: str, field: str, count: int, now: float) -> None:
         """Remember that ``field`` has more distinct values than the cap, so
@@ -1929,8 +1985,10 @@ class VocabularyIndex:
             "wanted_days": config.vocabulary_days,
             "age_s": round(max(0.0, t - vocab.covered_until), 1),
             "max_gap_s": vocabulary_max_gap(config),
-            # the range the top-up has to read before cases run again
+            # the range the top-up has to read before cases run again, and
+            # how it will be read: slices left and total, the one being read
             "gap": ([_iso(vocab.covered_until), _iso(t)] if vocab.behind(config, t) else None),
+            "catch_up": self.catch_up(cluster, config, t),
         }
         if state == "stale" and failed is not None:
             out["refused"] = failed
@@ -1952,11 +2010,20 @@ def next_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
     if not config.vocabulary_rules:
         return None
     oldest = now - config.vocabulary_days * 86400.0
-    if held is None:
+    if held is None or held.covered_until < oldest:
+        # nothing held, or a cover that has fallen out of vocabulary.days
+        # entirely (the broker drops it before this slice is saved: reading
+        # forward from it would read days nobody asks about, and reading
+        # from ``oldest`` would leave a hole)
         return (max(oldest, now - VOCABULARY_SLICE_S), now)
     if now - held.covered_until >= VOCABULARY_REFRESH_S:
-        # the newest end first: a case cares about now, not about 30 days ago
-        return (held.covered_until, now)
+        # The newest end first, **forward from the cover's end**, one slice
+        # at a time: a gap wider than a slice (a bridge down for a week) is
+        # read as whole slices, each with its own budget and saved as it
+        # lands, so a failure or a restart resumes rather than re-reading,
+        # and the saved cover is always one range with no hole. A ten-minute
+        # top-up is one short slice, as before.
+        return (held.covered_until, min(now, held.covered_until + VOCABULARY_SLICE_S))
     if held.covered_from > oldest + 1.0:
         return (max(oldest, held.covered_from - VOCABULARY_SLICE_S), held.covered_from)
     return None

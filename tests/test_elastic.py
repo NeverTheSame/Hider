@@ -1533,3 +1533,46 @@ def test_a_restarted_bridge_is_not_charged_for_the_time_it_was_down():
     # a day behind: past the bound, catching up, not serving, the gap named
     r = index.report("emea", CFG, now=now + 86400.0)
     assert r["state"] == "catching_up" and not r["serving"] and r["gap"]
+
+
+def test_a_saved_cover_never_claims_a_range_with_a_hole():
+    index = elastic.VocabularyIndex(None)
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    assert index.put("c", elastic.ClusterVocabulary(now - 10 * d, now - 7 * d, 0.0,
+                                                    {"job.name": ["a"]})) == "new"
+    # the next slice forward from the cover's end: one day, contiguous
+    assert elastic.next_vocabulary_slice(CFG, index.get("c"), now) == (now - 7 * d, now - 6 * d)
+    assert index.put("c", elastic.ClusterVocabulary(now - 7 * d, now - 6 * d, 0.0,
+                                                    {"job.name": ["b"]})) == "merged"
+    assert (index.get("c").covered_from, index.get("c").covered_until) == (now - 10 * d, now - 6 * d)
+    # a slice that does not touch the cover replaces it rather than bridging
+    assert index.put("c", elastic.ClusterVocabulary(now - d, now, 0.0,
+                                                    {"job.name": ["c"]})) == "replaced"
+    assert index.get("c").covered_from == now - d and index.get("c").fields == {"job.name": ["c"]}
+    # a ten-minute top-up is one short slice, as before
+    assert elastic.next_vocabulary_slice(CFG, index.get("c"), now + 900) == (now, now + 900)
+
+
+def test_an_expired_cover_is_dropped_and_the_build_starts_fresh():
+    index = elastic.VocabularyIndex(None)
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    old = elastic.ClusterVocabulary(now - 40 * d, now - 35 * d, 0.0, {"job.name": ["x"]})
+    index.put("c", old)
+    # before the broker drops it: refused as behind, and told what comes next
+    cu = index.catch_up("c", CFG, now)
+    assert cu["expired"] and cu["slices_left"] == elastic.VOCABULARY_SERVE_DAYS
+    assert elastic.next_vocabulary_slice(CFG, old, now) == (now - d, now)
+    assert index.drop_expired("c", CFG, now) is old and index.get("c") is None
+    assert index.drop_expired("c", CFG, now) is None
+    # a cover that only partly fell out of the window is kept and read forward
+    part = elastic.ClusterVocabulary(now - 40 * d, now - 5 * d, 0.0, {"job.name": ["y"]})
+    index.put("c", part)
+    assert index.drop_expired("c", CFG, now) is None
+    assert elastic.next_vocabulary_slice(CFG, part, now) == (now - 5 * d, now - 4 * d)
+    cu = index.catch_up("c", CFG, now)
+    assert not cu["expired"] and cu["slices_left"] == 5 and cu["slices_total"] == 5
+    index.catch_up_from["c"] = now - 7 * d
+    assert index.catch_up("c", CFG, now)["slices_total"] == 7
+    assert "y" not in json.dumps(index.catch_up("c", CFG, now))

@@ -657,15 +657,14 @@ class Bridge:
             # every query, not only a case's first: the gap is a property of
             # the cover now, and an open case is refused the same way
             gap_h = (t - vocab.covered_until) / 3600.0
-            prog = (self.index.in_progress and cluster.name in self.index.in_progress)
+            cu = self.index.catch_up(cluster.name, self.config, t) or {}
             raise elastic.Refused(
                 "vocabulary_building",
                 "response withheld: the name vocabulary for this cluster ends "
                 f"{gap_h:.1f}h ago, past the {elastic.vocabulary_max_gap(self.config) / 3600.0:.1f}h "
                 "bound, so a name first logged since then has not been read and could be plain "
                 "text on this page. Waiting for the top-up that reads "
-                f"{elastic._iso(vocab.covered_until)} to now"
-                + (" (running)" if prog else " (next to run)")
+                f"{elastic._iso(vocab.covered_until)} to now: " + _catch_up_note(cu)
                 + "; es-smoke's VOCAB line shows its progress.")
         applied = self.scrubber._vocabulary_at.get(cluster.name)
         if applied is not None and (vocab is None or applied[2] is None
@@ -975,6 +974,21 @@ def _over_cap_note(v: dict) -> str:
             + ", ".join(f"{f}~{n}>{v.get('max', '?')}" for f, n in sorted(over.items())))
 
 
+def _catch_up_note(cu: dict | None) -> str:
+    """Slices left and the range being read: counts and ranges only."""
+    if not cu:
+        return "waiting for the next slice"
+    if cu.get("expired"):
+        head = (f"the saved cover is older than vocabulary.days and is dropped; a fresh build "
+                f"reads {cu['slices_left']} one-day slices first")
+    else:
+        head = f"{cu['slices_left']} of {cu['slices_total']} one-day slices left"
+    rng = cu.get("reading") or ["?", "?"]
+    state = ("running" if cu.get("running") else
+             f"last attempt failed ({cu['failed']}), retrying" if cu.get("failed") else "next")
+    return f"{head}, reading {rng[0]} to {rng[1]} ({state})"
+
+
 def vocabulary_line(v: dict | None) -> str | None:
     """How close each vocabulary field is to its cap: counts, never values.
 
@@ -996,6 +1010,8 @@ def vocabulary_line(v: dict | None) -> str | None:
                 f"{b['seconds']:g}s of {b['budget_s']:g}s a slice"
                 + (f", reading {b['field']}" if b.get("field") else "")
                 + (f", values so far {b['values']}" if b.get("values") else "")
+                + (f"; CATCHING UP, cases refused: {_catch_up_note(v['catch_up'])}"
+                   if v.get("catch_up") else "")
                 + _over_cap_note(v))
     if v.get("state") == "failed":
         return (f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
@@ -1019,7 +1035,7 @@ def vocabulary_line(v: dict | None) -> str | None:
             gap = v.get("gap") or ["?", "now"]
             line += (f" - CATCHING UP: cases refused until the top-up reads {gap[0]} to now "
                      f"({v.get('age_s', 0) / 3600.0:.1f}h, bound "
-                     f"{v.get('max_gap_s', 0) / 3600.0:.1f}h)")
+                     f"{v.get('max_gap_s', 0) / 3600.0:.1f}h): " + _catch_up_note(v.get("catch_up")))
         if v.get("state") == "top_up_due":
             line += (" - cases run; names logged since the cover ended are not known until "
                      "the top-up finishes")
@@ -1412,6 +1428,18 @@ class Broker:
         t = clock() if now is None else now
         if t < self._retry_at.get(cluster.name, 0.0):
             return  # a slice failed moments ago; do not spin on it
+        dropped = self.vocabulary.drop_expired(cluster.name, self.config, t)
+        if dropped is not None:
+            # counts and days only, never a name
+            self._log_vocabulary(cluster.name, "expired", {
+                "covered_days": round(dropped.covered_days(t), 2),
+                "ended_days_ago": round((t - dropped.covered_until) / 86400.0, 2),
+                "values": dropped.total()})
+        held = self.vocabulary.get(cluster.name)
+        if held is not None and held.behind(self.config, t):
+            self.vocabulary.catch_up_from.setdefault(cluster.name, held.covered_until)
+        elif held is not None:
+            self.vocabulary.catch_up_from.pop(cluster.name, None)
         slice_range = elastic.next_vocabulary_slice(
             self.config, self.vocabulary.get(cluster.name), t)
         if slice_range is None:
@@ -1511,12 +1539,12 @@ class Broker:
             return True
         # the slice is whole: save it, and let the next iteration plan the
         # next slice. A restart resumes from here rather than starting over.
-        self.vocabulary.put(cluster.name, build.result())
+        how = self.vocabulary.put(cluster.name, build.result())
         self._build_failed.pop(cluster.name, None)
         self.vocabulary.failed.pop(cluster.name, None)
         self.vocabulary.in_progress.discard(cluster.name)
         self._log_vocabulary(cluster.name, "slice",
-                             {**build.progress(),
+                             {**build.progress(), "saved_as": how,
                               **self.vocabulary.report(cluster.name, self.config, now=clock())})
         self._build = self._build_cluster = None
         return True

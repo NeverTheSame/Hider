@@ -622,15 +622,70 @@ Listed with owners in the README's Limitations section and in
   first top-up and cases run as soon as it is whole; left as it was.
   **Cost** to a user who restarts the bridge every morning: the overnight
   gap is hours, so every case is refused for as long as that one top-up
-  takes - a page per 1,000 values per field over the whole gap; on a
-  cluster where a day's page is 8-35s that is minutes. **Known risk, not
-  changed** (slice width is out of scope): the catch-up is one read from
-  the cover's end to now, however wide, so after a long downtime it is
-  charged the wide-range rate and may exceed `vocabulary.budget_s`; then
-  it fails, retries, and cases stay refused. The way out today is a fresh
-  `out/es/vocabulary.json` (delete it and sign in again) or a larger
-  `budget_s`. Gate: `gap_fails_closed` on `eseval.gap_docs` (own index
-  pattern and map, appended last).
+  takes - one-day slices from the cover's end to now, each a page per
+  1,000 values per field at the slice rate; on a cluster where a day's
+  page is 8-35s that is a minute or two a slice, so an overnight gap is
+  minutes and a week is about ten. Gate: `gap_fails_closed` on
+  `eseval.gap_docs` (own index pattern and map, appended last).
+  **The catch-up is read in slices**, not as one request. It was one read
+  from the cover's end to now, however wide: after a week down that is
+  charged the wide-range rate (31-297s a page against 8-35s over a day),
+  which on the gap fixture is **10 requests, 1,392 simulated seconds and
+  9 wide pages against a 1,200s budget - refused, retried, refused, for
+  ever**, with every case refused the whole time. `next_vocabulary_slice`
+  now hands the gap out **forward from the cover's end**, one
+  `VOCABULARY_SLICE_S` at a time (the slice size and how one slice is read
+  are unchanged; a ten-minute top-up is still one short slice): each
+  slice has its own `budget_s`, is saved by `VocabularyIndex.put` as soon
+  as it is whole, and a failure or a restart resumes from the cover's new
+  end. On the same fixture: **7 slices, 35 requests, 433 seconds, worst
+  slice 75s, 0 wide pages**, and the case is shown with the gap tenant
+  hidden once the seventh lands. **Why forward, not newest-first**: the
+  hard rule is that the saved cover never claims a range with a hole in
+  it, and a forward slice always touches the cover, so `merge` extends one
+  range. Newest-first would serve cases two slices in - but the recent
+  slices would not touch the saved cover, so either the saved cover is
+  dropped (a week's gap on a 30-day cover re-reads 23 days that were
+  already on disk) or the index holds two ranges with a hole between
+  them, which is the thing the rule forbids. The cost of forward: cases
+  wait for the whole gap, seven slices for a week rather than two. `put`
+  enforces the rule structurally - a slice that does not touch the held
+  cover **replaces** it (logged as `saved_as: replaced`) rather than
+  bridging the hole; nothing in the live path produces one, and a test
+  pins it.
+  **A slice of the gap that fails** (its budget, an upstream error, a
+  misshapen reply) behaves as any slice does: the slices before it stay
+  saved, the cover is unchanged by the failure, the same slice is retried
+  after `VOCABULARY_RETRY_S` (a minute) from the cover's end, and cases
+  stay refused while the cover is behind the bound. The VOCAB line and
+  the refusal say `last attempt failed (<code>), retrying`.
+  **A cover that has fallen out of `vocabulary.days`** - its end older
+  than the window - is dropped (`VocabularyIndex.drop_expired`, logged as
+  `expired` with days and a count), and the build starts as a first build
+  does: newest day first, cases after `VOCABULARY_SERVE_DAYS`. Reading
+  forward from it would spend slices on days nobody asks about before any
+  case could run, and reading from the window's edge would leave a hole.
+  Cost: the names it held are lost (every day it covers is outside the
+  window, so none would be re-read), and the first case waits the
+  first-build time rather than two short slices. A cover that is only
+  **partly** out of the window is kept whole and read forward: the old
+  part is extra names, not a hole, and `complete()` is true for it.
+  **Progress is visible everywhere a user waits**:
+  `VocabularyIndex.catch_up` gives slices left and total (total counted
+  from where the cover ended when this bridge first found it behind,
+  `catch_up_from`, runtime-only), the range being read, and whether that
+  slice is running, next, or failed and retrying - counts and ranges
+  only. The VOCAB line prints it under `CATCHING UP` (and beside a running
+  slice's progress), es-login prints it when it stops waiting, and the
+  `vocabulary_building` refusal carries it word for word; none of it
+  depends on anything about a guess, and the numbers are what the broker
+  does next, not an estimate. Gate: `catch_up_sliced`
+  (`eseval.run_catch_up_eval`, on `eseval.gap_docs` with `GAP_JOBS` 12,000
+  job names spread over the seven-day gap, the stub charging the slice
+  and wide rates): the before and after figures above, the cover one range
+  from its old start to now, 145 refusals while behind with the
+  slices-left count 7 first and never increasing, the case shown and the
+  name hidden after, and no value in the build log.
   Anything that scrubs pages outside the bridge (es-eval's `Session`,
   tests) must build and apply first: `eseval.build_vocabulary`,
   `eseval.learn_vocabulary`.
@@ -999,7 +1054,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 31 pass, and a change that cannot keep them passing
+  MCP endpoint; all 32 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -1057,7 +1112,9 @@ Listed with owners in the README's Limitations section and in
   bound; the gap tenant is readable on that page with the gate off, is
   refused with 0 requests and `catching_up` with it on, the first top-up
   is the gap itself, after it the same open case is shown with the name
-  hidden, and a cover ten minutes behind serves).
+  hidden, and a cover ten minutes behind serves). `catch_up_sliced`
+  (`eseval.run_catch_up_eval`, see "The catch-up is read in slices"
+  above).
   Label use: `label_guessing_refused` - a fresh case on the estate
   guesses a hundred low-numbered labels, **100 of 100 are live labels it
   holds, 100 of 100 refused, 0 reach Kibana**, a nonexistent label

@@ -1666,3 +1666,63 @@ def test_an_open_case_picks_up_a_top_up_before_its_next_page(tmp_path):
     index.put("stub", gap)
     o = b.run("stub", eseval.GAP_QUERY)
     assert eseval.GAP_TENANT not in json.dumps(o.output)
+
+
+def test_a_week_long_gap_is_read_in_slices_and_the_single_wide_read_fails_its_budget():
+    """Before: the whole gap in one request pays the wide rate past the
+    budget, fails, and cases stay refused. After: one-day slices, each saved
+    as it lands, the cover one range, the case shown when the gap closes."""
+    r = eseval.run_catch_up_eval()
+    b, a = r["before"], r["after"]
+    assert b["refused"] == "vocabulary" and b["wide_pages"] > 0 and b["seconds"] > r["budget_s"]
+    assert a["slices"] == eseval.GAP_DAYS and a["failed_slices"] == 0
+    assert a["wide_pages"] == 0 and a["max_slice_s"] < r["budget_s"]
+    assert a["one_range"] and a["covered_from_kept"] and a["covered_until_now"]
+    assert a["refusals_while_behind"] > 0 and a["message_names_slices"]
+    assert a["first_slices_left"] == eseval.GAP_DAYS and a["slices_left_decreasing"]
+    assert a["shown_after"] and a["hidden_after"] and a["log_values"] == 0
+    assert "slices left" in a["line_before"] and "slices left" in a["line_mid"]
+
+
+def test_a_gap_slice_that_fails_keeps_what_landed_and_is_retried(tmp_path):
+    """One slice of the catch-up fails: the slices before it stay saved, the
+    cover is unchanged by the failure, the line and the refusal say which
+    slice failed and that it is retried, and after the retry delay the same
+    slice is read again."""
+    cfg = eseval.gap_map()
+    cluster = cfg.clusters[0]
+    engine = eseval.StubEngine(eseval.Fixture(eseval.gap_docs(), [], []), (eseval.GAP_INDEX,))
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    old, _b = eseval.build_vocabulary(cfg, engine, now - 10 * d, now - 7 * d)
+    broker = esbridge.Broker(cfg, lambda: eseval.SteppedSearchTransport(engine),
+                             poll_interval=0.0, sessions_dir=tmp_path)
+    broker.open()
+    broker.vocabulary.put("stub", old)
+    broker.start_vocabulary(cluster)
+    while sum(1 for r in broker._build_log if r["vocabulary"] == "slice") < 2:
+        assert broker.pump_vocabulary()
+    saved = broker.vocabulary.get("stub")
+    assert saved.covered_until == now - 5 * d
+    # the third slice starts, then fails mid-read
+    if broker._build is None:
+        assert broker.pump_vocabulary()
+    assert broker._build is not None and broker._build.covered_from == saved.covered_until
+    broker._end_slice(cluster, "vocabulary", broker._build)
+    assert broker.vocabulary.get("stub") == saved           # nothing lost, nothing added
+    cu = broker.vocabulary.catch_up("stub", cfg, now)
+    assert cu["failed"] == "vocabulary" and cu["slices_left"] == 5 and cu["slices_total"] == 7
+    line = esbridge.vocabulary_line(broker.vocabulary_progress("stub"))
+    assert "5 of 7 one-day slices left" in line and "last attempt failed (vocabulary), retrying" in line
+    bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"),
+                             eseval.EngineSession(engine), index=broker.vocabulary)
+    with pytest.raises(elastic.Refused) as e:
+        bridge.run("stub", eseval.GAP_QUERY)
+    assert e.value.code == "vocabulary_building" and "5 of 7" in e.value.message
+    assert "retrying" in e.value.message
+    # not retried at once; after the retry delay the same slice is read
+    assert not broker.pump_vocabulary()
+    esbridge.clock = lambda: now + elastic.VOCABULARY_RETRY_S + 1
+    assert broker.pump_vocabulary() and broker._build is not None
+    assert broker._build.covered_from == saved.covered_until
+    esbridge.clock = eseval.NOW.timestamp

@@ -1502,6 +1502,16 @@ GAP_QUERY = {"index": GAP_INDEX, "time_range": {"gte": "now-2d", "lte": "now"}, 
              "filters": [{"field": "message", "op": "phrase", "value": "sites mapped"}]}
 #: an older tenant the saved cover did read, so the cover has something in it
 GAP_OLD_TENANT = "Wexcombe Lantern Freight"
+#: Job names logged across the seven-day gap, one document each, spread
+#: evenly: enough that reading the whole gap in one request pays the
+#: wide-range rate for more pages than ``budget_s`` allows, while each
+#: one-day slice is two pages at the slice rate. Invented, by position.
+GAP_JOBS = 12_000
+GAP_DAYS = 7
+
+
+def gap_job(i: int) -> str:
+    return f"Gapwater Run {i:05d}"
 
 
 def gap_docs() -> list[Doc]:
@@ -1517,6 +1527,11 @@ def gap_docs() -> list[Doc]:
         Doc(GAP_INDEX, {"@timestamp": at(20), "log": {"level": "warn"},
                         "message": GAP_MESSAGE,
                         "labels": {"tenant_name": GAP_OLD_TENANT}}, {}),
+    ] + [
+        Doc(GAP_INDEX, {"@timestamp": at(0.5 + i * (GAP_DAYS * 24.0 - 1.0) / GAP_JOBS),
+                        "log": {"level": "info"}, "message": "Run finished",
+                        "job": {"name": gap_job(i)}}, {})
+        for i in range(GAP_JOBS)
     ]
 
 
@@ -1560,9 +1575,14 @@ def run_gap_eval(*, tier2: str = "none") -> dict:
         out["state"] = rep["state"]
         out["line"] = esbridge.vocabulary_line(rep) or ""
         nxt = elastic.next_vocabulary_slice(cfg, index.get("stub"), now)
-        out["top_up_first"] = nxt == (index.get("stub").covered_until, now)
-        top, _b = build_vocabulary(cfg, engine, *nxt)
-        index.put("stub", top)
+        # the first slice read is the one right after the cover's end
+        out["top_up_first"] = nxt is not None and nxt[0] == index.get("stub").covered_until
+        out["slices_to_close"] = 0
+        while nxt is not None and index.get("stub").behind(cfg, now):
+            top, _b = build_vocabulary(cfg, engine, *nxt)
+            index.put("stub", top)
+            out["slices_to_close"] += 1
+            nxt = elastic.next_vocabulary_slice(cfg, index.get("stub"), now)
         o = b.run("stub", GAP_QUERY)
         msgs = " ".join(_messages(o.output))
         out["shown_after"] = o.hits_shown >= 1
@@ -1600,8 +1620,143 @@ def gap_map() -> elastic.ElasticConfig:
         "indices": [GAP_INDEX], "time_field": "@timestamp",
         "clusters": {"stub": "https://kibana-stub.example.net"},
         "fields": {"@timestamp": "keep", "log.level": "keep", "message": "text",
-                   "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"}},
+                   "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+                   "job.name": {"kind": "identifier", "type": "JOB_NAME"}},
     }, source="gap-fixture")
+
+
+def run_catch_up_eval(*, tier2: str = "none", max_steps: int = 20_000) -> dict:
+    """The catch-up after a week down, with the stub charging the slice
+    rate over a day and the wide rate over anything wider.
+
+    Before: the gap read as one request from the cover's end to now, as the
+    broker did (``VocabularyBuild`` over the whole gap): requests, simulated
+    seconds, pages at the wide rate, and whether it failed its budget.
+    After: the real ``Broker`` stepping a slice at a time: slices, requests,
+    seconds, the worst slice against the budget, wide pages (must be none),
+    the saved cover still one range, a case refused throughout with a true
+    slices-left count, and the same open case shown after with the gap
+    tenant hidden.
+    """
+    from . import esbridge
+
+    cfg = gap_map()
+    cluster = elastic.Cluster("stub", "https://kibana-stub.example.net")
+    fx = Fixture(gap_docs(), [], [])
+    engine = StubEngine(fx, (GAP_INDEX,))
+    engine.page_seconds = PAGE_SECONDS
+    engine.wide_page_seconds = WIDE_PAGE_SECONDS
+    now = NOW.timestamp()
+    gap_s = GAP_DAYS * 86400.0
+    out: dict = {"gap_days": GAP_DAYS, "budget_s": cfg.vocabulary_budget_s,
+                 "before": {}, "after": {}}
+    old, _b = build_vocabulary(cfg, engine, now - gap_s - 3 * 86400.0, now - gap_s)
+
+    # -- before: one read over the whole gap ---------------------------------
+    r0, s0, w0 = len(engine.requests), engine.simulated_seconds, engine.wide_pages
+    build = elastic.VocabularyBuild(cfg, old.covered_until, now,
+                                    clock=lambda: engine.simulated_seconds)
+    refused = None
+    try:
+        while build.pending():
+            vq = build.request()["params"]
+            build.feed({"isPartial": False, "isRunning": False,
+                        "rawResponse": engine.search(vq["index"], vq["body"],
+                                                     ignore_unavailable=True)})
+    except elastic.Refused as e:
+        refused = e.code
+    out["before"] = {"requests": len(engine.requests) - r0,
+                     "seconds": round(engine.simulated_seconds - s0, 1),
+                     "wide_pages": engine.wide_pages - w0, "refused": refused}
+
+    # -- after: the broker, a serve-loop step at a time ------------------------
+    transport = SteppedSearchTransport(engine)
+    tmp = Path(tempfile.mkdtemp(prefix="hider-es-eval-catchup-"))
+    saved_clock = esbridge.clock
+    esbridge.clock = lambda: now
+    a: dict = {"slices": 0, "requests": 0, "seconds": 0.0, "max_slice_s": 0.0,
+               "wide_pages": 0, "failed_slices": 0, "steps": 0, "one_range": False,
+               "covered_from_kept": False, "refusals_while_behind": 0,
+               "slices_left_seen": [], "message_names_slices": False,
+               "shown_after": False, "hidden_after": False, "line_before": "", "line_mid": ""}
+    try:
+        broker = esbridge.Broker(cfg, lambda: transport, poll_interval=0.0, sessions_dir=tmp)
+        broker.open()
+        broker.vocabulary.put("stub", old)
+        r1, s1, w1 = len(engine.requests), engine.simulated_seconds, engine.wide_pages
+        bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2),
+                                 EngineSession(engine), index=broker.vocabulary)
+        a["line_before"] = esbridge.vocabulary_line(broker.vocabulary_progress("stub")) or ""
+        slice_seconds: list[float] = []
+        slice_start = engine.simulated_seconds
+        last_slices = 0
+        broker.start_vocabulary(cluster)
+        while a["steps"] < max_steps:
+            held = broker.vocabulary.get("stub")
+            if held is not None and not held.behind(cfg, now):
+                break
+            # a case during the catch-up: refused, and told how much is left
+            try:
+                bridge.run("stub", GAP_QUERY)
+            except elastic.Refused as e:
+                a["refusals_while_behind"] += 1
+                m = re.search(r"(\d+) of (\d+) one-day slices left", e.message)
+                if m:
+                    a["slices_left_seen"].append(int(m.group(1)))
+                    a["message_names_slices"] = True
+            if not broker.pump_vocabulary():
+                break
+            a["steps"] += 1
+            done = sum(1 for r in broker._build_log if r["vocabulary"] == "slice")
+            if done > last_slices:
+                slice_seconds.append(engine.simulated_seconds - slice_start)
+                slice_start = engine.simulated_seconds
+                last_slices = done
+                if a["line_mid"] == "" and done == 2:
+                    a["line_mid"] = esbridge.vocabulary_line(
+                        broker.vocabulary_progress("stub")) or ""
+        held = broker.vocabulary.get("stub")
+        a["slices"] = last_slices
+        a["failed_slices"] = sum(1 for r in broker._build_log if r["vocabulary"] == "failed")
+        a["requests"] = len(engine.requests) - r1
+        a["seconds"] = round(engine.simulated_seconds - s1, 1)
+        a["max_slice_s"] = round(max(slice_seconds), 1) if slice_seconds else 0.0
+        a["wide_pages"] = engine.wide_pages - w1
+        a["one_range"] = held is not None and len(broker.vocabulary.clusters) == 1
+        a["covered_from_kept"] = held is not None and held.covered_from == old.covered_from
+        a["covered_until_now"] = held is not None and now - held.covered_until < 1.0
+        a["slices_left_decreasing"] = a["slices_left_seen"] == sorted(
+            a["slices_left_seen"], reverse=True) and bool(a["slices_left_seen"])
+        a["first_slices_left"] = a["slices_left_seen"][0] if a["slices_left_seen"] else None
+        try:
+            o = bridge.run("stub", GAP_QUERY)
+            a["shown_after"] = o.hits_shown >= 1
+            a["hidden_after"] = GAP_TENANT not in json.dumps(o.output)
+        except elastic.Refused as e:
+            a["refused_after"] = e.code
+        a["log_values"] = sum(1 for r in broker._build_log
+                              if GAP_TENANT in json.dumps(r) or gap_job(7) in json.dumps(r))
+    finally:
+        esbridge.clock = saved_clock
+    out["after"] = a
+    return out
+
+
+def _catch_up_lines(o: dict | None) -> list[str]:
+    if not o:
+        return []
+    b, a = o["before"], o["after"]
+    return [f"catch-up after {o['gap_days']}d down  one wide read: {b['requests']} requests, "
+            f"{b['seconds']}s, {b['wide_pages']} pages at the wide rate, "
+            f"{'refused ' + b['refused'] if b['refused'] else 'finished'} against a "
+            f"{o['budget_s']:g}s budget; sliced: {a['slices']} slices ({a['failed_slices']} failed), "
+            f"{a['requests']} requests, {a['seconds']}s, worst slice {a['max_slice_s']}s, "
+            f"{a['wide_pages']} wide pages; cover one range {a['one_range']}, start kept "
+            f"{a['covered_from_kept']}, end at now {a.get('covered_until_now')}; "
+            f"{a['refusals_while_behind']} refusals while behind, slices left "
+            f"{a.get('first_slices_left')} first and decreasing {a.get('slices_left_decreasing')}; "
+            f"after: shown {a['shown_after']}, name hidden {a['hidden_after']}; values in the "
+            f"build log {a.get('log_values')}"]
 
 
 # ---------------------------------------------------------------------------
@@ -3859,6 +4014,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
 
     # es-review over that guessing run and over an ordinary investigation.
     gap = run_gap_eval(tier2="none")
+    catch_up = run_catch_up_eval(tier2="none")
     review = run_review_eval(cfg, engine, vocab, fx, phrase_budget["after"]["case_dir"],
                              tier2=tier2)
 
@@ -4075,6 +4231,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "phrase_budget": phrase_budget,
         "review": review,
         "gap": gap,
+        "catch_up": catch_up,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -4240,6 +4397,21 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and gap.get("message_names_gap") and not gap.get("message_has_value")
             and gap.get("top_up_first") and gap.get("shown_after") and gap.get("hidden_after")
             and gap.get("ten_minutes_serves"),
+        # A week-long gap: one wide read fails its budget (and would for
+        # ever); sliced, every slice lands under budget at the slice rate,
+        # the cover stays one range from its old start to now, a case is
+        # refused throughout with a true, decreasing slices-left count, and
+        # the same case is shown with the name hidden once the gap closes.
+        "catch_up_sliced":
+            catch_up["before"]["refused"] == "vocabulary"
+            and catch_up["before"]["wide_pages"] > 0
+            and (ca := catch_up["after"])["slices"] == GAP_DAYS
+            and ca["failed_slices"] == 0 and ca["wide_pages"] == 0
+            and ca["max_slice_s"] < catch_up["budget_s"]
+            and ca["one_range"] and ca["covered_from_kept"] and ca["covered_until_now"]
+            and ca["refusals_while_behind"] > 0 and ca["message_names_slices"]
+            and ca["first_slices_left"] == GAP_DAYS and ca["slices_left_decreasing"]
+            and ca["shown_after"] and ca["hidden_after"] and ca["log_values"] == 0,
         "review_flags_guessing":
             review["guessing"]["verdict"] == "flagged"
             and ("zero_hit_phrases" in review["guessing"]["flagged"]
@@ -4529,6 +4701,7 @@ def format_report(r: dict) -> str:
         *_phrase_budget_lines(r.get("phrase_budget")),
         *_review_lines(r.get("review")),
         *_gap_lines(r.get("gap")),
+        *_catch_up_lines(r.get("catch_up")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "
