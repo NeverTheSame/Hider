@@ -187,6 +187,16 @@ VOCABULARY_PROBE_MARGIN = 0.05
 #: within the day ask once, short enough that raising the cap or fixing the
 #: field takes effect the next day without clearing anything by hand.
 VOCABULARY_OVER_CAP_S = 86400.0
+#: A returning field (back from over the cap, read but not waited for)
+#: whose own slice fails waits before it is tried again: the retry delay
+#: doubles from VOCABULARY_RETRY_S up to this ceiling, so a field that
+#: fails for ever costs at most one attempt an hour - one request for a
+#: failing recount, two (the count and the first page) for a failing page.
+VOCABULARY_RETURNING_RETRY_MAX_S = 3600.0
+#: How long a returning field may keep failing before it is reported as
+#: STUCK. Cases are still served: its values were readable in text while
+#: it was over the cap and stay so; this only makes it loud.
+VOCABULARY_RETURNING_STUCK_S = 3600.0
 #: A field at or above this share of its cap is reported as near it.
 VOCABULARY_NEAR_CAP = 0.8
 #: Identifier types a site may not read as a vocabulary, and why: one value
@@ -1955,6 +1965,11 @@ class VocabularyIndex:
         #: saved file this index refused to trust (see the class docstring);
         #: the broker logs and clears it. Counts and names of fields only.
         self.untrusted: dict[str, dict] = {}
+        #: measurement switch, set by nothing in the live path: a field
+        #: back from over the cap is waited for at once, as it was before
+        #: :meth:`returning` existed. ``es-eval`` uses it for the "before"
+        #: half of the lapsed-decision figure.
+        self.lapsed_waited = False
         self.load()
 
     @property
@@ -1972,17 +1987,65 @@ class VocabularyIndex:
         over = self.over_cap_fields(cluster, now)
         return tuple(r.pattern for r in config.vocabulary_rules if r.pattern not in over)
 
-    def serves(self, cluster: str, config: ElasticConfig, now: float) -> bool:
-        read = self.read_set(cluster, config, now)
+    def returning(self, cluster: str, config: ElasticConfig, now: float) -> tuple[str, ...]:
+        """Fields of the read set coming back from over the cap: their
+        decision has lapsed (so the build counts them again, and reads them
+        if they now fit), but they have not yet served on their own cover.
+        They are read and **not waited for**. A field the build never read
+        while over the cap, and one whose earlier cover froze, are both
+        here: their values were readable in text while over the cap, and
+        stay so - no worse - until the field serves, when
+        :meth:`settle_over_cap` clears the record and the field is waited
+        for like any other. This is what stops a lapsing decision, or a
+        field that flips over and under the cap, refusing every case."""
+        if self.lapsed_waited:
+            return ()
+        records = self.over_cap.get(cluster) or {}
         held = self.clusters.get(cluster)
-        if not read:
+        return tuple(f for f in self.read_set(cluster, config, now)
+                     if f in records and not (held is not None
+                                              and held.field_serves(f, config, now)))
+
+    def wait_set(self, cluster: str, config: ElasticConfig, now: float) -> tuple[str, ...]:
+        """The fields a case waits for: the read set minus the returning
+        fields (see :meth:`returning`)."""
+        back = set(self.returning(cluster, config, now))
+        return tuple(f for f in self.read_set(cluster, config, now) if f not in back)
+
+    def settle_over_cap(self, cluster: str, config: ElasticConfig, now: float) -> list[str]:
+        """Clear the record of every field that came back from the cap and
+        now serves on its own cover: from here it is waited for. A standing
+        decision is never cleared here. Returns the field names cleared."""
+        records = self.over_cap.get(cluster) or {}
+        held = self.clusters.get(cluster)
+        standing = self.over_cap_fields(cluster, now)
+        done = [f for f in list(records) if f not in standing and held is not None
+                and f in {r.pattern for r in config.vocabulary_rules}
+                and held.field_serves(f, config, now)]
+        for f in done:
+            del records[f]
+        if done:
+            self.save()
+        return done
+
+    def serves(self, cluster: str, config: ElasticConfig, now: float) -> bool:
+        wait = self.wait_set(cluster, config, now)
+        held = self.clusters.get(cluster)
+        if not wait:
             return True
-        return held is not None and held.serves(config, now, read)
+        return held is not None and held.serves(config, now, wait)
 
     def next_slice(self, cluster: str, config: ElasticConfig, now: float) -> VocabularySlice | None:
-        """What the build reads next for a cluster, over its read set."""
+        """What the build reads next for a cluster, over its read set;
+        returning fields rank after the top-ups of the fields cases wait
+        for (see :func:`plan_vocabulary_slice`)."""
+        held_back = {f for f in self.returning(cluster, config, now)
+                     if (rec := self.returning_failure(cluster, f))
+                     and float(rec.get("retry_at", 0.0)) > now}
         return plan_vocabulary_slice(config, self.clusters.get(cluster), now,
-                                     self.read_set(cluster, config, now))
+                                     [f for f in self.read_set(cluster, config, now)
+                                      if f not in held_back],
+                                     waiting=self.wait_set(cluster, config, now))
 
     def put(self, cluster: str, vocab: ClusterVocabulary) -> str:
         """Fold a finished slice in, field by field. ``merged`` when every
@@ -2033,7 +2096,7 @@ class VocabularyIndex:
         among the fields behind, or a fresh first build when the cover has
         expired."""
         held = self.clusters.get(cluster)
-        read = self.read_set(cluster, config, now)
+        read = self.wait_set(cluster, config, now)
         if held is None or not held.behind(config, now, read):
             return None
         bound = vocabulary_max_gap(config)
@@ -2068,15 +2131,18 @@ class VocabularyIndex:
         and ranges only; nothing here depends on any query."""
         held = self.clusters.get(cluster)
         read = self.read_set(cluster, config, now)
+        back = set(self.returning(cluster, config, now))
         want = min(VOCABULARY_SERVE_DAYS, config.vocabulary_days) * 86400.0
         full = config.vocabulary_days * 86400.0
         bound = vocabulary_max_gap(config)
         out: dict[str, dict] = {}
         for f in read:
             c = held.cover(f) if held is not None else None
-            if c is not None and now - c[1] > bound:
+            if f in back:
+                pass                # read, not waited for: always listed
+            elif c is not None and now - c[1] > bound:
                 continue            # the catch-up's, not the backfill's
-            if c is not None and c[1] - c[0] >= want - 1.0:
+            elif c is not None and c[1] - c[0] >= want - 1.0:
                 continue            # serves on its own
             covered = 0.0 if c is None else max(0.0, c[1] - c[0])
             plan = plan_vocabulary_slice(config, held, now, (f,))
@@ -2088,7 +2154,20 @@ class VocabularyIndex:
                 "reading": [_iso(rng[0]), _iso(rng[1])],
                 "running": cluster in self.in_progress and f in self.building.get(cluster, ()),
                 "failed": self.failed.get(cluster),
+                # False: back from over the cap, read but not waited for
+                "waited": f not in back,
             }
+            rec = self.returning_failure(cluster, f) if f in back else None
+            if f in back:
+                # its own failures, never the cluster's
+                out[f]["failed"] = rec.get("code") if rec else None
+                if rec:
+                    out[f].update(attempts=int(rec["attempts"]),
+                                  failing_since=_iso(float(rec["failing_since"])),
+                                  next_try=_iso(float(rec["retry_at"])))
+                if c is None and (self.over_cap.get(cluster) or {}).get(f) is not None:
+                    # nothing read yet: what it waits for first is a recount
+                    out[f]["recount"] = True
         return out
 
     def note_over_cap(self, cluster: str, field: str, count: int, now: float) -> None:
@@ -2106,6 +2185,64 @@ class VocabularyIndex:
         held = self.over_cap.get(cluster) or {}
         return {f: v for f, v in held.items()
                 if now - float(v.get("at", 0.0)) < VOCABULARY_OVER_CAP_S}
+
+    # -- a returning field whose own slices fail ----------------------------
+
+    def note_returning_failure(self, cluster: str, fields: Iterable[str], code: str,
+                               now: float) -> dict[str, dict]:
+        """A slice that read only returning fields failed. Charged to those
+        fields, never to the cluster (the fields cases wait for are not
+        marked failed or held back), with a retry delay that doubles from
+        :data:`VOCABULARY_RETRY_S` to :data:`VOCABULARY_RETURNING_RETRY_MAX_S`.
+        Saved with the over-cap record, so a restart keeps the delay.
+        Returns field -> attempts, for the log."""
+        out: dict[str, dict] = {}
+        records = self.over_cap.get(cluster) or {}
+        for f in fields:
+            rec = records.get(f)
+            if rec is None:
+                continue
+            n = int(rec.get("attempts", 0)) + 1
+            rec["attempts"] = n
+            rec.setdefault("failing_since", float(now))
+            rec["code"] = str(code)
+            rec["retry_at"] = float(now) + min(VOCABULARY_RETURNING_RETRY_MAX_S,
+                                               VOCABULARY_RETRY_S * 2 ** (n - 1))
+            out[f] = {"attempts": n, "next_try": _iso(rec["retry_at"])}
+        if out:
+            self.save()
+        return out
+
+    def note_returning_progress(self, cluster: str, fields: Iterable[str]) -> None:
+        """A slice for these fields landed: their failure count starts again."""
+        changed = False
+        for f in fields:
+            rec = (self.over_cap.get(cluster) or {}).get(f)
+            if rec is not None and "attempts" in rec:
+                for k in ("attempts", "failing_since", "code", "retry_at"):
+                    rec.pop(k, None)
+                changed = True
+        if changed:
+            self.save()
+
+    def returning_failure(self, cluster: str, field: str) -> dict | None:
+        """``{"attempts", "failing_since", "code", "retry_at"}`` for a
+        returning field whose slices are failing, or None."""
+        rec = (self.over_cap.get(cluster) or {}).get(field)
+        return rec if rec is not None and rec.get("attempts") else None
+
+    def stuck(self, cluster: str, config: ElasticConfig, now: float) -> dict[str, dict]:
+        """Returning fields failing for :data:`VOCABULARY_RETURNING_STUCK_S`
+        or longer: field -> since, attempts, the last code and the next try.
+        Field names, counts, codes and times only."""
+        out: dict[str, dict] = {}
+        for f in self.returning(cluster, config, now):
+            rec = self.returning_failure(cluster, f)
+            if rec and now - float(rec["failing_since"]) >= VOCABULARY_RETURNING_STUCK_S:
+                out[f] = {"since": _iso(float(rec["failing_since"])),
+                          "attempts": int(rec["attempts"]), "code": rec.get("code"),
+                          "next_try": _iso(float(rec["retry_at"]))}
+        return out
 
     def load(self) -> None:
         path = self.path
@@ -2142,7 +2279,15 @@ class VocabularyIndex:
         for name, entry in (raw.get("over_cap") or {}).items():
             if not isinstance(entry, dict):
                 continue
-            kept = {str(f): {"count": int(v.get("count", 0)), "at": float(v.get("at", 0.0))}
+            kept = {str(f): {"count": int(v.get("count", 0)), "at": float(v.get("at", 0.0)),
+                             # a returning field's failures and retry delay
+                             **({"attempts": int(v["attempts"]),
+                                 "failing_since": float(v["failing_since"]),
+                                 "code": str(v.get("code", "")),
+                                 "retry_at": float(v["retry_at"])}
+                                if isinstance(v.get("attempts"), int)
+                                and isinstance(v.get("failing_since"), (int, float))
+                                and isinstance(v.get("retry_at"), (int, float)) else {})}
                     for f, v in entry.items()
                     if isinstance(v, dict) and isinstance(v.get("count"), (int, float))
                     and isinstance(v.get("at"), (int, float))}
@@ -2206,10 +2351,11 @@ class VocabularyIndex:
         counts = {f: n for f, n in vocab.counts.items() if f in read}
         frozen = {f: [_iso(a), _iso(b)] for f, (a, b) in vocab.covers.items() if f not in read}
         cap = config.vocabulary_max
-        serving = not read or vocab.serves(config, t, read)
-        complete = not read or vocab.complete(config, t, read)
-        behind = vocab.behind(config, t, read)
-        until = vocab.until_over(read)
+        wait = self.wait_set(cluster, config, t)
+        serving = not wait or vocab.serves(config, t, wait)
+        complete = not wait or vocab.complete(config, t, wait)
+        behind = vocab.behind(config, t, wait)
+        until = vocab.until_over(wait)
         age = 0.0 if until is None else max(0.0, t - until)
         # Overdue is measured from when the top-up could have started on
         # *this* bridge: the end of the cover, or the bridge's start if that
@@ -2259,7 +2405,7 @@ class VocabularyIndex:
             "skipped": {},
             "over_cap": over_cap,
             "omitted": list(config.vocabulary_omitted),
-            "covered_days": round(vocab.covered_days(t, read), 2),
+            "covered_days": round(vocab.covered_days(t, wait), 2),
             "wanted_days": config.vocabulary_days,
             "age_s": round(age, 1),
             "max_gap_s": vocabulary_max_gap(config),
@@ -2268,6 +2414,8 @@ class VocabularyIndex:
             "gap": ([_iso(until), _iso(t)] if behind and until is not None else None),
             "catch_up": self.catch_up(cluster, config, t),
             "backfill": backfill,
+            "returning": list(self.returning(cluster, config, t)),
+            "stuck": self.stuck(cluster, config, t),
             "building_fields": list(self.building.get(cluster, ())),
         }
         if state == "stale" and failed is not None:
@@ -2276,7 +2424,8 @@ class VocabularyIndex:
 
 
 def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",
-                          now: float, read: Iterable[str] | None = None
+                          now: float, read: Iterable[str] | None = None, *,
+                          waiting: Iterable[str] | None = None
                           ) -> VocabularySlice | None:
     """The next one-day slice to read for a cluster, **per field**, or None
     if every field in ``read`` is complete and fresh.
@@ -2301,6 +2450,11 @@ def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
       minutes for that field once, which is no more than any field pays
       for any top-up; a **first** or **back** slice is shared by the
       fields that want exactly that range.
+
+    A field in ``read`` but not in ``waiting`` (back from over the cap,
+    not yet waited for) never takes the first class: its slices rank after
+    the top-ups of the fields cases do wait for, so it cannot push them
+    behind the gap bound.
 
     Fields with identical covers therefore always share a slice, and an
     unchanged field set gets exactly the slices (and request counts) the
@@ -2344,6 +2498,9 @@ def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
                           max(oldest, c[0] - VOCABULARY_SLICE_S), c[0], "back"))
     if not cands:
         return None
+    if waiting is not None:
+        waited = set(waiting)
+        cands = [(1.5 if c[0] == 0 and c[1] not in waited else c[0], *c[1:]) for c in cands]
     _cls, _f, start, until, kind = min(cands, key=lambda c: (c[0], -c[3], -c[2], c[1]))
     if kind == "forward":
         fields = tuple(f for f in fields_read
@@ -2351,6 +2508,11 @@ def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
                        and c[1] < until - 1.0 and c[1] >= start - 1.0)
     else:
         fields = tuple(c[1] for c in cands if (c[2], c[3], c[4]) == (start, until, kind))
+    if waiting is not None:
+        # a returning field never shares a slice with a field cases wait
+        # for: its failure must not fail their top-up
+        same = _f in waited
+        fields = tuple(f for f in fields if (f in waited) == same)
     return VocabularySlice(start, until, fields, kind)
 
 

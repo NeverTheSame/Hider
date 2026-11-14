@@ -350,6 +350,9 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
         # and after those, in their own pattern and maps: a field added to
         # an existing cover (see added_docs)
         out.extend(added_docs())
+        # last of all, in their own pattern and map: an over-cap decision
+        # that lapses (see lapse_docs)
+        out.extend(lapse_docs())
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
@@ -1901,6 +1904,154 @@ def _added_lines(o: dict | None) -> list[str]:
             f"values in the build log or lines {a['log_values']}"]
 
 
+# -- an over-cap decision that lapses -------------------------------------------
+#: A map with no vocabulary section and one id-like field always far over
+#: the cap. Its decision lapses a day after it was made, by the clock
+#: alone; the field must be counted again without stopping cases. Own index
+#: pattern and map, appended last of all.
+LAPSE_INDEX = "logs-lapse-*"
+LAPSE_FIELD = "trace.ref"
+LAPSE_MAX = 200
+LAPSE_REFS_PER_DAY = 260
+LAPSE_DAYS = 10
+LAPSE_TENANT = "Ostrander Pike Logistics"
+LAPSE_MESSAGE = f"Mailbox moves resumed for {LAPSE_TENANT}, 5 batches left"
+LAPSE_PHRASE = "batches left"
+LAPSE_QUERY = {"index": LAPSE_INDEX, "time_range": {"gte": "now-3h", "lte": "now"}, "size": 20,
+               "filters": [{"field": "message", "op": "phrase", "value": LAPSE_PHRASE}]}
+
+
+def lapse_ref(i: int) -> str:
+    return f"tr-{i:06d}"
+
+
+def lapse_docs() -> list[Doc]:
+    at = lambda h: (NOW - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    n = LAPSE_REFS_PER_DAY * LAPSE_DAYS
+    return [
+        Doc(LAPSE_INDEX, {"@timestamp": at(5), "log": {"level": "info"},
+                          "message": "Inventory refreshed",
+                          "labels": {"tenant_name": LAPSE_TENANT}}, {}),
+        Doc(LAPSE_INDEX, {"@timestamp": at(1), "log": {"level": "warn"},
+                          "message": LAPSE_MESSAGE, "job": {"name": "Ledgerline Sweep"}}, {}),
+    ] + [
+        Doc(LAPSE_INDEX, {"@timestamp": at(0.2 + i * (LAPSE_DAYS * 24.0 - 1.0) / n),
+                          "log": {"level": "info"}, "message": "Request handled",
+                          "trace": {"ref": lapse_ref(i)}}, {})
+        for i in range(n)
+    ]
+
+
+def lapse_map() -> elastic.ElasticConfig:
+    return elastic.parse({
+        "indices": [LAPSE_INDEX], "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "vocabulary": {"days": LAPSE_DAYS, "max": LAPSE_MAX},
+        "fields": {"@timestamp": "keep", "log.level": "keep", "message": "text",
+                   "job.name": {"kind": "identifier", "type": "JOB_NAME"},
+                   "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+                   LAPSE_FIELD: {"kind": "identifier", "type": "REQUEST_REF"}},
+    }, source="lapse-fixture")
+
+
+def _lapse_run(*, waited: bool, tier2: str, max_steps: int) -> dict:
+    from . import esbridge
+
+    cfg = lapse_map()
+    cluster = elastic.Cluster("stub", "https://kibana-stub.example.net")
+    engine = StubEngine(Fixture(lapse_docs(), [], []), (LAPSE_INDEX,))
+    engine.page_seconds = PAGE_SECONDS
+    transport = SteppedSearchTransport(engine)
+    now = NOW.timestamp()
+    tmp = Path(tempfile.mkdtemp(prefix="hider-es-eval-lapse-"))
+    saved_clock = esbridge.clock
+    esbridge.clock = lambda: now
+    out: dict = {"refusals": 0, "codes": set(), "case_requests_while_refused": 0, "served": 0,
+                 "message_names_field": False, "message_has_value": False, "steps": 0}
+    try:
+        broker = esbridge.Broker(cfg, lambda: transport, poll_interval=0.0, sessions_dir=tmp)
+        broker.open()
+        broker.vocabulary.lapsed_waited = waited
+        broker.start_vocabulary(cluster)
+        steps = 0
+        while steps < max_steps and broker.pump_vocabulary():
+            steps += 1
+        idx = broker.vocabulary
+        out["build_slices"] = sum(1 for r in broker._build_log if r["vocabulary"] == "slice")
+        out["left_out"] = {f: int(v["count"]) for f, v in idx.over_cap.get("stub", {}).items()}
+        # a day on: the other fields were topped up meanwhile (their covers
+        # end now), and the decision lapses by the clock alone
+        idx.over_cap["stub"][LAPSE_FIELD]["at"] = now - elastic.VOCABULARY_OVER_CAP_S - 1.0
+        out["serving_at_lapse"] = idx.serves("stub", cfg, now)
+        rep = idx.report("stub", cfg, now=now)
+        out["state_at_lapse"] = rep["state"]
+        out["line_at_lapse"] = esbridge.vocabulary_line(broker.vocabulary_progress("stub")) or ""
+        bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2=tier2), EngineSession(engine),
+                                 index=idx)
+        r0 = len(engine.requests)
+        log0 = len(broker._build_log)
+        broker.start_vocabulary(cluster)
+        while out["steps"] < max_steps:
+            n = len(engine.requests)
+            try:
+                o = bridge.run("stub", LAPSE_QUERY)
+                out["served"] += 1
+                out["hidden"] = LAPSE_TENANT not in json.dumps(o.output) \
+                    and LAPSE_PHRASE in " ".join(_messages(o.output))
+            except elastic.Refused as e:
+                out["refusals"] += 1
+                out["codes"].add(e.code)
+                out["case_requests_while_refused"] += len(engine.requests) - n
+                out["message_names_field"] = out["message_names_field"] or LAPSE_FIELD in e.message
+                out["message_has_value"] = out["message_has_value"] or lapse_ref(3) in e.message
+            if not broker.pump_vocabulary():
+                break
+            out["steps"] += 1
+        out["codes"] = sorted(out["codes"])
+        vreq = [r for r in engine.requests[r0:]
+                if any(k.startswith(elastic.VOCABULARY_AGG) for k in r["body"].get("aggs", {}))]
+        out["recount_requests"] = len(vreq)
+        rec = idx.over_cap.get("stub", {}).get(LAPSE_FIELD) or {}
+        out["recounted"] = abs(float(rec.get("at", 0.0)) - now) < 1.0
+        held = idx.get("stub")
+        out["field_ever_covered"] = held is not None and LAPSE_FIELD in held.covers
+        out["line_after"] = esbridge.vocabulary_line(broker.vocabulary_progress("stub")) or ""
+        out["log_values"] = sum(1 for r in broker._build_log[log0:]
+                                if lapse_ref(3) in json.dumps(r) or LAPSE_TENANT in json.dumps(r))
+        out["log_values"] += int(LAPSE_TENANT in out["line_at_lapse"] + out["line_after"])
+    finally:
+        esbridge.clock = saved_clock
+    return out
+
+
+def run_lapse_eval(*, tier2: str = "none", max_steps: int = 5_000) -> dict:
+    """An over-cap decision that lapses by the clock, on the real broker.
+
+    Before (``VocabularyIndex.lapsed_waited``, the measurement switch): the
+    field is back in what cases wait for with no cover, and every case is
+    refused until the recount drops it again. After: it is counted again,
+    found still over the cap, left out again, and every case is served
+    throughout; the field is never claimed covered."""
+    return {"days": LAPSE_DAYS, "max": LAPSE_MAX, "per_day": LAPSE_REFS_PER_DAY,
+            "before": _lapse_run(waited=True, tier2=tier2, max_steps=max_steps),
+            "after": _lapse_run(waited=False, tier2=tier2, max_steps=max_steps)}
+
+
+def _lapse_lines(o: dict | None) -> list[str]:
+    if not o:
+        return []
+    b, a = o["before"], o["after"]
+    return [f"over-cap decision lapses  {LAPSE_FIELD} ~{o['per_day']} a day against a cap of "
+            f"{o['max']}, default set: waited for at once: serving {b['serving_at_lapse']}, "
+            f"{b['refusals']} refusals {b['codes']} with {b['case_requests_while_refused']} "
+            f"requests from the case, {b['served']} served, until the recount; returning rule: "
+            f"serving {a['serving_at_lapse']} (state {a['state_at_lapse']}), {a['refusals']} "
+            f"refusals, {a['served']} served, name hidden {a.get('hidden')}; recount "
+            f"{a['recount_requests']} request(s), left out again {a['recounted']}, field ever "
+            f"claimed covered {a['field_ever_covered']}; values in the log or lines "
+            f"{a['log_values']}"]
+
+
 def run_catch_up_eval(*, tier2: str = "none", max_steps: int = 20_000) -> dict:
     """The catch-up after a week down, with the stub charging the slice
     rate over a day and the wide rate over anything wider.
@@ -2855,10 +3006,15 @@ def build_vocabulary(config: elastic.ElasticConfig, engine: StubEngine,
                                    over_cap=seen_over_cap)
         return vocab, build
     while True:
-        nxt = elastic.next_vocabulary_slice(config, held, until)
-        if nxt is None:
+        # over the read set, as the broker plans: a field counted over the
+        # cap has no cover and is not read, so it must not be waited for
+        plan = elastic.plan_vocabulary_slice(
+            config, held, until,
+            [r.pattern for r in config.vocabulary_rules if r.pattern not in seen_over_cap])
+        if plan is None:
             break
-        vocab, last = build_slice(config, engine, *nxt, over_cap=seen_over_cap)
+        vocab, last = build_slice(config, engine, plan.start, plan.until,
+                                  over_cap=seen_over_cap, fields=plan.fields)
         requests += last.requests
         probes += last.probes
         held = vocab if held is None else held.merge(vocab)
@@ -2889,11 +3045,13 @@ def build_cover(config: elastic.ElasticConfig, engine: StubEngine, *,
     seen_over_cap: dict[str, dict] = {} if over_cap is None else over_cap
     before_all = engine.simulated_seconds
     while True:
-        nxt = elastic.next_vocabulary_slice(config, held, until)
-        if nxt is None:
+        read = [r.pattern for r in config.vocabulary_rules if r.pattern not in seen_over_cap]
+        plan = elastic.plan_vocabulary_slice(config, held, until, read)
+        if plan is None:
             break
         before = engine.simulated_seconds
-        vocab, build = build_slice(config, engine, *nxt, over_cap=seen_over_cap)
+        vocab, build = build_slice(config, engine, plan.start, plan.until,
+                                   over_cap=seen_over_cap, fields=plan.fields)
         held = vocab if held is None else held.merge(vocab)
         took = engine.simulated_seconds - before
         report["slices"] += 1
@@ -2901,7 +3059,7 @@ def build_cover(config: elastic.ElasticConfig, engine: StubEngine, *,
         report["probes"] += build.probes
         report["over_cap"] = {f: int(v["count"]) for f, v in seen_over_cap.items()}
         report["max_slice_s"] = round(max(report["max_slice_s"], took), 1)
-        if report["serving_after_slices"] is None and held.serves(config, until):
+        if report["serving_after_slices"] is None and held.serves(config, until, read):
             report["serving_after_slices"] = report["slices"]
             report["serving_requests"] = report["requests"]
             report["serving_seconds"] = round(engine.simulated_seconds - before_all, 1)
@@ -4295,6 +4453,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     # A field added to a saved cover: own documents, own maps, the real
     # broker backfilling that field alone.
     added_field = run_added_field_eval(tier2="none")
+    # An over-cap decision lapsing by the clock: own documents and map.
+    lapse = run_lapse_eval(tier2="none")
     review = run_review_eval(cfg, engine, vocab, fx, phrase_budget["after"]["case_dir"],
                              tier2=tier2)
 
@@ -4513,6 +4673,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "gap": gap,
         "catch_up": catch_up,
         "added_field": added_field,
+        "lapse": lapse,
         # The one build this bridge paid, and one top-up. No case reads
         # anything: a case applies what the build already holds. Counts and
         # seconds only, never a name.
@@ -4717,6 +4878,18 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and aa["new_field_complete"] and aa["one_range_per_field"]
             and aa["state_after"] == "ready"
             and aa["shown_after"] and aa["hidden_after"] and aa["log_values"] == 0,
+        # An over-cap decision lapses: waited for at once (the switch), every
+        # case is refused until the recount; with the returning rule every
+        # case is served, the field is counted again and left out again,
+        # and it is never claimed covered.
+        "lapsed_decision_serves":
+            not (lb := lapse["before"])["serving_at_lapse"] and lb["refusals"] > 0
+            and lb["codes"] == ["vocabulary_building"] and lb["case_requests_while_refused"] == 0
+            and lb["message_names_field"] and not lb["message_has_value"]
+            and (la := lapse["after"])["serving_at_lapse"] and la["refusals"] == 0
+            and la["served"] > 0 and la.get("hidden") and la["recounted"]
+            and la["recount_requests"] >= 1 and not la["field_ever_covered"]
+            and "OVER CAP" in la["line_after"] and la["log_values"] == 0,
         "review_flags_guessing":
             review["guessing"]["verdict"] == "flagged"
             and ("zero_hit_phrases" in review["guessing"]["flagged"]
@@ -5008,6 +5181,7 @@ def format_report(r: dict) -> str:
         *_gap_lines(r.get("gap")),
         *_catch_up_lines(r.get("catch_up")),
         *_added_lines(r.get("added_field")),
+        *_lapse_lines(r.get("lapse")),
         f"  top-up          {t['requests']} requests, {t['simulated_s']}s simulated, "
         f"{t['new_values']} new values, every {elastic.VOCABULARY_REFRESH_S:g}s; "
         f"{r['vocabulary']['cases_served']} cases served from it, none reading anything; "

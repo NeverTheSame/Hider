@@ -652,7 +652,9 @@ class Bridge:
             return False
         vocab = self.index.get(cluster.name)
         t = clock()
-        read = self.index.read_set(cluster.name, self.config, t)
+        # the fields a case waits for: a field back from over the cap is
+        # read but not waited for until it serves (VocabularyIndex.returning)
+        read = self.index.wait_set(cluster.name, self.config, t)
         if self.scrubber._vocab_rules and vocab is not None \
                 and vocab.behind(self.config, t, read):
             # every query, not only a case's first: the gap is a property of
@@ -687,7 +689,9 @@ class Bridge:
                 f"the last {elastic.VOCABULARY_SERVE_DAYS} days for every field it reads (it "
                 "is read in one-day slices, newest first, and a page shown before those are "
                 "in could leak a customer name in message text). "
-                + _backfill_note(self.index.backfill(cluster.name, self.config, t))
+                + _backfill_note({f: b for f, b in
+                                  self.index.backfill(cluster.name, self.config, t).items()
+                                  if b.get("waited", True)})
                 + ". Try again shortly; es-smoke's VOCAB line shows how far back each "
                 "field's cover reaches.")
         over_cap = {f: int(v["count"])
@@ -994,11 +998,35 @@ def _backfill_note(bf: dict | None) -> str:
     for f, b in sorted(bf.items()):
         rng = b.get("reading") or ["?", "?"]
         state = ("running" if b.get("running") else
+                 f"last attempt failed ({b['failed']}), {b['attempts']} attempts since "
+                 f"{b['failing_since']}, next try {b['next_try']}" if b.get("attempts") else
                  f"last attempt failed ({b['failed']}), retrying" if b.get("failed") else "next")
+        if b.get("recount"):
+            parts.append(f"{f} not read since it came back from over the cap: its next slice "
+                         f"recounts it against the cap and, if it fits, reads its first day "
+                         f"({state}); {b['slices_left']} one-day slices before it serves"
+                         + ("" if b.get("waited", True) else
+                            "; back from over the cap, cases do not wait for it and its values "
+                            "stay readable in text until it serves"))
+            continue
         parts.append(f"{f} covers {b['covered_days']}d, {b['slices_left']} one-day slices "
                      f"left before it serves and {b['slices_total']} to the full cover, "
-                     f"reading {rng[0]} to {rng[1]} ({state})")
+                     f"reading {rng[0]} to {rng[1]} ({state})"
+                     + ("" if b.get("waited", True) else
+                        "; back from over the cap, cases do not wait for it and its values "
+                        "stay readable in text until it serves"))
     return "BACKFILLING " + "; ".join(parts)
+
+
+def _stuck_note(v: dict) -> str:
+    """Returning fields failing past VOCABULARY_RETURNING_STUCK_S. Cases are
+    served; this is the loud form of what the backfill note says."""
+    stuck = v.get("stuck") or {}
+    if not stuck:
+        return ""
+    return (" STUCK, NOT READ (readable in text): "
+            + ", ".join(f"{f} failing since {x['since']}, {x['attempts']} attempts ({x['code']}), "
+                        f"next try {x['next_try']}" for f, x in sorted(stuck.items())))
 
 
 def _frozen_note(v: dict) -> str:
@@ -1055,7 +1083,7 @@ def vocabulary_line(v: dict | None) -> str | None:
                 + (f"; {_backfill_note(v['backfill'])}"
                    + ("" if v.get("serving") else ", cases refused")
                    if v.get("backfill") else "")
-                + _over_cap_note(v) + _frozen_note(v))
+                + _over_cap_note(v) + _frozen_note(v) + _stuck_note(v))
     if v.get("state") == "failed":
         return (f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
                 + _over_cap_note(v))
@@ -1098,13 +1126,16 @@ def vocabulary_line(v: dict | None) -> str | None:
             line += " - NOT ENOUGH COVER YET: cases are refused"
             if v.get("backfill"):
                 line += ": " + _backfill_note(v["backfill"])
+        back = {f: b for f, b in (v.get("backfill") or {}).items() if not b.get("waited", True)}
+        if back and v.get("state") in ("ready", "top_up_due", "stale", "catching_up"):
+            line += " - " + _backfill_note(back)
     if v.get("skipped"):
         line += " skipped=" + ",".join(f"{k}:{n}" for k, n in sorted(v["skipped"].items()))
     if v.get("near_cap"):
         line += f" NEAR CAP: {', '.join(v['near_cap'])}"
     if v.get("omitted"):
         line += (f" NOT READ (readable in text): {', '.join(sorted(v['omitted']))}")
-    line += _over_cap_note(v) + _frozen_note(v)
+    line += _over_cap_note(v) + _frozen_note(v) + _stuck_note(v)
     return line
 
 
@@ -1494,7 +1525,7 @@ class Broker:
             self._log_vocabulary(cluster.name, "expired", {
                 "fields": dropped, "values": sum(dropped.values())})
         held = self.vocabulary.get(cluster.name)
-        read = self.vocabulary.read_set(cluster.name, self.config, t)
+        read = self.vocabulary.wait_set(cluster.name, self.config, t)
         if held is not None and held.behind(self.config, t, read):
             bound = elastic.vocabulary_max_gap(self.config)
             ends = min(held.covers[f][1] for f in read
@@ -1522,7 +1553,24 @@ class Broker:
 
     def _end_slice(self, cluster: elastic.Cluster, code: str, build) -> None:
         """A slice that failed teaches the index nothing. Everything saved
-        by earlier slices stays saved, and this one is retried later."""
+        by earlier slices stays saved, and this one is retried later.
+
+        A slice that read only returning fields is charged to those fields
+        (``note_returning_failure``: doubling delay, saved), not to the
+        cluster: the fields cases wait for are not marked failed, not shown
+        stale and not held back by the retry delay."""
+        fields = set(getattr(build, "only", None) or ())
+        back = set(self.vocabulary.returning(cluster.name, self.config, clock()))
+        if fields and fields <= back:
+            got = self.vocabulary.note_returning_failure(cluster.name, sorted(fields), code,
+                                                         clock())
+            self._log_vocabulary(cluster.name, "returning_failed",
+                                 {**build.progress(), "refused": code, "retry": got})
+            self.vocabulary.in_progress.discard(cluster.name)
+            self.vocabulary.building.pop(cluster.name, None)
+            self._drop_page()
+            self._build = self._build_cluster = None
+            return
         self._log_vocabulary(cluster.name, "failed", {**build.progress(), "refused": code})
         self._build_failed[cluster.name] = code
         self.vocabulary.failed[cluster.name] = code
@@ -1605,6 +1653,11 @@ class Broker:
         # the slice is whole: save it, and let the next iteration plan the
         # next slice. A restart resumes from here rather than starting over.
         how = self.vocabulary.put(cluster.name, build.result())
+        self.vocabulary.note_returning_progress(cluster.name, getattr(build, "only", None) or ())
+        returned = self.vocabulary.settle_over_cap(cluster.name, self.config, clock())
+        if returned:
+            # back under the cap and serving on its own: waited for from now
+            self._log_vocabulary(cluster.name, "returned", {"fields": returned})
         self._build_failed.pop(cluster.name, None)
         self.vocabulary.failed.pop(cluster.name, None)
         self.vocabulary.in_progress.discard(cluster.name)

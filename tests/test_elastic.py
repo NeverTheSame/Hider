@@ -1680,23 +1680,19 @@ def test_a_default_set_field_over_the_cap_after_being_read_is_frozen_not_claimed
     r = index.report("emea", cfg, now=now)
     assert r["serving"] and r["over_cap"] == {"labels.site_name": 70_000}
     assert "labels.site_name" in r["frozen"] and "labels.site_name" not in r["fields"]
-    # a day later the decision has expired and the field is read again:
-    # forward from where its own cover ends, in the top-up every other
-    # field is due for by then (one slice, as a top-up always was)
+    # a day later the decision has expired and the field is read again,
+    # forward from where its own cover ends - but on a slice of its own:
+    # it is returning, and a returning field never rides in the top-up of
+    # the fields cases wait for (its failure would fail theirs)
     later = now + elastic.VOCABULARY_OVER_CAP_S + 1
     assert "labels.site_name" in index.read_set("emea", cfg, later)
+    assert index.returning("emea", cfg, later) == ("labels.site_name",)
     plan = index.next_slice("emea", cfg, later)
-    assert "labels.site_name" in plan.fields and plan.kind == "forward"
+    assert plan.kind == "forward" and "labels.site_name" not in plan.fields
     assert plan.start == now and plan.until == now + d
-    # had the others been topped up a minute earlier, the forward slice
-    # still starts where its own cover ends and carries them along for the
-    # minute they are short: that is their next top-up, brought forward,
-    # not an extra read - and it leaves every field ending together
-    index.put("emea", elastic.ClusterVocabulary(
-        now, later - 60.0, 0.0,
-        {r.pattern: [] for r in cfg.vocabulary_rules if r.pattern != "labels.site_name"}))
+    index.put("emea", elastic.ClusterVocabulary(now, now + d, 0.0, {f: [] for f in plan.fields}))
     plan = index.next_slice("emea", cfg, later)
-    assert "labels.site_name" in plan.fields and plan.kind == "forward"
+    assert plan.fields == ("labels.site_name",) and plan.kind == "forward"
     assert plan.start == now and plan.until == now + d
     index.put("emea", elastic.ClusterVocabulary(now, now + d, 0.0, {f: [] for f in plan.fields}))
     assert len({c[1] for c in index.get("emea").covers.values()}) == 1
@@ -1728,3 +1724,111 @@ def test_a_vocabulary_file_with_one_range_is_not_trusted(tmp_path):
     index.save()
     assert json.loads((d / elastic.VocabularyIndex.FILENAME).read_text())["schema"] \
         == elastic.VocabularyIndex.SCHEMA
+
+
+# -- an over-cap decision that lapses --------------------------------------------
+
+def _lapse_setup():
+    """A default-set map with one id-like field always over the cap, a
+    30-day cover of the other two, and the over-cap decision about to lapse."""
+    cfg = eseval.over_cap_map(listed=False)
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    index = elastic.VocabularyIndex(None)
+    index.started_at = now - 60.0
+    index.put("stub", elastic.ClusterVocabulary(
+        now - 30 * d, now, 0.0, {"job.name": ["Harbour Nightly"], "labels.tenant_name": ["Wrenfield"]}))
+    index.note_over_cap("stub", eseval.OVER_CAP_FIELD, eseval.OVER_CAP_REFS, now - 120.0)
+    lapsed = now - 120.0 + elastic.VOCABULARY_OVER_CAP_S + 1.0
+    # the other fields stay fresh across the lapse: only the decision moves
+    index.put("stub", elastic.ClusterVocabulary(now, lapsed, 0.0,
+                                                {"job.name": [], "labels.tenant_name": []}))
+    return cfg, index, now, lapsed
+
+
+def test_a_lapsed_over_cap_decision_does_not_stop_cases():
+    cfg, index, now, lapsed = _lapse_setup()
+    assert index.report("stub", cfg, now=now)["serving"]          # while it stands
+    assert index.serves("stub", cfg, lapsed)                      # after it lapses
+    assert index.report("stub", cfg, now=lapsed)["serving"]
+
+
+def test_a_never_read_field_back_under_the_cap_is_read_without_stopping_cases():
+    """The recount says it fits: it is read newest day first, cases keep
+    running while it is short (its values were readable while over the cap
+    and stay so, no worse), and once it serves on its own it is waited for."""
+    cfg, index, now, t = _lapse_setup()
+    f = eseval.OVER_CAP_FIELD
+    d = 86400.0
+    assert index.returning("stub", cfg, t) == (f,)
+    plan = index.next_slice("stub", cfg, t)
+    assert plan.fields == (f,) and plan.kind == "first"
+    r = index.report("stub", cfg, now=t)
+    assert r["serving"] and r["returning"] == [f] and r["backfill"][f]["waited"] is False
+    from hider import esbridge
+    line = esbridge.vocabulary_line(r)
+    assert f"BACKFILLING {f}" in line and "back from over the cap, cases do not wait" in line
+    index.put("stub", elastic.ClusterVocabulary(t - d, t, 0.0, {f: ["ref-1"]}))
+    assert index.serves("stub", cfg, t) and index.returning("stub", cfg, t) == (f,)
+    index.put("stub", elastic.ClusterVocabulary(t - 2 * d, t - d, 0.0, {f: ["ref-2"]}))
+    assert index.settle_over_cap("stub", cfg, t) == [f]
+    assert f in index.wait_set("stub", cfg, t) and index.returning("stub", cfg, t) == ()
+    assert "ref-1" not in line
+
+
+def test_a_field_flipping_over_and_under_the_cap_never_stops_cases():
+    """Over: left out, its cover frozen. Lapsed: counted, back under, read.
+    Over again mid-backfill: left out again. At no point does a case wait."""
+    cfg, index, now, t = _lapse_setup()
+    f = eseval.OVER_CAP_FIELD
+    d = 86400.0
+    for day in range(4):
+        at = t + day * d
+        others = {"job.name": [], "labels.tenant_name": []}
+        index.put("stub", elastic.ClusterVocabulary(at - d, at, 0.0, others))
+        assert index.serves("stub", cfg, at), day          # lapsed, returning
+        if day % 2 == 0:                                    # under: one day read
+            index.put("stub", elastic.ClusterVocabulary(at - d, at, 0.0, {**others, f: []}))
+            assert index.serves("stub", cfg, at), day
+        index.note_over_cap("stub", f, 5_100, at)           # over again
+        assert index.serves("stub", cfg, at), day
+        assert f in index.report("stub", cfg, now=at)["frozen"] or day % 2 == 1
+
+
+def test_a_frozen_field_returning_next_to_a_field_never_read():
+    """Two fields back from the cap at once: one with a week-old frozen
+    cover (read forward from it), one never read (newest day first). Both
+    are read, neither is waited for, cases run, and the plan reads the
+    never-read one first because its slice ends latest. The frozen one is
+    not 'catching up' for the cluster: cases are not refused for its gap."""
+    cfg = eseval.over_cap_map(listed=False)
+    now = eseval.NOW.timestamp()
+    d = 86400.0
+    index = elastic.VocabularyIndex(None)
+    index.started_at = now - 60.0
+    index.put("stub", elastic.ClusterVocabulary(now - 37 * d, now - 7 * d, 0.0,
+                                                {"labels.tenant_name": ["Wrenfield"]}))
+    index.put("stub", elastic.ClusterVocabulary(now - 30 * d, now, 0.0, {"job.name": []}))
+    f = eseval.OVER_CAP_FIELD
+    index.note_over_cap("stub", "labels.tenant_name", 5_200, now - 2 * d)
+    index.note_over_cap("stub", f, 5_500, now - 2 * d)
+    assert set(index.returning("stub", cfg, now)) == {"labels.tenant_name", f}
+    r = index.report("stub", cfg, now=now)
+    assert r["serving"] and r["state"] != "catching_up" and r["catch_up"] is None
+    assert {k: b["waited"] for k, b in r["backfill"].items()} == {"labels.tenant_name": False, f: False}
+    first = index.next_slice("stub", cfg, now)
+    assert first.fields == (f,) and first.kind == "first"
+    index.put("stub", elastic.ClusterVocabulary(first.start, first.until, 0.0, {f: []}))
+    nxt = index.next_slice("stub", cfg, now)
+    # the frozen field, forward from where it froze, alone (job.name is fresh)
+    assert nxt.fields in {("labels.tenant_name",), (f,)}
+    if nxt.fields == ("labels.tenant_name",):
+        assert nxt.kind == "forward" and nxt.start == now - 7 * d
+    assert "Wrenfield" not in json.dumps(r)
+
+
+def test_a_returning_field_ranks_after_the_top_ups_cases_wait_for():
+    cfg, index, now, t = _lapse_setup()
+    later = t + elastic.VOCABULARY_REFRESH_S + 1
+    plan = index.next_slice("stub", cfg, later)
+    assert plan.kind == "forward" and "job.name" in plan.fields

@@ -419,3 +419,12 @@ def test_the_added_field_gate_measures_the_claim_and_the_backfill():
     assert a["shown_after"] and a["hidden_after"] and a["log_values"] == 0
     assert "BACKFILLING labels.tenant_name" in a["line_before"]
     assert eseval.ADDED_TENANT not in "".join(eseval._added_lines(r))
+
+
+def test_the_lapse_gate_measures_the_refusals_and_their_close():
+    r = eseval.run_lapse_eval()
+    b, a = r["before"], r["after"]
+    assert not b["serving_at_lapse"] and b["refusals"] > 0 and b["case_requests_while_refused"] == 0
+    assert a["serving_at_lapse"] and a["refusals"] == 0 and a["served"] > 0 and a["hidden"]
+    assert a["recounted"] and not a["field_ever_covered"] and a["log_values"] == 0
+    assert a["state_at_lapse"] == "ready" and "back from over the cap" in a["line_at_lapse"]

@@ -1444,18 +1444,24 @@ def test_a_field_over_the_cap_in_the_default_set_is_left_out_not_fatal(stub, tmp
     assert over_cap[widest]["count"] == counts[widest]
     assert built.fields                        # and the rest was read
     at = esbridge.clock()
-    index.note_over_cap("stub", widest, counts[widest], at)
+    # every decision the build made goes to the index, as the broker saves
+    # them (the margin can take a second field with the widest); a field
+    # left out has no cover, and the read set must not wait for it
+    for field, v in over_cap.items():
+        index.note_over_cap("stub", field, v["count"], at)
     report = index.report("stub", cfg, now=at)
-    assert report["over_cap"] == {widest: counts[widest]}
+    assert report["over_cap"] == {f: v["count"] for f, v in over_cap.items()}
+    assert report["over_cap"][widest] == counts[widest]
     line = esbridge.vocabulary_line(report)
-    assert f"OVER CAP, NOT READ (readable in text): {widest}~{counts[widest]}" in line
+    assert f"OVER CAP, NOT READ (readable in text): " in line
+    assert f"{widest}~{counts[widest]}" in line
     assert f"{widest}=" not in line            # not reported as read, and not as zero
     # a case on that bridge runs, with the fields that were read applied
     bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), b.session,
                              log_path=tmp_path / "d4.jsonl", index=index)
     o = bridge.run("stub", {"index": "logs-app-*", "size": 1})
     assert o.refused is None
-    assert bridge.vocabulary["stub"]["over_cap"] == {widest: counts[widest]}
+    assert bridge.vocabulary["stub"]["over_cap"][widest] == counts[widest]
 
 
 def test_an_over_cap_decision_survives_a_failed_slice_and_a_restart(tmp_path):
@@ -1799,3 +1805,239 @@ def test_a_field_added_to_an_existing_cover_is_not_claimed_covered_for_days_it_w
     assert o.hits_shown >= 1 and eseval.ADDED_TENANT not in json.dumps(o.output)
     assert index.get("stub").cover("labels.tenant_name") == index.get("stub").cover("job.name")
     assert index.report("stub", after, now=now)["state"] == "ready"
+
+
+def test_two_fields_added_at_once_are_backfilled_together(tmp_path, capsys):
+    """Two fields added to a 30-day cover of job.name share every slice
+    (their covers are identical), job.name is not read again, cases are
+    refused until both have two days and served after, through the real
+    Bridge. Prints the slices, requests and simulated seconds."""
+    fx = eseval.generate(docs=150)
+    engine = eseval.StubEngine(fx, CFG0.indices)
+    engine.page_seconds = eseval.PAGE_SECONDS
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": "https://kibana-stub.example.net"}
+    raw["vocabulary"]["fields"] = ["job.name"]
+    before = elastic.parse(raw, source="t")
+    raw["vocabulary"]["fields"] = ["job.name", "labels.tenant_name", "labels.tenant_full_name"]
+    after = elastic.parse(raw, source="t")
+    now = eseval.NOW.timestamp()
+    index = elastic.VocabularyIndex(None)
+    index.started_at = now - 60.0
+    old, _b = eseval.build_vocabulary(before, engine)
+    index.put("stub", old)
+    b = esbridge.Bridge(after, elastic.EsScrubber(after, tier2="none"), eseval.EngineSession(engine),
+                        log_path=tmp_path / "d.jsonl", index=index)
+    q = {"index": "logs-app-*", "size": 1}
+    with pytest.raises(elastic.Refused) as e:
+        b.run("stub", q)
+    assert "labels.tenant_name" in e.value.message and "labels.tenant_full_name" in e.value.message
+    r0, s0 = len(engine.requests), engine.simulated_seconds
+    slices = to_serve = to_serve_requests = 0
+    to_serve_s = 0.0
+    while (plan := index.next_slice("stub", after, now)) is not None:
+        assert set(plan.fields) == {"labels.tenant_full_name", "labels.tenant_name"}
+        got, _b = eseval.build_slice(after, engine, plan.start, plan.until, fields=plan.fields)
+        index.put("stub", got)
+        slices += 1
+        if not to_serve and index.serves("stub", after, now):
+            to_serve = slices
+            to_serve_requests = sum(1 for r in engine.requests[r0:]
+                                    if any(k.startswith(elastic.VOCABULARY_AGG)
+                                           for k in r["body"].get("aggs", {})))
+            to_serve_s = engine.simulated_seconds - s0
+            b.run("stub", q)                                # served now
+    vocab_req = lambda r: any(k.startswith(elastic.VOCABULARY_AGG) for k in r["body"].get("aggs", {}))
+    reqs = [r for r in engine.requests[r0:] if vocab_req(r)]
+    assert not any(f.get("exists", {}).get("field") == "job.name"
+                   for r in reqs for f in r["body"]["query"]["bool"]["filter"])
+    assert to_serve == elastic.VOCABULARY_SERVE_DAYS and slices == after.vocabulary_days
+    with capsys.disabled():
+        print(f"\nTWO FIELDS: served after {to_serve} slices, {to_serve_requests} requests, "
+              f"{to_serve_s:g}s; whole backfill {slices} slices, {len(reqs)} requests, "
+              f"{engine.simulated_seconds - s0:g}s; job.name requests 0")
+
+
+# -- a returning field whose own slices fail ---------------------------------------
+
+class _FailingField(eseval.SteppedSearchTransport):
+    """Fails every request for one field, of the kinds asked ("count",
+    "page"), once switched on."""
+
+    def __init__(self, engine, field, kinds):
+        super().__init__(engine)
+        self.field, self.kinds, self.on, self.failed = field, set(kinds), False, 0
+
+    def _dispatch(self, method, path, body):
+        if method != "DELETE" and path == esbridge.SEARCH_PATH and self.on:
+            b = (body or {}).get("params", {}).get("body", {})
+            flt = b.get("query", {}).get("bool", {}).get("filter", [])
+            if any(f.get("exists", {}).get("field") == self.field for f in flt):
+                kind = "count" if elastic.VOCABULARY_COUNT_AGG in b.get("aggs", {}) else "page"
+                if kind in self.kinds:
+                    self.failed += 1
+                    return eseval.kibana_error(500, "upstream")
+        return super()._dispatch(method, path, body)
+
+
+def _lapse_cfg(cap):
+    import dataclasses
+    return dataclasses.replace(eseval.lapse_map(), vocabulary_max=cap)
+
+
+def _returning_broker(tmp_path, *, kinds, cap_after, read_first=False):
+    """A cover built with the field over the cap, its decision lapsed, then
+    a bridge (re)started with ``cap_after``; the transport then fails that
+    field's requests of ``kinds``. Returns broker, transport, engine, cfg."""
+    now = eseval.NOW.timestamp()
+    engine = eseval.StubEngine(eseval.Fixture(eseval.lapse_docs(), [], []), (eseval.LAPSE_INDEX,))
+    tr = _FailingField(engine, eseval.LAPSE_FIELD, kinds)
+    cl = elastic.Cluster("stub", "https://kibana-stub.example.net")
+    esbridge.clock = lambda: now
+    b0 = esbridge.Broker(_lapse_cfg(200), lambda: tr, poll_interval=0.0, sessions_dir=tmp_path)
+    b0.open()
+    b0.start_vocabulary(cl)
+    while b0.pump_vocabulary():
+        pass
+    b0.vocabulary.over_cap["stub"][eseval.LAPSE_FIELD]["at"] = now - elastic.VOCABULARY_OVER_CAP_S - 1
+    b0.vocabulary.save()
+    cfg = _lapse_cfg(cap_after)
+    br = esbridge.Broker(cfg, lambda: tr, poll_interval=0.0, sessions_dir=tmp_path)
+    br.open()
+    br.start_vocabulary(cl)
+    if read_first:
+        while br.pump_vocabulary():
+            if br.vocabulary.get("stub").cover(eseval.LAPSE_FIELD):
+                break
+    tr.on = True
+    return br, tr, engine, cfg
+
+
+def _run_minutes(br, engine, cfg, minutes):
+    now = eseval.NOW.timestamp()
+    bridge = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"),
+                             eseval.EngineSession(engine), index=br.vocabulary)
+    out = {"served": 0, "refused": 0, "states": set(), "lag": 0.0}
+    for m in range(minutes):
+        t = now + m * 60.0
+        esbridge.clock = lambda t=t: t
+        for _ in range(500):
+            if not br.pump_vocabulary():
+                break
+        try:
+            bridge.run("stub", eseval.LAPSE_QUERY)
+            out["served"] += 1
+        except elastic.Refused:
+            out["refused"] += 1
+        out["states"].add(br.vocabulary.report("stub", cfg, now=t)["state"])
+        out["lag"] = max(out["lag"], t - br.vocabulary.get("stub").cover("job.name")[1])
+    out["t"] = now + (minutes - 1) * 60.0
+    return out
+
+
+@pytest.mark.parametrize("kinds,cap,read_first", [
+    ({"count"}, 200, False),              # the recount fails every time
+    ({"page"}, 1000, False),              # it fits, every page fails
+    ({"count", "page"}, 1000, True),      # one good day, then every slice fails
+])
+def test_a_returning_field_that_fails_for_ever_never_stops_cases(tmp_path, kinds, cap, read_first):
+    """Its failures are charged to it, not the cluster: every case is served,
+    the fields cases wait for are topped up on time, retries back off to one
+    an hour, and past an hour the field is reported STUCK."""
+    br, tr, engine, cfg = _returning_broker(tmp_path, kinds=kinds, cap_after=cap,
+                                            read_first=read_first)
+    r = _run_minutes(br, engine, cfg, 180)
+    assert r["refused"] == 0 and r["served"] == 180 and r["states"] == {"ready"}
+    assert r["lag"] <= elastic.VOCABULARY_REFRESH_S
+    # 0, 1, 3, 7, 15, 31, 63, 123 minutes: doubling to the one-hour ceiling
+    assert tr.failed == 8
+    rep = br.vocabulary_progress("stub")
+    assert rep["stuck"][eseval.LAPSE_FIELD]["attempts"] == 8
+    line = esbridge.vocabulary_line(rep)
+    assert f"STUCK, NOT READ (readable in text): {eseval.LAPSE_FIELD} failing since" in line
+    assert "back from over the cap, cases do not wait for it" in line
+    assert eseval.LAPSE_TENANT not in line and eseval.lapse_ref(3) not in line
+    rows = [x for x in br._build_log if x["vocabulary"] == "returning_failed"]
+    assert len(rows) == 8 and not any(x["vocabulary"] == "failed" for x in br._build_log[-30:])
+    assert eseval.LAPSE_FIELD not in br.vocabulary.wait_set("stub", cfg, r["t"])
+
+
+def test_a_restart_mid_read_keeps_the_field_returning_and_loses_nothing(tmp_path):
+    """Stopped after the returning field read one day of its two: on restart
+    it is still returning, its one day is kept and not read again, it is not
+    claimed covered for more, and cases are served as before."""
+    br, tr, engine, cfg = _returning_broker(tmp_path, kinds=set(), cap_after=1000,
+                                            read_first=True)
+    f = eseval.LAPSE_FIELD
+    now = eseval.NOW.timestamp()
+    held = br.vocabulary.get("stub")
+    cover, values = held.cover(f), list(held.fields[f])
+    assert br.vocabulary.returning("stub", cfg, now) == (f,)
+    before = br.vocabulary.report("stub", cfg, now=now)
+    again = esbridge.Broker(cfg, lambda: tr, poll_interval=0.0, sessions_dir=tmp_path)
+    again.open()
+    idx = again.vocabulary
+    assert idx.returning("stub", cfg, now) == (f,)
+    assert idx.get("stub").cover(f) == cover and idx.get("stub").fields[f] == values
+    assert idx.report("stub", cfg, now=now)["serving"] == before["serving"] is True
+    plan = idx.next_slice("stub", cfg, now)
+    assert plan.fields == (f,) and plan.kind == "back" and plan.until == cover[0]
+    b = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), eseval.EngineSession(engine),
+                        index=idx)
+    b.run("stub", eseval.LAPSE_QUERY)
+
+
+def test_a_restart_with_a_recount_due_and_unanswered_keeps_it_returning(tmp_path):
+    """Stopped with the recount submitted and not answered, after it had
+    already failed twice: on restart the field is still returning, it has no
+    cover (nothing was learnt from the unanswered read), its retry delay and
+    attempt count are kept, and cases are served."""
+    br, tr, engine, cfg = _returning_broker(tmp_path, kinds={"count"}, cap_after=200)
+    f = eseval.LAPSE_FIELD
+    now = eseval.NOW.timestamp()
+    _run_minutes(br, engine, cfg, 3)                   # two failures: at 0 and 1 minute
+    rec = dict(br.vocabulary.returning_failure("stub", f))
+    assert rec["attempts"] == 2
+    t = rec["retry_at"] + 1.0
+    esbridge.clock = lambda: t
+    tr.on = False
+    assert br.pump_vocabulary()                        # the recount is submitted ...
+    assert br._build is not None and br._build.only == frozenset({f})
+    again = esbridge.Broker(cfg, lambda: tr, poll_interval=0.0, sessions_dir=tmp_path)
+    again.open()                                       # ... and the bridge stops
+    idx = again.vocabulary
+    assert idx.returning("stub", cfg, t) == (f,)
+    assert idx.get("stub").cover(f) is None
+    assert idx.returning_failure("stub", f)["attempts"] == 2
+    assert idx.serves("stub", cfg, t)
+    b = esbridge.Bridge(cfg, elastic.EsScrubber(cfg, tier2="none"), eseval.EngineSession(engine),
+                        index=idx)
+    b.run("stub", eseval.LAPSE_QUERY)
+    # the recount runs again after the restart and, over the cap, leaves it out
+    again.start_vocabulary(elastic.Cluster("stub", "https://kibana-stub.example.net"))
+    while again.pump_vocabulary():
+        pass
+    assert idx.returning("stub", cfg, t) == () and f in idx.over_cap_fields("stub", t)
+    assert idx.get("stub").cover(f) is None
+
+
+def test_a_listed_field_over_the_cap_still_refuses_the_slice(tmp_path):
+    """None of the returning rule applies to a field the map lists: over the
+    cap refuses the slice, no record is made, nothing is returning."""
+    import dataclasses
+    cfg = dataclasses.replace(eseval.lapse_map(), vocabulary_fields=(
+        "job.name", "labels.tenant_name", eseval.LAPSE_FIELD))
+    now = eseval.NOW.timestamp()
+    engine = eseval.StubEngine(eseval.Fixture(eseval.lapse_docs(), [], []), (eseval.LAPSE_INDEX,))
+    esbridge.clock = lambda: now
+    br = esbridge.Broker(cfg, lambda: eseval.SteppedSearchTransport(engine), poll_interval=0.0,
+                         sessions_dir=tmp_path)
+    br.open()
+    br.start_vocabulary(elastic.Cluster("stub", "https://kibana-stub.example.net"))
+    while br._build is not None:
+        br.pump_vocabulary()
+    failed = [x for x in br._build_log if x["vocabulary"] == "failed"]
+    assert failed and failed[0]["refused"] == "vocabulary"
+    assert not br.vocabulary.over_cap.get("stub")
+    assert br.vocabulary.returning("stub", cfg, now) == ()
+    assert not br.vocabulary.serves("stub", cfg, now)

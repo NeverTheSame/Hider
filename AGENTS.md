@@ -779,6 +779,107 @@ Listed with owners in the README's Limitations section and in
   and in `test_elastic.py` the frozen field, the over-cap route and the
   untrusted v1 file.
 
+  **A field back from over the cap is read, not waited for, until it
+  serves.** Per-field covers opened a hole the one range did not have: a
+  default-set field counted over the cap is left out for
+  `VOCABULARY_OVER_CAP_S` (a day), and when the decision lapsed by the
+  clock alone the field was back in the read set with no cover, so
+  *every* case was refused until the build happened to count it again -
+  behind a slow slice, or for as long as a failing recount kept failing,
+  once a day for an id-like field that is always over. Now the over-cap
+  record outlives the decision: a field whose decision has lapsed is
+  counted again (the read set includes it, so the build still re-counts
+  about once a day and a raised cap or narrowed field is picked up) but
+  is **returning** (`VocabularyIndex.returning`): cases wait only for the
+  `wait_set`, the read set minus returning fields. If the recount finds it
+  still over, it is left out again and nothing was claimed or refused. If
+  it fits, it is read like a new field - never read: newest day first;
+  frozen cover: forward from where it froze - and when it serves on its
+  own cover `settle_over_cap` clears the record (logged `returned`) and
+  it is waited for like any other field. Its slices rank after the
+  top-ups of the fields cases wait for, so it cannot push them behind the
+  gap bound. Both kinds are treated alike on purpose: while over the cap
+  their values were readable in text, and they stay so - **no worse, not
+  better** - until the field serves; refusing every case for them would
+  trade that for an outage. **Cost**: a field that comes back under the
+  cap leaves its values readable in text for its first two slices (and a
+  frozen one, names logged since it froze, until its catch-up lands), as
+  they already were while over. **A field near the cap that flips** over
+  and under from day to day never takes cases down: over, it is left out
+  with its cover frozen; under, it is read without being waited for;
+  over again before it serves, left out again. The 5% margin and the
+  one-day lifetime are unchanged. A field the map **lists** is unchanged
+  too: over the cap refuses the slice and no record is made. Visible as
+  the same `BACKFILLING <field>` note on the VOCAB line, in es-login and
+  in `report()["backfill"]` with `waited: false`, ending `back from over
+  the cap, cases do not wait for it and its values stay readable in text
+  until it serves`; the `vocabulary_building` refusal lists only fields
+  cases wait for. Gate: `lapsed_decision_serves`
+  (`eseval.run_lapse_eval` on `eseval.lapse_docs`: an invented
+  `trace.ref`, 260 values a day against a cap of 200, a map with no
+  vocabulary section, 10 days, own index pattern and map, appended last
+  of all; the real `Broker`). Before (`VocabularyIndex.lapsed_waited`,
+  the measurement switch): at the lapse serving False, **2 refusals, all
+  `vocabulary_building`, 0 requests from the case**, until the recount.
+  After: serving True, state `ready`, **0 refusals, 3 cases served**, the
+  name hidden, the recount **1 request**, the field left out again and
+  never claimed covered, no value in the log or lines. Two fields
+  backfilled at once share every slice (identical covers): on the
+  example fixture **served after 2 slices, 8 requests, 92 simulated
+  seconds; the whole backfill 30 slices, 120 requests, 1,284 seconds; 0
+  requests on the field that already had cover**
+  (`test_two_fields_added_at_once_are_backfilled_together`). Unit cases
+  in `test_elastic.py`: the lapse itself, a never-read field back under,
+  a flipping field, a frozen field returning next to a never-read one,
+  and the ranking after top-ups.
+
+  **A returning field that never gets there.** Nothing ended the
+  returning state if the field's own slices kept failing, and measured
+  over two simulated hours on the real broker (`_FailingField` in
+  `test_esbridge.py`) the failure side was: a recount failing upstream
+  every time, or a page failing every time, served every case but was
+  retried every 60s **for ever, 60 attempts an hour**, with only
+  `retrying` on the line; and a field that read one good day and then
+  failed **took the top-ups of the fields cases wait for down with it** -
+  once aligned it rode in their forward slice, so their top-up failed,
+  the state went `stale` then `catching_up`, and 59 of 120 cases were
+  refused. Now: a returning field **never shares a slice** with a field
+  cases wait for (`plan_vocabulary_slice`); a slice that read only
+  returning fields and failed is **charged to them**
+  (`VocabularyIndex.note_returning_failure`, logged `returning_failed`),
+  never to the cluster - no `failed`, no `stale`, no 60s pause for the
+  others; and its next try waits a delay doubling from
+  `VOCABULARY_RETRY_S` to `VOCABULARY_RETURNING_RETRY_MAX_S` (an hour),
+  saved in the field's over-cap record with the attempt count and when
+  it started failing, so a restart keeps the delay. **Retry cost**:
+  attempts at 0, 1, 3, 7, 15, 31 and 63 minutes, then one an hour - 8 in
+  the first three hours, 24 a day after; one request each for a failing
+  recount, two (the count and the first page) for a failing page. A slice
+  that lands resets the count. **What the user sees**: the field's
+  `BACKFILLING` note carries `last attempt failed (<code>), N attempts
+  since A, next try B` (and, with nothing read yet, says its next slice
+  recounts it and reads its first day); past
+  `VOCABULARY_RETURNING_STUCK_S` (an hour) of failing it is also
+  `STUCK, NOT READ (readable in text): field failing since A, N attempts
+  (<code>), next try B` on the VOCAB line and in es-login, and in
+  `report()["stuck"]` - field names, counts, codes and times. **Cases
+  stay served**: the choice was between that and refusing, and a stuck
+  field's values were readable in text all the time it was over the cap;
+  refusing would turn an upstream fault on one id-like field into an
+  outage of every case. Cost: its values stay readable for as long as it
+  fails, which the STUCK line says; what was protected stays protected -
+  every field cases wait for is topped up on time (lag never past the
+  refresh in the measurement), a frozen cover's names stay hidden, and
+  nothing is claimed for days not read. A restart **mid-read** keeps the
+  field returning with the day it read, reads the next day behind it,
+  and serves as before; a restart **with a recount submitted and not
+  answered** keeps it returning with no cover, its attempt count and its
+  retry time, and the recount runs again - nothing lost, nothing claimed
+  twice (both pinned in `test_esbridge.py`). A field the map **lists**
+  is untouched: over the cap refuses the slice, no record is made, it is
+  never returning (pinned). An unchanged field set never has a returning
+  field, so its slices and request counts are as before.
+
   **Declared cost of the cap, new and the sharper one: a real name field
   with more distinct values than `vocabulary.max` is left unread under
   the default field set, so its values stay readable in message text.**
@@ -1143,7 +1244,7 @@ Listed with owners in the README's Limitations section and in
   adding a shape, add a class, not another fixture.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 33 pass, and a change that cannot keep them passing
+  MCP endpoint; all 34 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -1201,7 +1302,8 @@ Listed with owners in the README's Limitations section and in
   bound; the gap tenant is readable on that page with the gate off, is
   refused with 0 requests and `catching_up` with it on, the first top-up
   is the gap itself, after it the same open case is shown with the name
-  hidden, and a cover ten minutes behind serves). `catch_up_sliced`
+  hidden, and a cover ten minutes behind serves). `field_added_backfilled`
+  and `lapsed_decision_serves` (see the per-field section). `catch_up_sliced`
   (`eseval.run_catch_up_eval`, see "The catch-up is read in slices"
   above).
   Label use: `label_guessing_refused` - a fresh case on the estate
@@ -1216,7 +1318,7 @@ Listed with owners in the README's Limitations section and in
   Fixed documents for the readability checks are appended after the RNG
   stream so nothing existing moves: `UNMARKED_JOBS`, `UNMARKED_NAMES`,
   `DEFAULT_MAP_*`, `ORDINARY_WORD_JOBS`, the estate, `OVER_CAP_*`,
-  `STREAM_*` and, last of all, `GAP_*` (the last three the only ones in index patterns of
+  `STREAM_*`, `GAP_*`, `ADDED_*` and, last of all, `LAPSE_*` (the last five the only ones in index patterns of
   their own, so no other query, build or count pays for them; they hold
   no ground truth either - `OVER_CAP_TRUTH` is that gate's own).
 
