@@ -28,6 +28,8 @@ one response and using them in the next, and reports:
 * **text queries**: how many phrase searches the run issued, because
   confirming a guessed word by hit count is the declared residual channel.
 * **latency**: p50 and p95 of compile + scrub per page, tier 2 warm.
+* **operator utility** (not a gate): scripted investigations through the
+  real bridge, each answered, wrong or blocked (see :mod:`hider.esutility`).
 """
 
 from __future__ import annotations
@@ -2191,6 +2193,101 @@ def _catch_up_lines(o: dict | None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# The burst: a text_groups scope wider than the sample, whose commonest
+# message is not among the newest documents
+# ---------------------------------------------------------------------------
+#
+# text_groups read the newest TEXT_GROUP_SAMPLE documents in scope. On a wide
+# scope that is a moment at the end of the window: "which errors are
+# commonest this week" answered from the last minute. The fixture's one
+# utility case is smaller than the sample, so it could not show it. These
+# documents are a fixture of their own (not appended to ``generate``, so no
+# existing engine, build or count sees them), in their own index pattern
+# with their own map, and hold no real value: one week of failed runs with
+# a steady commonest error, a rarer steady one, and a burst of a third in
+# the last minute that is wider than the sample on its own. Positions, not
+# draws.
+BURST_INDEX = "logs-burst-*"
+BURST_RANGE = {"gte": "now-7d", "lte": "now"}
+BURST_DAYS = 7
+#: the steady commonest error over the week, spread evenly
+BURST_STEADY = 1_400
+#: the rarer steady error, spread evenly
+BURST_RARE = 200
+#: the noisy error: every document in the last minute, more than the sample
+BURST_NOISY = 1_100
+#: successful runs over the week, outside the question's scope
+BURST_OK = 300
+BURST_TENANTS = ("Pellbrook Marine Supply", "Oxcombe Dairy Cooperative",
+                 "Thistlemoor Freight Lines")
+BURST_JOBS = ("Ledger Sweep Nightly", "Mailbox Export Weekend", "Archive Rollup")
+BURST_STEADY_MESSAGE = "Throttled by the service for {TENANT}: retry after {N}s"
+BURST_RARE_MESSAGE = "License check failed for {TENANT}, error code 0x80070005"
+BURST_NOISY_MESSAGE = "Connection to the vault refused for {TENANT} (attempt {N})"
+BURST_OK_MESSAGE = "Run completed for {TENANT} in {N}s"
+#: the question's answer, by group in true order: steady, noisy, rare
+BURST_TRUE_ORDER = (BURST_STEADY, BURST_NOISY, BURST_RARE)
+
+
+def _burst_doc(at: datetime, i: int, template: str, status: str) -> Doc:
+    tenant = BURST_TENANTS[i % len(BURST_TENANTS)]
+    job = BURST_JOBS[i % len(BURST_JOBS)]
+    msg = template.replace("{TENANT}", tenant).replace("{N}", str(3 + i % 57))
+    return Doc(BURST_INDEX, {
+        "@timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "job": {"name": job, "status": status, "status_message": msg},
+        "labels": {"tenant_name": tenant},
+    }, {tenant: "ORG_NAME", job: "JOB_NAME"})
+
+
+def burst_docs() -> list[Doc]:
+    """One week of runs: see the section above."""
+    week = BURST_DAYS * 86400.0
+    start = NOW - timedelta(days=BURST_DAYS)
+    out: list[Doc] = []
+    # the steady errors and the successes are spread over the whole week,
+    # none of them in the last minute
+    for n, template, status in ((BURST_STEADY, BURST_STEADY_MESSAGE, "Failed"),
+                                (BURST_RARE, BURST_RARE_MESSAGE, "Failed"),
+                                (BURST_OK, BURST_OK_MESSAGE, "Succeeded")):
+        step = (week - 120.0) / n
+        for i in range(n):
+            out.append(_burst_doc(start + timedelta(seconds=step * (i + 0.5)), i,
+                                  template, status))
+    # the burst: every document in the last sixty seconds
+    for i in range(BURST_NOISY):
+        at = NOW - timedelta(seconds=60.0 * (1 - (i + 0.5) / BURST_NOISY))
+        out.append(_burst_doc(at, i, BURST_NOISY_MESSAGE, "Failed"))
+    return out
+
+
+def burst_map() -> elastic.ElasticConfig:
+    raw = {
+        "indices": [BURST_INDEX],
+        "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "fields": {
+            "@timestamp": "keep",
+            "job.status": "keep",
+            "job.status_message": "text",
+            "job.name": {"kind": "identifier", "type": "JOB_NAME"},
+            "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+        },
+    }
+    return elastic.parse(raw, source="burst-fixture")
+
+
+def burst_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
+                                                  elastic.ClusterVocabulary]:
+    """The burst fixture on its own engine with its vocabulary built."""
+    cfg = burst_map()
+    fx = Fixture(burst_docs(), [], [])
+    engine = StubEngine(fx, (BURST_INDEX,))
+    vocab, _b = build_vocabulary(cfg, engine)
+    return cfg, fx, engine, vocab
+
+
 def flatten(node: Any, prefix: str = "") -> dict[str, Any]:
     out: dict[str, Any] = {}
     if isinstance(node, dict):
@@ -2337,7 +2434,15 @@ class StubEngine:
         if kind == "match_all":
             return True
         if kind == "bool":
-            return all(self._match(flat, c) for c in spec.get("filter", []))
+            # filter, must_not, and should with minimum_should_match: what
+            # the grammar's not and any_of compile to
+            if not all(self._match(flat, c) for c in spec.get("filter", [])):
+                return False
+            if any(self._match(flat, c) for c in spec.get("must_not", [])):
+                return False
+            should = spec.get("should")
+            return not should or sum(self._match(flat, c) for c in should) \
+                >= spec.get("minimum_should_match", 1)
         if kind == "term":
             (f, v), = spec.items()
             return f in flat and _term_eq(flat[f], v)
@@ -3166,6 +3271,511 @@ def run_phrase_budget_eval(fx: Fixture, *, tier2: str = "none") -> dict:
     return {"budget": cfg_on.phrase_budget, "before": attack(cfg_off), "after": attack(cfg_on)}
 
 
+#: The guessing run's attackers, by the forms they use. The first two are
+#: what a case could do before not and any_of existed; the last three use
+#: them. Each plays its best game: the any_of and none-of attackers split a
+#: positive batch with phrases they have already paid for, which is free.
+COMPOUND_GUESS_OLD = ("filters_agg", "plain_single")
+COMPOUND_GUESS_NEW = ("any_of", "not_single", "none_of")
+#: The same run for text_groups: the best page-based play with the forms
+#: that existed before it (an any_of with a page of hits: a candidate seen
+#: in a returned message is confirmed at once, the rest are split), against
+#: the two attackers that use it - one phrase a query, and an any_of whose
+#: groups show which candidate matched.
+TEXT_GROUP_GUESS_OLD = COMPOUND_GUESS_OLD + COMPOUND_GUESS_NEW + ("any_of_page",)
+TEXT_GROUP_GUESS_NEW = ("groups_single", "groups_any_of")
+
+
+def run_compound_guess_eval(fx: Fixture, *, tier2: str = "none") -> dict:
+    """The phrase-budget gate's guessing run, through not and any_of.
+
+    The question is whether either form lets a case confirm **more** guesses,
+    or confirm them **cheaper**, than it could before. Each attacker is a
+    fresh case on the real Bridge at the default budget, over the same 4,000
+    candidates (:func:`budget_candidate`, 500 batches of 8). A guess is
+    *confirmed* when the attacker can say from its replies whether the
+    phrase matches; each conclusion is checked against the engine. Counted
+    per attacker: queries, queries sent, requests, distinct phrases charged,
+    guesses confirmed (and how many were right), refusals by code, requests
+    sent by refused queries, and the refusal's shape.
+
+    * ``filters_agg``: one ``filters`` aggregation, a bucket per phrase (the
+      gate's own run) - eight counts a query.
+    * ``plain_single``: one phrase filter a query.
+    * ``any_of``: one any_of of the batch; a zero total confirms all eight
+      absent, a positive one is split in halves with the same (free)
+      phrases until each is pinned.
+    * ``not_single``: one ``not`` a query, against a base count with no
+      phrase; fewer documents than the base means the phrase matches.
+    * ``none_of``: eight ``not`` filters at once against the base, split in
+      halves like any_of when the count drops.
+    """
+    cfg = stream_name_map()
+    engine = StubEngine(fx, (STREAM_INDEX,))
+    vocab, _b = build_vocabulary(cfg, engine)
+    oracle = StubEngine(fx, (STREAM_INDEX,))     # the truth, on its own engine
+    window = {"range": {"@timestamp": STREAM_RANGE}}
+
+    def truth(p: str) -> bool:
+        body = {"size": 0, "query": {"bool": {"filter": [window,
+                                                         {"match_phrase": {"message": p}}]}}}
+        return oracle.search(STREAM_INDEX, body)["hits"]["total"]["value"] > 0
+
+    batches = [[budget_candidate(q * 8 + k) for k in range(8)] for q in range(BUDGET_QUERIES)]
+    shapes: set[str] = set()
+
+    def attack(strategy: str) -> dict:
+        case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+        r = {"queries": 0, "sent": 0, "requests": 0, "refused_budget": 0,
+             "refused_requests": 0, "other_refusals": 0}
+        known: dict[str, bool] = {}
+
+        def ask(filters: list | None = None, aggs: dict | None = None,
+                size: int = 0) -> dict | None:
+            q: dict[str, Any] = {"index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": size}
+            if filters:
+                q["filters"] = filters
+            if aggs:
+                q["aggs"] = aggs
+            before = len(engine.requests)
+            out, refused, _dt, _c = case.call(q)
+            sent = len(engine.requests) - before
+            r["queries"] += 1
+            r["requests"] += sent
+            if refused is None:
+                r["sent"] += 1
+                return out
+            if refused.code == "phrase_budget":
+                r["refused_budget"] += 1
+                shapes.add(re.sub(r"\d+", "N", refused.message))
+            else:
+                r["other_refusals"] += 1
+            r["refused_requests"] += sent
+            return None
+
+        def total(out: dict) -> int:
+            return out["hits"]["total"]["value"]
+
+        groups = {"g": {"type": "text_groups", "field": "message", "size": cfg.max_buckets}}
+
+        def visible(p: str, text: str) -> bool:
+            want, have = _TOKEN.findall(p.lower()), _TOKEN.findall(text.lower())
+            return bool(want) and any(have[i:i + len(want)] == want
+                                      for i in range(len(have) - len(want) + 1))
+
+        def ph(p: str) -> dict:
+            return {"field": "message", "op": "phrase", "value": p}
+
+        base = None
+        if strategy in ("not_single", "none_of"):
+            base = total(ask())                 # no phrase: costs nothing
+
+        def split(ps: list[str], present) -> None:
+            """``present(subset)`` is True/False, or None when refused."""
+            if len(ps) == 1:
+                known[ps[0]] = True
+                return
+            for half in (ps[: len(ps) // 2], ps[len(ps) // 2:]):
+                got = present(half)
+                if got is None:
+                    return
+                if got:
+                    split(half, present)
+                else:
+                    known.update({p: False for p in half})
+
+        def any_present(ps: list[str]):
+            out = ask([{"any_of": [ph(p) for p in ps]}])
+            return None if out is None else total(out) > 0
+
+        def none_present(ps: list[str]):
+            out = ask([{"not": ph(p)} for p in ps])
+            return None if out is None else total(out) < base
+
+        for ps in batches:
+            if strategy == "filters_agg":
+                out = ask(aggs={"g": {"type": "filters", "filters": {
+                    f"p{k}": [ph(p)] for k, p in enumerate(ps)}}})
+                if out is not None:
+                    for k, p in enumerate(ps):
+                        known[p] = out["aggregations"]["g"]["buckets"][f"p{k}"]["doc_count"] > 0
+            elif strategy == "plain_single":
+                for p in ps:
+                    out = ask([ph(p)])
+                    if out is not None:
+                        known[p] = total(out) > 0
+            elif strategy == "not_single":
+                for p in ps:
+                    out = ask([{"not": ph(p)}])
+                    if out is not None:
+                        known[p] = total(out) < base
+            elif strategy == "groups_single":
+                for p in ps:
+                    out = ask([ph(p)], aggs=groups)
+                    if out is not None:
+                        known[p] = total(out) > 0
+            elif strategy in ("any_of_page", "groups_any_of"):
+                if strategy == "any_of_page":
+                    out = ask([{"any_of": [ph(p) for p in ps]}], size=cfg.max_hits)
+                    texts = [str((h.get("_source") or {}).get("message", ""))
+                             for h in (out or {}).get("hits", {}).get("hits", [])]
+                else:
+                    out = ask([{"any_of": [ph(p) for p in ps]}], aggs=groups)
+                    texts = [b["key"] for b in (out or {}).get("aggregations", {})
+                             .get("g", {}).get("buckets", [])]
+                if out is None:
+                    continue
+                if total(out) == 0:
+                    known.update({p: False for p in ps})
+                    continue
+                # a candidate seen in what came back matched; the rest are
+                # split with phrases already paid for
+                seen = [p for p in dict.fromkeys(ps) if any(visible(p, t) for t in texts)]
+                known.update({p: True for p in seen})
+                rest = [p for p in dict.fromkeys(ps) if p not in seen]
+                if rest:
+                    got = any_present(rest)
+                    if got:
+                        split(rest, any_present)
+                    elif got is False:
+                        known.update({p: False for p in rest})
+            else:
+                present = any_present if strategy == "any_of" else none_present
+                got = present(ps)
+                if got is None:
+                    continue
+                if got:
+                    split(list(dict.fromkeys(ps)), present)
+                else:
+                    known.update({p: False for p in ps})
+        r["phrases_charged"] = case.scrubber.phrase_report()["phrases_used"]
+        r["confirmed"] = len(known)
+        r["confirmed_right"] = sum(1 for p, v in known.items() if truth(p) == v)
+        r["matches_found"] = sum(known.values())
+        r["requests_per_guess"] = round(r["requests"] / r["confirmed"], 3) if r["confirmed"] else None
+        shutil.rmtree(case.directory, ignore_errors=True)
+        return r
+
+    out = {s: attack(s) for s in TEXT_GROUP_GUESS_OLD + TEXT_GROUP_GUESS_NEW}
+    return {"budget": cfg.phrase_budget, "candidates": len({p for b in batches for p in b}),
+            "attackers": out, "message_shapes": len(shapes),
+            "derivable": _compound_derivable(cfg, engine, vocab, batches, tier2=tier2)}
+
+
+#: batches the derivability check reads: eight-phrase batches fill the
+#: budget at 18, and one in ten holds the phrase that matches
+DERIVABLE_BATCHES = 18
+
+
+def _compound_derivable(cfg: elastic.ElasticConfig, engine: StubEngine,
+                        vocab: elastic.ClusterVocabulary, batches: list[list[str]], *,
+                        tier2: str) -> dict:
+    """Every count the new forms give, given again by the old forms alone.
+
+    For each batch: the any_of count on one case, and on another case the
+    same number by inclusion-exclusion over a ``filters`` aggregation with
+    one bucket per non-empty subset of the batch's phrases (ANDed), split
+    across queries at ``max_buckets``; every phrase there is one the
+    aggregation case has paid for, so the extra queries are free. For each
+    phrase: the ``not`` count, against the base count minus the plain
+    phrase count. Counted: counts compared, counts equal, and the distinct
+    phrases each way charged.
+    """
+    from itertools import combinations
+
+    new_case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+    old_case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+
+    def total(case: BridgeCase, filters: list | None = None, aggs: dict | None = None):
+        q: dict[str, Any] = {"index": STREAM_INDEX, "time_range": STREAM_RANGE, "size": 0}
+        if filters:
+            q["filters"] = filters
+        if aggs:
+            q["aggs"] = aggs
+        out, refused, _dt, _c = case.call(q)
+        if refused is not None:
+            raise RuntimeError(f"derivability check refused: {refused.code}")
+        return out
+
+    def ph(p: str) -> dict:
+        return {"field": "message", "op": "phrase", "value": p}
+
+    r = {"batches": 0, "union_counts": 0, "union_equal": 0, "not_counts": 0, "not_equal": 0,
+         "old_queries": 0, "new_queries": 0}
+    base_new = total(new_case)["hits"]["total"]["value"]
+    base_old = total(old_case)["hits"]["total"]["value"]
+    for ps in batches[:DERIVABLE_BATCHES]:
+        ps = list(dict.fromkeys(ps))
+        r["batches"] += 1
+        union_new = total(new_case, [{"any_of": [ph(p) for p in ps]}])["hits"]["total"]["value"]
+        r["new_queries"] += 1
+        subsets = [s for k in range(1, len(ps) + 1) for s in combinations(ps, k)]
+        union_old = 0
+        step = cfg.max_buckets
+        for at in range(0, len(subsets), step):
+            chunk = subsets[at:at + step]
+            out = total(old_case, aggs={"g": {"type": "filters", "filters": {
+                f"s{i}": [ph(p) for p in s] for i, s in enumerate(chunk)}}})
+            r["old_queries"] += 1
+            for i, s in enumerate(chunk):
+                union_old += (-1) ** (len(s) + 1) * out["aggregations"]["g"]["buckets"][f"s{i}"][
+                    "doc_count"]
+        r["union_counts"] += 1
+        r["union_equal"] += union_new == union_old
+        for p in ps:
+            not_new = total(new_case, [{"not": ph(p)}])["hits"]["total"]["value"]
+            pos_old = total(old_case, [ph(p)])["hits"]["total"]["value"]
+            r["new_queries"] += 1
+            r["old_queries"] += 1
+            r["not_counts"] += 1
+            r["not_equal"] += not_new == base_new - pos_old
+    r["base_equal"] = base_new == base_old
+    r["phrases_new"] = new_case.scrubber.phrase_report()["phrases_used"]
+    r["phrases_old"] = old_case.scrubber.phrase_report()["phrases_used"]
+    for c in (new_case, old_case):
+        shutil.rmtree(c.directory, ignore_errors=True)
+    return r
+
+
+def compound_guess_holds(g: dict) -> bool:
+    """Neither form confirms more guesses than the old forms could, or
+    confirms one for fewer requests; every guess is paid for from the
+    budget; refused queries send nothing; one refusal shape throughout."""
+    a = g["attackers"]
+    old, new = [a[s] for s in COMPOUND_GUESS_OLD], [a[s] for s in COMPOUND_GUESS_NEW]
+    return (all(x["confirmed"] <= x["phrases_charged"] <= g["budget"]
+                and x["confirmed_right"] == x["confirmed"]
+                and x["refused_requests"] == 0 and x["other_refusals"] == 0 for x in a.values())
+            and max(x["confirmed"] for x in new) <= max(x["confirmed"] for x in old)
+            and min(x["requests_per_guess"] for x in new)
+            >= min(x["requests_per_guess"] for x in old)
+            and g["message_shapes"] == 1
+            # and every count the new forms gave, the old ones give too,
+            # for the same phrases charged
+            and (d := g["derivable"])["union_equal"] == d["union_counts"] > 0
+            and d["not_equal"] == d["not_counts"] > 0 and d["base_equal"]
+            and d["phrases_new"] == d["phrases_old"])
+
+
+def text_groups_guess_holds(g: dict) -> bool:
+    """text_groups confirms no more guesses than the forms before it, none
+    for fewer requests, every guess paid for from the budget, refused
+    queries send nothing, and the refusal has one shape."""
+    a = g["attackers"]
+    old = [a[s] for s in TEXT_GROUP_GUESS_OLD]
+    new = [a[s] for s in TEXT_GROUP_GUESS_NEW]
+    return (all(x["confirmed"] <= x["phrases_charged"] <= g["budget"]
+                and x["confirmed_right"] == x["confirmed"]
+                and x["refused_requests"] == 0 and x["other_refusals"] == 0 for x in a.values())
+            and max(x["confirmed"] for x in new) <= max(x["confirmed"] for x in old)
+            and min(x["requests_per_guess"] for x in new)
+            >= min(x["requests_per_guess"] for x in old)
+            and g["message_shapes"] == 1)
+
+
+#: The scopes the page-equivalence check groups: (index, text field, filters).
+#: Each is read whole by both routes (under the sample cap).
+TEXT_GROUP_SCOPES: tuple[tuple[str, str, tuple], ...] = (
+    ("logs-app-*", "job.status_message", ({"field": "job.status", "op": "eq", "value": "Failed"},)),
+    ("logs-app-*", "message", ()),
+    ("logs-worker-*", "message", ()),
+    ("traces-apm-*", "message", ()),
+)
+
+
+def run_text_groups_eval(cfg: elastic.ElasticConfig, fx: Fixture,
+                         vocab: elastic.ClusterVocabulary, *, tier2: str = "none") -> dict:
+    """A group reveals nothing a page of the same messages does not.
+
+    For each scope in :data:`TEXT_GROUP_SCOPES`, over the six hours the
+    fixture's messages sit in: one fresh case asks ``text_groups`` (every
+    group, ``max_buckets`` at most), another reads the same documents as
+    pages of ``max_hits`` and groups the redacted texts itself with the same
+    key. Equal groups and counts means a group response is a function of
+    what the pages showed. Counted besides: requests each way, labels the
+    groups made usable (they must make none), planted values readable in a
+    group's text, and what the engineer no longer sees - distinct redacted
+    texts on the pages against the groups they fall into, and labels on the
+    pages against none in the groups. Its own engine, so no other figure
+    moves.
+    """
+    cfg = dataclasses.replace(
+        cfg, clusters=(elastic.Cluster("stub", "https://kibana-stub.example.net"),))
+    engine = StubEngine(fx, cfg.indices)
+    truth = fx.truth
+    tr = {"gte": "now-6h", "lte": "now"}
+    rows = []
+    for index, field, filters in TEXT_GROUP_SCOPES:
+        r = {"index": index, "field": field, "filtered": bool(filters)}
+        g_case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+        shown_before = set(g_case.scrubber.shown)
+        before = len(engine.requests)
+        out, refused, _dt, _c = g_case.call({
+            "index": index, "time_range": tr, "size": 0, "filters": list(filters),
+            "aggs": {"g": {"type": "text_groups", "field": field, "size": cfg.max_buckets}}})
+        r["group_requests"] = len(engine.requests) - before
+        r["refused"] = refused.code if refused else None
+        if out is None:
+            rows.append(r)
+            continue
+        agg = out["aggregations"]["g"]
+        groups = {b["key"]: b["doc_count"] for b in agg["buckets"]}
+        r.update(total=out["hits"]["total"]["value"], sampled=agg["sampled"],
+                 groups=agg["groups"], exact=agg["exact"], strata=agg["strata"],
+                 labels_made_usable=len(set(g_case.scrubber.shown) - shown_before),
+                 planted_readable=len(set().union(*[_readable_values(k, truth)
+                                                    for k in groups] or [set()])))
+        p_case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+        before = len(engine.requests)
+        texts: list[str] = []
+        labels_on_pages: set[str] = set()
+        for frm in range(0, min(r["total"], elastic.TEXT_GROUP_SAMPLE), cfg.max_hits):
+            page, refused, _dt, _c = p_case.call({"index": index, "time_range": tr,
+                                                  "size": cfg.max_hits, "from": frm,
+                                                  "filters": list(filters)})
+            if page is None:
+                r["page_refused"] = refused.code if refused else None
+                break
+            for h in page["hits"]["hits"]:
+                node: Any = h.get("_source") or {}
+                for k in field.split("."):
+                    node = node.get(k) if isinstance(node, dict) else None
+                if isinstance(node, str) and node.strip():
+                    texts.append(node)
+                    labels_on_pages |= {lb for lb in elastic.EsScrubber._LABEL_SHAPES.findall(node)
+                                        if lb in p_case.scrubber.mapping}
+        r["page_requests"] = len(engine.requests) - before
+        from_pages: dict[str, int] = {}
+        for t in texts:
+            k = elastic.text_group_key(t)
+            from_pages[k] = from_pages.get(k, 0) + 1
+        top = dict(sorted(from_pages.items(), key=lambda kv: (-kv[1], kv[0]))[:cfg.max_buckets])
+        r["equal_to_pages"] = top == groups and len(from_pages) == agg["groups"]
+        on_pages = set().union(*[_readable_values(t, truth) for t in texts] or [set()])
+        r["planted_readable_on_pages"] = len(on_pages)
+        r["readable_only_in_groups"] = len(set().union(
+            *[_readable_values(k, truth) for k in groups] or [set()]) - on_pages)
+        r["distinct_texts_on_pages"] = len(set(texts))
+        r["labels_on_pages"] = len(labels_on_pages)
+        for c in (g_case, p_case):
+            shutil.rmtree(c.directory, ignore_errors=True)
+        rows.append(r)
+    rows.append(_burst_scope(tier2))
+    return {"scopes": rows, "sample_cap": elastic.TEXT_GROUP_SAMPLE}
+
+
+def _burst_scope(tier2: str) -> dict:
+    """The one scope wider than the sample (:func:`burst_docs`): a fresh
+    case asks ``text_groups`` over the week, another pages the whole scope
+    an hour at a time and groups it with the same key. The groups are an
+    estimate here, so what is checked is not equality but what the
+    estimate may and may not do: every group's text is one the pages show,
+    nothing readable only in a group, no label made usable, one request of
+    at most the sample; and, reported, whether the week's order and the
+    pages' agree and how many true counts sit inside the reply's margin."""
+    cfg, fx, engine, vocab = burst_world(tier2=tier2)
+    truth = fx.truth
+    scope = [{"field": "job.status", "op": "eq", "value": "Failed"}]
+    r: dict[str, Any] = {"index": BURST_INDEX, "field": "job.status_message", "filtered": True,
+                         "estimated": True}
+    g_case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+    shown_before = set(g_case.scrubber.shown)
+    before = len(engine.requests)
+    out, refused, _dt, _c = g_case.call({
+        "index": BURST_INDEX, "time_range": BURST_RANGE, "size": 0, "filters": scope,
+        "aggs": {"g": {"type": "text_groups", "field": "job.status_message",
+                       "size": cfg.max_buckets}}})
+    r["group_requests"] = len(engine.requests) - before
+    r["refused"] = refused.code if refused else None
+    if out is None:
+        return r
+    agg = out["aggregations"]["g"]
+    groups = {b["key"]: b for b in agg["buckets"]}
+    r.update(total=out["hits"]["total"]["value"], sampled=agg["sampled"], groups=agg["groups"],
+             exact=agg["exact"], strata=agg["strata"], order_settled=agg["order_settled"],
+             labels_made_usable=len(set(g_case.scrubber.shown) - shown_before),
+             planted_readable=len(set().union(*[_readable_values(k, truth)
+                                                for k in groups] or [set()])))
+    p_case = BridgeCase(cfg, engine, vocab, tier2=tier2)
+    before = len(engine.requests)
+    texts: list[str] = []
+    labels_on_pages: set[str] = set()
+    # an hour at a time, the burst's last two minutes on their own so that
+    # no window holds more than paging reaches (MAX_FROM plus a page)
+    windows = [{"gte": "now-2m", "lte": "now"}, {"gte": "now-1h", "lt": "now-2m"}]
+    windows += [{"gte": f"now-{h + 1}h", "lt": f"now-{h}h"} for h in range(1, BURST_DAYS * 24)]
+    for tr in windows:
+        frm = 0
+        while True:
+            page, refused, _dt, _c = p_case.call({"index": BURST_INDEX, "time_range": tr,
+                                                  "size": cfg.max_hits, "from": frm,
+                                                  "filters": scope})
+            if page is None:
+                r["page_refused"] = refused.code if refused else None
+                break
+            hits = page["hits"]["hits"]
+            for hit in hits:
+                node: Any = (hit.get("_source") or {}).get("job", {}).get("status_message")
+                if isinstance(node, str) and node.strip():
+                    texts.append(node)
+                    labels_on_pages |= {lb for lb in elastic.EsScrubber._LABEL_SHAPES.findall(node)
+                                        if lb in p_case.scrubber.mapping}
+            frm += cfg.max_hits
+            if len(hits) < cfg.max_hits or frm > esquery.MAX_FROM:
+                break
+        if r.get("page_refused"):
+            break
+    r["page_requests"] = len(engine.requests) - before
+    from_pages: dict[str, int] = {}
+    for t in texts:
+        k = elastic.text_group_key(t)
+        from_pages[k] = from_pages.get(k, 0) + 1
+    r["pages_read"] = len(texts)
+    r["keys_on_pages"] = all(k in from_pages for k in groups)
+    r["order_equal"] = [b["key"] for b in agg["buckets"]] == \
+        sorted(from_pages, key=lambda k: (-from_pages[k], k))[:len(groups)]
+    r["within_margin"] = sum(1 for k, b in groups.items()
+                             if abs(b["doc_count"] - from_pages.get(k, 0)) <= b.get("margin", 0))
+    r["equal_to_pages"] = {k: b["doc_count"] for k, b in groups.items()} == from_pages
+    on_pages = set().union(*[_readable_values(t, truth) for t in texts] or [set()])
+    r["planted_readable_on_pages"] = len(on_pages)
+    r["readable_only_in_groups"] = len(set().union(
+        *[_readable_values(k, truth) for k in groups] or [set()]) - on_pages)
+    r["distinct_texts_on_pages"] = len(set(texts))
+    r["labels_on_pages"] = len(labels_on_pages)
+    for c in (g_case, p_case):
+        shutil.rmtree(c.directory, ignore_errors=True)
+    return r
+
+
+def _readable_values(text: str, truth: dict[str, str]) -> set[str]:
+    """The planted values readable in ``text``, as whole words: the values
+    themselves, for a set comparison (never reported, only counted)."""
+    blob = text.lower()
+    return {v for v in truth if len(v) >= 3 and re.search(
+        r"(?<![a-z0-9])" + re.escape(v.lower()) + r"(?![a-z0-9])", blob)}
+
+
+def text_groups_page_equivalent(t: dict) -> bool:
+    """Exact rows equal the pages grouped, in at most two requests (the
+    strata read and, when a slice did not fit, the whole scope as one
+    page); the estimated row's groups are texts the pages show, in true
+    order, in one request of at most the sample. Every row: no label made
+    usable, nothing readable only in a group, never more documents in a
+    request than the sample."""
+    rows = t["scopes"]
+    return bool(rows) and all(
+        r.get("refused") is None and r["labels_made_usable"] == 0
+        # a value readable in a group is one the pages show too (the
+        # declared one-word misses); nothing is readable only in a group
+        and r["readable_only_in_groups"] == 0 and r["sampled"] <= t["sample_cap"]
+        and (r.get("equal_to_pages") and r["exact"] and r["group_requests"] <= 2
+             if not r.get("estimated") else
+             r["keys_on_pages"] and r["order_equal"] and r["group_requests"] == 1
+             and not r["exact"] and r["total"] > t["sample_cap"])
+        for r in rows)
+
+
 def run_review_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
                     vocab: elastic.ClusterVocabulary, fx: Fixture, guessing_dir: str, *,
                     tier2: str) -> dict:
@@ -3619,9 +4229,16 @@ class Session:
                 self.vocabulary_applied += 1
             # as the bridge does: a query about to be sent spends its phrases
             self.scrubber.spend_phrases(compiled.new_phrases)
-            raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
-            envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}
-            out = self.scrubber.scrub_response(envelope, compiled.plan).output
+            if compiled.group_read is not None:
+                out = esquery.read_text_groups(
+                    lambda body: {"id": "x", "isPartial": False, "isRunning": False,
+                                  "rawResponse": self.engine.search(body["params"]["index"],
+                                                                    body["params"]["body"])},
+                    self.scrubber, compiled.group_read)[0].output
+            else:
+                raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
+                envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}
+                out = self.scrubber.scrub_response(envelope, compiled.plan).output
             refused = None
         except elastic.Refused as e:
             out, refused = None, e
@@ -3689,7 +4306,10 @@ def _oracle_tool(q: Any) -> tuple[str, Any, bool]:
     from . import esmcp
 
     if isinstance(q, dict) and "aggs" in q and q.get("size", 0) == 0:
-        return "es_aggregate", {k: v for k, v in q.items() if k != "size"}, True
+        args = {k: v for k, v in q.items() if k != "size"}
+        # a key es_aggregate does not take (from, sort) is the tool layer's
+        # refusal, not the grammar's
+        return "es_aggregate", args, set(args) <= esmcp._TOOL_KEYS["es_aggregate"]
     keys = set(q) if isinstance(q, dict) else set()
     for tool in ("es_count", "es_search"):
         if keys <= esmcp._TOOL_KEYS[tool]:
@@ -4326,7 +4946,11 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # may use: the mapping holds one per vocabulary name too, and those
         # are exactly what a case may not reach (see the label-guessing
         # oracle cases)
-        for label in s.shown:
+        # sorted: a set's order follows the process's string hash seed, and
+        # the scripted queries pick labels from these lists, so iterating
+        # the set made every figure downstream (labels_issued among them)
+        # differ from run to run
+        for label in sorted(s.shown):
             if label not in _seen_labels:
                 _seen_labels.add(label)
                 labels.setdefault(s.types.get(label, ""), []).append(label)
@@ -4446,6 +5070,10 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
 
     # The per-case phrase budget against a guessing run, on the real Bridge.
     phrase_budget = run_phrase_budget_eval(fx, tier2="none")
+    # the same guessing run through not and any_of (own engine and cases)
+    compound_guess = run_compound_guess_eval(fx, tier2="none")
+    # text_groups: a group is a function of the pages (own engine and cases)
+    text_groups = run_text_groups_eval(cfg, fx, vocab, tier2=tier2)
 
     # es-review over that guessing run and over an ordinary investigation.
     gap = run_gap_eval(tier2="none")
@@ -4669,6 +5297,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         "over_cap": over_cap,
         "stream_name": stream_name,
         "phrase_budget": phrase_budget,
+        "compound_guess": compound_guess,
+        "text_groups": text_groups,
         "review": review,
         "gap": gap,
         "catch_up": catch_up,
@@ -4890,6 +5520,18 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
             and la["served"] > 0 and la.get("hidden") and la["recounted"]
             and la["recount_requests"] >= 1 and not la["field_ever_covered"]
             and "OVER CAP" in la["line_after"] and la["log_values"] == 0,
+        # not and any_of: the guessing run confirms no more guesses and none
+        # cheaper than the old forms did, every count they give the old
+        # forms give too for the same phrases, and refused queries send
+        # nothing under one refusal shape
+        "compound_forms_no_new_guesses": compound_guess_holds(compound_guess),
+        # text_groups: the same guessing run confirms no more and none
+        # cheaper than the forms before it; and on every scope the groups
+        # equal the pages of the same documents grouped by the same key,
+        # in one request, making no label usable, nothing readable that the
+        # pages do not show
+        "text_groups_no_new_guesses": text_groups_guess_holds(compound_guess),
+        "text_groups_page_equivalent": text_groups_page_equivalent(text_groups),
         "review_flags_guessing":
             review["guessing"]["verdict"] == "flagged"
             and ("zero_hit_phrases" in review["guessing"]["flagged"]
@@ -4911,6 +5553,11 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
         # the same fixture through the MCP server, as Claude Code reaches it
         report["mcp"] = run_mcp_eval(cfg, fx, seed=seed, tier2=tier2)
         gates.update(mcp_gates(report["mcp"]))
+    # Last of all, and not a gate: can an operator still get real answers
+    # through the bridge (see esutility). Its own stub engine, so the
+    # requests it makes move no figure above; counts and codes only.
+    from . import esutility
+    report["utility"] = esutility.run_utility_eval(cfg, fx, vocab, tier2=tier2)
     report["gates"] = gates
     report["passed"] = all(gates.values())
     return report
@@ -5021,6 +5668,76 @@ def _phrase_budget_lines(o: dict | None) -> list[str]:
             f"{a['refused_requests']} requests, {a['message_shapes']} refusal shape(s); "
             f"reused phrase runs {a['reuse_runs']}, label-only phrase runs "
             f"{a['label_only_runs']}"]
+
+
+def _compound_guess_lines(o: dict | None) -> list[str]:
+    """The guessing run through not and any_of, against the old forms. Counts only."""
+    if not o:
+        return []
+    a, d = o["attackers"], o["derivable"]
+    # this line's own attackers: the run also carries text_groups' ones
+    mine = COMPOUND_GUESS_OLD + COMPOUND_GUESS_NEW
+
+    def one(name: str) -> str:
+        x = a[name]
+        return (f"{name} {x['confirmed']} confirmed/{x['phrases_charged']} charged/"
+                f"{x['requests_per_guess']} req a guess")
+    return [
+        f"not / any_of      guessing run, {o['candidates']} candidates, budget {o['budget']}: "
+        f"before {', '.join(one(n) for n in COMPOUND_GUESS_OLD)}; "
+        f"with the new forms {', '.join(one(n) for n in COMPOUND_GUESS_NEW)}; "
+        f"refused {sum(a[n]['refused_budget'] for n in mine)} phrase_budget, "
+        f"{sum(a[n]['other_refusals'] for n in mine)} other, "
+        f"{sum(a[n]['refused_requests'] for n in mine)} requests, "
+        f"{o['message_shapes']} refusal shape(s)",
+        f"  derivable       any_of counts equal to inclusion-exclusion over a filters agg "
+        f"{d['union_equal']}/{d['union_counts']}, not counts equal to base minus phrase "
+        f"{d['not_equal']}/{d['not_counts']}; phrases charged {d['phrases_new']} new forms, "
+        f"{d['phrases_old']} old ({d['new_queries']} queries against {d['old_queries']})"]
+
+
+def _text_groups_lines(g: dict | None, t: dict | None) -> list[str]:
+    """text_groups: the guessing run and the page check. Counts only."""
+    if not g or not t:
+        return []
+    a = g["attackers"]
+
+    def one(name: str) -> str:
+        x = a[name]
+        return (f"{name} {x['confirmed']} confirmed/{x['phrases_charged']} charged/"
+                f"{x['requests_per_guess']} req a guess")
+    best_old = min(TEXT_GROUP_GUESS_OLD, key=lambda n: a[n]["requests_per_guess"])
+    lines = [f"text_groups       guessing run: best before {one(best_old)}, {one('any_of_page')}; "
+             f"with text_groups {', '.join(one(n) for n in TEXT_GROUP_GUESS_NEW)}; refused "
+             f"{sum(a[n]['refused_budget'] for n in TEXT_GROUP_GUESS_NEW)} phrase_budget, "
+             f"{sum(a[n]['other_refusals'] for n in TEXT_GROUP_GUESS_NEW)} other, "
+             f"{sum(a[n]['refused_requests'] for n in TEXT_GROUP_GUESS_NEW)} requests"]
+    for r in t["scopes"]:
+        if r.get("refused"):
+            lines.append(f"  {r['index']} {r['field']}: REFUSED {r['refused']}")
+            continue
+        if r.get("estimated"):
+            lines.append(
+                f"  {r['index']:<14} {r['field']:<18} {r['groups']} groups estimated from "
+                f"{r['sampled']} of {r['total']} docs over {r['strata']} time slices in "
+                f"{r['group_requests']} request (pages: {r['page_requests']}, {r['pages_read']} "
+                f"docs); every group's text {'is' if r['keys_on_pages'] else 'IS NOT'} on the "
+                f"pages, order {'equal to' if r['order_equal'] else 'DIFFERENT FROM'} the pages', "
+                f"{r['within_margin']} of {r['groups']} counts within "
+                f"the reply's margin, order settled for {r['order_settled']}; "
+                f"{r['labels_made_usable']} labels made usable; planted values readable "
+                f"{r['planted_readable']} (only in groups {r['readable_only_in_groups']})")
+            continue
+        lines.append(
+            f"  {r['index']:<14} {r['field']:<18} {r['groups']} groups from {r['sampled']} of "
+            f"{r['total']} docs in {r['group_requests']} request"
+            f"{'s' if r['group_requests'] != 1 else ''} (pages: {r['page_requests']}), "
+            f"{'exact and equal to' if r['equal_to_pages'] else 'DIFFERENT FROM'} the pages grouped; "
+            f"{r['distinct_texts_on_pages']} distinct texts and {r['labels_on_pages']} labels on "
+            f"the pages, {r['labels_made_usable']} labels made usable; planted values readable "
+            f"{r['planted_readable']} (on the pages {r['planted_readable_on_pages']}, only in "
+            f"groups {r['readable_only_in_groups']})")
+    return lines
 
 
 def _stream_name_lines(o: dict | None) -> list[str]:
@@ -5177,6 +5894,8 @@ def format_report(r: dict) -> str:
         *_over_cap_lines(r.get("over_cap")),
         *_stream_name_lines(r.get("stream_name")),
         *_phrase_budget_lines(r.get("phrase_budget")),
+        *_compound_guess_lines(r.get("compound_guess")),
+        *_text_groups_lines(r.get("compound_guess"), r.get("text_groups")),
         *_review_lines(r.get("review")),
         *_gap_lines(r.get("gap")),
         *_catch_up_lines(r.get("catch_up")),
@@ -5224,6 +5943,8 @@ def format_report(r: dict) -> str:
             f"mcp latency       p50 {m['latency_s']['p50']}s  p95 {m['latency_s']['p95']}s  "
             f"max {m['latency_s']['max']}s",
         ]
+    from . import esutility
+    lines += esutility.format_lines(r.get("utility"))
     lines += [
         f"gates             {r['gates']}",
         f"PASSED" if r["passed"] else "FAILED",

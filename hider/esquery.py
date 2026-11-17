@@ -27,6 +27,20 @@ On the way out, two substitutions and one gate:
   never the resolved one): confirming a guessed plain word by its hit count
   is an accepted and declared channel.
 * Literals on ``keep`` fields pass the same gate.
+
+Two compound filters, in a query's ``filters`` only: ``{"not": filter}``
+(compiled to ``must_not``) and ``{"any_of": [filter, ...]}`` (``should``,
+``minimum_should_match`` 1). Each holds plain filters, one level deep, and
+each inner filter goes through :meth:`_Compiler.one_filter` with the outer
+position's name, so every rule above applies inside them and a refusal
+inside is the refusal outside, word for word. Their phrases count toward
+the per-query cap and the per-case budget like any other.
+
+One aggregation that is not Elasticsearch's: ``text_groups`` on a text
+field, the commonest redacted messages in scope with their counts. It
+compiles to a read of a page's worth of documents spread over the scope's
+time span, grouped by the scrubber after redaction (see
+:class:`GroupRead` and :meth:`_Compiler.text_groups`).
 """
 
 from __future__ import annotations
@@ -35,9 +49,10 @@ import calendar
 import math
 import re
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from . import elastic, jsonscrub, pipeline
 
@@ -59,7 +74,11 @@ _INTERVAL = re.compile(r"^(?:\d{1,4}(?:ms|s|m|h|d)|1[wMqy]|minute|hour|day|week|
 _FILTER_OPS = {"eq", "in", "exists", "range", "phrase"}
 _RANGE_KEYS = {"gte", "gt", "lte", "lt"}
 _METRICS = {"min", "max", "avg", "sum", "value_count", "percentiles"}
-_AGG_TYPES = _METRICS | {"terms", "date_histogram", "cardinality", "top_hits", "filters"}
+_AGG_TYPES = _METRICS | {"terms", "date_histogram", "cardinality", "top_hits", "filters",
+                         "text_groups"}
+#: what a text_groups key puts where a value was: never a label, so typed
+#: into a phrase it is refused rather than searched for as a word
+_GROUP_PLACEHOLDER = re.compile(r"<\*>|<[A-Za-z_]+>")
 _QUERY_KEYS = {"index", "time_range", "filters", "size", "from", "sort", "aggs"}
 _LABEL_WORD = re.compile(r"<[A-Za-z][A-Za-z_]*-\d+>")
 
@@ -220,6 +239,125 @@ class Compiled:
     #: plain-word (field, phrase key) pairs this query would add to the
     #: case's spent set; the caller spends them just before sending
     new_phrases: frozenset = frozenset()
+    #: set for a text_groups query: the read is several requests, and
+    #: ``body``/``plan`` are its first (see :func:`read_text_groups`)
+    group_read: "GroupRead | None" = None
+
+
+@dataclass(frozen=True)
+class GroupRead:
+    """How a ``text_groups`` query is read: one to three requests, each a
+    page's worth of documents at most, built here and run by
+    :func:`read_text_groups`.
+
+    1. **bounds** - only when the query gave no closed time range: the
+       scope's first and last timestamp (``min``/``max``, no documents).
+    2. **strata** - the scope's span cut into at most ``strata`` equal
+       slices, the newest ``per_stratum`` documents of each, in one
+       request: the sample is spread over the time the engineer asked
+       about instead of being the newest moment of it.
+    3. **exact** - the whole scope as one page of :data:`elastic.TEXT_GROUP_SAMPLE`
+       hits, only when the strata read was not exact and the scope fits.
+    """
+
+    index: str
+    query: dict
+    includes: list[str]
+    time_field: str
+    groups: elastic.GroupPlan
+    #: the query's closed time range, epoch seconds, or None
+    window: tuple[float, float] | None
+    strata: int
+    per_stratum: int
+
+    def _request(self, body: dict) -> dict:
+        return {"params": {"index": self.index, "body": body}}
+
+    def bounds(self) -> tuple[dict, elastic.Plan]:
+        tf = self.time_field
+        body = {"size": 0, "track_total_hits": True, "query": self.query,
+                "aggs": {"first": {"min": {"field": tf}}, "last": {"max": {"field": tf}}}}
+        plan = elastic.Plan(self.index, {"first": elastic.AggPlan("min", tf),
+                                         "last": elastic.AggPlan("max", tf)}, 0)
+        return self._request(body), plan
+
+    def interval_s(self, lo: float, hi: float) -> int:
+        """Seconds per slice: the span over ``strata - 2``, so the slices,
+        aligned to the epoch as Elasticsearch aligns them, number at most
+        ``strata`` even when the range sits across a boundary."""
+        return max(1, math.ceil(max(hi - lo, 0.0) / max(self.strata - 2, 1)))
+
+    def strata_read(self, lo: float, hi: float) -> tuple[dict, elastic.Plan]:
+        tf = self.time_field
+        body = {
+            "size": 0, "track_total_hits": True, "query": self.query,
+            "aggs": {elastic.STRATA_AGG: {
+                "date_histogram": {"field": tf, "fixed_interval": f"{self.interval_s(lo, hi)}s",
+                                   "min_doc_count": 1},
+                "aggs": {elastic.STRATA_HITS_AGG: {"top_hits": {
+                    "size": self.per_stratum, "sort": [{tf: {"order": "desc"}}],
+                    "_source": {"includes": self.includes}}}}}},
+        }
+        plan = elastic.Plan(
+            self.index,
+            {elastic.STRATA_AGG: elastic.AggPlan(
+                "date_histogram", tf, None, {elastic.STRATA_HITS_AGG: elastic.AggPlan("top_hits")})},
+            0, dataclasses.replace(self.groups, phase="strata", strata=self.strata,
+                                   per_stratum=self.per_stratum))
+        return self._request(body), plan
+
+    def exact(self) -> tuple[dict, elastic.Plan]:
+        body = {"size": elastic.TEXT_GROUP_SAMPLE, "track_total_hits": True, "query": self.query,
+                "_source": {"includes": self.includes},
+                "sort": [{self.time_field: {"order": "desc"}}]}
+        plan = elastic.Plan(self.index, {}, elastic.TEXT_GROUP_SAMPLE,
+                            dataclasses.replace(self.groups, phase="exact"))
+        return self._request(body), plan
+
+    def first(self) -> tuple[dict, elastic.Plan]:
+        """The read's first request: strata when the span is known, else bounds."""
+        if self.window is not None:
+            return self.strata_read(*self.window)
+        return self.bounds()
+
+
+def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber,
+                     read: GroupRead) -> tuple[elastic.Scrubbed, int]:
+    """Run a ``text_groups`` read: ``search`` takes a request document and
+    returns the raw envelope; every reply goes through the scrubber with
+    the plan of its own request. Returns the groups and how many requests
+    were made; the groups carry the count too."""
+    n = 0
+    lo_hi = read.window
+    if lo_hi is None:
+        body, plan = read.bounds()
+        n += 1
+        out = scrubber.scrub_response(search(body), plan).output
+        first = (out.get("aggregations") or {}).get("first", {}).get("value")
+        last = (out.get("aggregations") or {}).get("last", {}).get("value")
+        if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
+            # nothing in scope: no groups, the total as the reply gave it
+            agg = elastic.group_estimate([], read.groups.size,
+                                         (out.get("hits") or {}).get("total", {}).get("value"))
+            agg["sample_cap"] = elastic.TEXT_GROUP_SAMPLE
+            agg["requests"] = n
+            return elastic.Scrubbed({"hits": {"total": out["hits"]["total"], "hits": []},
+                                     "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
+        lo_hi = (float(first) / 1000.0, float(last) / 1000.0)
+    body, plan = read.strata_read(*lo_hi)
+    n += 1
+    scrubbed = scrubber.scrub_response(search(body), plan)
+    agg = scrubbed.output["aggregations"][read.groups.name]
+    total = agg.get("total")
+    if not agg["exact"] and isinstance(total, int) and total <= elastic.TEXT_GROUP_SAMPLE:
+        # the scope fits one page but a slice did not fit its share: read
+        # it whole rather than estimate what is all there
+        body, plan = read.exact()
+        n += 1
+        scrubbed = scrubber.scrub_response(search(body), plan)
+        agg = scrubbed.output["aggregations"][read.groups.name]
+    agg["requests"] = n
+    return scrubbed, n
 
 
 class _Compiler:
@@ -384,16 +522,54 @@ class _Compiler:
 
     # -- filters -----------------------------------------------------------
 
-    def filters(self, raw: Any, *, what: str) -> list[dict]:
+    def filters(self, raw: Any, *, what: str, compound: bool = False) -> list[dict]:
+        """``compound``: the query's own filters, where ``not`` and
+        ``any_of`` are allowed; everywhere else (a filters aggregation's
+        buckets) they are refused."""
         if raw is None:
             return []
         if not isinstance(raw, list):
             raise self.refuse("bad_filter", f"{what}: filters must be a list")
-        return [self.one_filter(f, what=f"{what}[{i}]") for i, f in enumerate(raw)]
+        return [self.one_filter(f, what=f"{what}[{i}]", compound=compound)
+                for i, f in enumerate(raw)]
 
-    def one_filter(self, f: Any, *, what: str) -> dict:
+    def compound_filter(self, f: dict, *, what: str, allowed: bool) -> dict:
+        """``{"not": filter}`` or ``{"any_of": [filter, ...]}``.
+
+        Every filter inside is compiled by :meth:`one_filter` **with the
+        outer position's ``what``**, so a refusal inside one is the refusal
+        the same filter gets on its own at that position, word for word,
+        and every rule - labels, shown labels, keep literals, the phrase cap
+        and the per-case budget (both count through ``self.phrases``) - is
+        the same code path. One level deep and in the query's filters only:
+        nothing nests, and a filters aggregation's bucket takes plain
+        filters.
+        """
+        key = "not" if "not" in f else "any_of"
+        unknown = set(f) - {key}
+        if unknown:
+            raise self.refuse("raw_dsl", f"{what}: unknown filter keys {sorted(unknown)}")
+        if not allowed:
+            raise self.refuse("bad_filter", f"{what}: not and any_of hold plain filters and "
+                                            "apply to the query's filters only (not nested, not "
+                                            "inside an aggregation)")
+        inner = f[key]
+        if key == "not":
+            if not isinstance(inner, dict):
+                raise self.refuse("bad_filter", f"{what}: not takes one filter")
+            return {"bool": {"must_not": [self.one_filter(inner, what=what)]}}
+        if not isinstance(inner, list) or not inner:
+            raise self.refuse("bad_filter", f"{what}: any_of takes a non-empty list of filters")
+        if len(inner) > MAX_IN_VALUES:
+            raise self.refuse("bad_filter", f"{what}: too many filters in any_of")
+        return {"bool": {"should": [self.one_filter(x, what=what) for x in inner],
+                         "minimum_should_match": 1}}
+
+    def one_filter(self, f: Any, *, what: str, compound: bool = False) -> dict:
         if not isinstance(f, dict):
             raise self.refuse("bad_filter", f"{what}: a filter is an object")
+        if "not" in f or "any_of" in f:
+            return self.compound_filter(f, what=what, allowed=compound)
         unknown = set(f) - {"field", "op", "value"}
         if unknown:
             raise self.refuse("raw_dsl", f"{what}: unknown filter keys {sorted(unknown)}")
@@ -414,6 +590,10 @@ class _Compiler:
                 raise self.refuse("bad_value", f"{what}: phrase must be a non-empty string")
             if len(v) > MAX_PHRASE_CHARS:
                 raise self.refuse("bad_value", f"{what}: phrase is too long")
+            if _GROUP_PLACEHOLDER.search(v):
+                raise self.refuse("bad_value", f"{what}: <*> (and <Org>, <n> and the like) "
+                                               "is a group placeholder standing for any value; "
+                                               "search the words around it")
             if any(c in v for c in "*?"):
                 raise self.refuse("pattern_query", f"{what}: wildcards are not allowed")
             resolved = self._resolve_text(v)
@@ -594,6 +774,11 @@ class _Compiler:
         atype = spec.get("type")
         if atype not in _AGG_TYPES:
             raise self.refuse("bad_agg", f"{what}: type must be one of {sorted(_AGG_TYPES)}")
+        if atype == "text_groups":
+            # the query-level path (text_groups) handles it; reaching here
+            # means it is nested or beside another aggregation
+            raise self.refuse("bad_agg", f"{what}: text_groups is a query's only aggregation, "
+                                         "at the top level")
         allowed = {"type", "aggs"}
         allowed |= {
             "terms": {"field", "size"}, "date_histogram": {"field", "interval"},
@@ -675,6 +860,47 @@ class _Compiler:
             body["aggs"] = sub_body
         return body, elastic.AggPlan(atype, fname, rule, sub_plans if sub_body else {})
 
+    def text_groups(self, raw: dict, q: dict) -> elastic.GroupPlan:
+        """``{"type": "text_groups", "field": <text field>, "size": n}``.
+
+        The commonest redacted texts of a text field in the query's scope,
+        each with its count. Not an Elasticsearch aggregation: the read
+        (:class:`GroupRead`) samples at most :data:`elastic.TEXT_GROUP_SAMPLE`
+        documents per request, spread over the scope's time span, the
+        scrubber redacts them as one page and groups the result
+        (:meth:`elastic.EsScrubber._text_groups`). So it is the only
+        aggregation in its query, at the top level, with no hits, offset or
+        order of its own, and no sub-aggregations; and nothing in the spec
+        shapes the read - no sample size, slice count or width, no "exact"
+        and no "newest" - because the per-request read is the cap that
+        keeps a group read no wider than paging.
+        """
+        if len(raw) != 1:
+            raise self.refuse("bad_agg", "aggs: text_groups is a query's only aggregation, at "
+                                         "the top level")
+        (name, spec), = raw.items()
+        what = f"aggs.{name}"
+        if not isinstance(name, str) or not _NAME.match(name):
+            raise self.refuse("bad_agg", "aggs: aggregation names are short lowercase words")
+        if q.get("size", 10) != 0:
+            raise self.refuse("bad_agg", f"{what}: text_groups returns groups, not hits; size 0")
+        if q.get("from") or "sort" in q:
+            raise self.refuse("bad_agg", f"{what}: text_groups samples the documents in scope "
+                                         "over its time span; no from or sort")
+        unknown = set(spec) - {"type", "field", "size", "aggs"}
+        if unknown:
+            raise self.refuse("raw_dsl", f"{what}: unknown keys {sorted(unknown)}")
+        if "aggs" in spec:
+            raise self.refuse("bad_agg", f"{what}: text_groups takes no sub-aggregations")
+        rule = self.rule(spec.get("field"), what=what)
+        if rule.kind != "text":
+            raise self.refuse("field_not_queryable", f"{what}: text_groups applies to text "
+                                                     "fields")
+        n = spec.get("size", 10)
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= self.cfg.max_buckets:
+            raise self.refuse("size_cap", f"{what}: text_groups size is 1..{self.cfg.max_buckets}")
+        return elastic.GroupPlan(name, spec["field"], n)
+
     # -- the whole request -------------------------------------------------
 
     def compile(self, q: Any) -> Compiled:
@@ -693,12 +919,32 @@ class _Compiler:
         frm = q.get("from", 0)
         if isinstance(frm, bool) or not isinstance(frm, int) or not 0 <= frm <= MAX_FROM:
             raise self.refuse("size_cap", f"from is 0..{MAX_FROM}")
-        filters = self.filters(q.get("filters"), what="filters")
+        filters = self.filters(q.get("filters"), what="filters", compound=True)
         tr = self.time_range(q.get("time_range"))
         if tr:
             filters.insert(0, tr)
+        raw_aggs = q.get("aggs")
+        groups = None
+        if isinstance(raw_aggs, dict) and any(isinstance(v, dict) and v.get("type") == "text_groups"
+                                              for v in raw_aggs.values()):
+            groups = self.text_groups(raw_aggs, q)
+            self.check_phrases()
+            new_phrases = self.check_budget()
+            # the read: a page's worth of documents per request, spread over
+            # the scope's time span, each scrubbed exactly as it would be on
+            # a page (see GroupRead)
+            strata = min(elastic.TEXT_GROUP_STRATA, self.cfg.max_buckets)
+            per_stratum = min(elastic.TEXT_GROUP_SAMPLE // strata, elastic.TEXT_GROUP_MAX_PER_STRATUM,
+                              self.cfg.max_hits)
+            read = GroupRead(index, {"bool": {"filter": filters}} if filters else {"match_all": {}},
+                             self.cfg.source_includes(), self.cfg.time_field, groups,
+                             (self.window[0], self.window[1]) if self.window else None,
+                             strata, per_stratum)
+            body, plan = read.first()
+            return Compiled(body, plan, list(self.text_queries), list(self.labels_used),
+                            new_phrases, read)
         sort = self.sort(q.get("sort")) if size else []
-        agg_body, agg_plans = self.aggs(q.get("aggs"))
+        agg_body, agg_plans = self.aggs(raw_aggs)
         self.check_phrases()
         new_phrases = self.check_budget()
         body: dict[str, Any] = {
@@ -713,7 +959,7 @@ class _Compiler:
             body["sort"] = sort
         if agg_body:
             body["aggs"] = agg_body
-        plan = elastic.Plan(index, agg_plans, size)
+        plan = elastic.Plan(index, agg_plans, size, groups)
         return Compiled({"params": {"index": index, "body": body}}, plan,
                         list(self.text_queries), list(self.labels_used), new_phrases)
 
@@ -953,3 +1199,223 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
                                             "value": ["3f2a9c4e-1b7d-4e8a-9c2f-6d5b4a3e2f10"]}]},
                "literal_identifier"),
 )
+
+
+# -- not and any_of: every filter rule, inside them -------------------------
+#
+# A filter inside ``not`` or ``any_of`` is compiled by the same code as a
+# filter outside, so every rule above must refuse it with the same code and
+# the same words. The cases below are generated, not copied: every oracle
+# case that is one plain filter is wrapped once in ``not`` and once in
+# ``any_of`` (after a filter that is fine on its own, so the refusal cannot
+# come from the any_of being short). Two plain cases are added first because
+# the rule exists and had no case of its own: a never-shown label inside a
+# phrase, and an exact match on a text field.
+
+ORACLE_CASES += (
+    OracleCase("vocabulary-label-in-phrase-never-shown",
+               "a live label this case was never shown, inside a phrase",
+               {"index": _IDX, "filters": [{"field": "message", "op": "phrase",
+                                            "value": "failed for <Org-77>"}]}, "unknown_label"),
+    OracleCase("eq-on-text", "an exact match on a text field is a whole-message oracle",
+               {"index": _IDX, "filters": [{"field": "message", "op": "eq",
+                                            "value": "Backup job failed"}]},
+               "field_not_queryable"),
+)
+
+#: a filter every session accepts, put first in each wrapped any_of
+COMPOUND_GOOD = {"field": "message", "op": "phrase", "value": "completed with"}
+
+
+def _one_filter_case(c: OracleCase) -> bool:
+    q = c.query
+    return set(q) == {"index", "filters"} and len(q["filters"]) == 1 \
+        and isinstance(q["filters"][0], dict) and not ({"not", "any_of"} & set(q["filters"][0]))
+
+
+#: (plain case, wrapped case) pairs: a test compiles both and requires the
+#: same refusal - code, message and label
+def _wrapped(c: OracleCase) -> tuple[tuple[OracleCase, OracleCase], ...]:
+    inner = c.query["filters"][0]
+    return ((c, OracleCase(f"not-{c.name}", f"inside not: {c.why}",
+                           {"index": _IDX, "filters": [{"not": inner}]}, c.code)),
+            (c, OracleCase(f"any-of-{c.name}", f"inside any_of: {c.why}",
+                           {"index": _IDX, "filters": [{"any_of": [COMPOUND_GOOD, inner]}]},
+                           c.code)))
+
+
+COMPOUND_TWINS: tuple[tuple[OracleCase, OracleCase], ...] = tuple(
+    pair for c in ORACLE_CASES if _one_filter_case(c) for pair in _wrapped(c))
+
+_FLOOD = ("harbor", "violet", "granite", "meadow", "copper", "lantern", "orchid", "summit",
+          "willow", "ember", "falcon", "juniper")
+
+
+def _phrase(word: str) -> dict:
+    return {"field": "message", "op": "phrase", "value": word}
+
+
+#: Shapes only these forms have. One level deep, in the query's filters
+#: only: nesting and use inside a filters aggregation are refused, so the
+#: phrase accounting and the zero-hit rule have exactly two new places to
+#: look, not a tree.
+COMPOUND_CASES: tuple[OracleCase, ...] = tuple(w for _p, w in COMPOUND_TWINS) + (
+    OracleCase("not-of-not", "negation nested in negation",
+               {"index": _IDX, "filters": [{"not": {"not": _phrase("completed with")}}]},
+               "bad_filter"),
+    OracleCase("not-of-any-of", "a none-of: an any_of nested in a not",
+               {"index": _IDX, "filters": [{"not": {"any_of": [_phrase("harbor"),
+                                                               _phrase("violet")]}}]},
+               "bad_filter"),
+    OracleCase("any-of-of-any-of", "an any_of nested in an any_of",
+               {"index": _IDX, "filters": [{"any_of": [COMPOUND_GOOD, {"any_of": [
+                   _phrase("harbor"), _phrase("violet")]}]}]}, "bad_filter"),
+    OracleCase("any-of-of-not", "a not nested in an any_of",
+               {"index": _IDX, "filters": [{"any_of": [COMPOUND_GOOD,
+                                                       {"not": _phrase("harbor")}]}]},
+               "bad_filter"),
+    OracleCase("not-with-extra-key", "DSL smuggled beside a not",
+               {"index": _IDX, "filters": [{"not": _phrase("completed with"), "boost": 2}]},
+               "raw_dsl"),
+    OracleCase("any-of-with-extra-key", "DSL smuggled beside an any_of",
+               {"index": _IDX, "filters": [{"any_of": [COMPOUND_GOOD],
+                                            "minimum_should_match": 0}]}, "raw_dsl"),
+    OracleCase("not-and-any-of-together", "both forms in one object",
+               {"index": _IDX, "filters": [{"not": COMPOUND_GOOD, "any_of": [COMPOUND_GOOD]}]},
+               "raw_dsl"),
+    OracleCase("not-of-a-list", "not takes one filter, not a list",
+               {"index": _IDX, "filters": [{"not": [COMPOUND_GOOD]}]}, "bad_filter"),
+    OracleCase("any-of-empty", "an empty any_of matches nothing in Elasticsearch's reading and "
+               "everything in another's", {"index": _IDX, "filters": [{"any_of": []}]},
+               "bad_filter"),
+    OracleCase("any-of-over-cap", "more alternatives than an in takes values",
+               {"index": _IDX, "filters": [{"any_of": [
+                   {"field": "job.status", "op": "eq", "value": f"s{i}"} for i in range(51)]}]},
+               "bad_filter"),
+    OracleCase("not-inside-filters-agg", "a not inside a filters aggregation bucket",
+               {"index": _IDX, "size": 0, "aggs": {"f": {"type": "filters", "filters": {
+                   "a": [{"not": _phrase("harbor")}]}}}}, "bad_filter"),
+    OracleCase("any-of-inside-filters-agg", "an any_of inside a filters aggregation bucket",
+               {"index": _IDX, "size": 0, "aggs": {"f": {"type": "filters", "filters": {
+                   "a": [{"any_of": [_phrase("harbor"), _phrase("violet")]}]}}}}, "bad_filter"),
+    OracleCase("phrase-flooded-any-of", "one any_of of a whole word list: more distinct phrases "
+               "than the per-query cap", {"index": _IDX, "size": 0, "filters": [
+                   {"any_of": [_phrase(w) for w in _FLOOD]}]}, "size_cap"),
+    OracleCase("phrase-flooded-nots", "a none-of spelled as many nots",
+               {"index": _IDX, "size": 0, "filters": [{"not": _phrase(w)} for w in _FLOOD]},
+               "size_cap"),
+    OracleCase("phrase-flood-split-across-forms", "the word list split across an any_of, nots "
+               "and plain phrases, so no one part is over the cap",
+               {"index": _IDX, "size": 0, "filters": [
+                   {"any_of": [_phrase(w) for w in _FLOOD[:4]]},
+                   *[{"not": _phrase(w)} for w in _FLOOD[4:8]],
+                   *[_phrase(w) for w in _FLOOD[8:]]]}, "size_cap"),
+)
+
+ORACLE_CASES += COMPOUND_CASES
+
+
+# -- text_groups: the commonest messages in a scope -------------------------
+#
+# Grouping is done by the bridge after redaction: a sample of the documents
+# in scope, spread over its time span, is scrubbed as a page is, and grouped by their redacted text with
+# every label and every token carrying a digit masked, so two messages that
+# differ only by a hidden value are one group. Everything that would group
+# before redaction, unmask, nest, widen the read or smuggle DSL is refused.
+
+def _groups(**over: Any) -> dict:
+    spec = {"type": "text_groups", "field": "message", "size": 10}
+    spec.update(over)
+    return {k: v for k, v in spec.items() if v is not None}
+
+
+TEXT_GROUP_CASES: tuple[OracleCase, ...] = (
+    OracleCase("text-groups-on-keep-field", "grouping a keep field is a terms aggregation's job",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(field="log.level")}},
+               "field_not_queryable"),
+    OracleCase("text-groups-on-identifier", "grouping an identifier field by its text",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(field=_TENANT)}},
+               "field_not_queryable"),
+    OracleCase("text-groups-on-time-field", "grouping the time field",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(field="@timestamp")}},
+               "field_not_queryable"),
+    OracleCase("text-groups-unlisted-field", "grouping a field the site map does not list",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(field="process.command_line")}},
+               "unknown_field"),
+    OracleCase("text-groups-field-glob", "a glob in the grouped field",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(field="job.*")}},
+               "unknown_field"),
+    OracleCase("text-groups-unmasked", "asking for groups by the unmasked text",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(mask=False)}}, "raw_dsl"),
+    OracleCase("text-groups-include-regex", "an include pattern over the grouped text",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(include="Contoso.*")}},
+               "raw_dsl"),
+    OracleCase("text-groups-min-doc-count", "a minimum count filters groups by how rare they are",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(min_doc_count=1)}}, "raw_dsl"),
+    OracleCase("text-groups-size-over-cap", "more groups than the bucket cap",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(size=51)}}, "size_cap"),
+    OracleCase("text-groups-nested-under-terms", "groups per tenant label: one group read per "
+               "bucket, nested", {"index": _IDX, "size": 0, "aggs": {"t": {
+                   "type": "terms", "field": _TENANT, "aggs": {"g": _groups()}}}}, "bad_agg"),
+    OracleCase("text-groups-under-filters-agg", "groups per filters bucket, nested",
+               {"index": _IDX, "size": 0, "aggs": {"f": {"type": "filters", "filters": {
+                   "a": [{"field": "message", "op": "phrase", "value": "completed with"}]},
+                   "aggs": {"g": _groups()}}}}, "bad_agg"),
+    OracleCase("text-groups-with-sub-aggs", "a sub-aggregation under each group",
+               {"index": _IDX, "size": 0, "aggs": {"g": {**_groups(), "aggs": {
+                   "t": {"type": "terms", "field": _TENANT}}}}}, "bad_agg"),
+    OracleCase("text-groups-beside-another-agg", "groups and another aggregation in one query",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(),
+                                                   "t": {"type": "terms", "field": _SERVER}}},
+               "bad_agg"),
+    OracleCase("text-groups-with-hits", "groups and a page of hits in one query",
+               {"index": _IDX, "size": 20, "aggs": {"g": _groups()}}, "bad_agg"),
+    OracleCase("text-groups-with-from", "groups read from an offset: a wider read than the newest "
+               "documents", {"index": _IDX, "size": 0, "from": 500, "aggs": {"g": _groups()}},
+               "bad_agg"),
+    OracleCase("text-groups-with-sort", "groups over documents chosen by another order",
+               {"index": _IDX, "size": 0, "sort": [{"field": "job.status", "order": "asc"}],
+                "aggs": {"g": _groups()}}, "bad_agg"),
+    OracleCase("text-groups-scoped-by-literal", "the scope is gated like any filter: a literal "
+               "on an identifier", {"index": _IDX, "size": 0, "filters": [
+                   {"field": _TENANT, "op": "eq", "value": "Contoso"}], "aggs": {"g": _groups()}},
+               "literal_identifier"),
+    OracleCase("text-groups-scoped-by-unshown-label", "the scope is gated like any filter: a "
+               "label never shown", {"index": _IDX, "size": 0, "filters": [
+                   {"field": _TENANT, "op": "eq", "value": "<Org-77>"}], "aggs": {"g": _groups()}},
+               "unknown_label"),
+    OracleCase("text-groups-scope-phrase-flood", "the scope's phrases count toward the cap",
+               {"index": _IDX, "size": 0, "filters": [{"any_of": [_phrase(w) for w in _FLOOD]}],
+                "aggs": {"g": _groups()}}, "size_cap"),
+    # the read is the bridge's to shape: a query cannot widen the sample,
+    # choose the time slices it is spread over, or ask for the whole scope
+    OracleCase("text-groups-wider-sample", "a sample wider than the cap: more documents in one "
+               "request than paging allows", {"index": _IDX, "size": 0,
+                                               "aggs": {"g": _groups(sample=10_000)}}, "raw_dsl"),
+    OracleCase("text-groups-own-strata", "choosing how many time slices the sample is spread "
+               "over", {"index": _IDX, "size": 0, "aggs": {"g": _groups(strata=500)}}, "raw_dsl"),
+    OracleCase("text-groups-own-interval", "choosing the width of a time slice",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(interval="1m")}}, "raw_dsl"),
+    OracleCase("text-groups-exact-asked", "asking for every document in scope to be read",
+               {"index": _IDX, "size": 0, "aggs": {"g": _groups(exact=True)}}, "raw_dsl"),
+    OracleCase("text-groups-newest-asked", "asking for the newest documents only, the read "
+               "this replaced", {"index": _IDX, "size": 0, "aggs": {"g": _groups(newest=True)}},
+               "raw_dsl"),
+    OracleCase("group-placeholder-in-phrase", "a group's placeholder stands for any value; typed "
+               "into a phrase it would search for the placeholder's letters",
+               {"index": _IDX, "filters": [{"field": "message", "op": "phrase",
+                                            "value": "Throttled by SharePoint for <Org>"}]},
+               "bad_value"),
+    OracleCase("group-wildcard-placeholder-in-phrase", "the <*> a group puts where a hidden value "
+               "or a number was, typed back into a phrase",
+               {"index": _IDX, "filters": [{"field": "message", "op": "phrase",
+                                            "value": "Rate limit for <*> reached"}]},
+               "bad_value"),
+)
+
+ORACLE_CASES += TEXT_GROUP_CASES
+# a one-filter case added here is wrapped in not and any_of like the others
+_LATE_TWINS = tuple(pair for c in TEXT_GROUP_CASES if _one_filter_case(c)
+                    for pair in _wrapped(c))
+COMPOUND_TWINS += _LATE_TWINS
+ORACLE_CASES += tuple(w for _p, w in _LATE_TWINS)

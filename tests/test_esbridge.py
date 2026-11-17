@@ -1346,7 +1346,9 @@ def test_a_query_the_grammar_refuses_keeps_its_code_whatever_the_vocabulary(
     b.scrubber.mark_shown({"x": "<Tenant-01>"})
     n = len(stub.engine.requests)
     for case in esquery.ORACLE_CASES:
-        if case.name == "learnt-name-in-keep-literal-never-shown" and vocabulary is not True:
+        # the same literal wrapped in not or any_of behaves the same way
+        if case.name.endswith("learnt-name-in-keep-literal-never-shown") \
+                and vocabulary is not True:
             # no cluster vocabulary held: the name is not known, so the
             # literal is well-formed (refused as vocabulary_building, or with
             # no index it would run) - its own test is the first-query one

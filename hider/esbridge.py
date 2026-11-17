@@ -598,8 +598,18 @@ class Bridge:
                     self.session.probe(cluster)
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
-                envelope = self.session.search(cluster, compiled.body)
-                scrubbed = self.scrubber.scrub_response(envelope, compiled.plan)
+                if compiled.group_read is not None:
+                    # a text_groups read: one to three requests, a page's
+                    # worth each, every reply scrubbed with its own plan
+                    scrubbed, requests = esquery.read_text_groups(
+                        lambda body: self.session.search(cluster, body), self.scrubber,
+                        compiled.group_read)
+                    agg = scrubbed.output["aggregations"][compiled.group_read.groups.name]
+                    row.update({"requests": requests, "sampled": agg.get("sampled"),
+                                "exact": agg.get("exact"), "strata": agg.get("strata")})
+                else:
+                    envelope = self.session.search(cluster, compiled.body)
+                    scrubbed = self.scrubber.scrub_response(envelope, compiled.plan)
                 outcome.output = scrubbed.output
                 total = scrubbed.output.get("hits", {}).get("total") or {}
                 outcome.hits_total = total.get("value") if isinstance(total, dict) else None
@@ -617,6 +627,11 @@ class Bridge:
                             # nothing: Claude's own words, already in
                             # text_queries, so the log holds nothing new
                             "zero_hit_phrases": _zero_hit_phrases(query, scrubbed.output)})
+                # only on rows that use not or any_of, so every other row
+                # is written exactly as before
+                if _negated(query.get("filters")) or _alternatives(query.get("filters")):
+                    row["unjudged_phrases"] = _unjudged_phrases(query, scrubbed.output)
+                    row["negated_phrases"] = _negated_phrases(query)
             except elastic.Refused as e:
                 outcome.refused = e.code
                 row["refused"] = e.code
@@ -718,6 +733,37 @@ def _phrases_of(filters: Any) -> list[str]:
             and f.get("op") == "phrase" and isinstance(f.get("value"), str)]
 
 
+def _negated(filters: Any) -> list[dict]:
+    return [f["not"] for f in filters or [] if isinstance(f, dict)
+            and isinstance(f.get("not"), dict)]
+
+
+def _alternatives(filters: Any) -> list[list]:
+    return [f["any_of"] for f in filters or [] if isinstance(f, dict)
+            and isinstance(f.get("any_of"), list)]
+
+
+def _unjudged_phrases(query: dict, output: dict) -> list[str]:
+    """The phrases whose own hit this row cannot say: every phrase inside a
+    ``not`` (zero documents means it matched everything in scope; some
+    documents says nothing about whether it matched any), and every phrase
+    in an ``any_of`` of two or more when the page found something (one of
+    them matched, the row cannot say which). Claude's own words, already in
+    ``text_queries``; es-review reads them (see its zero_hit_phrases)."""
+    filters = query.get("filters")
+    out = _phrases_of(_negated(filters))
+    total = (output.get("hits") or {}).get("total") or {}
+    if not (isinstance(total, dict) and total.get("value") == 0):
+        for alts in _alternatives(filters):
+            if len(alts) > 1:
+                out.extend(_phrases_of(alts))
+    return out
+
+
+def _negated_phrases(query: dict) -> list[str]:
+    return _phrases_of(_negated(query.get("filters")))
+
+
 def _zero_hit_phrases(query: dict, output: dict) -> list[str]:
     """The phrases in this query whose filter (the page) or whose bucket (a
     filters aggregation, at any depth under filters aggregations) matched
@@ -727,6 +773,11 @@ def _zero_hit_phrases(query: dict, output: dict) -> list[str]:
     total = (output.get("hits") or {}).get("total") or {}
     if isinstance(total, dict) and total.get("value") == 0:
         out.extend(_phrases_of(query.get("filters")))
+        # nothing matched any alternative, so each alternative found
+        # nothing; a phrase inside a not is never zero-hit (no documents
+        # means it matched all of them)
+        for alts in _alternatives(query.get("filters")):
+            out.extend(_phrases_of(alts))
 
     def walk(specs: Any, node: Any) -> None:
         if not isinstance(specs, dict) or not isinstance(node, dict):
@@ -750,10 +801,20 @@ def _zero_hit_phrases(query: dict, output: dict) -> list[str]:
 
 def _describe(query: dict, compiled: esquery.Compiled) -> dict:
     """The decision-log view of a query: shape, not content."""
+    def shape(f: dict) -> dict:
+        return {"field": f.get("field"), "op": f.get("op")}
+
     filters = []
     for f in query.get("filters") or []:
-        if isinstance(f, dict):
-            filters.append({"field": f.get("field"), "op": f.get("op")})
+        if not isinstance(f, dict):
+            continue
+        if isinstance(f.get("not"), dict):
+            filters.append({"op": "not", "filters": [shape(f["not"])]})
+        elif isinstance(f.get("any_of"), list):
+            filters.append({"op": "any_of", "filters": [shape(x) for x in f["any_of"]
+                                                        if isinstance(x, dict)]})
+        else:
+            filters.append(shape(f))
 
     def agg_shape(aggs: Any) -> list[dict]:
         out = []
@@ -855,6 +916,11 @@ def field_probe(query: dict, *, max_buckets: int = elastic.DEFAULT_MAX_BUCKETS
     field order.
     """
     filters = [f for f in query.get("filters") or [] if isinstance(f, dict)]
+    if any("not" in f or "any_of" in f for f in filters):
+        # not and any_of are refused inside a filters aggregation, so the
+        # check could not be built from them without being refused itself:
+        # no check rather than a refused one (es-smoke never builds them)
+        return None
     fields = list(dict.fromkeys(f.get("field") for f in filters))
     if not fields:
         return None

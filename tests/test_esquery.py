@@ -718,3 +718,115 @@ def test_spent_phrases_are_saved_and_an_old_case_starts_at_zero(tmp_path):
     (tmp_path / "session.json").write_text(json.dumps(saved))
     old = elastic.EsScrubber.load_session(tmp_path, s.config, tier2="none")
     assert old.phrase_report()["phrases_used"] == 0
+
+
+# -- not and any_of: every filter rule applies inside them -------------------
+
+
+@pytest.mark.parametrize("plain,wrapped", esquery.COMPOUND_TWINS,
+                         ids=[w.name for _p, w in esquery.COMPOUND_TWINS])
+def test_a_refusal_inside_not_or_any_of_is_the_refusal_outside_word_for_word(plain, wrapped):
+    got = []
+    for q in (plain.query, wrapped.query):
+        with pytest.raises(elastic.Refused) as e:
+            _compile(q)
+        got.append((e.value.code, e.value.message, e.value.label))
+    assert got[0] == got[1]
+
+
+def test_every_plain_filter_oracle_case_is_wrapped_both_ways():
+    plain = [c.name for c in esquery.ORACLE_CASES if esquery._one_filter_case(c)]
+    wrapped = {w.name for _p, w in esquery.COMPOUND_TWINS}
+    assert len(plain) >= 20
+    assert wrapped == {f"{k}-{n}" for n in plain for k in ("not", "any-of")}
+
+
+def _eq(field: str, value):
+    return {"field": field, "op": "eq", "value": value}
+
+
+def test_not_and_any_of_compile_to_must_not_and_should():
+    c = _compile({"index": "logs-app-*", "filters": [
+        {"not": _eq("log.level", "error")},
+        {"any_of": [_eq("job.status", "Failed"), _eq("event.outcome", "failure")]}]})
+    assert c.body["params"]["body"]["query"]["bool"]["filter"] == [
+        {"bool": {"must_not": [{"term": {"log.level": "error"}}]}},
+        {"bool": {"should": [{"term": {"job.status": "Failed"}},
+                             {"term": {"event.outcome": "failure"}}],
+                  "minimum_should_match": 1}}]
+
+
+def test_a_label_inside_is_usable_only_once_shown_and_resolves_like_outside():
+    s = _with_vocabulary()
+    guess = "<Org-07>"
+    for form in ({"not": _eq("labels.tenant_name", guess)},
+                 {"any_of": [_eq("labels.tenant_name", "<Org-01>"),
+                             _eq("labels.tenant_name", guess)]}):
+        q = {"index": "logs-app-*", "filters": [form]}
+        with pytest.raises(elastic.Refused) as e:
+            _compile(q, s)
+        assert e.value.code == "unknown_label" and e.value.label == guess
+    s.mark_shown({"hits": [{"_source": {"labels": {"tenant_name": guess}}}]})
+    c = _compile({"index": "logs-app-*", "filters": [
+        {"any_of": [_eq("labels.tenant_name", "<Org-01>"), _eq("labels.tenant_name", guess)]}]}, s)
+    assert c.labels_used == ["<Org-01>", guess]
+    body = json.dumps(c.body)
+    assert "Contoso Holdings" in body and guess not in body
+
+
+@pytest.mark.parametrize("case", esquery.SHOWN_KEEP_CASES,
+                         ids=[c.name for c in esquery.SHOWN_KEEP_CASES])
+def test_a_shown_keep_literal_is_gated_inside_exactly_as_outside(case):
+    inner = case.query["filters"][0]
+    for form in ({"not": inner}, {"any_of": [esquery.COMPOUND_GOOD, inner]}):
+        s = _session()
+        q = {**case.query, "filters": [form]}
+        with pytest.raises(elastic.Refused) as e:
+            _compile(q, s)
+        assert e.value.code == case.code
+        _path, value = case.shown
+        _page(s, {"data_stream": {"dataset": value}, "message": "ok"})
+        assert value in json.dumps(_compile(q, s).body)
+
+
+def test_phrases_inside_count_against_the_per_query_cap_once_each():
+    words = [f"word{chr(97 + i)} here" for i in range(9)]
+    p = [{"field": "message", "op": "phrase", "value": w} for w in words]
+    ok = {"index": "logs-app-*", "filters": [{"any_of": p[:3]}, {"not": p[3]}, {"not": p[4]},
+                                             *p[5:8], {"not": p[0]}]}
+    c = _compile(ok)                              # 8 distinct, word a twice
+    assert len(c.text_queries) == 9
+    with pytest.raises(elastic.Refused) as e:
+        _compile({**ok, "filters": ok["filters"] + [{"any_of": [p[8]]}]})
+    assert e.value.code == "size_cap" and "9 distinct phrases" in e.value.message
+
+
+def _send_filters(s: elastic.EsScrubber, filters: list) -> esquery.Compiled:
+    c = esquery.compile_query({"index": "logs-app-*", "filters": filters}, s.config, s)
+    s.spend_phrases(c.new_phrases)
+    return c
+
+
+def _ph(v: str) -> dict:
+    return {"field": "message", "op": "phrase", "value": v}
+
+
+def test_phrases_inside_spend_the_per_case_budget_with_the_same_refusal():
+    s = _budget_session(3)
+    _send_filters(s, [{"any_of": [_ph("alpha one"), _ph("beta two")]}])
+    _send_filters(s, [{"not": _ph("gamma three")}])
+    assert s.phrase_report()["phrases_used"] == 3
+    # reuse is free inside as outside, in either direction
+    _send_filters(s, [_ph("alpha one"), {"not": _ph("BETA  two")}, {"any_of": [_ph("gamma three")]}])
+    label = s.seed("Contoso Holdings")
+    _send_filters(s, [{"not": _ph(label)}])         # label-only is free inside too
+    assert s.phrase_report()["phrases_used"] == 3
+    refusals = []
+    for filters in ([_ph("delta four")], [{"not": _ph("delta four")}],
+                    [{"any_of": [_ph("alpha one"), _ph("delta four")]}]):
+        n = len(s.phrases_spent)
+        with pytest.raises(elastic.Refused) as e:
+            _send_filters(s, filters)
+        assert e.value.code == "phrase_budget" and len(s.phrases_spent) == n
+        refusals.append(e.value.message)
+    assert len(set(refusals)) == 1 and "delta" not in refusals[0]

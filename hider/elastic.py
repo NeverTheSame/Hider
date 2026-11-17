@@ -672,11 +672,201 @@ class AggPlan:
     names: tuple[str, ...] = ()
 
 
+#: How many documents a ``text_groups`` read scrubs and groups per request.
+#: Not a parameter, so a query cannot widen it. A read is a stratified
+#: sample: the scope's time span is cut into at most TEXT_GROUP_STRATA equal
+#: slices (fewer when the site's ``max_buckets`` is lower) and the newest
+#: ``TEXT_GROUP_SAMPLE // strata`` documents of each are read in one request,
+#: so a noisy last minute weighs what its slice weighs, not the whole
+#: sample. Exact when every slice fits; when the scope fits the sample but
+#: one slice does not, a second request reads the whole scope.
+TEXT_GROUP_SAMPLE = 1000
+TEXT_GROUP_STRATA = 50
+#: documents read from one slice never exceed Elasticsearch's default
+#: ``index.max_inner_result_window``, which is what bounds a top_hits size
+TEXT_GROUP_MAX_PER_STRATUM = 100
+#: aggregation names in the strata request (the bridge's own, never Claude's)
+STRATA_AGG = "strata"
+STRATA_HITS_AGG = "sample"
+#: the margin's confidence: 1.96 standard errors, about 95%
+_GROUP_Z = 1.96
+
+#: What a group puts where a hidden value or a masked number was: one
+#: placeholder for all of them, never a type. A label's type depends on how
+#: the value was first labelled (its own field's rule, tier 1 or tier 2 in
+#: text), so two different ids in one slot can be <Guid-01> and <Session-02>
+#: and a type in the key would split their messages into two groups.
+GROUP_PLACEHOLDER = "<*>"
+#: every substitute the scrubber writes that is not caught by the digit
+#: rule below: labels and destroyed secrets (every pseudonym shape carries a
+#: digit, so the digit rule catches those)
+_GROUP_HIDDEN = re.compile(r"<[A-Za-z_]+-\d+>|<REDACTED:[A-Z_0-9]+>")
+#: Codes that stay readable: a short value right after a code word (HTTP,
+#: status, code, error, exit, ...), or a failure HRESULT/NTSTATUS anywhere.
+_CODE_WORD = (r"(?:http(?:/\d(?:\.\d)?)?|status(?:[ _]?code)?|(?:error[ _]?)?code|error|err|"
+              r"errno|exit(?:[ _]?code)?|hresult|sqlstate|ntstatus|rc)")
+_CODE_VALUE = r"(?:-?\d{1,5}|0x[0-9A-Fa-f]{1,8}|[A-Z][A-Z_]{1,15}\d{2,6})"
+_GROUP_TOKENS = re.compile(
+    r"(?P<code>(?i:\b" + _CODE_WORD + r"\b)\s*[:=]?\s*" + _CODE_VALUE + r"(?![\w]|\.\d))"
+    r"|(?P<hex>(?<![\w])0x[89ABCabc][0-9A-Fa-f]{7}(?![\w]))"
+    # any other token with a digit in it: numbers, ids, versions, and every
+    # pseudonym shape; trailing punctuation is kept
+    r"|(?P<num>[^\s<>]*\d[^\s<>]*?(?=[,;:.)\]]*(?:\s|$)))")
+
+
+def text_group_key(text: str) -> str:
+    """A redacted text as its group.
+
+    Every label and destroyed secret becomes :data:`GROUP_PLACEHOLDER`, and
+    so does every token carrying a digit - except a **code**: a value of up
+    to five digits, a ``0x`` hex value or an upper-case code
+    (``AADSTS50076``) right after a code word (``HTTP 429``,
+    ``status=503``, ``error code: 0x80070005``), or a failure HRESULT or
+    NTSTATUS (``0x8`` / ``0xC`` and seven hex digits) anywhere. Hidden
+    values are masked first, so no code is ever a hidden value. Two
+    messages that differ only by hidden values, or by numbers that are not
+    codes, have one key; messages that differ by a code do not. Applied to
+    text that has already been scrubbed; it only ever removes what a page
+    shows."""
+    t = _GROUP_HIDDEN.sub(GROUP_PLACEHOLDER, text)
+    t = _GROUP_TOKENS.sub(lambda m: m.group(0) if m.lastgroup in ("code", "hex")
+                          else GROUP_PLACEHOLDER, t)
+    return " ".join(t.split())
+
+
+def text_group_codes(text: str) -> tuple[str, ...]:
+    """The codes :func:`text_group_key` keeps readable in ``text``, in order."""
+    t = _GROUP_HIDDEN.sub(GROUP_PLACEHOLDER, text)
+    return tuple(m.group(0) for m in _GROUP_TOKENS.finditer(t) if m.lastgroup in ("code", "hex"))
+
+
+def _field_text(hit: Any, field: str) -> str | None:
+    """A hit's text in ``field``, or None when it has none."""
+    node: Any = hit.get("_source") if isinstance(hit, dict) else None
+    for k in field.split("."):
+        node = node.get(k) if isinstance(node, dict) else None
+    return str(node) if isinstance(node, str) and node.strip() else None
+
+
+def _stratum_hits(bucket: Any) -> list:
+    """The documents a strata bucket carries (its top_hits), or none."""
+    inner = bucket.get(STRATA_HITS_AGG) if isinstance(bucket, dict) else None
+    hits = inner.get("hits") if isinstance(inner, dict) else None
+    rows = hits.get("hits") if isinstance(hits, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
+def group_estimate(strata: list[tuple[int, list[str | None]]], size: int,
+                   total: int | None) -> dict:
+    """Groups and their counts from a stratified sample.
+
+    ``strata`` is one ``(documents in the slice, texts read from it)`` pair
+    per time slice; a text is None for a document that lacks the field.
+    A group's count is the sum over slices of its sampled count scaled by
+    ``documents / read``, so a slice read whole contributes its true count
+    and a slice read in part its share. ``exact`` when every slice was read
+    whole. When it is not, every group carries ``margin``: about 95% under
+    the assumption that what was read in a slice stands for the slice (a
+    Jeffreys-adjusted binomial, finite-population corrected, so a group
+    seen in every or in no sampled document of a slice still has one), and
+    ``order_settled`` says how many leading groups the margins keep apart
+    from the next. Counts only, no text but the keys, which are redacted
+    text already.
+    """
+    per_key: dict[str, list[int]] = {}
+    for i, (_n_docs, texts) in enumerate(strata):
+        for t in texts:
+            if t is None:
+                continue
+            key = text_group_key(t)
+            per_key.setdefault(key, [0] * len(strata))[i] += 1
+    sampled = sum(len(texts) for _n, texts in strata)
+    with_field_read = sum(1 for _n, texts in strata for t in texts if t is not None)
+    exact = all(len(texts) >= n_docs for n_docs, texts in strata)
+    est: dict[str, float] = {}
+    var: dict[str, float] = {}
+    for key, counts in per_key.items():
+        e = v = 0.0
+        for (n_docs, texts), c in zip(strata, counts):
+            n = len(texts)
+            if n == 0:
+                continue
+            e += c * n_docs / n
+            if n < n_docs:
+                p = (c + 0.5) / (n + 1)
+                v += n_docs * n_docs * (1 - n / n_docs) * p * (1 - p) / n
+        est[key], var[key] = e, v
+    ordered = sorted(est, key=lambda k: (-est[k], k))
+    shown = ordered[:size]
+    margin = {k: math.ceil(_GROUP_Z * math.sqrt(var[k])) for k in ordered}
+
+    def count(k: str) -> int:
+        return int(round(est[k]))
+
+    buckets = []
+    for k in shown:
+        b: dict[str, Any] = {"key": k, "doc_count": count(k), "sampled_count": sum(per_key[k])}
+        if not exact:
+            b["margin"] = margin[k]
+        buckets.append(b)
+    # the leading groups whose order the margins support: each kept apart
+    # from the group after it (the first unshown one counts as "after"; the
+    # last group of all has nothing after it)
+    settled = 0
+    for a, b_ in zip(ordered, ordered[1:]):
+        if est[a] - margin[a] > est[b_] + margin[b_]:
+            settled += 1
+        else:
+            break
+    else:
+        settled = len(ordered)
+    settled = min(settled, len(shown))
+    with_field = 0.0
+    for n_docs, texts in strata:
+        if texts:
+            with_field += sum(1 for t in texts if t is not None) * n_docs / len(texts)
+    bucketed = sum(n_docs for n_docs, _t in strata)
+    agg: dict[str, Any] = {
+        "buckets": buckets,
+        "sum_other_doc_count": int(round(sum(est[k] for k in ordered[size:]))),
+        "sampled": sampled, "with_field": int(round(with_field)),
+        "groups": len(ordered), "exact": exact,
+        "total": total,
+        "coverage": (round(sampled / total, 4) if isinstance(total, int) and total > 0
+                     else (1.0 if exact else None)),
+        "strata": len(strata),
+        "strata_read_whole": sum(1 for n_docs, texts in strata if len(texts) >= n_docs),
+        "order_settled": settled,
+    }
+    if isinstance(total, int) and total > bucketed:
+        # documents without the time field fall in no slice and are never read
+        agg["unbucketed"] = total - bucketed
+    return agg
+
+
+@dataclass(frozen=True)
+class GroupPlan:
+    """A ``text_groups`` aggregation: its name, the text field, how many
+    groups to return, and which request of the read this plan reads -
+    ``strata`` (the sample spread over time slices, under ``STRATA_AGG``)
+    or ``exact`` (the whole scope as one page of hits)."""
+
+    name: str
+    field: str
+    size: int
+    phase: str = "exact"
+    #: strata phase: how many slices were asked for and how many documents
+    #: from each; what the reply may carry at most
+    strata: int = 0
+    per_stratum: int = 0
+
+
 @dataclass(frozen=True)
 class Plan:
     index: str
     aggs: dict[str, AggPlan] = dataclasses.field(default_factory=dict)
     size: int = 0
+    groups: GroupPlan | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1195,11 +1385,18 @@ class EsScrubber(jsonscrub.JsonScrubber):
         rows = hits.get("hits") if isinstance(hits, dict) else None
         if not isinstance(rows, list):
             raise self._refuse("malformed", "response withheld: hits.hits is not a list")
-        if len(rows) > self.config.max_hits:
+        # a text_groups read scrubs its whole sample as one page; only the
+        # groups leave (see _text_groups)
+        cap = TEXT_GROUP_SAMPLE if plan.groups is not None else self.config.max_hits
+        if len(rows) > cap:
             raise self._refuse("size_cap", "response withheld: more hits than the cap allows")
+        aggs = body.get("aggregations", {})
+        if plan.groups is not None and plan.groups.phase == "strata":
+            # before anything is harvested: the slices and the documents in
+            # them are capped as a page is, per slice and in all
+            self._check_strata(aggs, plan.groups, len(rows))
         for h in rows:
             self._harvest_hit(h)
-        aggs = body.get("aggregations", {})
         if aggs:
             if not isinstance(aggs, dict):
                 raise self._refuse("malformed", "response withheld: aggregations is not an object")
@@ -1224,6 +1421,13 @@ class EsScrubber(jsonscrub.JsonScrubber):
         leaks = self.leak_check(out)
         if leaks:
             raise self._refuse("leak", "response withheld: a known value survived redaction")
+        if plan.groups is not None:
+            # every sampled hit went through the three passes and the leak
+            # check above, exactly as a page does; what leaves is only the
+            # groups, built from that redacted text, checked again
+            out = self._text_groups(out, plan.groups)
+            if self.leak_check(out):
+                raise self._refuse("leak", "response withheld: a known value survived redaction")
         # This page is about to go to Claude, so every label in it - and
         # every keep value - is one the case may use from now on. After the
         # leak check: a page that is refused was never shown and teaches no
@@ -1238,6 +1442,58 @@ class EsScrubber(jsonscrub.JsonScrubber):
             "seconds": round(time.time() - t0, 3),
         }
         return Scrubbed(out, stats)
+
+    def _check_strata(self, aggs: Any, g: GroupPlan, top_rows: int) -> None:
+        """A strata reply carries at most the slices asked for, at most
+        ``per_stratum`` documents in each and at most the sample in all;
+        anything wider is withheld before a document of it is read."""
+        node = aggs.get(STRATA_AGG) if isinstance(aggs, dict) else None
+        buckets = node.get("buckets") if isinstance(node, dict) else None
+        if not isinstance(buckets, list):
+            raise self._refuse("malformed", "response withheld: the strata are missing")
+        if len(buckets) > g.strata:
+            raise self._refuse("size_cap", "response withheld: more time slices than asked for")
+        read = top_rows
+        for b in buckets:
+            hits = _stratum_hits(b)
+            if len(hits) > g.per_stratum:
+                raise self._refuse("size_cap", "response withheld: more hits in a time slice "
+                                               "than asked for")
+            read += len(hits)
+        if read > TEXT_GROUP_SAMPLE:
+            raise self._refuse("size_cap", "response withheld: more hits than the cap allows")
+
+    def _text_groups(self, out: dict, g: GroupPlan) -> dict:
+        """The scrubbed sample, as groups of its redacted text.
+
+        Keyed by :func:`text_group_key`, so no group text carries a label
+        and none is split by a hidden value; ordered by count, then by the
+        key. The hits themselves are dropped: Claude sees the groups, the
+        scope's total and the sample size, and no label from the sample is
+        marked shown, because none of them leaves.
+
+        Counts are **estimated from the sample per time slice**: a group's
+        count in a slice is scaled by that slice's documents over its
+        documents read (:func:`group_estimate`). A slice read whole
+        contributes exactly; a read in which every slice was read whole is
+        ``exact``. The exact phase is one slice, the whole scope.
+        """
+        total = out["hits"]["total"]
+        total_n = total.get("value") if isinstance(total, dict) else None
+        strata: list[tuple[int, list[str | None]]] = []
+        if g.phase == "strata":
+            for b in out["aggregations"][STRATA_AGG]["buckets"]:
+                hits = _stratum_hits(b)
+                n = b.get("doc_count")
+                strata.append((n if isinstance(n, int) else len(hits),
+                               [_field_text(h, g.field) for h in hits]))
+        else:
+            rows = out["hits"]["hits"]
+            n = total_n if isinstance(total_n, int) and total_n >= len(rows) else len(rows)
+            strata.append((n, [_field_text(h, g.field) for h in rows]))
+        agg = group_estimate(strata, g.size, total_n)
+        agg["sample_cap"] = TEXT_GROUP_SAMPLE
+        return {"hits": {"total": total, "hits": []}, "aggregations": {g.name: agg}}
 
     @staticmethod
     def _total(total: Any) -> Any:

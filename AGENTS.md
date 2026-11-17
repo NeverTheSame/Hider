@@ -65,7 +65,7 @@ design conversation, not a code change.
 | Eval metrics or gates | `hider/evaluate.py` (recall, precision, adversarial, injection), `hider/utility.py` (answer accuracy raw vs redacted) |
 | JSON exports and the web UI | `hider/jsonscrub.py`, `hider/webserver.py` (single-file page, stdlib server), `hider/research.py` (Claude Code bridge) |
 | Site-specific patterns | Never in the repo. `templates/profile.example.json` and `HIDER_PROFILE`; see `hider/profiles.py` |
-| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esreview.py` (`es-review`: a case read back from its decision log), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log), `hider/esmcp.py` (the MCP server inside the broker: cases and tokens, the four tools, transport guards, the Claude Code launch). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
+| Live Elasticsearch research | `hider/elastic.py` (site map, response scrubber, case vault), `hider/esquery.py` (closed grammar, compiler, `ORACLE_CASES`), `hider/eseval.py` (synthetic documents, stub Kibana, `es-eval`), `hider/esreview.py` (`es-review`: a case read back from its decision log), `hider/esutility.py` (the operator-utility section of `es-eval`: scripted investigations scored answered/wrong/blocked), `hider/esbridge.py` (the Kibana session: a long-lived broker process owning one off-the-record Chrome via Playwright, async-search protocol, every malformed reply a refusal, decision log), `hider/esmcp.py` (the MCP server inside the broker: cases and tokens, the four tools, transport guards, the Claude Code launch). Design: `docs/es-bridge-design.md`. Site map example: `templates/elastic.example.json`; the real one is `elastic` in `hider.local.json` or `HIDER_ELASTIC` |
 
 ## Running things
 
@@ -366,8 +366,229 @@ Listed with owners in the README's Limitations section and in
   vocabulary per query, not the number of counts); literals on `keep`
   fields, uncapped because a keep field is declared non-sensitive (a
   sensitive value under `keep` is a site-map error); and punctuation
-  variants of one phrase, which count separately (safe direction). OR
-  across phrases is not built - `any_of` waits for a decision.
+  variants of one phrase, which count separately (safe direction).
+  **`not` and `any_of`** (decided: built, under the same caps as
+  everything else). `{"not": filter}` compiles to `must_not`,
+  `{"any_of": [filter, ...]}` (1-50) to `should` with
+  `minimum_should_match` 1. Both hold **plain filters only, one level
+  deep, in a query's `filters` only** - nesting, and either form inside a
+  `filters` aggregation bucket, are refused `bad_filter`. That is all the
+  two questions they were built for need (`esutility`'s
+  `except_top_error` and `any_failure_signal`); left out, each a decision
+  rather than an oversight: none-of as `not(any_of)` (a list of `not`s
+  says the same), an any_of of nots or of any_ofs, and compound filters in
+  aggregation buckets (per-bucket counts there already exist, and
+  `esbridge.field_probe` builds its buckets from a query's filters, so it
+  now skips a query that uses either form rather than being refused).
+  **Every rule is the same code path**: `_Compiler.compound_filter` hands
+  each inner filter to `one_filter` with the *outer position's* name, so
+  label rules, shown labels, keep literals, the shaped-literal gate, the
+  per-query distinct-phrase cap and the per-case budget apply inside
+  exactly as outside, and a refusal inside is the refusal the same filter
+  gets on its own, code, message and label (pinned per case by
+  `test_a_refusal_inside_not_or_any_of_is_the_refusal_outside_word_for_word`).
+  Oracle cases, written first: every one-filter case wrapped once in each
+  form (`esquery.COMPOUND_TWINS`, generated so the two lists cannot
+  drift), plus the structural shapes (`COMPOUND_CASES`: nesting both
+  ways, extra keys, both keys at once, a list under `not`, an empty or
+  over-long `any_of`, either form in a filters aggregation, and three
+  phrase floods - one any_of, many nots, and a word list split across both
+  forms and plain phrases, all `size_cap`).
+  **They are not a new way to guess, measured** (`run_compound_guess_eval`,
+  gate `compound_forms_no_new_guesses`): the budget gate's guessing run
+  (500 batches of 8 candidates, default budget) through five attackers,
+  each a fresh case on the real `Bridge` playing its best game - the
+  any_of and none-of attackers split a positive batch with phrases they
+  already paid for, which is free. Old forms: filters aggregation 145
+  confirmed for 145 charged at 0.138 requests a guess, one phrase a query
+  150 for 150 at 3.66. New forms: any_of 145/145 at 0.80, one `not` a
+  query against a phrase-free base count 150/150 at 3.667, eight `not`s at
+  once 145/145 at 0.807. So no form confirms more than the budget or more
+  than the old forms reached, none is cheaper per request than the
+  filters aggregation, every guess costs one phrase, every refusal is
+  `phrase_budget` with 0 requests and one message shape. And the counts
+  are derivable from the old forms, shown rather than said: on 18 of those
+  batches every any_of count equals inclusion-exclusion over a filters
+  aggregation of the subsets (18/18), every `not` count equals the base
+  minus the plain phrase count (144/144), for the same 130 phrases
+  charged either way (252 old-form queries against 162). What they do add
+  is reach, not information: listing the hits of a complement or a union
+  in one page, which paging and client-side filtering could already do.
+  **The zero-hit rule for them** (`esbridge._zero_hit_phrases`,
+  `_unjudged_phrases`): a page that found nothing makes every phrase of
+  an `any_of` zero-hit (each alternative found nothing), as a plain phrase
+  is; a phrase inside a `not` is never zero-hit (zero documents means it
+  matched everything in scope); and a row that uses either form also logs
+  `unjudged_phrases` - every negated phrase, and the alternatives of an
+  any_of of two or more when the page found something - and
+  `negated_phrases`, both Claude's own words already in `text_queries`.
+  Rows without either form are written exactly as before.
+  **`text_groups`: the commonest messages in a scope.** `{"type":
+  "text_groups", "field": <text field>, "size": n}` (1..`max_buckets`)
+  returns each group's redacted text and its count. **Grouping happens
+  after redaction, in the bridge**, never in Elasticsearch: the read
+  (`esquery.GroupRead`, run by `esquery.read_text_groups` from
+  `Bridge.run` and `eseval.Session`) samples at most
+  `elastic.TEXT_GROUP_SAMPLE` (1,000) documents **per request**, with the
+  whole `_source` a page carries, the scrubber runs its three passes and
+  the leak check over them exactly as over a page (the page cap lifted to
+  the sample for this read only), then groups the redacted texts by
+  `elastic.text_group_key` and checks the groups again.
+  **The sample is spread over the scope's time span**, not the newest
+  moment of it. It was the newest 1,000 documents in one request, and on
+  a wide scope that is the end of the window: "which errors are commonest
+  this week", answered from the last minute, with nothing but `sampled`
+  against the total to say so. The fixture's one utility case is smaller
+  than the sample and could not show it; `esutility`'s `week_census`
+  question (on `eseval.burst_docs`, a fixture of its own: 1,400 of one
+  steady error and 200 of another over a week, 1,100 of a third in the
+  last minute, invented names, own index pattern and map, not appended to
+  `generate`) scored **wrong: the noisy group alone, 1,000 of 2,700 read,
+  two of three groups missing**. Now the span is cut into at most
+  `TEXT_GROUP_STRATA` (50; the site's `max_buckets` if lower) equal
+  slices - one `date_histogram` with `fixed_interval` span/48 s, aligned
+  to the epoch as Elasticsearch aligns it, so at most 50 buckets even
+  across a boundary - and the newest `TEXT_GROUP_SAMPLE // strata` (20;
+  never more than a page or Elasticsearch's `index.max_inner_result_window`)
+  documents of each are read as a `top_hits`, **in one request**. A
+  group's count is its sampled count in each slice scaled by that slice's
+  documents over its documents read (`elastic.group_estimate`): a slice
+  read whole counts exactly, and a read in which every slice fits is
+  `exact`. When the scope fits the sample but a slice does not (a burst
+  inside a small scope), a **second request** reads the whole scope as
+  one page, as before. A query with no closed `time_range` costs **one
+  more request first**, `min`/`max` of the time field under the scope's
+  filters, so the slices cover the documents' span; nothing of it is
+  shown. The same question now scores **answered: 3 of 3 groups in the
+  week's order, 979 of 2,700 read over 49 slices in 1 request, every
+  count within the reply's margin, worst off by 1.3%**.
+  **How the reply says how far to trust itself**: `exact`; `sampled`,
+  `total`, `coverage` (sampled/total), `strata` and `strata_read_whole`;
+  per group `doc_count` (the estimate, or the count when exact),
+  `sampled_count` (documents actually read in the group) and, when not
+  exact, `margin` - about 95%, a Jeffreys-adjusted binomial with the
+  finite-population correction per slice, so a group seen in every or in
+  no sampled document of a slice still has one - and `order_settled`, the
+  number of leading groups whose estimate minus margin is above the
+  next's estimate plus margin (the first unshown group counts as next; a
+  tie is not settled even when exact); `unbucketed` when documents in
+  scope have no time field (they are in no slice and never read);
+  `requests`. The decision log row carries `requests`, `sampled`, `exact`
+  and `strata`. The `es_schema` text tells Claude to read these before
+  trusting the counts and the order. **Where it is still wrong**, each
+  declared: the read **within a slice is still newest-first**, so a burst
+  at the end of one slice is counted as that whole slice (pinned in
+  `test_estextgroups.py`: 20 noisy documents ending a slice of 1,000 are
+  estimated at 1,000, and the margin does not reach the truth) - on a
+  week a slice is 3.4 hours, so a noisy minute misattributes at most its
+  slice's share, which was the whole sample before; a group rarer than
+  about one document in twenty per slice is missed in that slice and
+  under-counted or absent overall (`sum_other_doc_count` and `groups` say
+  how much is unaccounted, not what); the margin assumes what was read in
+  a slice stands for the slice, which the burst case shows it need not;
+  on a scope of a hundred million documents the sample is 0.001% and a
+  group's margin is around ±3% of the total at a 30% share; and relative
+  ranges (`now-7d`) re-align the slices each call, so the edge slices'
+  newest twenty move between two calls of the same question. **Asking
+  the same question again** returns the same sample (the slices are
+  deterministic, the top_hits are the newest of each) and teaches nothing
+  new; shifting the window to walk other documents reads them as groups
+  at the same cost per request the newest-1,000 read had, and every one
+  of them is reachable by paging with a narrower range, so it is reach,
+  not information. **Cost**: one request for a scope with a closed range
+  (the same as before), two without one or when a slice overflowed a
+  scope that fits; the request itself is a histogram with a 20-deep heap
+  per slice over every matching document, the fetch is still 1,000 docs.
+  **The key**: every label, destroyed secret and token
+  carrying a digit becomes one placeholder, `<*>` - **never a type**,
+  because a label's type depends on how its value was first labelled (its
+  own field's rule, tier 1 or tier 2 in text): two job ids in one slot came
+  back as `<Guid>` and `<Session>`, and on the fixture one tenant slot as
+  `<Org>` and `<Person>`, which split one message into two groups
+  (`test_an_id_labelled_by_its_field_and_one_labelled_in_text_are_one_group`
+  failed before the fix). Every pseudonym shape carries a digit, so
+  numbers and hidden values share the placeholder for the same reason.
+  **Except codes**, which stay readable: a value of up to five digits, a
+  `0x` hex value or an upper-case code (`AADSTS50076`) right after a code
+  word - `HTTP` (and `HTTP/1.1`), `status`, `status code`, `code`,
+  `error`, `error code`, `err`, `errno`, `exit`, `exit code`, `hresult`,
+  `sqlstate`, `ntstatus`, `rc`, with or without `:`/`=` - and a failure
+  HRESULT/NTSTATUS (`0x8`/`0xC` and seven hex digits) anywhere. Hidden
+  values are masked first, so a code is never a hidden value
+  (`status <Org-01>` is `status <*>`). What still merges: a code with no
+  code word before it (`GET /api/sites 429 in 333 ms`), and every count,
+  duration, size, version and id. What could split that should not: a
+  per-request number of five digits or fewer after a code word (`error
+  48213`), and a count after one (`error 1 of 3`). Measured on the
+  fixture: the typeless key merged the one real split (worker messages,
+  34 groups to 33), codes split 18/23/33/13 groups into 20/32/42/14, and
+  every split is by an HTTP or status code - nothing else is kept. Only the groups leave; the hits are dropped, so
+  `mark_shown` sees no label and **a group response makes no label
+  usable**. Two messages that differ only by a hidden value are one
+  group, and a group is a function of the pages of the same documents:
+  the gate `text_groups_page_equivalent` (`eseval.run_text_groups_eval`)
+  pages four scopes at `max_hits` in a second case, groups the texts with
+  the same key and gets the same groups and counts (exact, in at most two
+  requests), with 0 labels made usable and nothing readable in a group
+  that the pages do not show (the three one-word tenant names the skip
+  rules leave readable - the declared miss - are readable in both); and
+  on the burst scope (`eseval._burst_scope`, 2,700 documents paged an
+  hour at a time, 178 pages) every group's text is one the pages show,
+  the order is the pages' order, no label is made usable, one request of
+  at most the sample, and - reported, not gated - 3 of 3 counts within
+  the margin. It is the query's only
+  aggregation, at the top level, with query `size` 0 and no `from`,
+  `sort` or sub-aggregations; the scope's filters are gated as every
+  filter is. A placeholder typed into a phrase is refused `bad_value`.
+  Oracle cases, written first: `esquery.TEXT_GROUP_CASES` (26: wrong
+  field kinds, unlisted and glob fields, unmasked/include/min-count keys,
+  over the size cap, nested under terms or a filters aggregation, with
+  sub-aggregations, beside another aggregation, with hits, `from` or
+  `sort`, a scope with a literal, an unshown label or a phrase flood, a
+  placeholder - `<Org>` or `<*>` - typed into a phrase, and the read's
+  own knobs typed into the spec - `sample`, `strata`, `interval`, `exact`,
+  `newest` - all `raw_dsl`: nothing in a query shapes how the sample is
+  read, because the per-request read is the cap that keeps a group read
+  no wider than paging), the one-filter ones wrapped in `not` and
+  `any_of` like the others. **Not a cheaper way to guess** (gate
+  `text_groups_no_new_guesses`, the same guessing run): one phrase a query
+  with groups 150/150 at 3.66 requests a guess, an any_of whose groups show
+  which candidate matched 145/145 at 0.248 - exactly the any_of-with-a-page
+  attacker the forms before it allow, and the filters aggregation's 0.138
+  is still the cheapest; unchanged, every figure, by the typeless key and
+  the readable codes. **Costs**: the engineer no longer sees which
+  hidden value is in which message, nor what kind of value sat in a slot
+  (tenant, id, server and user are all `<*>`; a page of one phrase shows
+  them), nor numbers other than codes (on the fixture 313 distinct
+  redacted texts on the pages are 32 groups), and counts over a scope
+  wider than the sample are estimates, with the reply saying so (`exact`,
+  `margin`, `order_settled`, above); a leak in any sampled document
+  withholds the whole reply, as it would that page; one request reads ten
+  pages' worth, scrubbed with tier 2. **What a real cluster needs that
+  the stub does not show**: a 1,000-hit reply with full `_source` is
+  megabytes through Kibana (its payload limits apply) and tier 2 over
+  1,000 texts takes seconds in the bridge; the strata request is a
+  `date_histogram` with a `top_hits` of 20 per bucket, which makes
+  Elasticsearch bucket every matching document and keep a 20-deep heap
+  per bucket per shard - a full pass over the scope with the time field's
+  doc values, seconds to tens of seconds on a hundred million documents,
+  the fetch phase still 1,000 documents; the async search runs for that
+  long and the bridge polls it, under the usual completion ceiling;
+  `fixed_interval` in seconds (`12600s`) is valid; `top_hits` size must
+  fit `index.max_inner_result_window` (100 by default, the cap on
+  `TEXT_GROUP_MAX_PER_STRATUM`); the exact read's `size` 1,000 must still
+  fit `index.max_result_window` (10,000); the histogram's `doc_count` is
+  exact in Elasticsearch as in the stub (only `terms` is approximate);
+  documents whose time field is missing fall in no bucket (`unbucketed`);
+  the `min`/`max` bounds request is cheap (doc values, no fetch); and an
+  exact count over a large scope would still need Elasticsearch to group
+  first, which is the one thing this design refuses to do
+  (`categorize_text` groups before redaction, so a hidden name would
+  split groups). A uniformly random sample (`random_score`, or the
+  `random_sampler` aggregation) would be unbiased within a slice where
+  newest-first is not, and was not chosen because a different sample on
+  every call would make re-asking a way to read new documents each time,
+  and `random_score` over the whole scope costs a full scoring pass.
   Identifier fields take labels only. Every forbidden shape (wildcard,
   prefix, range, sort, terms include, scripts, raw DSL, literals,
   wrong-type labels) is an `esquery.ORACLE_CASES` entry and must be
@@ -1013,7 +1234,14 @@ Listed with owners in the README's Limitations section and in
   - `zero_hit_phrases`: 5+ name-shaped phrases (one to three capitalised
     words, no digits) that found nothing, or 20+ phrases with half
     finding nothing (innocent: a handful of lower-case error fragments
-    while narrowing);
+    while narrowing). A phrase a row cannot judge (`unjudged_phrases`) is
+    neither found nor zero-hit there; it is found once any row finds it.
+    A name-shaped phrase only ever used inside `not` counts toward the 5,
+    because guessing through `not` is exactly that test (base count minus
+    negated count) and an honest exclusion is an error fragment, not a
+    name. Cost: a case excluding five capitalised names by phrase is
+    flagged; excluding a tenant by its label on its field is not a phrase
+    and is not counted;
   - `phrase_budget_pressure`: any `phrase_budget` refusal, or 80% of the
     budget spent (innocent: tens of phrases and no refusal);
   - `wide_collection`: one **aggregation** that made 20+ labels or keep
@@ -1243,8 +1471,39 @@ Listed with owners in the README's Limitations section and in
   names, names with digits and four-word job names are covered. When
   adding a shape, add a class, not another fixture.
 
+  **Operator utility (measured, not a gate).** Every gate below measures
+  what the bridge hides or refuses; `esutility` measures whether an
+  operator can still get answers through it, with no model. One case from
+  the fixture (the first tenant with a failing `Nightly` job), eleven
+  scripted investigations of different kinds (onset, servers, jobs, error
+  text, other tenants, per day, a job named in the ticket, an error census,
+  everything but the known error, any failure signal, tenant size), each a
+  fresh `BridgeCase` seeded with the tenant's name only, each expected
+  answer computed from the raw documents. Scored in **label space**: a
+  label counts as its value, so an answer is `answered` when it equals the
+  fixture's with every customer value swapped for this case's label and
+  nothing else changed; `wrong` otherwise, as `redaction` when unmasking
+  would make it right (the operator reads the redacted answer, so that is
+  not a pass) and `differs` when it would not; `blocked` when refused or
+  when the needed value came back only as a label. A question whose honest
+  query is not in the grammar is sent in that form and left blocked, with
+  a cause code from `esutility.GAPS`; never rewritten to fit. The section
+  prints keys, statuses, codes and counts only, runs last on its own stub
+  engine so no other figure moves, and is pinned in
+  `tests/test_esutility.py`. **What it does not cover:** a script is not
+  Claude (whether a model finds these queries, or runs out of phrase
+  budget over a long case, is not measured); the questions are a chosen
+  set, so "10 of 12" (6 of 11 before `not` and `any_of`, 8 before
+  `text_groups`, whose question now asks with it, 9 of 12 before the
+  sample was spread over the span) is not a rate of anything; one tenant
+  over six hours of synthetic data, so "per day" is one day, and the one
+  question on its own data (`week_census`, `eseval.burst_world`) is one
+  week of three invented messages; `Bridge.run` directly, not
+  the MCP tool layer; a vocabulary that always serves (no building or gap
+  refusals); and nothing on the realistic estate's name shapes.
+
   **Gates.** `es-eval` runs the fixture end to end and through the real
-  MCP endpoint; all 34 pass, and a change that cannot keep them passing
+  MCP endpoint; all 37 pass, and a change that cannot keep them passing
   is a design conversation. Page safety: `no_leaks`, `no_degraded`,
   `unlisted_never_shown`, `fresh_case_no_leaks` (with the word-by-word
   `eseval.name_part_leaks`, since a half-hidden name passes the
@@ -1288,6 +1547,14 @@ Listed with owners in the README's Limitations section and in
   by a fresh case never shown it, **3 hits** - the whole stream - for the
   case the page showed it to, and the whole job name typed as the keep
   field that held it refused still).
+  `compound_forms_no_new_guesses` (`eseval.run_compound_guess_eval`, see
+  "`not` and `any_of`" above).
+  `text_groups_no_new_guesses` and `text_groups_page_equivalent` (see
+  "`text_groups`" above).
+  Every figure is the same from run to run: the main session picks the
+  labels its scripted queries use from lists built in sorted order, not
+  in the order of a set, which follows the process's string hash seed
+  (`labels_issued` moved between runs before that).
   `phrase_budget_holds` (`eseval.run_phrase_budget_eval`, on the stream
   fixture through the real `Bridge`): 500 queries of 8 candidate names
   each, one in ten a phrase that does match. **4,000 phrase uses (3,601

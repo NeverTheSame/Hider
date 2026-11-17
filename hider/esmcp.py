@@ -93,6 +93,10 @@ Rules:
    has issued). Text fields take op phrase; a phrase may contain labels. Wildcards,
    ranges or sorts on identifier fields, raw query DSL and literal identifiers are
    refused by design: do not try to work around a refusal, change the question.
+   Filters are ANDed. {"not": filter} excludes what one filter matches, and
+   {"any_of": [filter, ...]} matches any one of them; both hold plain filters
+   only, one level deep, in a query's filters (not in a filters aggregation),
+   and every rule above applies to the filters inside them.
 4. Size things with es_count and es_aggregate before paging hits with es_search.
 5. Keep fields hold values exactly as logged: one level can be spelled err, Error
    and ERROR, one outcome Failed and failure. Before an exact filter on a keep
@@ -218,19 +222,31 @@ _BOUNDS = {"type": "object", "additionalProperties": False,
 _TIME_RANGE = {**_BOUNDS, "properties": {k: {"type": "string"} for k in ("gte", "gt", "lte", "lt")},
                "description": "Window on the time field: ISO timestamps or date math "
                               "(now-7d, now-1d/d, now). Defaults to no bound; give one."}
+_PLAIN_FILTER = {"type": "object", "additionalProperties": False, "required": ["field", "op"],
+                 "properties": {"field": {"type": "string"},
+                                "op": {"type": "string",
+                                       "enum": ["eq", "in", "exists", "range", "phrase"]},
+                                "value": {"description": "string, number, list (in) or bounds "
+                                                         "object (range); omitted for exists"}}}
 _FILTERS = {
     "type": "array",
     "description": (
         "ANDed. eq: one exact value; in: a list of up to 50; exists: no value; range: "
         "{gte,gt,lte,lt} on keep fields only; phrase: words on a text field, may contain "
         "labels, no wildcards. On identifier fields the value is a label this case has "
-        "issued (<Org-01>, ctr-amer-s01), never a literal."),
-    "items": {"type": "object", "additionalProperties": False, "required": ["field", "op"],
-              "properties": {"field": {"type": "string"},
-                             "op": {"type": "string",
-                                    "enum": ["eq", "in", "exists", "range", "phrase"]},
-                             "value": {"description": "string, number, list (in) or bounds "
-                                                      "object (range); omitted for exists"}}},
+        "issued (<Org-01>, ctr-amer-s01), never a literal. {not: filter} excludes what one "
+        "plain filter matches; {any_of: [filter, ...]} (up to 50) matches any one of them. "
+        "Neither nests, neither goes inside a filters aggregation, and every rule for a "
+        "plain filter applies inside them; their phrases count toward the per-query cap "
+        "and the case's phrase budget."),
+    "items": {"anyOf": [
+        _PLAIN_FILTER,
+        {"type": "object", "additionalProperties": False, "required": ["not"],
+         "properties": {"not": _PLAIN_FILTER}},
+        {"type": "object", "additionalProperties": False, "required": ["any_of"],
+         "properties": {"any_of": {"type": "array", "minItems": 1, "maxItems": 50,
+                                   "items": _PLAIN_FILTER}}},
+    ]},
 }
 _SORT = {"type": "array", "description": "keep fields only; default newest first on the time field",
          "items": {"type": "object", "additionalProperties": False, "required": ["field"],
@@ -245,7 +261,23 @@ _AGGS = {
         "time_range with a start and an end. filters {filters: {name: [filter, ...]}, aggs}. "
         "cardinality {field}. min|max|avg|sum|value_count {field} and percentiles "
         "{field, percents} on keep fields. top_hits {size: 1..10, sort}. Text fields cannot "
-        "be aggregated."),
+        "be aggregated by terms; text_groups {field: a text field, size} returns the "
+        "commonest messages in scope, each with its count: a sample of at most "
+        f"{elastic.TEXT_GROUP_SAMPLE} documents spread over the scope's time span (up to "
+        f"{elastic.TEXT_GROUP_STRATA} equal time slices, the newest documents of each) is "
+        "redacted as a page is and grouped by its redacted text with every hidden value and "
+        "every number shown as <*>, except codes (HTTP 429, status=503, error code 0x80070005), "
+        "which stay readable. Read the reply's own account before trusting it: exact true means "
+        "every document in scope was read and the counts are exact; otherwise doc_count is an "
+        "estimate (each slice's share scaled to the slice's documents), margin is about its 95% "
+        "band if what was read in a slice stands for the slice, sampled_count is the documents "
+        "actually read in the group, coverage is sampled/total, and order_settled is how many "
+        "leading groups the margins keep apart from the next - beyond it the order is not "
+        "known. A group rarer than one document in twenty per slice may be missing; a burst at "
+        "the end of one slice is counted as that slice. Give a closed time_range (one request); "
+        "without one the span is read first (two). It is the query's only aggregation, takes no "
+        "sub-aggregations, nothing in it changes how the sample is read, and <*> is not a "
+        "label."),
     "additionalProperties": {"type": "object"},
 }
 

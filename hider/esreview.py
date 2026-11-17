@@ -163,12 +163,24 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
     # (the typed phrases whose filter or bucket matched nothing); an older
     # row only has the page's hits_total, which decides for its top-level
     # phrases and says nothing about phrases inside aggregations.
+    # Inside not and any_of (rows carry unjudged_phrases / negated_phrases
+    # only when they use one): a phrase whose own hit the row cannot say is
+    # neither found nor zero-hit there. It counts as found once any row
+    # finds it, as zero-hit once any row judges it and none finds it; a
+    # phrase only ever negated stays unjudged, and a name-shaped one of those
+    # counts toward the zero-hit name tally - guessing through not is that
+    # very test (the base count minus the negated count), and an honest
+    # exclusion is an error fragment, not a name.
     phrase_text: dict[str, str] = {}
     found: dict[str, bool] = {}
+    judged: set[str] = set()
+    negated: set[str] = set()
     unknown_rows = 0
     for r in shown:
         zero_known = "zero_hit_phrases" in r
         zero = {_phrase_key(z) for z in r.get("zero_hit_phrases") or [] if isinstance(z, str)}
+        unjudged = {_phrase_key(z) for z in r.get("unjudged_phrases") or [] if isinstance(z, str)}
+        negated |= {_phrase_key(z) for z in r.get("negated_phrases") or [] if isinstance(z, str)}
         if not zero_known:
             if r.get("aggs"):
                 unknown_rows += 1
@@ -179,11 +191,17 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
                 continue
             key = _phrase_key(text)
             phrase_text.setdefault(key, text)
+            if key in unjudged:
+                found.setdefault(key, False)
+                continue
+            judged.add(key)
             hit = key not in zero and (zero_known or not r.get("aggs"))
             found[key] = found.get(key, False) or hit
-    phrase_hits = phrase_text  # distinct plain phrases typed
-    zero_hit = [k for k in phrase_text if not found[k]]
+    phrase_hits = {k: v for k, v in phrase_text.items() if k in judged}  # judged distinct
+    zero_hit = [k for k in phrase_hits if not found[k]]
     zero_hit_names = [k for k in zero_hit if _name_shaped(phrase_text[k])]
+    unjudged_only = [k for k in phrase_text if k not in judged and not found[k]]
+    negated_names = [k for k in unjudged_only if k in negated and _name_shaped(phrase_text[k])]
     if unknown_rows:
         report["not_recorded"].append(
             f"zero_hit_phrases on {unknown_rows} aggregation rows (log written before "
@@ -218,8 +236,9 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
                            or r.get("aggs")),
         "hits_total": sum(r.get("hits_total") or 0 for r in shown),
         "refusals": by_code,
-        "text_phrases_distinct": len(phrase_hits),
+        "text_phrases_distinct": len(phrase_text),
         "text_phrases_zero_hit": len(zero_hit),
+        "text_phrases_unjudged": len(unjudged_only),
         "phrases_used": budget["phrases_used"] if budget else NOT_RECORDED,
         "phrase_budget": (budget.get("phrase_budget") or "off") if budget else NOT_RECORDED,
         "labels_usable": labels_usable, "keep_values_usable": keep_usable,
@@ -256,14 +275,18 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
     share = len(zero_hit) / len(phrase_hits) if phrase_hits else 0.0
     signals.append({
         "name": "zero_hit_phrases",
-        "flagged": len(zero_hit_names) >= ZERO_HIT_NAMES_FLAG or (
+        "flagged": len(zero_hit_names) + len(negated_names) >= ZERO_HIT_NAMES_FLAG or (
             len(phrase_hits) >= ZERO_HIT_SHARE_FLAG[0] and share >= ZERO_HIT_SHARE_FLAG[1]),
         "evidence": {"phrases_distinct": len(phrase_hits), "zero_hit": len(zero_hit),
                      "zero_hit_share": round(share, 2),
                      "zero_hit_name_shaped": len(zero_hit_names),
-                     "zero_hit_phrases": sorted(phrase_text[k] for k in zero_hit)[:40]},
+                     "zero_hit_phrases": sorted(phrase_text[k] for k in zero_hit)[:40],
+                     "unjudged": len(unjudged_only),
+                     "negated_name_shaped": len(negated_names),
+                     "negated_name_phrases": sorted(phrase_text[k] for k in negated_names)[:40]},
         "innocent": "a handful of zero-hit phrases while narrowing an error text, most of "
-                    "them lower-case fragments of a message; most phrases find something",
+                    "them lower-case fragments of a message; most phrases find something; "
+                    "a phrase inside not excludes a known error fragment, not a name",
     })
 
     # 3. budget pressure
@@ -321,7 +344,10 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
     lit_fields: dict[str, int] = {}
     for r in refused:
         if r.get("refused") in literal_codes:
-            for f in r.get("filters") or []:
+            flat = [g for f in r.get("filters") or [] if isinstance(f, dict)
+                     for g in (f.get("filters") if f.get("op") in ("not", "any_of")
+                               and isinstance(f.get("filters"), list) else [f])]
+            for f in flat:
                 if isinstance(f, dict) and f.get("op") in ("eq", "in", "phrase"):
                     lit_fields[str(f.get("field"))] = lit_fields.get(str(f.get("field")), 0) + 1
     signals.append({
@@ -361,7 +387,10 @@ def format_review(r: dict) -> list[str]:
     out.append(f"USABLE   labels {n['labels_usable']}, keep values {n['keep_values_usable']}, "
                f"labels issued {n['labels_issued']}")
     out.append(f"PHRASES  {n['text_phrases_distinct']} distinct typed, "
-               f"{n['text_phrases_zero_hit']} found nothing; budget {n['phrases_used']} used of "
+               f"{n['text_phrases_zero_hit']} found nothing"
+               + (f", {n['text_phrases_unjudged']} only inside not/any_of (unjudged)"
+                  if n.get("text_phrases_unjudged") else "")
+               + f"; budget {n['phrases_used']} used of "
                f"{n['phrase_budget']}")
     for s in r["signals"]:
         mark = "FLAG" if s["flagged"] else ("n/a " if s["flagged"] is None else "ok  ")
