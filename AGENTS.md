@@ -85,6 +85,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
                                                  # then build the name vocabulary: minutes on a large estate
 .venv/bin/python -m hider es-research --case c1 --term "<customer>"   # Claude Code, bridge tools only
 .venv/bin/python -m hider es-research --stub --case demo --prompt "..."  # the same on a synthetic Kibana
+.venv/bin/python -m hider es-seed --case c1 --term "JOB_NAME=<job>"  # add a name to the open case; the session goes on
 .venv/bin/python -m hider es-review --case c1    # read a case back: numbers, phrase spend, probing signals (human-only)
 .venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
 ```
@@ -1250,7 +1251,15 @@ Listed with owners in the README's Limitations section and in
     the job (innocent: a terms over servers or levels, about ten keys);
   - `literal_probing`: 3+ `known_value`/`literal_identifier`/
     `shaped_literal` refusals, with the fields (innocent: 0-1, a value
-    typed back before it was shown, then corrected to the label).
+    typed back before it was shown, then corrected to the label);
+  - `mid_case_seeding`: names the engineer added while the session ran
+    (the `event: seed` rows below), flagged at 3+ in one case, or when
+    any such label's first use found nothing - a guess turned into a
+    label by hand and confirmed by a zero (innocent: none, or one or two
+    names from the ticket or the customer's reply, each then used and
+    found). The `SEEDED` line lists every one: label, type, after which
+    query, whether the case already held a label for the value, and what
+    its first use found; never the value.
   Three fields were added to the decision log for it, all counts or
   Claude's own words: `new_labels`/`new_keep_values` (how many a page made
   usable) with the running totals `labels_usable`/`keep_values_usable`,
@@ -1269,6 +1278,68 @@ Listed with owners in the README's Limitations section and in
   `wide_collection` - the innocent note under each flag is there to be
   read; and a bridge not restarted since this change writes none of the
   new fields, which the review then marks rather than infers.
+
+  **A name can be added to an open case without ending its session**
+  (`es-seed --case c1 --term "JOB_NAME=…"`, broker op `seed_case`,
+  `Bridge.seed`, `CaseBook.seed`). Before: a human could turn a name
+  into a label only by opening the case, and `CaseBook.open` on a case
+  already open closed the earlier session first - its token stopped
+  working at once, so the Claude conversation was lost - while the
+  reopened case kept its shown labels and every earlier seed on disk but
+  told Claude (es_schema `case.seeded`) about the **latest opening's
+  terms alone**, and nothing in the decision log recorded the reopen or
+  the seed. So when the customer replied halfway through with a second
+  job, the engineer chose between losing the conversation and not asking
+  about the job. Now `es-seed` reaches the running broker over its 0600
+  socket by the case's **name** (no token, no tool: Claude Code has no
+  shell, no files and no socket, and `es_seed` is not a tool - a
+  value-to-label step Claude could trigger would let it confirm a guess
+  with a count), the value is labelled, seeded and marked shown, the
+  session and its token are untouched, and the human gets the label and
+  its type to hand to Claude. **How Claude learns**: its next tool result
+  carries `seeded_since_last_call` (label and type, once), `es_schema`
+  lists every seed with its type under `case.seeds` (the reopen list is
+  complete now too), and the esmcp instructions (rule 9) tell it what the
+  step is and never to ask for one. The value reaches Claude nowhere, and
+  no log: the decision log gets an `event: seed` row with the label, the
+  type, `known_before` (the case already held a label for the value - from
+  the cluster vocabulary, a page or an earlier seed), `already_seeded`,
+  `queries_before` and `seeded_total`; `es-seed` prints the same and a
+  reminder, and `vocabulary.log.jsonl`, the VOCAB line and every reply
+  stay as they were. A case holds at most `esbridge._MAX_SEEDS` (40)
+  seeded names over its life (cost: a longer case opens a new one).
+  **Misuse, thought through before building.** Claude *can* use the
+  human as its value-to-label step by asking "please seed Northwind":
+  the human types the name, hands over the label, and a count confirms
+  the guess outside the phrase budget. What closes it is not a rule in
+  the bridge but visibility and the instruction: every seed is the
+  engineer's logged step, `es-review` lists each one with what its label
+  then found, flags the pattern (`mid_case_seeding`, above), and `es-seed`
+  itself says that a name Claude asked for is a guess it could not make
+  itself. **A name the cluster knows looks different to Claude from one
+  it does not**, and this is declared rather than closed: a known value
+  keeps the label it already has (a number minted when the vocabulary
+  was applied or when a page showed it), while a new value gets the
+  next number, which Claude can read against the numbers it has seen on
+  pages. Closing it would mean minting labels out of order, which is a
+  change to label numbering, not made. What it leaks is one bit per name
+  the human chose to type - "has the cluster labelled this value" - and
+  the human is told the same bit (`already labelled in this case` / `new
+  to this case`) before handing over the label, so the human knows
+  exactly what Claude can infer and the review shows it (`known_before`).
+  A seed before the case's first query is always "new" (the vocabulary
+  is applied at the first query), so an opening seed tells Claude
+  nothing. **Not touched**: the query grammar (a seeded label is a label
+  like any other), the phrase budget (a seed is not a phrase; charging
+  it would change what the budget means), the vocabulary, tier 2 and
+  the scrubbing rules. Tests: `test_esmcp.py` (the op through the real
+  broker: token kept, label in the next result and in `es_schema`, no
+  `es_seed` tool, no value in any byte Claude received or in the log,
+  `no_case` for a case not open, the CLI, the reopen list),
+  `test_esbridge.py::test_a_mid_case_seed_is_logged_as_a_label_never_a_value_and_capped`,
+  `test_esreview.py`. The review eval's ordinary investigation now seeds
+  one name mid-case (the customer naming a job), which es-review
+  reports and does not flag, gated in `review_flags_guessing`.
 
   **Every run says which names stayed readable**, because a clean verdict
   looks identical whether or not it happened, and nobody can seed a name
@@ -1487,15 +1558,24 @@ Listed with owners in the README's Limitations section and in
   not a pass) and `differs` when it would not; `blocked` when refused or
   when the needed value came back only as a label. A question whose honest
   query is not in the grammar is sent in that form and left blocked, with
-  a cause code from `esutility.GAPS`; never rewritten to fit. The section
+  a cause code from `esutility.GAPS`; never rewritten to fit. **A human
+  step is shown as a human step**: `named_job` (the engineer knows the
+  job by its name from the ticket) has the engineer seed the name into
+  the open case by hand (`Operator.human_seed`, the same `Bridge.seed`
+  that `es-seed` reaches) and then asks with the label; the row carries
+  `human_steps` (`es-seed JOB_NAME from the ticket`) and the section's
+  header counts them, so the answer is not credited to the grammar. It
+  was blocked `name_not_seeded` before `es-seed` existed. The section
   prints keys, statuses, codes and counts only, runs last on its own stub
   engine so no other figure moves, and is pinned in
   `tests/test_esutility.py`. **What it does not cover:** a script is not
   Claude (whether a model finds these queries, or runs out of phrase
   budget over a long case, is not measured); the questions are a chosen
-  set, so "10 of 12" (6 of 11 before `not` and `any_of`, 8 before
+  set, so "11 of 12" (6 of 11 before `not` and `any_of`, 8 before
   `text_groups`, whose question now asks with it, 9 of 12 before the
-  sample was spread over the span) is not a rate of anything; one tenant
+  sample was spread over the span, 10 of 12 before the human step) is not
+  a rate of anything, and the one human step is scripted here, not a
+  person deciding whether the name deserves seeding; one tenant
   over six hours of synthetic data, so "per day" is one day, and the one
   question on its own data (`week_census`, `eseval.burst_world`) is one
   week of three invented messages; `Bridge.run` directly, not

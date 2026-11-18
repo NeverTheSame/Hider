@@ -16,7 +16,6 @@ CFG = dataclasses.replace(elastic.load(elastic.EXAMPLE),
 #: what each grammar or site-map gap is refused with when the honest query
 #: is sent unbent - the list the measure exists to produce
 BLOCKED = {
-    "named_job": ("name_not_seeded", "literal_identifier"),
     "tenant_size": ("label_only", None),
 }
 
@@ -76,6 +75,9 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
          "except_top_error", "any_failure_signal",
          # and this one's honest query is text_groups now
          "error_census",
+         # the engineer seeds the job name from the ticket by hand (es-seed),
+         # one human step shown as such, then Claude asks with the label
+         "named_job",
          # and this one's scope is wider than the sample and its commonest
          # error is not among the newest documents: wrong (the noisy group
          # alone, two of three groups missing) when the sample was the
@@ -83,6 +85,10 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
          # scope's time span
          "week_census"}
     assert report["counts"]["wrong"] == 0
+    assert rows["named_job"]["human_steps"] == ["es-seed JOB_NAME from the ticket"]
+    assert rows["named_job"]["requests"] == rows["named_job"]["queries"] == 1
+    assert report["human_steps"] == 1
+    assert all(r["human_steps"] == [] for k, r in rows.items() if k != "named_job")
     f = rows["week_census"]["figures"]
     assert f["total"] > f["sampled"] and f["requests"] == 1 and not f["exact"]
     assert f["missing"] == 0 and f["within_margin"] == f["groups"] == 3 == f["order_settled"]
@@ -98,7 +104,7 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
 def test_the_same_result_with_tier_2_on(world):
     fx, _e, vocab = world
     u = esutility.run_utility_eval(CFG, fx, vocab, tier2="classifier")
-    assert u["counts"] == {"answered": 10, "wrong": 0, "blocked": 2}
+    assert u["counts"] == {"answered": 11, "wrong": 0, "blocked": 1}
 
 
 def test_the_grader_tells_redaction_from_a_wrong_answer(world):

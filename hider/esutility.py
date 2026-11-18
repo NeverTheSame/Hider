@@ -63,7 +63,9 @@ STATUSES = ("answered", "wrong", "blocked")
 GAPS = {
     "name_not_seeded": "the engineer knows the job by its name from the ticket; an identifier "
                        "field takes only a label the case has been shown, and only the human "
-                       "can seed a name (there is deliberately no value-to-label tool)",
+                       "can seed a name (there is deliberately no value-to-label tool): "
+                       "es-seed adds it to the open case, which is the human step the "
+                       "named_job question shows",
     "text_aggregation": "group failures by their message text; text fields cannot be "
                         "aggregated by terms (text_groups groups them after redaction)",
     "negation": "exclude what matches a filter (everything except the known error); the "
@@ -170,6 +172,9 @@ class Operator:
         self.engine = engine
         self.tenant = self.scrubber.seed(seed)
         self.queries = 0
+        #: the human's steps, as the report shows them: what the engineer
+        #: did by hand between queries (never a value)
+        self.human_steps: list[str] = []
         self._requests0 = len(engine.requests)
 
     @property
@@ -186,6 +191,15 @@ class Operator:
             raise Blocked(gap if gap and refused.code in gap_codes else refused.code,
                           refused.code)
         return out
+
+    def human_seed(self, term: str, what: str) -> str:
+        """The engineer adds a name to the open case (es-seed): the same
+        bridge step the CLI reaches through the broker, a decision-log row
+        with the label and never the value. Returns the label the engineer
+        hands to Claude. ``what`` says where the name came from."""
+        r = self.case.bridge.seed(term)
+        self.human_steps.append(f"es-seed {r['type']} {what}")
+        return r["label"]
 
     def close(self) -> None:
         shutil.rmtree(self.case.directory, ignore_errors=True)
@@ -390,7 +404,13 @@ def _per_day(op: Operator, cs: CaseFacts) -> Graded:
 
 
 def _named_job(op: Operator, cs: CaseFacts) -> Graded:
-    out = op.ask(_q(_eq("labels.tenant_name", op.tenant), _eq("job.name", cs.job),
+    """The engineer knows the job by its name from the ticket. The case
+    knows labels only, so the honest flow has a human step in it: the
+    engineer seeds the name (es-seed, no session ended), reads the label
+    back, and Claude asks with the label. The step is counted and shown as
+    the engineer's, not hidden in the query."""
+    label = op.human_seed(f"JOB_NAME={cs.job}", "from the ticket")
+    out = op.ask(_q(_eq("labels.tenant_name", op.tenant), _eq("job.name", label),
                     _eq("job.status", FAILED),
                     aggs={"first": {"type": "min", "field": "@timestamp"}}),
                  gap="name_not_seeded", gap_codes=("literal_identifier", "known_value"))
@@ -525,7 +545,8 @@ QUESTIONS: tuple[Question, ...] = (
     Question("named_job", "external name",
              "is it the job the customer named in the ticket, and since when", _named_job,
              gap="name_not_seeded", gap_codes=("literal_identifier", "known_value"),
-             honest="job.name eq the name from the ticket, min @timestamp"),
+             honest="the engineer seeds the job name from the ticket (es-seed), then job.name "
+                    "eq its label, min @timestamp"),
     Question("error_census", "text grouping",
              "which errors are commonest across all failing jobs: what to fix first",
              _error_census, gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"),
@@ -611,6 +632,7 @@ def run_utility_eval(cfg: elastic.ElasticConfig, fx: eseval.Fixture,
             row["status"], row["cause"], row["refused"] = "blocked", b.cause, b.code
         finally:
             row["queries"], row["requests"] = op.queries, op.requests
+            row["human_steps"] = list(op.human_steps)
             op.close()
         rows.append(row)
     by = Counter(r["status"] for r in rows)
@@ -622,6 +644,7 @@ def run_utility_eval(cfg: elastic.ElasticConfig, fx: eseval.Fixture,
         "wrong_by": dict(Counter(r["cause"] for r in rows if r["status"] == "wrong")),
         "queries": sum(r["queries"] for r in rows),
         "requests": sum(r["requests"] for r in rows),
+        "human_steps": sum(len(r["human_steps"]) for r in rows),
         "tier2": tier2,
     }
 
@@ -652,7 +675,8 @@ def format_lines(u: dict | None) -> list[str]:
         head,
         f"utility           {c['answered']}/{len(u['questions'])} answered, {c['wrong']} wrong, "
         f"{c['blocked']} blocked; each a fresh case seeded with one tenant only; "
-        f"{u['queries']} queries, {u['requests']} reached Kibana (tier2={u['tier2']})",
+        f"{u['queries']} queries, {u['requests']} reached Kibana, {u.get('human_steps', 0)} human "
+        f"step(s) (tier2={u['tier2']})",
     ]
     for r in u["questions"]:
         detail = r["cause"] or ""
@@ -663,6 +687,9 @@ def format_lines(u: dict | None) -> list[str]:
         if r["got_items"] is not None:
             detail = (detail + "; " if detail else "") + \
                 f"{r['got_items']} of {r['expected_items']} items"
+        if r.get("human_steps"):
+            detail = (detail + "; " if detail else "") + \
+                f"{len(r['human_steps'])} human step: {', '.join(r['human_steps'])}"
         lines.append(f"  {r['key']:<19}{r['status']:<9}{r['kind']:<15}{detail}")
         if r.get("figures"):
             lines.append("  " + " " * 19 + _figures(r["figures"]))

@@ -2043,3 +2043,59 @@ def test_a_listed_field_over_the_cap_still_refuses_the_slice(tmp_path):
     assert not br.vocabulary.over_cap.get("stub")
     assert br.vocabulary.returning("stub", cfg, now) == ()
     assert not br.vocabulary.serves("stub", cfg, now)
+
+
+def test_a_mid_case_seed_is_logged_as_a_label_never_a_value_and_capped(tmp_path):
+    """Bridge.seed: the human's step while a session runs. The row holds the
+    label, type, whether the case already held the value and the query
+    count; the value is nowhere but the case's own files. Known-before is
+    true for a value the vocabulary or a page already labelled, and the
+    label is then the one it already had."""
+    import dataclasses
+    cfg = dataclasses.replace(elastic.load(elastic.EXAMPLE),
+                              clusters=(elastic.Cluster("stub", "https://kibana-stub.example.net"),))
+    fx = eseval.generate(docs=200)
+    engine = eseval.StubEngine(fx, cfg.indices)
+    vocab, _b = eseval.build_vocabulary(cfg, engine)
+    case = eseval.BridgeCase(cfg, engine, vocab, tier2="none")
+    tenant = fx.tenants[1]
+    org = case.scrubber.seed(fx.tenants[0].name)
+    # before any query the vocabulary is not applied: a tenant on the
+    # cluster is new to the case and gets a fresh label
+    r = case.bridge.seed(tenant.name)
+    assert r["known_before"] is False and r["label"].startswith("<Org-") and r["label"] != org
+    assert r["queries_before"] == 0 and r["seeded_total"] == 2
+    out, refused, _dt, _c = case.call({"index": "logs-app-*", "size": 1,
+                                       "filters": [{"field": "labels.tenant_name", "op": "eq",
+                                                    "value": r["label"]}]})
+    assert refused is None and out["hits"]["total"]["value"] >= 1
+    # after it, a tenant the vocabulary knows keeps its existing label
+    other = fx.tenants[2].name
+    before = case.scrubber.known[eseval.jsonscrub_norm(other)]
+    r2 = case.bridge.seed(other)
+    assert r2["known_before"] is True and r2["label"] == before and r2["queries_before"] == 1
+    # seeding it again changes nothing and says so
+    r3 = case.bridge.seed(other)
+    assert r3["already_seeded"] is True and r3["seeded_total"] == r2["seeded_total"]
+    # a typed term of a type the site map lacks is refused before anything
+    with pytest.raises(elastic.Refused) as e:
+        case.bridge.seed("NOPE=Something")
+    assert e.value.code == "bad_request" and "Something" not in e.value.message
+    log = (case.directory / "decisions.jsonl").read_text()
+    rows = [json.loads(x) for x in log.splitlines()]
+    seeds = [x for x in rows if x.get("event") == "seed"]
+    assert [x["label"] for x in seeds] == [r["label"], r2["label"], r3["label"]]
+    assert tenant.name not in log and other not in log
+    assert all(set(x) == {"schema", "ts", "event", "label", "type", "known_before",
+                          "already_seeded", "queries_before", "seeded_total"} for x in seeds)
+    # the cap over a case's life
+    n = len(case.scrubber.seeded_labels)
+    for i in range(esbridge._MAX_SEEDS - n):
+        case.bridge.seed(f"Invented Tenant Number {i}")
+    with pytest.raises(elastic.Refused) as e:
+        case.bridge.seed("One Tenant Too Many")
+    assert e.value.code == "bad_request" and "Too Many" not in e.value.message
+    assert len(case.scrubber.seeded_labels) == esbridge._MAX_SEEDS
+    # a seeded one still re-seeds past the cap (it adds nothing)
+    assert case.bridge.seed(other)["already_seeded"] is True
+    shutil.rmtree(case.directory, ignore_errors=True)

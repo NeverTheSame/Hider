@@ -811,3 +811,94 @@ def test_schema_and_instructions_warn_about_keep_field_spellings(bridge):
     assert "exact filter" in esmcp.INSTRUCTIONS and "op in" in esmcp.INSTRUCTIONS
     # and it says what a zero means, so "no errors" is not reported as fact
     assert "Zero hits" in esmcp.INSTRUCTIONS
+
+
+# -- the engineer adds a name to an open case --------------------------------------
+
+
+def test_the_engineer_adds_a_name_without_ending_the_session(bridge, fixture):
+    """es-seed: a broker op by case name, no token, no tool. The session
+    keeps working, Claude learns the label and its type in its next tool
+    result and in es_schema, the value is in no reply and no log row, and
+    the step is a decision-log row es-review reads back."""
+    tenant = fixture.tenants[0]
+    job = next(j[0] for j in tenant.jobs)
+    opened = bridge.open(terms=[tenant.name])
+    mcp = Mcp(opened["url"], opened["token"])
+    org = opened["seeded"][0][0]
+    page, err = mcp.tool("es_search", index="logs-app-*", size=5,
+                         filters=[{"field": "labels.tenant_name", "op": "eq", "value": org}])
+    assert not err
+    # the customer names a job halfway through: the engineer seeds it by hand
+    reply = bridge.call("seed_case", case="c1", terms=[f"JOB_NAME={job}"])
+    (seed,) = reply["seeded"]
+    assert seed["type"] == "JOB_NAME" and seed["label"].startswith("<Job_Name-")
+    assert seed["queries_before"] == 1 and seed["seeded_total"] == 2
+    assert job not in json.dumps(reply)
+    # the same token still works, and the next result carries the label once
+    count, err = mcp.tool("es_count", index="logs-app-*",
+                          filters=[{"field": "job.name", "op": "eq", "value": seed["label"]}])
+    assert not err and count["hits_total"]["value"] >= 1
+    assert count["seeded_since_last_call"] == [{"label": seed["label"], "type": "JOB_NAME"}]
+    again, _e = mcp.tool("es_count", index="logs-app-*")
+    assert "seeded_since_last_call" not in again
+    schema, _e = mcp.tool("es_schema")
+    assert schema["case"]["seeded"] == [org, seed["label"]]
+    assert schema["case"]["seeds"] == [{"label": org, "type": "ORG_NAME"},
+                                       {"label": seed["label"], "type": "JOB_NAME"}]
+    # nothing Claude can call does this
+    assert mcp.rpc("tools/call", {"name": "es_seed", "arguments": {"term": job}})["error"]
+    assert "es_seed" not in [t["name"] for t in mcp.rpc("tools/list")["result"]["tools"]]
+    # the value reached neither Claude nor the log; the step did reach the log
+    assert not _no_truth(mcp.bodies, fixture) and job not in b"\n".join(mcp.bodies).decode()
+    log = (bridge.sessions / "c1" / "decisions.jsonl").read_text()
+    rows = [json.loads(x) for x in log.splitlines()]
+    seeds = [r for r in rows if r.get("event") == "seed"]
+    assert len(seeds) == 1 and seeds[0]["label"] == seed["label"] and job not in log
+    assert seeds[0]["queries_before"] == 1 and "value" not in seeds[0]
+    # a case that is not open is a refusal naming no value
+    with pytest.raises(elastic.Refused) as e:
+        bridge.call("seed_case", case="nobody", terms=["Anything At All"])
+    assert e.value.code == "no_case" and "Anything" not in e.value.message
+    with pytest.raises(elastic.Refused) as e:
+        bridge.call("seed_case", case="c1", terms=[])
+    assert e.value.code == "bad_request"
+
+
+def test_reopening_lists_every_seed_the_case_holds(bridge, fixture):
+    tenant = fixture.tenants[0]
+    job = next(j[0] for j in tenant.jobs)
+    first = bridge.open(terms=[tenant.name])
+    org = first["seeded"][0][0]
+    second = bridge.open(terms=[f"JOB_NAME={job}"])
+    # it used to list this opening's term alone, while the earlier label
+    # still resolved: Claude was told about one seed of two
+    assert [lab for lab, _t in second["seeded"]] == [
+        next(lab for lab, _t in second["seeded"] if lab.startswith("<Job_Name-")), org]
+    schema, _e = Mcp(second["url"], second["token"]).tool("es_schema")
+    assert {s["type"] for s in schema["case"]["seeds"]} == {"ORG_NAME", "JOB_NAME"}
+
+
+def test_es_seed_cli_prints_labels_only_and_refuses_without_a_bridge(bridge, capsys, short_dir):
+    from hider import cli
+
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": "https://kibana-stub.example.net"}}
+    raw["profile_dir"] = str(bridge.broker.config.profile_dir)
+    path = short_dir / "elastic.json"
+    path.write_text(json.dumps(raw))
+    assert cli.main(["es-seed", "--config", str(path), "--case", "c9", "--term", "Quiet Harbour Ltd"]) == 2
+    out = capsys.readouterr().out
+    assert "code=no_case" in out and "Quiet Harbour" not in out
+    bridge.open(case="c9", terms=[])
+    assert cli.main(["es-seed", "--config", str(path), "--case", "c9", "--term", "Quiet Harbour Ltd",
+                     "--term", "JOB_NAME=Quiet Harbour Nightly"]) == 0
+    cap = capsys.readouterr()
+    assert cap.out.count("seeded    ") == 2 and "new to this case" in cap.out
+    assert "Quiet Harbour" not in cap.out and "Quiet Harbour" not in cap.err
+    assert "Seed only names from the ticket" in cap.err
+    # no bridge at all
+    raw["profile_dir"] = str(short_dir / "nowhere")
+    path.write_text(json.dumps(raw))
+    assert cli.main(["es-seed", "--config", str(path), "--case", "c9", "--term", "x"]) == 2
+    assert "code=session_expired" in capsys.readouterr().out

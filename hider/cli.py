@@ -559,6 +559,34 @@ def _cmd_es_research(args: argparse.Namespace) -> int:
     return _es_research(args, esbridge.BrokerClient(sock, timeout=60), elastic.SESSIONS, cfg)
 
 
+def _cmd_es_seed(args: argparse.Namespace) -> int:
+    """Add a name to an open case without ending its Claude session: the
+    human's step, through the broker's socket only. Prints the labels and
+    their types; the names stay in the bridge."""
+    from . import elastic, esbridge
+
+    cfg = _es_config(args.config)
+    sock = esbridge.broker_socket(args.profile_dir or cfg.profile_dir)
+    if not esbridge.broker_running(sock):
+        print("REFUSED  code=session_expired: no bridge is running; start it with "
+              "es-login --cluster NAME")
+        return 2
+    try:
+        reply = esbridge.BrokerClient(sock, timeout=60).call("seed_case", case=args.case,
+                                                             terms=args.term)
+    except elastic.Refused as e:
+        print(f"REFUSED  code={e.code}: {e.message}")
+        return 2
+    for r in reply["seeded"]:
+        held = "already labelled in this case" if r["known_before"] else "new to this case"
+        print(f"seeded    {r['label']}  ({r['type']}; {held}; the real value stays in the bridge)")
+    print("tell Claude the label, not the name; it also sees it in its next tool result and in "
+          "es_schema. Seed only names from the ticket or the customer: a name Claude asked you "
+          "for is a guess it could not make itself, and every seed is logged and shown by "
+          "es-review.", file=sys.stderr)
+    return 0
+
+
 def _cmd_es_review(args: argparse.Namespace) -> int:
     """Review one case from its decision log and saved session: human-only,
     read-only, counts and labels by default. Exit 0 when nothing is flagged,
@@ -1122,6 +1150,16 @@ def main(argv: list[str] | None = None) -> int:
     lg.add_argument("--profile-dir")
     lg.add_argument("--timeout", type=float, default=600.0)
     lg.set_defaults(fn=_cmd_es_login)
+
+    sd = sub.add_parser("es-seed", help="add a name to an open es-research case without ending "
+                                        "its Claude session; the name stays in the bridge, you "
+                                        "get the label to hand to Claude")
+    sd.add_argument("--case", required=True, help="the open case's name")
+    sd.add_argument("--term", action="append", required=True,
+                    help="a customer name, or TYPE=VALUE (JOB_NAME=...); repeatable")
+    sd.add_argument("--config")
+    sd.add_argument("--profile-dir")
+    sd.set_defaults(fn=_cmd_es_seed)
 
     rv = sub.add_parser("es-review", help="review what an es-research case did, from its "
                                           "decision log: queries, refusals, phrase spend and "

@@ -63,7 +63,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import elastic, esquery
+from . import elastic, esquery, jsonscrub
 
 SEARCH_PATH = "/internal/search/ese"
 PROBE_PATH = "/internal/security/me"
@@ -720,6 +720,38 @@ class Bridge:
                    "cluster": cluster.name, "vocabulary": "applied", **report})
         return True
 
+    def seed(self, term: str) -> dict:
+        """Add a name to this case while its session runs: the human's step.
+
+        ``term`` is as ``--term`` takes it (a name, or ``TYPE=VALUE``). The
+        value is labelled, seeded (it matches inside keep values, as a
+        seed does) and marked shown, so Claude may use the label as soon
+        as it has it. Reached only through the broker's socket (es-seed),
+        never through a tool: a value-to-label step Claude could trigger
+        would let it confirm a guess with a count. The decision log gets a
+        row with the label, its type, whether the case already held a label
+        for the value, how many queries had run, and **never the value**;
+        es-review reads those rows back as the human's steps. A case holds
+        at most ``_MAX_SEEDS`` seeded names over its life.
+        """
+        value, etype = parse_term(self.config, term)
+        with self._lock:
+            label = self.scrubber.known.get(jsonscrub._norm(value))
+            known_before = label is not None
+            already = label is not None and label in self.scrubber.seeded_labels
+            if not already and len(self.scrubber.seeded_labels) >= _MAX_SEEDS:
+                raise elastic.Refused("bad_request", f"this case already holds {_MAX_SEEDS} seeded "
+                                                     "names, the most a case may; open a new case")
+            label = self.scrubber.seed(value, etype)
+            row = {"schema": LOG_SCHEMA, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                   "event": "seed", "label": label, "type": self.scrubber.types.get(label, etype),
+                   "known_before": known_before, "already_seeded": already,
+                   "queries_before": len(self.outcomes),
+                   "seeded_total": len(self.scrubber.seeded_labels)}
+            self._log(row)
+        return {k: row[k] for k in ("label", "type", "known_before", "already_seeded",
+                                    "queries_before", "seeded_total")}
+
     def _log(self, row: dict) -> None:
         if self.log_path is None:
             return
@@ -987,18 +1019,22 @@ def seed_terms(config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
     fields take labels only, and each run is a fresh case). The same terms
     in the same order give the same labels on every run.
     """
+    return [scrubber.seed(*parse_term(config, t)) for t in terms]
+
+
+def parse_term(config: elastic.ElasticConfig, term: str) -> tuple[str, str]:
+    """``(value, type)`` for one ``--term``: a bare name is an organisation,
+    ``TYPE=VALUE`` an identifier type the site map declares."""
+    if not isinstance(term, str) or not 0 < len(term) <= 128:
+        raise elastic.Refused("bad_request", "a term is a string of up to 128 characters")
+    m = _TYPED_SEED.match(term)
+    if m is None:
+        return term, "ORG_NAME"
     types = {"ORG_NAME"} | {r.type for r in config.fields if r.kind == "identifier"}
-    labels = []
-    for t in terms:
-        m = _TYPED_SEED.match(t)
-        if m is None:
-            labels.append(scrubber.seed(t))
-            continue
-        if m.group(1) not in types:
-            raise elastic.Refused("bad_request", f"a typed term needs an identifier type from the "
-                                                 f"site map: {sorted(types)}")
-        labels.append(scrubber.seed(m.group(2), m.group(1)))
-    return labels
+    if m.group(1) not in types:
+        raise elastic.Refused("bad_request", f"a typed term needs an identifier type from the "
+                                             f"site map: {sorted(types)}")
+    return m.group(2), m.group(1)
 
 
 def run_case(bridge: Bridge, cluster: str, query: dict, *, show_names: bool = False) -> dict:
@@ -1384,6 +1420,9 @@ _MAX_REPLY = 64 << 20
 _SUN_PATH_MAX = 103  # macOS: 104 bytes including the terminating NUL
 _TIER2 = ("classifier", "spacy", "none")
 _MAX_TERMS = 20
+#: seeded names a case may hold over its life: what it was opened with plus
+#: what es-seed adds while a session runs
+_MAX_SEEDS = 40
 
 
 def broker_socket(profile_dir: str | Path) -> Path:
@@ -1489,6 +1528,14 @@ class Broker:
                 return self._open_case(req)
             if op == "close_case":
                 return {"ok": True, "closed": self.cases.close(req.get("token"))}
+            if op == "seed_case":
+                # the human adding a name to an open case, by the case's
+                # name over this 0600 socket: no token, no tool, no value in
+                # the reply beyond what the human just typed
+                terms, _t2 = self._terms_tier2(req)
+                if not terms:
+                    return _fail("bad_request", "seed_case needs at least one term")
+                return {"ok": True, "seeded": self.cases.seed(req.get("case"), terms)}
             name = req.get("cluster")
             cluster = self.config.cluster(name) if isinstance(name, str) else None
             if cluster is None:

@@ -3808,7 +3808,19 @@ def run_review_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
          "aggs": {"h": {"type": "date_histogram", "field": cfg.time_field, "interval": "1h"}}},
     ]
     refusals = 0
-    for q in calls:
+    seeded_mid_case = 0
+    for i, q in enumerate(calls):
+        if i == 2:
+            # the customer replies halfway through naming a job: the
+            # engineer adds it by hand (es-seed), the session goes on, and
+            # the next query uses the label
+            job = next(j[0] for j in tenant.jobs)
+            label_job = case.bridge.seed(f"JOB_NAME={job}")["label"]
+            seeded_mid_case += 1
+            _o, refused3, _dt, _c = case.call({
+                "index": "logs-app-*", "time_range": tr, "size": 0,
+                "filters": by_case + [{"field": "job.name", "op": "eq", "value": label_job}]})
+            refusals += refused3 is not None
         out, refused, _dt, _c = case.call(q)
         refusals += refused is not None
         if out is not None and "srv" in (out.get("aggregations") or {}):
@@ -3831,7 +3843,9 @@ def run_review_eval(cfg: elastic.ElasticConfig, engine: StubEngine,
     return {
         "ordinary": {"queries": ordinary["numbers"].get("queries"), "refusals": refusals,
                      "verdict": ordinary["verdict"], "flagged": ordinary["flagged"],
-                     "log_status": ordinary["log_status"]},
+                     "log_status": ordinary["log_status"],
+                     "names_added_mid_case": ordinary["numbers"].get("names_added_mid_case"),
+                     "seeded_mid_case": seeded_mid_case},
         "guessing": {"queries": guessing["numbers"].get("queries"),
                      "verdict": guessing["verdict"], "flagged": guessing["flagged"],
                      "log_status": guessing["log_status"],
@@ -5538,6 +5552,8 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
                  or "phrase_budget_pressure" in review["guessing"]["flagged"])
             and review["ordinary"]["verdict"] == "nothing flagged"
             and review["ordinary"]["refusals"] == 0
+            # the one name the engineer added mid-case is reported, not flagged
+            and review["ordinary"]["names_added_mid_case"] == review["ordinary"]["seeded_mid_case"] == 1
             and review["ordinary"]["log_status"] == "ok"
             and review["missing"]["log_status"] == "missing"
             and review["missing"]["verdict"] is None
@@ -5649,7 +5665,8 @@ def _review_lines(o: dict | None) -> list[str]:
     g, n = o["guessing"], o["ordinary"]
     return [f"es-review        guessing run ({g['queries']} queries, {g['zero_hit']} zero-hit "
             f"phrases): {g['verdict']} {g['flagged']}; ordinary investigation ({n['queries']} "
-            f"queries, {n['refusals']} refusals): {n['verdict']} {n['flagged']}; a case with no "
+            f"queries, {n['refusals']} refusals, {n.get('names_added_mid_case')} name added by "
+            f"the engineer mid-case and reported): {n['verdict']} {n['flagged']}; a case with no "
             f"log: {o['missing']['log_status']}, verdict {o['missing']['verdict']}; values in the "
             f"default output: {o['values_in_default_output']}"]
 

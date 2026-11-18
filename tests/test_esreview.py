@@ -147,3 +147,51 @@ def test_the_cli_exit_codes(tmp_path, capsys):
     assert "NO REVIEW" in out
     assert cli.main(["es-review", "--case", "c1", "--sessions-dir", str(tmp_path), "--json"]) == 0
     assert json.loads(capsys.readouterr().out.split("\n", 0)[0])["verdict"] == "nothing flagged"
+
+
+def _seed(label, etype, after, known=False, ts="2026-11-11T10:00:30"):
+    return {"schema": "hider.es-decision.v1", "ts": ts, "event": "seed", "label": label,
+            "type": etype, "known_before": known, "already_seeded": False,
+            "queries_before": after, "seeded_total": after + 1}
+
+
+def test_names_the_engineer_added_mid_case_are_reported_and_a_guess_pattern_is_flagged(tmp_path):
+    # one name from the ticket, seeded after the first query and then
+    # found: reported, not flagged, and not counted as a query
+    rows = [
+        _row(ts="2026-11-11T10:00:00", filters=[{"field": "labels.tenant_name", "op": "eq"}],
+             labels_used=["<Org-01>"]),
+        _seed("<Job_Name-02>", "JOB_NAME", 1, known=True),
+        _row(ts="2026-11-11T10:01:00", filters=[{"field": "job.name", "op": "eq"}],
+             labels_used=["<Job_Name-02>"], hits_total=4),
+    ]
+    r = esreview.review(_write(tmp_path, rows))
+    assert r["numbers"]["queries"] == 2 and r["numbers"]["names_added_mid_case"] == 1
+    sig = next(s for s in r["signals"] if s["name"] == "mid_case_seeding")
+    assert sig["flagged"] is False
+    assert sig["evidence"]["seeds"] == [{"label": "<Job_Name-02>", "type": "JOB_NAME",
+                                         "after_query": 1, "known_before": True,
+                                         "already_seeded": False, "first_use": "found"}]
+    text = "\n".join(esreview.format_review(r))
+    assert "SEEDED   1 name(s) added by the engineer" in text and "first use found" in text
+    assert r["verdict"] == "nothing flagged"
+    # a name whose first use finds nothing is a guess confirmed by hand
+    rows.append(_seed("<Org-77>", "ORG_NAME", 2, ts="2026-11-11T10:02:00"))
+    rows.append(_row(ts="2026-11-11T10:03:00", filters=[{"field": "labels.tenant_name", "op": "eq"}],
+                     labels_used=["<Org-77>"], hits_total=0, hits_shown=0))
+    r = esreview.review(_write(tmp_path, rows))
+    sig = next(s for s in r["signals"] if s["name"] == "mid_case_seeding")
+    assert sig["flagged"] is True and sig["evidence"]["first_use_found_nothing"] == 1
+    assert sig["evidence"]["seeds"][1]["first_use"] == "nothing"
+    assert "mid_case_seeding" in r["flagged"]
+    # three names, all found: flagged on the count alone, with an unused one shown
+    rows = [_row(ts="2026-11-11T10:00:00")] + [
+        _seed(f"<Org-{i}>", "ORG_NAME", 1, ts=f"2026-11-11T10:00:{i:02d}") for i in (11, 12, 13)]
+    r = esreview.review(_write(tmp_path, rows))
+    sig = next(s for s in r["signals"] if s["name"] == "mid_case_seeding")
+    assert sig["flagged"] is True and sig["evidence"]["names_added"] == 3
+    assert {a["first_use"] for a in sig["evidence"]["seeds"]} == {"unused"}
+    # an old log has none: not flagged, nothing added
+    r = esreview.review(_write(tmp_path, [_row()]))
+    sig = next(s for s in r["signals"] if s["name"] == "mid_case_seeding")
+    assert sig["flagged"] is False and r["numbers"]["names_added_mid_case"] == 0
