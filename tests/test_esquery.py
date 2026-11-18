@@ -830,3 +830,27 @@ def test_phrases_inside_spend_the_per_case_budget_with_the_same_refusal():
         assert e.value.code == "phrase_budget" and len(s.phrases_spent) == n
         refusals.append(e.value.message)
     assert len(set(refusals)) == 1 and "delta" not in refusals[0]
+
+
+def test_label_only_phrases_count_toward_the_per_query_cap_and_spend_no_budget():
+    """The wider tenant scope (any_of of the field eq a label and a text
+    phrase made only of the label) leans on the label-in-phrase channel:
+    pin that it weakens nothing. A label-only phrase is free of the
+    per-case budget but still one of the query's max_phrases, so a word
+    list of labels cannot widen a query past the cap."""
+    s = elastic.EsScrubber(CFG, tier2="none")
+    labels = [s.seed(f"Invented Tenant Number {i}") for i in range(CFG.max_phrases + 1)]
+    wider = {"index": "logs-app-*", "size": 0, "filters": [{"any_of": [
+        {"field": "labels.tenant_name", "op": "eq", "value": labels[0]},
+        {"field": "message", "op": "phrase", "value": labels[0]}]}]}
+    c = esquery.compile_query(wider, CFG, s)
+    assert c.new_phrases == frozenset() and c.text_queries == [labels[0]]
+    assert labels[0] in c.labels_used
+    # one more label-only phrase than the cap allows is still size_cap
+    flood = {"index": "logs-app-*", "size": 0, "filters": [
+        {"field": "message", "op": "phrase", "value": lab} for lab in labels]}
+    with pytest.raises(elastic.Refused) as e:
+        esquery.compile_query(flood, CFG, s)
+    assert e.value.code == "size_cap" and "distinct phrases" in e.value.message
+    for lab in labels:
+        assert s.mapping[lab] not in e.value.message

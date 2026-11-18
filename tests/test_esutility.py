@@ -17,6 +17,10 @@ CFG = dataclasses.replace(elastic.load(elastic.EXAMPLE),
 #: is sent unbent - the list the measure exists to produce
 BLOCKED = {
     "tenant_size": ("label_only", None),
+    # the honest query runs; the documents naming their tenant only in text
+    # are in no bucket of a terms aggregation, and a group shows <*> where a
+    # name stood, so tenants named only in text cannot be listed
+    "text_which_tenants": ("text_names_not_enumerable", None),
 }
 
 
@@ -83,8 +87,22 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
          # alone, two of three groups missing) when the sample was the
          # newest documents, answered since the sample is spread over the
          # scope's time span
-         "week_census"}
-    assert report["counts"]["wrong"] == 0
+         "week_census",
+         # the tenant split between its field and the text: asked over the
+         # wider scope (any_of of the field eq the label and a text phrase
+         # made only of the label), where the field scope alone is wrong
+         # against the full truth - the figures on each row show both
+         "text_onset", "text_servers", "text_per_day", "text_error_census"}
+    # the one deliberate wrong: the name's words in another sense are inside
+    # the wider scope, and nothing mechanical can tell the senses apart
+    assert {k for k, r in rows.items() if r["status"] == "wrong"} == {"text_lookalike"}
+    assert rows["text_lookalike"]["cause"] == "differs"
+    assert rows["text_lookalike"]["figures"]["same_words_another_sense"] == 1
+    for k in ("text_onset", "text_servers", "text_per_day", "text_error_census"):
+        fs = rows[k]["figures"]
+        assert fs["field_scope_against_full_truth"] == "wrong", k
+        assert fs["field_scope_items"] is None or fs["field_scope_items"] <= fs["full_truth_items"]
+    assert report["counts"]["wrong"] == 1
     assert rows["named_job"]["human_steps"] == ["es-seed JOB_NAME from the ticket"]
     assert rows["named_job"]["requests"] == rows["named_job"]["queries"] == 1
     assert report["human_steps"] == 1
@@ -104,7 +122,7 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
 def test_the_same_result_with_tier_2_on(world):
     fx, _e, vocab = world
     u = esutility.run_utility_eval(CFG, fx, vocab, tier2="classifier")
-    assert u["counts"] == {"answered": 11, "wrong": 0, "blocked": 1}
+    assert u["counts"] == {"answered": 15, "wrong": 1, "blocked": 2}
 
 
 def test_the_grader_tells_redaction_from_a_wrong_answer(world):
@@ -148,6 +166,55 @@ def test_the_section_carries_counts_and_codes_never_a_value(world, report):
     values = set(fx.truth) | {t.name for t in fx.tenants} | {j[0] for t in fx.tenants
                                                              for j in t.jobs}
     values |= set(eseval.BURST_TENANTS) | set(eseval.BURST_JOBS)
+    values |= {eseval.SPLIT_TENANT, eseval.SPLIT_OTHER, eseval.SPLIT_THIRD,
+               "relay-07", "relay-08", "indexer-03"}
     assert not [v for v in values if any(c.isalpha() for c in v) and v.lower() in blob]
     for key in esutility.GAPS:
         assert key == key.lower() and " " not in key
+
+
+def test_the_wider_scope_weakens_nothing_and_the_log_shows_the_label_not_the_name():
+    """One any_of of the tenant field eq its label and a text phrase made
+    only of the label: counts one of the query's max_phrases, spends
+    nothing from the per-case budget, resolves only a shown label, never
+    double counts a document matching both branches, and the decision log
+    and es-review see the label, never the value."""
+    from hider import esquery, esreview
+
+    cfg, fx, engine, vocab = eseval.split_world()
+    op = esutility.Operator(cfg, engine, vocab, eseval.SPLIT_TENANT, tier2="none")
+    try:
+        wider = esutility._wider(op)
+        out = op.ask(esutility._split_q(op, wider))
+        # the full truth, each matching document once (the field-marked
+        # documents also name the tenant in text and still count once)
+        in_window = [d for d in eseval.split_truth()
+                     if eseval._parse_time(d.source["@timestamp"])
+                     >= eseval._parse_time("now-3d")]
+        assert out["hits"]["total"]["value"] == len(in_window) == 39
+        # budget: a phrase made only of the label is free; the per-query
+        # width still charges it one of max_phrases
+        rep = op.scrubber.phrase_report()
+        assert rep["phrases_used"] == 0
+        c = esquery.compile_query(esutility._split_q(op, wider), cfg, op.scrubber)
+        assert len(c.new_phrases) == 0 and c.text_queries == [op.tenant]
+        # an unshown label in the same shape refuses as any label rule does
+        with pytest.raises(esutility.Blocked) as e:
+            op.ask(esutility._split_q(op, {"any_of": [
+                {"field": "labels.tenant_name", "op": "eq", "value": op.tenant},
+                {"field": "job.status_message", "op": "phrase", "value": "<Org-77>"}]}))
+        assert e.value.code == "unknown_label"
+        # the log carries the phrase as written (the label) and never the name
+        log = (op.case.directory / "decisions.jsonl").read_text()
+        rows = [json.loads(x) for x in log.splitlines() if "vocabulary" not in x]
+        assert rows[0]["text_queries"] == [op.tenant] and op.tenant in rows[0]["labels_used"]
+        assert eseval.SPLIT_TENANT not in log and "Welland" not in log
+        # es-review does not read the label-only phrase as a typed guess
+        op.case.save()
+        r = esreview.review(op.case.directory)
+        assert r["numbers"]["text_phrases_distinct"] == 0
+        assert not any(s["flagged"] for s in r["signals"]), r["signals"]
+        blob = json.dumps(r)
+        assert eseval.SPLIT_TENANT not in blob and "Welland" not in blob
+    finally:
+        op.close()

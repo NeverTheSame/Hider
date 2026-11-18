@@ -75,6 +75,13 @@ GAPS = {
     "label_only": "the answer is a value the site map declares an identifier (tenant size), "
                   "so only its label comes back, and range/min/max/avg on it are refused",
     "no_readable_phrase": "redaction left no run of two plain words in the error to search by",
+    "text_names_not_enumerable": "which tenants an error hits, when some are named only in "
+                                 "text: a terms aggregation buckets the tenant field, so a "
+                                 "document without it is in no bucket, and a group's text "
+                                 "shows <*> where a name stood (a group makes no label "
+                                 "usable), so names in text cannot be listed; each candidate "
+                                 "must be asked for by its own label, one wider scope at a "
+                                 "time",
 }
 
 _LABELISH = re.compile(r"<[^<>\s]+>")
@@ -446,6 +453,113 @@ def _error_census(op: Operator, cs: CaseFacts) -> Graded:
                                      for b in out["aggregations"]["errors"]["buckets"]}))
 
 
+def _wider(op: Operator, text_field: str = "job.status_message") -> dict:
+    """The tenant's **wider scope**: the tenant field, or the name unmarked
+    in the text - one any_of of the field eq the label and a phrase made
+    only of the label on the text field. The phrase resolves in the bridge
+    (the name never leaves it), costs nothing from the per-case budget (a
+    label-only phrase is free) and one of the query's ``max_phrases``; a
+    document matching both branches is one hit, never two."""
+    return {"any_of": [_eq("labels.tenant_name", op.tenant),
+                       {"field": text_field, "op": "phrase", "value": op.tenant}]}
+
+
+def _split_q(op: Operator, *filters: dict, aggs: dict | None = None, size: int = 0,
+             tr: dict | None = None) -> dict:
+    q: dict[str, Any] = {"index": eseval.SPLIT_INDEX,
+                         "time_range": tr or eseval.SPLIT_RANGE, "size": size,
+                         "filters": [*filters, _eq("job.status", FAILED)]}
+    if aggs:
+        q["aggs"] = aggs
+    return q
+
+
+def _split_both(op: Operator, read: Callable[[dict], Any], expected: Callable[[], Any],
+                aggs: dict | None = None) -> Graded:
+    """Ask the question **today's way first** (tenant field alone), grade
+    that against the full truth into the figures, then ask the wider scope
+    and grade it: the row shows what the field scope missed beside the
+    honest answer. ``expected`` is computed after the queries, when the
+    labels the answer is read in exist."""
+    narrow = read(op.ask(_split_q(op, _eq("labels.tenant_name", op.tenant), aggs=aggs)))
+    wide = read(op.ask(_split_q(op, _wider(op), aggs=aggs)))
+    raw, want = expected()
+    fig = {"field_scope_against_full_truth": "answered" if narrow == want else "wrong",
+           "field_scope_items": _items(narrow), "full_truth_items": _items(want)}
+    return Graded(raw, want, wide, figures=fig)
+
+
+def _text_onset(op: Operator, cs: Any) -> Graded:
+    want = round(min(eseval._parse_time(d.source["@timestamp"]).timestamp() * 1000
+                     for d in eseval.split_truth()))
+    read = lambda out: (None if out["aggregations"]["first"]["value"] is None
+                        else round(out["aggregations"]["first"]["value"]))
+    return _split_both(op, read, lambda: (want, want),
+                       aggs={"first": {"type": "min", "field": "@timestamp"}})
+
+
+def _text_servers(op: Operator, cs: Any) -> Graded:
+    read = lambda out: Counter({b["key"]: b["doc_count"]
+                                for b in out["aggregations"]["by"]["buckets"]})
+    raw = Counter(d.source["agent"]["name"] for d in eseval.split_truth())
+    return _split_both(op, read,
+                       lambda: (raw, Counter({op.label_of(k): v for k, v in raw.items()})),
+                       aggs={"by": {"type": "terms", "field": "agent.name", "size": 50}})
+
+
+def _text_per_day(op: Operator, cs: Any) -> Graded:
+    want = Counter(d.source["@timestamp"][:10] for d in eseval.split_truth())
+    read = lambda out: Counter({str(b.get("key_as_string", ""))[:10]: b["doc_count"]
+                                for b in out["aggregations"]["d"]["buckets"] if b["doc_count"]})
+    return _split_both(op, read, lambda: (want, want),
+                       aggs={"d": {"type": "date_histogram", "field": "@timestamp",
+                                   "interval": "1d"}})
+
+
+def _text_error_census(op: Operator, cs: Any) -> Graded:
+    def expected():
+        want: Counter = Counter()
+        for d in eseval.split_truth():
+            want[elastic.text_group_key(op.project(
+                d.source["job"]["status_message"], {eseval.SPLIT_TENANT: "ORG_NAME"}))] += 1
+        return want, want
+    read = lambda out: Counter({b["key"]: b["doc_count"]
+                                for b in out["aggregations"]["g"]["buckets"]})
+    return _split_both(op, read, expected,
+                       aggs={"g": {"type": "text_groups", "field": "job.status_message",
+                                   "size": 10}})
+
+
+def _text_lookalike(op: Operator, cs: Any) -> Graded:
+    """The declared miss of the wider scope, measured: a week's count pulls
+    in one failure whose text uses the name's words in another sense (a
+    route named after the same place). Scored wrong on purpose - nothing
+    mechanical can tell the senses apart - with the overcount in the
+    figures. A one-word tenant is this miss at its worst: its label
+    resolves to a word every message may use in English."""
+    out = op.ask(_split_q(op, _wider(op), tr=eseval.SPLIT_WIDE_RANGE))
+    want = len(eseval.split_truth())
+    got = out["hits"]["total"]["value"]
+    return Graded(want, want, got,
+                  figures={"counted": got, "about_the_tenant": want,
+                           "same_words_another_sense": got - want})
+
+
+def _text_which_tenants(op: Operator, cs: Any) -> Graded:
+    """Which tenants does the text-only error hit: the honest query runs
+    and cannot answer - the terms aggregation buckets the tenant field,
+    and the documents naming their tenant only in text are in no bucket."""
+    out = op.ask(_split_q(op, {"field": "job.status_message", "op": "phrase",
+                               "value": eseval.SPLIT_TEXT_PHRASE},
+                          aggs={"t": {"type": "terms", "field": "labels.tenant_name",
+                                      "size": 50}}))
+    hits = out["hits"]["total"]["value"]
+    buckets = out["aggregations"]["t"]["buckets"]
+    if hits and len(buckets) < hits:
+        raise Blocked("text_names_not_enumerable")
+    return Graded(None, None, [b["key"] for b in buckets])
+
+
 def _week_census(op: Operator, cs: Any) -> Graded:
     """Which errors are commonest **this week**, over a scope wider than the
     group sample, whose commonest error is not among the newest documents
@@ -552,6 +666,37 @@ QUESTIONS: tuple[Question, ...] = (
              _error_census, gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"),
              honest="text_groups on job.status_message over every failed run (it was terms "
                     "on the text field, which has no way to group by message)"),
+    Question("text_onset", "time point",
+             "when did the failures start, counting the ones named only in the text: the "
+             "component that names the tenant in its message does not fill the tenant field",
+             _text_onset, own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="min @timestamp over any_of(tenant field eq its label, text phrase of the "
+                    "label) and status Failed - the wider scope"),
+    Question("text_servers", "identifier set",
+             "which servers ran the failing jobs, counting the text-only ones: the worst "
+             "server fills no tenant field at all", _text_servers,
+             own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="terms agent.name over the wider scope"),
+    Question("text_per_day", "time series",
+             "how often per day, counting the text-only failures", _text_per_day,
+             own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="date_histogram 1d over the wider scope"),
+    Question("text_error_census", "text grouping",
+             "which errors hit the tenant, when the commonest is named only in the text",
+             _text_error_census, own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="text_groups on job.status_message over the wider scope"),
+    Question("text_lookalike", "magnitude",
+             "how many of the tenant's runs failed this week, when another document uses the "
+             "name's words in another sense: the declared miss of the wider scope, scored "
+             "wrong on purpose", _text_lookalike,
+             own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="count over the wider scope, a week back"),
+    Question("text_which_tenants", "cross-tenant",
+             "which tenants does the text-only error hit, when they are named only in text",
+             _text_which_tenants, gap="text_names_not_enumerable",
+             own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="terms labels.tenant_name over the error's phrase: runs, and the "
+                    "documents naming their tenant only in text are in no bucket"),
     Question("week_census", "text grouping",
              "which errors are commonest this week, over far more documents than one group "
              "read samples, when the last minute was noisy", _week_census,
@@ -651,14 +796,24 @@ def run_utility_eval(cfg: elastic.ElasticConfig, fx: eseval.Fixture,
 
 def _figures(f: dict[str, Any]) -> str:
     """The reply's own account of itself against the truth, counts only."""
-    parts = [f"{f.get('sampled')} of {f.get('total')} docs read in {f.get('requests')} "
-             f"request{'s' if f.get('requests') != 1 else ''}, "
-             f"{'exact' if f.get('exact') else 'estimated'}"]
+    parts = []
+    if "sampled" in f:
+        parts.append(f"{f.get('sampled')} of {f.get('total')} docs read in {f.get('requests')} "
+                     f"request{'s' if f.get('requests') != 1 else ''}, "
+                     f"{'exact' if f.get('exact') else 'estimated'}")
     if "groups" in f:
         parts.append(f"{f['groups']} groups, {f.get('missing')} of the true groups missing, "
                      f"{f.get('within_margin')} of {f['groups']} counts within the reply's margin, "
                      f"worst count off by {f.get('max_error_pct')}%, order settled for "
                      f"{f.get('order_settled')}")
+    if "field_scope_against_full_truth" in f:
+        parts.append(f"asked today's way (tenant field alone) first: "
+                     f"{f['field_scope_against_full_truth']} against the full truth, "
+                     f"{f.get('field_scope_items')} of {f.get('full_truth_items')} items")
+    if "same_words_another_sense" in f:
+        parts.append(f"counted {f.get('counted')}, about the tenant {f.get('about_the_tenant')}, "
+                     f"the name's words in another sense {f['same_words_another_sense']} "
+                     "(the wider scope cannot tell the senses apart; declared)")
     return "; ".join(parts)
 
 

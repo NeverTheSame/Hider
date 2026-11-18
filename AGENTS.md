@@ -758,10 +758,16 @@ Listed with owners in the README's Limitations section and in
     field's `after_key`. One field at a time because the cost is per
     aggregation: a request carrying every field pays for all of them
     before it can be stopped, logged or resumed. Fields are read
-    JOB_NAME-first, because a message naming a tenant almost always
-    carries the tenant fields on the same document (harvesting the page
-    covers it) while about three in four messages naming a job carry no
-    job field.
+    JOB_NAME-first. The sentence that used to justify that order -
+    "a message naming a tenant almost always carries the tenant fields
+    on the same document" - **turned out to be wrong on a real cluster**:
+    one tenant had 11,465 documents carrying it in the tenant field, 427
+    naming it in message text, and **one** document doing both. The read
+    order stands on the other half of the argument alone (about three in
+    four messages naming a job carry no job field, so job fields teach
+    the most per page); what the wrong half had quietly licensed - tenant
+    questions scoped by the tenant field alone - is the split-tenant
+    section below.
   - **Every field is counted before it is paged**, one `cardinality`
     request per field per slice (`VOCABULARY_COUNT_AGG`,
     `precision_threshold` asked for at the cap). Without it, an id-shaped
@@ -1618,6 +1624,69 @@ Listed with owners in the README's Limitations section and in
   names, names with digits and four-word job names are covered. When
   adding a shape, add a class, not another fixture.
 
+  **A tenant split between its field and the text.** Every tenant
+  question in the measure scoped by the tenant field, and its expected
+  answer was computed from the same field-scoped documents, so a line
+  like "Quota exceeded for Harbour Ridge" from a component that does not
+  fill the tenant field was outside every question asked **and the
+  measure still scored the answer right**. On a real cluster one tenant
+  was 11,465 documents in the field, 427 in text, 1 in both.
+  `eseval.split_docs` (own index pattern and map, not in `generate`, all
+  names invented, positions fixed) is that shape in miniature: 24
+  field-marked failures on two relay servers, 15 naming the tenant only
+  in the text from an indexer that fills no tenant field, starting ten
+  hours before any field-marked one and skewed to the newest day. Asked
+  **today's way and graded against the full truth**: onset ten hours
+  late, 2 of 3 servers (the worst one invisible), 3 of 4 days, 1 of 2
+  error groups, 24 of 39 failures counted - every tenant question wrong.
+  **The honest ask is the wider scope**, already in the grammar: one
+  `any_of` of the tenant field `eq` its label and a **phrase made only
+  of the label** on the text field. The label resolves in the bridge (the
+  name never leaves it), a document matching both branches is one hit
+  (bool `should`, never counted twice in one query; summing a
+  field-scoped and a text-scoped count *would* double the overlap, which
+  is why the scope is one query), and counting, aggregating and grouping
+  all work over it: `esutility`'s `text_onset`, `text_servers` (terms),
+  `text_per_day` (date_histogram) and `text_error_census` (text_groups)
+  are answered over the wider scope, each row's figures showing the
+  field-scope-alone answer wrong against the full truth beside it.
+  **What does not work**, measured or declared: `text_which_tenants` is
+  blocked (`GAPS["text_names_not_enumerable"]`) - the honest terms query
+  runs and the documents naming their tenant only in text are in no
+  bucket, and a group's text shows `<*>` where a name stood (a group
+  makes no label usable), so tenants named only in text cannot be
+  listed; each candidate must be asked for by its own label, one wider
+  scope at a time. A per-tenant breakdown in one query is out too:
+  compound filters do not go inside a `filters` aggregation (unchanged).
+  **Where the wider scope is still wrong**, each declared: text whose
+  words spell the name **in another sense** is inside it -
+  `text_lookalike` measures this, scored `wrong` on purpose (a week's
+  count is 40 where 39 are about the tenant; the fortieth is a route
+  named after the same place, and nothing mechanical can tell the senses
+  apart); a **one-word tenant** is that miss at its worst, since its
+  label resolves to a word any message may use in English (and unseeded
+  it has no label at all - the skip rules' declared miss); a tenant known
+  under **two fields** (name and full name) is two labels, and the honest
+  any_of must carry each field with its own label - nothing merges the
+  spellings; and the phrase matches the text field it names, so a name
+  only in *another* text field needs that field's phrase in the any_of.
+  **Cost**: one of the query's `max_phrases` per name (the label-only
+  phrase), nothing from the per-case budget, and the usual price of a
+  wider scope - more documents in every count.
+  **Nothing existing weakens**, pinned
+  (`test_esquery.py::test_label_only_phrases_count_toward_the_per_query_cap_and_spend_no_budget`,
+  `test_esutility.py::test_the_wider_scope_weakens_nothing_and_the_log_shows_the_label_not_the_name`):
+  a label-only phrase still counts toward `max_phrases` (a word list of
+  labels cannot widen a query), still spends nothing from
+  `phrase_budget`, still resolves only a **shown** label (`<Org-77>`
+  inside the any_of refuses `unknown_label` with the usual words), the
+  decision log carries the phrase as written - the label, under
+  `labels_used` too, never the value - and es-review does not read a
+  label-only phrase as a typed guess (`text_phrases_distinct` 0, no
+  flag). The model is told all of this: esmcp instructions rule 3 and
+  `es_schema`'s `kinds.identifier` carry the wider scope, its costs and
+  the one real figure (427 to 1).
+
   **Operator utility (measured, not a gate).** Every gate below measures
   what the bridge hides or refuses; `esutility` measures whether an
   operator can still get answers through it, with no model. One case from
@@ -1647,16 +1716,19 @@ Listed with owners in the README's Limitations section and in
   `tests/test_esutility.py`. **What it does not cover:** a script is not
   Claude (whether a model finds these queries, or runs out of phrase
   budget over a long case, is not measured); the questions are a chosen
-  set, so "11 of 12" (6 of 11 before `not` and `any_of`, 8 before
-  `text_groups`, whose question now asks with it, 9 of 12 before the
-  sample was spread over the span, 10 of 12 before the human step) is not
-  a rate of anything, and the one human step is scripted here, not a
-  person deciding whether the name deserves seeding; one tenant
-  over six hours of synthetic data, so "per day" is one day, and the one
-  question on its own data (`week_census`, `eseval.burst_world`) is one
-  week of three invented messages; `Bridge.run` directly, not
-  the MCP tool layer; a vocabulary that always serves (no building or gap
-  refusals); and nothing on the realistic estate's name shapes.
+  set, so "15 of 18 answered, 1 wrong, 2 blocked" (6 of 11 before `not`
+  and `any_of`, 8 before `text_groups`, whose question now asks with it,
+  9 of 12 before the sample was spread over the span, 10 of 12 before
+  the human step, 11 of 12 before the split-tenant questions, whose
+  `text_lookalike` is wrong **by design**) is not a rate of anything,
+  and the one human step is scripted here, not a person deciding whether
+  the name deserves seeding; one tenant over six hours of synthetic
+  data, so "per day" is one day, and the questions on their own data
+  (`week_census` on `eseval.burst_world`, the `text_*` six on
+  `eseval.split_world`) are one invented shape each; `Bridge.run`
+  directly, not the MCP tool layer; a vocabulary that always serves (no
+  building or gap refusals); and nothing on the realistic estate's name
+  shapes.
 
   **Gates.** `es-eval` runs the fixture end to end and through the real
   MCP endpoint; all 37 pass, and a change that cannot keep them passing

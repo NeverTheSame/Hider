@@ -2194,6 +2194,145 @@ def _catch_up_lines(o: dict | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# A tenant split between its field and the text: failures named only in
+# message text, from a component that does not fill the tenant field
+# ---------------------------------------------------------------------------
+#
+# Every tenant question in the measure used to scope by the tenant field
+# alone, and its expected answer was computed from the same field-scoped
+# documents, so the measure could not see what the scope missed. On a real
+# cluster one tenant had 11,465 documents carrying it in the tenant field,
+# 427 naming it in message text, and one document doing both: a line like
+# "Quota exceeded for <tenant>" from a component that does not fill the
+# field was outside every tenant question asked. These documents are a
+# fixture of their own (own index pattern and map, not appended to
+# ``generate``, so no existing figure moves), with every name invented and
+# every position fixed:
+#
+# * 24 failures from a component that fills the tenant field (two relay
+#   servers, one error, over the last two and a half days);
+# * 15 failures naming the tenant **only in the text** (one indexer server
+#   the field-marked docs never use, another error, starting ten hours
+#   before any field-marked failure and skewed toward the newest day), so
+#   under the field scope the onset, the servers, the days and the error
+#   census are all wrong against the full truth;
+# * another tenant's ordinary failures, so the scope has something to
+#   exclude; successes as noise;
+# * one failure of the other tenant whose text uses the split tenant's
+#   words **in another sense** (a route named after the same place), five
+#   days back: the declared miss of the wider scope, measured by the
+#   lookalike question over the wide window;
+# * a third tenant named **only in text**, sharing the text-only error:
+#   what "which tenants does this error hit" cannot enumerate.
+SPLIT_INDEX = "logs-split-*"
+SPLIT_RANGE = {"gte": "now-3d", "lte": "now"}
+SPLIT_WIDE_RANGE = {"gte": "now-7d", "lte": "now"}
+SPLIT_TENANT = "Welland Cross Shipping"
+SPLIT_OTHER = "Brayford Mills Cooperative"
+SPLIT_THIRD = "Quayle Harbour Logistics"
+SPLIT_FIELD_DOCS = 24
+SPLIT_TEXT_DOCS = 15
+SPLIT_THIRD_DOCS = 3
+SPLIT_FIELD_ERROR = "Quota exceeded for {T}, retry in {N}s"
+SPLIT_TEXT_ERROR = "Replication stalled for {T} at sequence {N}"
+SPLIT_OTHER_ERROR = "Snapshot verification failed for {T}, code 0x80070005"
+SPLIT_OK_MESSAGE = "Nightly maintenance finished for {T} in {N}s"
+SPLIT_LOOKALIKE = ("Convoy rerouted along the Welland Cross Shipping lane after a closure, "
+                   "8 pallets held")
+SPLIT_TEXT_PHRASE = "Replication stalled for"
+#: the first text-only failure is this many hours back: before any
+#: field-marked one, so the field scope gets the onset wrong too
+SPLIT_TEXT_FIRST_H = 70.0
+SPLIT_FIELD_FIRST_H = 60.0
+
+
+def _split_doc(hours_ago: float, server: str, status: str, message: str,
+               tenant: str | None) -> Doc:
+    at = (NOW - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    src: dict = {"@timestamp": at, "agent": {"name": server},
+                 "job": {"status": status, "status_message": message}}
+    seeded = {}
+    if tenant is not None:
+        src["labels"] = {"tenant_name": tenant}
+        seeded[tenant] = "ORG_NAME"
+    return Doc(SPLIT_INDEX, src, seeded)
+
+
+def split_docs() -> list[Doc]:
+    out: list[Doc] = []
+    fill = lambda t, n: t.replace("{T}", SPLIT_TENANT).replace("{N}", str(3 + n % 41))
+    # the component that fills the field: two relay servers, newest first
+    for i in range(SPLIT_FIELD_DOCS):
+        h = SPLIT_FIELD_FIRST_H - i * (SPLIT_FIELD_FIRST_H - 6.0) / (SPLIT_FIELD_DOCS - 1)
+        out.append(_split_doc(h, f"relay-0{7 + i % 2}", "Failed",
+                              fill(SPLIT_FIELD_ERROR, i), SPLIT_TENANT))
+    # the component that does not: the tenant is in the text alone, one
+    # server the field-marked documents never use, skewed to the newest day
+    for i in range(SPLIT_TEXT_DOCS):
+        h = SPLIT_TEXT_FIRST_H if i == 0 else (26.0 if i < 6 else 20.0) - i
+        out.append(_split_doc(h, "indexer-03", "Failed",
+                              fill(SPLIT_TEXT_ERROR, i), None))
+    # the other tenant's ordinary failures and some successes
+    for i in range(10):
+        out.append(_split_doc(50.0 - 4 * i, "relay-07", "Failed",
+                              SPLIT_OTHER_ERROR.replace("{T}", SPLIT_OTHER), SPLIT_OTHER))
+    for i in range(6):
+        out.append(_split_doc(40.0 - 5 * i, "relay-08", "Succeeded",
+                              SPLIT_OK_MESSAGE.replace("{T}", SPLIT_OTHER).replace("{N}", "88"),
+                              SPLIT_OTHER))
+        out.append(_split_doc(39.0 - 5 * i, "relay-07", "Succeeded",
+                              fill(SPLIT_OK_MESSAGE, i), SPLIT_TENANT))
+    # the same words in another sense, five days back: the other tenant's
+    # failure about a route, inside the wide window only
+    out.append(_split_doc(120.0, "relay-08", "Failed", SPLIT_LOOKALIKE, SPLIT_OTHER))
+    # a third tenant named only in text, sharing the text-only error
+    for i in range(SPLIT_THIRD_DOCS):
+        out.append(_split_doc(18.0 - i, "indexer-03", "Failed",
+                              SPLIT_TEXT_ERROR.replace("{T}", SPLIT_THIRD)
+                              .replace("{N}", str(60 + i)), None))
+    return out
+
+
+def split_truth(docs: list[Doc] | None = None) -> list[Doc]:
+    """The full truth of the split tenant's failures: the field **or** the
+    name in the text, never the lookalike (its words are another sense,
+    which nothing mechanical can tell; the lookalike question measures
+    that)."""
+    docs = split_docs() if docs is None else docs
+    return [d for d in docs
+            if d.source["job"]["status"] == "Failed"
+            and d.source["job"]["status_message"] != SPLIT_LOOKALIKE
+            and (d.source.get("labels", {}).get("tenant_name") == SPLIT_TENANT
+                 or SPLIT_TENANT in d.source["job"]["status_message"])]
+
+
+def split_map() -> elastic.ElasticConfig:
+    raw = {
+        "indices": [SPLIT_INDEX],
+        "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "fields": {
+            "@timestamp": "keep",
+            "job.status": "keep",
+            "job.status_message": "text",
+            "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+            "agent.name": {"kind": "identifier", "type": "SERVER_NAME"},
+        },
+    }
+    return elastic.parse(raw, source="split-fixture")
+
+
+def split_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
+                                                  elastic.ClusterVocabulary]:
+    """The split fixture on its own engine with its vocabulary built."""
+    cfg = split_map()
+    fx = Fixture(split_docs(), [], [])
+    engine = StubEngine(fx, (SPLIT_INDEX,))
+    vocab, _b = build_vocabulary(cfg, engine)
+    return cfg, fx, engine, vocab
+
+
+# ---------------------------------------------------------------------------
 # The burst: a text_groups scope wider than the sample, whose commonest
 # message is not among the newest documents
 # ---------------------------------------------------------------------------

@@ -97,6 +97,17 @@ Rules:
    {"any_of": [filter, ...]} matches any one of them; both hold plain filters
    only, one level deep, in a query's filters (not in a filters aggregation),
    and every rule above applies to the filters inside them.
+   A name lives in two places: its identifier field, and - from components that do
+   not fill that field - unmarked in message text. A filter on the field alone can
+   miss most of a tenant's events (one real tenant: 427 text mentions, 1 carrying
+   the field). The scope that covers both is one any_of of the field eq the label
+   and a phrase made only of the label on the text field; a document matching both
+   is one hit, and a label-only phrase is free of the phrase budget. Counting,
+   aggregating and grouping work over that scope. Its costs: text whose words
+   spell the name in another sense is inside it, a name split across two fields
+   needs each field's own label in the any_of, and tenants named only in text
+   cannot be listed (a terms aggregation buckets a field; a group shows <*> where
+   a name stood) - ask per candidate label, never ask the engineer to seed guesses.
 4. Size things with es_count and es_aggregate before paging hits with es_search.
 5. Keep fields hold values exactly as logged: one level can be spelled err, Error
    and ERROR, one outcome Failed and failure. Before an exact filter on a keep
@@ -421,7 +432,11 @@ def schema_payload(config: elastic.ElasticConfig, case: Case) -> dict:
                 "Aggregate a keep field (terms) before an exact filter, then use op in "
                 "across the spellings you saw",
         "identifier": "values are labels; filter with eq/in on a label of a fitting type; terms "
-                      "aggregations bucket by label",
+                      "aggregations bucket by label. The same name can occur unmarked in "
+                      "message text, from components that do not fill the field: "
+                      "any_of(field eq label, text phrase of the label) is the scope that "
+                      "covers both, one hit per document, the label-only phrase free of the "
+                      "phrase budget; documents without the field are in no terms bucket",
         "text": "scrubbed free text; filter with phrase only; cannot be aggregated",
     }
     return out
