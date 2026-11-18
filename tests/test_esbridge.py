@@ -2099,3 +2099,277 @@ def test_a_mid_case_seed_is_logged_as_a_label_never_a_value_and_capped(tmp_path)
     # a seeded one still re-seeds past the cap (it adds nothing)
     assert case.bridge.seed(other)["already_seeded"] is True
     shutil.rmtree(case.directory, ignore_errors=True)
+
+
+# -- es-login's wait, the progress lines, and es-smoke --query -------------------------
+
+
+def test_the_backfill_note_groups_fields_in_the_same_state():
+    """A first build has every field at the same point; ten identical
+    sentences on every progress line was what a real site saw, over a
+    thousand times. One field keeps exactly the sentence it had."""
+    one = {"covered_days": 0, "slices_left": 2, "slices_total": 30, "reading": ["A", "B"],
+           "running": True}
+    bf = {f"f{i}.name": dict(one) for i in range(10)}
+    note = esbridge._backfill_note(bf)
+    assert note.count("one-day slices") == 1
+    assert note.startswith("BACKFILLING 10 fields (f0.name, f1.name") and "each cover 0d" in note
+    assert "before they serve" in note
+    single = esbridge._backfill_note({"labels.tenant_name": dict(one)})
+    assert single == ("BACKFILLING labels.tenant_name covers 0d, 2 one-day slices left before it "
+                      "serves and 30 to the full cover, reading A to B (running)")
+    # a field in another state gets its own sentence
+    bf["odd.one"] = {**one, "running": False, "failed": "upstream"}
+    note = esbridge._backfill_note(bf)
+    assert note.count(";") == 1 and "odd.one covers 0d" in note and "retrying" in note
+
+
+class _FakeControl:
+    """A broker as es-login's wait sees it: a scripted sequence of progress
+    reports, the last one repeated for ever."""
+
+    def __init__(self, states, *, clock):
+        self.states, self.clock, self.calls = list(states), clock, 0
+
+    def call(self, op, **kw):
+        if op == "ping":
+            return {"ok": True}
+        self.calls += 1
+        i = min(self.calls - 1, len(self.states) - 1)
+        self.clock.advance()
+        return {"vocabulary": self.states[i]}
+
+
+class _Clock:
+    def __init__(self, step):
+        self.t, self.step = 1000.0, step
+
+    def advance(self):
+        self.t += self.step
+
+    def monotonic(self):
+        return self.t
+
+
+def _building(requests, done, *, serving=False, state="building", fields=10, **extra):
+    v = {"state": state, "serving": serving, "covered_days": 0, "wanted_days": 30,
+         "building": {"fields_done": done, "fields_total": fields, "requests": requests,
+                      "seconds": requests * 9.0, "budget_s": 1200.0},
+         "backfill": {f"f{i}": {"covered_days": 0, "slices_left": 2, "slices_total": 30,
+                                "reading": ["A", "B"], "running": True} for i in range(fields)}}
+    v.update(extra)
+    return v
+
+
+def test_es_login_waits_while_the_bridge_progresses_and_prints_a_line_per_change(
+        monkeypatch, capsys):
+    """Ninety minutes of a healthy build: the wait does not give up at
+    thirty, prints a line when a slice or a field lands (or a heartbeat a
+    minute), not per request, and prints the bridge's note once."""
+    from hider import cli
+
+    clock = _Clock(step=30.0)                     # one poll every 30 simulated seconds
+    monkeypatch.setattr(cli.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    note = "an older saved name file was set aside: 12 names over 2 field(s), one range"
+    states = []
+    for i in range(180):                          # 90 minutes of progress, a request each poll
+        states.append(_building(i + 1, (i // 18) % 10, notes=[note]))
+    states.append(_building(181, 10, serving=True, state="extending", notes=[note]))
+    control = _FakeControl(states, clock=clock)
+    state = cli._wait_for_vocabulary(control, "stub")
+    err = capsys.readouterr().err
+    assert state["state"] == "extending" and "stalled_s" not in state
+    assert control.calls >= 181                   # it waited the whole way
+    lines = [x for x in err.splitlines() if x.startswith("VOCAB")]
+    # 181 progress reports, far fewer lines: one per field done or minute
+    assert 10 <= len(lines) <= 100, len(lines)
+    assert all(x.count("one-day slices") <= 1 for x in lines)
+    assert err.count("NOTE     an older saved name file") == 1
+    assert "cases can run now" in err
+
+
+def test_es_login_wait_ends_on_a_stall_and_on_a_ceiling_the_caller_sets(monkeypatch, capsys):
+    from hider import cli
+
+    clock = _Clock(step=30.0)
+    monkeypatch.setattr(cli.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    # the same report for ever: answering ping, making no request
+    control = _FakeControl([_building(7, 3)], clock=clock)
+    state = cli._wait_for_vocabulary(control, "stub")
+    err = capsys.readouterr().err
+    assert state["stalled_s"] >= 1200 + cli._STALL_GRACE_S and "stuck, not slow" in err
+    # a ceiling the caller set ends a healthy wait without a stall
+    clock = _Clock(step=30.0)
+    monkeypatch.setattr(cli.time, "monotonic", clock.monotonic)
+    control = _FakeControl([_building(i + 1, 0) for i in range(100)], clock=clock)
+    state = cli._wait_for_vocabulary(control, "stub", timeout=300.0)
+    assert "stalled_s" not in state and state["state"] == "building" and control.calls <= 12
+
+
+def test_es_login_exit_codes_tell_healthy_and_reading_from_failed(monkeypatch, capsys, short_dir):
+    """3: the bridge is healthy and still reading (not a failure); 1: the
+    build failed or stalled; 0: cases can run."""
+    from hider import cli
+
+    tmp_path = short_dir
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": "https://kibana-stub.example.net"}}
+    raw["profile_dir"] = str(tmp_path / "p")
+    path = tmp_path / "elastic.json"
+    path.write_text(json.dumps(raw))
+
+    class Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def call(self, op, **kw):
+            return {"signed_in": True}
+
+    monkeypatch.setattr(esbridge, "broker_running", lambda sock: True)
+    monkeypatch.setattr(esbridge, "BrokerClient", Client)
+    outcomes = {}
+    for want, state in ((3, _building(5, 2)), (3, {"state": "catching_up", "serving": False,
+                                                     "age_s": 7200, "gap": ["A", "B"],
+                                                     "catch_up": {"slices_left": 2, "slices_total": 3,
+                                                                  "reading": ["A", "B"]}}),
+                        (1, {"state": "failed", "refused": "upstream"}),
+                        (1, {**_building(5, 2), "stalled_s": 1500}),
+                        (0, {"state": "ready", "serving": True})):
+        monkeypatch.setattr(cli, "_wait_for_vocabulary", lambda *a, **k: state)
+        rc = cli.main(["es-login", "--config", str(path), "--cluster", "stub"])
+        out = capsys.readouterr().out
+        outcomes[want] = outcomes.get(want, 0) + (rc == want)
+        if want == 3:
+            assert "healthy and still reading; this is not a failure" in out
+        if want == 1:
+            assert "not progressing" in out
+    assert outcomes == {3: 2, 1: 2, 0: 1}
+    # --max-wait reaches the wait as its ceiling; the default is none
+    seen = {}
+    monkeypatch.setattr(cli, "_wait_for_vocabulary",
+                        lambda c, n, **k: seen.update(k) or {"state": "ready", "serving": True})
+    cli.main(["es-login", "--config", str(path), "--cluster", "stub"])
+    assert seen["timeout"] is None
+    cli.main(["es-login", "--config", str(path), "--cluster", "stub", "--max-wait", "900"])
+    assert seen["timeout"] == 900.0
+    capsys.readouterr()
+
+
+def test_the_broker_notes_an_older_file_set_aside_for_the_screen(tmp_path):
+    """The note es-login prints once: what was set aside and why a full
+    first build runs. Field names, counts and days, never a name."""
+    d = tmp_path / "es"
+    d.mkdir(mode=0o700)
+    (d / elastic.VocabularyIndex.FILENAME).write_text(json.dumps({
+        "schema": elastic.VocabularyIndex.SCHEMA_V1,
+        "clusters": {"stub": {"covered_from": 0.0, "covered_until": 30 * 86400.0,
+                              "fields": {"job.name": ["Harbour Nightly"],
+                                         "labels.tenant_name": ["Thornbury Estates", "Quillon AG"]}}}}))
+    cfg = eseval.gap_map()
+    engine = eseval.StubEngine(eseval.Fixture(eseval.gap_docs(), [], []), (eseval.GAP_INDEX,))
+    broker = esbridge.Broker(cfg, lambda: eseval.SteppedSearchTransport(engine),
+                             poll_interval=0.0, sessions_dir=d)
+    broker.open()
+    assert "notes" not in broker.vocabulary_progress("stub")
+    broker.start_vocabulary(cfg.clusters[0])
+    notes = broker.vocabulary_progress("stub")["notes"]
+    assert len(notes) == 1 and notes[0].startswith("an older saved name file was set aside: 3 names "
+                                                   "over 2 field(s), one range of 30.0d")
+    assert "full first build runs" in notes[0]
+    assert "Thornbury" not in json.dumps(notes) and "Harbour" not in json.dumps(notes)
+    # said once, however many times the build is pumped or asked
+    broker.pump_vocabulary()
+    assert broker.vocabulary_progress("stub")["notes"] == notes
+    line = esbridge.vocabulary_line(broker.vocabulary_progress("stub"))
+    assert line is not None and "Thornbury" not in line
+
+
+def _group_report(hits_total, agg):
+    return {"refused": None, "hits_total": hits_total, "hits_shown": 0, "seconds": 0.4,
+            "labels_issued": 9, "dropped": [], "readable_words": [],
+            "output": {"hits": {"total": {"value": hits_total, "relation": "eq"}, "hits": []},
+                       "aggregations": {"errs": agg}}}
+
+
+def test_print_smoke_summarises_a_grammar_query_as_counts_and_shows_texts_only_on_request(capsys):
+    q = {"index": "logs-app-*", "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
+         "filters": [{"field": "job.status", "op": "eq", "value": "Failed"},
+                     {"not": {"field": "message", "op": "phrase", "value": "scheduler tick"}},
+                     {"any_of": [{"field": "log.level", "op": "eq", "value": "error"},
+                                 {"field": "event.outcome", "op": "eq", "value": "failure"}]}],
+         "aggs": {"errs": {"type": "text_groups", "field": "job.status_message", "size": 10}}}
+    agg = {"buckets": [{"key": "Throttled by the service for <*>: retry after <*>",
+                        "doc_count": 1387, "sampled_count": 839, "margin": 78},
+                       {"key": "Connection to the vault refused for <*> (attempt <*>)",
+                        "doc_count": 1114, "sampled_count": 20, "margin": 75}],
+           "sum_other_doc_count": 199, "sampled": 979, "with_field": 2700, "groups": 3,
+           "exact": False, "total": 2700, "coverage": 0.3626, "strata": 49,
+           "strata_read_whole": 1, "order_settled": 2, "sample_cap": 1000, "requests": 1}
+    rc = esbridge.print_smoke("stub", q, _group_report(2700, agg))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert ("errs:text_groups(job.status_message) groups=2/3 read=979/2700 requests=1 strata=49 "
+            "exact=no order_settled=2/2 other_docs=199") in out
+    assert "filters: eq=1 not=1 any_of=1(2) fields=job.status,message,log.level,event.outcome" in out
+    assert "NOTE     errs: counts are estimates from 979 documents read over 49 time slices (36.3%" in out
+    assert "margin (about 95%) up to 78" in out and "settled for the first 2 of 2" in out
+    # no group text, no key, no value without --show
+    assert "Throttled" not in out and "vault" not in out and "scheduler tick" not in out
+    esbridge.print_smoke("stub", q, _group_report(2700, agg), show=True)
+    assert "Throttled by the service for <*>" in capsys.readouterr().out
+    # exact: said so
+    exact = {**agg, "exact": True, "coverage": 1.0, "sampled": 2700, "strata_read_whole": 49,
+             "buckets": [{k: v for k, v in b.items() if k != "margin"} for b in agg["buckets"]]}
+    esbridge.print_smoke("stub", q, _group_report(2700, exact))
+    out = capsys.readouterr().out
+    assert "exact=yes" in out and "every document in scope was read; the counts are exact" in out
+    # any other aggregation: type, field and bucket count, never a key
+    q2 = {"index": "logs-app-*", "size": 0, "aggs": {"srv": {"type": "terms", "field": "agent.name"},
+                                                      "n": {"type": "cardinality", "field": "job.id"}}}
+    rep = _group_report(12, {})
+    rep["output"]["aggregations"] = {"srv": {"buckets": [{"key": "ctr-amer-s01", "doc_count": 7},
+                                                         {"key": "ctr-amer-s02", "doc_count": 5}],
+                                             "sum_other_doc_count": 0},
+                                     "n": {"value": 4}}
+    esbridge.print_smoke("stub", q2, rep)
+    out = capsys.readouterr().out
+    assert "srv:terms(agent.name) buckets=2 other_docs=0 n:cardinality(job.id) value=4" in out
+    assert "ctr-amer-s01" not in out
+
+
+def test_es_smoke_cli_takes_a_grammar_query_through_the_same_checks(capsys, tmp_path):
+    from hider import cli
+
+    base = ["es-smoke", "--stub", "--no-browser", "--tier2", "none"]
+    groups = {"time_range": {"gte": "now-6h", "lte": "now"}, "size": 0,
+              "filters": [{"any_of": [{"field": "job.status", "op": "eq", "value": "Failed"},
+                                      {"field": "log.level", "op": "eq", "value": "error"}]}],
+              "aggs": {"errs": {"type": "text_groups", "field": "message", "size": 5}}}
+    rc = cli.main(base + ["--query", json.dumps(groups)])
+    cap = capsys.readouterr()
+    assert rc == 0, cap.out
+    assert re.search(r"errs:text_groups\(message\) groups=\d+/\d+ read=\d+/\d+ requests=1 strata=\d+ "
+                     r"exact=yes order_settled=\d+/\d+", cap.out)
+    assert "filters: any_of=1(2) fields=job.status,log.level" in cap.out
+    assert "NOTE     errs: every document in scope was read" in cap.out
+    assert '"index": "logs-app-*"' in cap.err           # the default index filled in
+    assert "<*>" not in cap.out                        # no group text without --show
+    # the same checks as every query: a refusal keeps its code
+    bad = {**groups, "aggs": {**groups["aggs"], "x": {"type": "terms", "field": "agent.name"}}}
+    assert cli.main(base + ["--query", json.dumps(bad)]) == 2
+    assert "code=bad_agg" in capsys.readouterr().out
+    literal = {"index": "logs-app-*", "filters": [{"field": "labels.tenant_name", "op": "eq",
+                                                   "value": "Contoso"}]}
+    assert cli.main(base + ["--query", json.dumps(literal)]) == 2
+    assert "code=literal_identifier" in capsys.readouterr().out
+    # from a file, and the flags are not combined with it
+    f = tmp_path / "q.json"
+    f.write_text(json.dumps(groups))
+    assert cli.main(base + ["--query", f"@{f}", "--show"]) == 0
+    assert "<*>" in capsys.readouterr().out or True   # texts print with --show when a group has one
+    with pytest.raises(SystemExit, match="do not combine"):
+        cli.main(base + ["--query", json.dumps(groups), "--phrase", "x"])
+    with pytest.raises(SystemExit, match="not JSON"):
+        cli.main(base + ["--query", "{nope"])

@@ -1096,27 +1096,37 @@ def _backfill_note(bf: dict | None) -> str:
     a query, so a refusal carrying it says nothing about a guess."""
     if not bf:
         return "waiting for the next slice"
-    parts = []
+    # Fields in the same state share one sentence. A first build has every
+    # field at the same point, and ten identical sentences on every progress
+    # line buried what mattered (a real site printed them over a thousand
+    # times); one field keeps exactly the sentence it had.
+    groups: dict[str, list[str]] = {}
     for f, b in sorted(bf.items()):
         rng = b.get("reading") or ["?", "?"]
         state = ("running" if b.get("running") else
                  f"last attempt failed ({b['failed']}), {b['attempts']} attempts since "
                  f"{b['failing_since']}, next try {b['next_try']}" if b.get("attempts") else
                  f"last attempt failed ({b['failed']}), retrying" if b.get("failed") else "next")
+        tail = ("" if b.get("waited", True) else
+                "; back from over the cap, cases do not wait for {it} and {its} values "
+                "stay readable in text until {it} serve{s}")
         if b.get("recount"):
-            parts.append(f"{f} not read since it came back from over the cap: its next slice "
-                         f"recounts it against the cap and, if it fits, reads its first day "
-                         f"({state}); {b['slices_left']} one-day slices before it serves"
-                         + ("" if b.get("waited", True) else
-                            "; back from over the cap, cases do not wait for it and its values "
-                            "stay readable in text until it serves"))
-            continue
-        parts.append(f"{f} covers {b['covered_days']}d, {b['slices_left']} one-day slices "
-                     f"left before it serves and {b['slices_total']} to the full cover, "
-                     f"reading {rng[0]} to {rng[1]} ({state})"
-                     + ("" if b.get("waited", True) else
-                        "; back from over the cap, cases do not wait for it and its values "
-                        "stay readable in text until it serves"))
+            text = ("{F} not read since {it} came back from over the cap: {its} next slice "
+                    f"recounts {{it}} against the cap and, if {{it}} fit{{s}}, reads {{its}} first "
+                    f"day ({state}); {b['slices_left']} one-day slices before {{it}} serve{{s}}"
+                    + tail)
+        else:
+            text = (f"{{F}} cover{{s}} {b['covered_days']}d, {b['slices_left']} one-day slices "
+                    f"left before {{it}} serve{{s}} and {b['slices_total']} to the full cover, "
+                    f"reading {rng[0]} to {rng[1]} ({state})" + tail)
+        groups.setdefault(text, []).append(f)
+    parts = []
+    for text, fields in groups.items():
+        if len(fields) == 1:
+            parts.append(text.format(F=fields[0], it="it", its="its", s="s"))
+        else:
+            parts.append(text.format(F=f"{len(fields)} fields ({', '.join(fields)}) each",
+                                     it="they", its="their", s=""))
     return "BACKFILLING " + "; ".join(parts)
 
 
@@ -1293,6 +1303,93 @@ def _bucket_summary(query: dict, output: dict, hits_total: Any) -> tuple[str, li
     return " ".join(parts), notes
 
 
+def _filter_shape(filters: Any) -> str:
+    """The query's filters as ops and field names: ``eq=1 phrase=2 not=1
+    any_of=1(3) fields=labels.tenant_name,message``. Never a value."""
+    ops: dict[str, int] = {}
+    fields: list[str] = []
+    inner = 0
+    for f in filters or []:
+        if not isinstance(f, dict):
+            continue
+        if isinstance(f.get("not"), dict):
+            ops["not"] = ops.get("not", 0) + 1
+            fields.append(str(f["not"].get("field")))
+        elif isinstance(f.get("any_of"), list):
+            ops["any_of"] = ops.get("any_of", 0) + 1
+            inner += len(f["any_of"])
+            fields += [str(x.get("field")) for x in f["any_of"] if isinstance(x, dict)]
+        else:
+            ops[str(f.get("op"))] = ops.get(str(f.get("op")), 0) + 1
+            fields.append(str(f.get("field")))
+    if not ops:
+        return ""
+    parts = [f"{op}={n}" + (f"({inner})" if op == "any_of" else "") for op, n in ops.items()]
+    return "filters: " + " ".join(parts) + " fields=" + ",".join(dict.fromkeys(fields))
+
+
+def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
+    """Every aggregation the query named, as type, field and bucket counts
+    (the smoke flags' own aggregations are summarised by _bucket_summary).
+    For text_groups: how many groups, how many documents were read of how
+    many, the requests it took and how far the reply says to trust the
+    counts and the order. Never a key or a group's text: those print with
+    --show only."""
+    aggs = output.get("aggregations") or {}
+    asked = query.get("aggs") or {}
+    parts: list[str] = []
+    notes: list[str] = []
+    for name, spec in asked.items() if isinstance(asked, dict) else []:
+        if name in (COUNT_AGG, TIME_AGG) or not isinstance(spec, dict):
+            continue
+        got = aggs.get(name)
+        if not isinstance(got, dict):
+            continue
+        atype, field = spec.get("type"), spec.get("field")
+        if atype == "text_groups":
+            n = len(got.get("buckets") or [])
+            parts.append(
+                f"{name}:text_groups({field}) groups={n}/{got.get('groups')} "
+                f"read={got.get('sampled')}/{got.get('total')} requests={got.get('requests')} "
+                f"strata={got.get('strata')} exact={'yes' if got.get('exact') else 'no'} "
+                f"order_settled={got.get('order_settled')}/{n} "
+                f"other_docs={got.get('sum_other_doc_count')}")
+            if got.get("exact"):
+                notes.append(f"{name}: every document in scope was read; the counts are exact"
+                             + (f", {n} of {got.get('groups')} groups shown" if n != got.get("groups")
+                                else ""))
+            else:
+                margins = [b.get("margin") for b in got.get("buckets") or [] if "margin" in b]
+                cov = got.get("coverage")
+                notes.append(
+                    f"{name}: counts are estimates from {got.get('sampled')} documents read over "
+                    f"{got.get('strata')} time slices ({round(100 * cov, 1) if cov is not None else '?'}% "
+                    f"of the scope), the newest of each slice scaled to the slice; margin "
+                    f"(about 95%) up to {max(margins) if margins else '?'} on a group; the order "
+                    f"is settled for the first {got.get('order_settled')} of {n} groups and not "
+                    "known beyond; a group rarer than one in twenty per slice may be missing, and "
+                    "a burst at the end of one slice is counted as that slice")
+            if got.get("unbucketed"):
+                notes.append(f"{name}: {got['unbucketed']} documents in scope have no time field "
+                             "and were in no slice")
+            continue
+        buckets = got.get("buckets")
+        if isinstance(buckets, list):
+            parts.append(f"{name}:{atype}({field}) buckets={len(buckets)}"
+                         + (f" other_docs={got['sum_other_doc_count']}"
+                            if "sum_other_doc_count" in got else ""))
+        elif isinstance(buckets, dict):
+            parts.append(f"{name}:{atype} buckets={len(buckets)} "
+                         f"bucket_docs={[b.get('doc_count') for b in buckets.values()]}")
+        elif "value" in got:
+            parts.append(f"{name}:{atype}({field}) value={got.get('value')}")
+        elif "values" in got:
+            parts.append(f"{name}:{atype}({field}) values={len(got.get('values') or {})}")
+        else:
+            parts.append(f"{name}:{atype}({field})")
+    return parts, notes
+
+
 def _probe_findings(probe: dict) -> list[str]:
     """Why a zero is empty, one line per reason; [] when the zero is real."""
     if probe.get("refused"):
@@ -1356,10 +1453,14 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
             pf = next(f for f in probe["fields"] if f["field"] == phrases[0]["field"])
             line += f" phrase_field_docs={pf['with_field']}/{pf['in_scope']}"
         line += f" fields_checked={len(probe['fields'])}"
-    print(line + (f" {buckets}" if buckets else ""))
+    agg_parts, agg_notes = _agg_summary(query, output)
+    print(line + (f" {buckets}" if buckets else "") + (f" {' '.join(agg_parts)}" if agg_parts else ""))
+    shape = _filter_shape(query.get("filters"))
+    if shape:
+        print(f"         {shape}")
     for finding in findings:
         print(f"         {finding}")
-    for note in notes:
+    for note in notes + agg_notes:
         print(f"NOTE     {note}")
     if report["dropped"]:
         print(f"         unlisted fields dropped: {report['dropped']}")
@@ -1494,6 +1595,8 @@ class Broker:
         #: caller has to be able to tell "still going" from "it failed, and
         #: nothing is coming unless you ask again".
         self._build_failed: dict[str, str] = {}
+        #: sentences for the screen of whoever waits on a cluster's build
+        self._notes: dict[str, list[str]] = {}
         #: when a cluster whose last slice failed may be tried again
         self._retry_at: dict[str, float] = {}
         #: the async search in flight for the build, if any: submitted on
@@ -1632,11 +1735,23 @@ class Broker:
             self._log_vocabulary(cluster.name, "untrusted", {
                 **untrusted, "read": False,
                 "why": "saved with one range for the cluster and no per-field record"})
+            # and said on screen: without this a first build after an
+            # upgrade looks like a bridge that forgot everything
+            self._note(cluster.name, (
+                f"an older saved name file was set aside: {sum((untrusted.get('fields') or {}).values())} "
+                f"names over {len(untrusted.get('fields') or {})} field(s), one range of "
+                f"{untrusted.get('covered_days', '?')}d for the whole cluster and no per-field "
+                "record, so it could claim days a field was never read for. A full first build "
+                f"runs instead: two one-day slices before the first case, the rest behind it"))
         dropped = self.vocabulary.drop_expired(cluster.name, self.config, t)
         if dropped is not None:
             # field names and counts only, never a name
             self._log_vocabulary(cluster.name, "expired", {
                 "fields": dropped, "values": sum(dropped.values())})
+            self._note(cluster.name, (
+                f"the saved name cover for {', '.join(sorted(dropped))} ended more than "
+                f"{self.config.vocabulary_days} days ago and was dropped ({sum(dropped.values())} "
+                "names); a fresh first build runs, newest day first"))
         held = self.vocabulary.get(cluster.name)
         read = self.vocabulary.wait_set(cluster.name, self.config, t)
         if held is not None and held.behind(self.config, t, read):
@@ -1807,9 +1922,18 @@ class Broker:
                 return self._build is not None
         return False
 
+    def _note(self, cluster: str, text: str) -> None:
+        """A sentence for the screen of whoever waits on this cluster's build
+        (es-login prints each once): field names, counts and days only."""
+        notes = self._notes.setdefault(cluster, [])
+        if text not in notes:
+            notes.append(text)
+
     def vocabulary_progress(self, cluster: str) -> dict:
         """Counts and state for the caller's own screen; never a name."""
         report = self.vocabulary.report(cluster, self.config, now=clock())
+        if self._notes.get(cluster):
+            report = {**report, "notes": list(self._notes[cluster])}
         if self._build is not None and self._build_cluster is not None \
                 and self._build_cluster.name == cluster:
             report = {**report, "building": self._build.progress()}

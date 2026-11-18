@@ -337,11 +337,41 @@ def _eq_pairs(raw: list[str]) -> list[tuple[str, str]]:
 
 
 def _smoke_query(esbridge, cfg, args: argparse.Namespace, size: int) -> dict:
-    q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
-                             until=args.until, count_by=args.count_by,
-                             interval=args.interval, buckets=args.buckets,
-                             phrase_field=args.phrase_field, eq=args.eq_pairs)
+    if getattr(args, "query", None):
+        q = _grammar_query(cfg, args)
+    else:
+        q = esbridge.smoke_query(cfg, args.index, args.phrase, size=size, since=args.since,
+                                 until=args.until, count_by=args.count_by,
+                                 interval=args.interval, buckets=args.buckets,
+                                 phrase_field=args.phrase_field, eq=args.eq_pairs)
     print(f"query     {json.dumps(q)}", file=sys.stderr)
+    return q
+
+
+def _grammar_query(cfg, args: argparse.Namespace) -> dict:
+    """``--query``: any query the grammar accepts, as JSON text, ``@file``
+    or ``-`` for stdin. Sent as written - the same compile, vocabulary
+    gate, probe and scrub as every other query - except that ``index``
+    defaults to the first configured pattern when it is left out, as the
+    flags do. Nothing here validates it: a bad query is the grammar's
+    refusal, with its code."""
+    raw = args.query
+    if raw == "-":
+        raw = sys.stdin.read()
+    elif raw.startswith("@"):
+        raw = Path(raw[1:]).expanduser().read_text(encoding="utf-8")
+    try:
+        q = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--query is not JSON: {e.msg} at character {e.pos}") from None
+    if not isinstance(q, dict):
+        raise SystemExit("--query is a JSON object: {\"index\": ..., \"filters\": [...], ...}")
+    if args.phrase or args.eq or args.count_by or args.interval or args.phrase_field \
+            or args.size is not None:
+        raise SystemExit("--query is the whole query; do not combine it with --phrase, --eq, "
+                         "--phrase-field, --size, --count-by or --interval")
+    if "index" not in q:
+        q = {"index": args.index or cfg.indices[0], **q}
     return q
 
 
@@ -468,22 +498,34 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
         print("reading the cluster's customer names once, so a name in message text can be "
               "labelled. This is the slow part of signing in; cases are refused until it "
               "finishes.", file=sys.stderr)
+        # No ceiling by default: a healthy bridge is waited for however long
+        # its slices take (nine-minute slices and a retry ran a fixed thirty
+        # minutes out, and the exit looked like a failure). --max-wait sets
+        # one; the wait still ends on a failure or a stall.
         state = _wait_for_vocabulary(
-            esbridge.BrokerClient(sock, timeout=60), cluster.name)
-        if state.get("state") == "catching_up":
-            print(f"the saved name vocabulary for {cluster.name} ends {state.get('age_s', 0) / 3600:.1f}h "
-                  f"ago; cases are refused until the top-up reads {(state.get('gap') or ['?'])[0]} "
-                  f"to now: {esbridge._catch_up_note(state.get('catch_up'))}. The bridge keeps "
-                  "reading, one day a slice - run es-login again to see the progress.")
+            esbridge.BrokerClient(sock, timeout=60), cluster.name,
+            timeout=args.max_wait if args.max_wait else None)
+        if state.get("state") == "failed" or state.get("stalled_s") is not None:
+            print(f"the name vocabulary build for {cluster.name} is not progressing"
+                  + (f": {state.get('refused')}" if state.get("refused") else "")
+                  + "; cases are refused until the recent days are read")
             return 1
+        if state.get("state") == "catching_up":
+            print(f"the bridge is healthy and still reading; this is not a failure. The saved "
+                  f"name vocabulary for {cluster.name} ends {state.get('age_s', 0) / 3600:.1f}h "
+                  f"ago; cases are refused until the top-up reads {(state.get('gap') or ['?'])[0]} "
+                  f"to now: {esbridge._catch_up_note(state.get('catch_up'))}. It keeps reading, "
+                  "one day a slice - run es-login again to wait for it or see the progress.")
+            return 3
         if state.get("state") == "building" and not state.get("serving"):
-            print(f"the name vocabulary for {cluster.name} does not yet cover the last "
-                  f"{elastic.VOCABULARY_SERVE_DAYS} days for every field it reads; cases will "
-                  "be refused until it does"
+            print(f"the bridge is healthy and still reading; this is not a failure. The name "
+                  f"vocabulary for {cluster.name} does not yet cover the last "
+                  f"{elastic.VOCABULARY_SERVE_DAYS} days for every field it reads; cases are "
+                  "refused until it does"
                   + (f": {esbridge._backfill_note(state['backfill'])}" if state.get("backfill")
                      else "")
-                  + ". The bridge keeps reading - run es-login again to see the progress.")
-            return 1
+                  + ". It keeps reading - run es-login again to wait for it or see the progress.")
+            return 3
         return 0
     print(f"timed out: cluster {cluster.name} did not reach Kibana; run es-login again")
     return 1
@@ -750,13 +792,64 @@ def _es_research_stub(args: argparse.Namespace) -> int:
         shutil.rmtree(base, ignore_errors=True)
 
 
-def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
-                         quiet: bool = False) -> dict:
+#: how often the wait prints a line when nothing coarse has changed
+_PROGRESS_HEARTBEAT_S = 60.0
+#: on top of a slice budget: how long the bridge may make no progress at
+#: all (no request, no slice, no retry) before the wait calls it stalled
+_STALL_GRACE_S = 120.0
+
+
+def _progress_key(v: dict | None) -> tuple:
+    """Everything that moves while a build is healthy: a request sent, a
+    field done, a slice landed, a retry made. Unchanged for a whole slice
+    budget means the bridge is stuck, not slow."""
+    if not v:
+        return ()
+    b = v.get("building") or {}
+    cu = v.get("catch_up") or {}
+    bf = v.get("backfill") or {}
+    return (v.get("state"), v.get("serving"), b.get("requests"), b.get("fields_done"),
+            b.get("field"), v.get("covered_days"), v.get("refused"),
+            cu.get("slices_left"), cu.get("failed"), cu.get("running"),
+            tuple(sorted((f, x.get("slices_left"), x.get("attempts"), x.get("running"))
+                         for f, x in bf.items())),
+            len(v.get("notes") or ()))
+
+
+def _coarse_key(v: dict | None) -> tuple:
+    """What is worth a new line on the screen: a slice landing, a field
+    finishing, a state change, a failure - not every request."""
+    if not v:
+        return ()
+    b = v.get("building") or {}
+    cu = v.get("catch_up") or {}
+    bf = v.get("backfill") or {}
+    return (v.get("state"), v.get("serving"), b.get("fields_done"), b.get("fields_total"),
+            v.get("covered_days"), v.get("refused"), cu.get("slices_left"), cu.get("failed"),
+            tuple(sorted((f, x.get("slices_left"), x.get("attempts")) for f, x in bf.items())),
+            tuple(sorted((v.get("over_cap") or {}).items())))
+
+
+def _wait_for_vocabulary(control, cluster: str, *, timeout: float | None = None,
+                         quiet: bool = False, stall_s: float | None = None) -> dict:
     """Start the cluster's name vocabulary build and wait for it.
 
     The build is paid once per bridge, and a case opened before it finishes
     is refused, so every entry point that opens a case waits here first.
     Progress goes to stderr as counts, never a name.
+
+    The wait ends when the cover serves cases, when the bridge reports a
+    failure or stops answering, when it makes **no progress** for a slice
+    budget plus a grace (``stall_s``; the result then carries
+    ``stalled_s``), or when ``timeout`` seconds have passed (None: no
+    ceiling - a healthy bridge is waited for however long its slices take;
+    0: look once). It used to be a fixed thirty minutes, and a catch-up of
+    three nine-minute slices with one retry ran past it while the bridge
+    was healthy and minutes from done: to the person that looked like a
+    failure. A line is printed when something coarse changes (a slice, a
+    field, the state) or every ``_PROGRESS_HEARTBEAT_S``, not on every
+    request; the bridge's notes (an older saved file set aside, a cover
+    dropped) print once each.
     """
     from . import elastic, esbridge
 
@@ -776,26 +869,56 @@ def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
             return None
 
     state = poll(build=True)
-    deadline = time.monotonic() + timeout
-    shown = None
+    started = time.monotonic()
+    deadline = started + timeout if timeout is not None else None
+    shown_coarse: tuple = ()
+    shown_at = 0.0
+    notes_shown: set[str] = set()
+    progress = _progress_key(state)
+    progress_at = time.monotonic()
+    stalled = None
+
+    def say(v: dict | None, *, force: bool = False) -> None:
+        nonlocal shown_coarse, shown_at
+        if quiet or not v:
+            return
+        for note in v.get("notes") or ():
+            if note not in notes_shown:
+                notes_shown.add(note)
+                print(f"NOTE     {note}", file=sys.stderr)
+        key = _coarse_key(v)
+        now = time.monotonic()
+        if force or key != shown_coarse or now - shown_at >= _PROGRESS_HEARTBEAT_S:
+            line = esbridge.vocabulary_line(v)
+            if line:
+                print(line, file=sys.stderr)
+            shown_coarse, shown_at = key, now
+
     # The wait ends when the cover reaches the recent days ("serving"), not
     # when the whole of vocabulary.days is in: that is hours on a real
     # estate, and the older slices keep building behind the case.
     # "failed" ends it as surely, or a caller would wait out the timeout.
     while (state is None or (state.get("state") in ("building", "catching_up")
                              and not state.get("serving"))) \
-            and time.monotonic() < deadline:
-        line = esbridge.vocabulary_line(state) if state else None
-        if line and line != shown and not quiet:
-            print(line, file=sys.stderr)
-            shown = line
+            and (deadline is None or time.monotonic() < deadline):
+        say(state)
+        now = time.monotonic()
+        key = _progress_key(state)
+        if key != progress:
+            progress, progress_at = key, now
+        budget = ((state or {}).get("building") or {}).get("budget_s")
+        allowed = stall_s if stall_s is not None else (
+            float(budget) if budget else float(elastic.DEFAULT_VOCABULARY_BUDGET_S)) + _STALL_GRACE_S
+        if state is not None and now - progress_at >= allowed:
+            stalled = round(now - progress_at)
+            break
         time.sleep(0.05)
         state = poll()
     state = state or {"state": "building"}
+    if stalled is not None:
+        state = {**state, "stalled_s": stalled}
+    say(state, force=True)
     if not quiet:
-        line = esbridge.vocabulary_line(state)
-        if line:
-            print(line, file=sys.stderr)
         if state.get("state") in {"extending", "top_up_due"}:
             print("the recent days are in, so cases can run now; the bridge keeps reading "
                   "further back on its own. A name logged only in a day not yet covered is "
@@ -805,6 +928,10 @@ def _wait_for_vocabulary(control, cluster: str, *, timeout: float = 1800.0,
             print(f"the name vocabulary build stopped: {state.get('refused')}. Cases stay "
                   "refused until the recent days are read; the bridge retries on its own, "
                   "and es-login again shows the progress.", file=sys.stderr)
+        if stalled is not None:
+            print(f"the bridge answered but made no progress for {stalled // 60} minutes (no "
+                  "request, no slice, no retry): it is stuck, not slow. es-logout and es-login "
+                  "again restarts it; the slices already saved stay.", file=sys.stderr)
     return state
 
 
@@ -1140,6 +1267,13 @@ def main(argv: list[str] | None = None) -> int:
                          "ordinary words and stay readable in text). Off by default: this "
                          "output is read by scripts too, so a customer name is never printed "
                          "unasked")
+    sm.add_argument("--query", metavar="JSON",
+                    help="any query the grammar accepts, as JSON text, @file or - for stdin: "
+                         "filters with not/any_of, text_groups, any aggregation. Sent as "
+                         "written through the same checks as every query; index defaults to "
+                         "the first configured. Not combined with the query-building flags. "
+                         "The summary stays counts, codes, timings and field names; group "
+                         "texts and keys print with --show only")
     sm.add_argument("--log", help="append a decision-log row to this JSONL file")
     sm.set_defaults(fn=_cmd_es_smoke)
 
@@ -1148,7 +1282,13 @@ def main(argv: list[str] | None = None) -> int:
     lg.add_argument("--cluster", required=True)
     lg.add_argument("--config")
     lg.add_argument("--profile-dir")
-    lg.add_argument("--timeout", type=float, default=600.0)
+    lg.add_argument("--timeout", type=float, default=600.0,
+                    help="seconds to wait for the sign-in itself (default 600)")
+    lg.add_argument("--max-wait", type=float, default=0.0,
+                    help="seconds to wait for the name vocabulary before leaving it reading "
+                         "in the bridge (exit 3, not a failure). Default 0: wait while the "
+                         "bridge makes progress, however long its slices take; a build that "
+                         "fails or stalls ends the wait anyway (exit 1)")
     lg.set_defaults(fn=_cmd_es_login)
 
     sd = sub.add_parser("es-seed", help="add a name to an open es-research case without ending "

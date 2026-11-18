@@ -81,6 +81,10 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m hider serve                  # web UI on 127.0.0.1:8790
 .venv/bin/python -m hider es-eval                # Elasticsearch core: leaks, refusals, oracle cases, no cluster
 .venv/bin/python -m hider es-smoke --stub        # one query through Chrome against a synthetic Kibana
+.venv/bin/python -m hider es-smoke --cluster emea --query '{"time_range": {"gte": "now-7d", "lte": "now"},
+    "size": 0, "filters": [{"field": "job.status", "op": "eq", "value": "Failed"}],
+    "aggs": {"errs": {"type": "text_groups", "field": "job.status_message", "size": 10}}}'
+                                                 # any grammar query, same checks, summary of counts only
 .venv/bin/python -m hider es-login --cluster emea # start the bridge, sign in (headed, once per bridge),
                                                  # then build the name vocabulary: minutes on a large estate
 .venv/bin/python -m hider es-research --case c1 --term "<customer>"   # Claude Code, bridge tools only
@@ -608,6 +612,78 @@ Listed with owners in the README's Limitations section and in
   backing index (`.ds-<stream>-<date>-<gen>`), which `index_allowed`
   checks by stream. The stub enforces the same rules (cookie sessions, an
   IdP that refuses headless and fetches).
+  **es-login waits for a healthy bridge however long its slices take.**
+  `cli._wait_for_vocabulary` waited a fixed thirty minutes and then
+  exited 1 with a refusal message. On a cluster where a day's slice takes
+  about nine minutes, a long weekend's catch-up is three slices, one
+  retry pushed it past thirty, and es-login gave up while the bridge was
+  healthy and minutes from done: to the person, a failure. Now the wait
+  has **no ceiling by default** and ends on one of four things: the
+  cover serves cases (exit 0, as before); the bridge reports a failure or
+  stops answering (exit 1); the bridge **stalls** - its progress key
+  (state, requests sent, field being read, slices left, retry attempts,
+  notes) unchanged for one slice budget plus `_STALL_GRACE_S` (120s),
+  which is a bridge that answers ping and does nothing, not a slow one
+  (exit 1, `stalled_s` in the state, "stuck, not slow" on screen); or a
+  ceiling the person set with `--max-wait SECONDS` (exit **3**: "the
+  bridge is healthy and still reading; this is not a failure", with the
+  same words for a build that is still catching up or backfilling when
+  the wait ends). 3 rather than 1 so a script can tell "come back later"
+  from "broken". Cost: with no ceiling, es-login on a bridge whose slices
+  are legitimately slow sits there for as long as they take, printing
+  progress; Ctrl-C leaves the bridge reading. **Progress lines are per
+  change, not per request**: a line prints when something coarse moves
+  (state, a field done, a slice landed, a retry, an over-cap decision) or
+  every `_PROGRESS_HEARTBEAT_S` (60s), where it used to print every time
+  the line's text changed - which was every request. And
+  `esbridge._backfill_note` says one sentence per **state**, not per
+  field: a first build has every field at the same point, and ten
+  identical sentences on every line (a real site saw them more than a
+  thousand times) buried what mattered; `BACKFILLING 10 fields (a, b, …)
+  each cover 0d, 2 one-day slices left before they serve …`, while a
+  single field keeps exactly the sentence it had (pinned). **What was set
+  aside is said on screen**: the broker keeps per-cluster `notes`
+  (`Broker._note`, in `vocabulary_progress`), one sentence each, printed
+  once by es-login as `NOTE`: an older one-range file set aside (how many
+  names over how many fields, its range, why it cannot be trusted, and
+  that a full first build runs with two slices before the first case),
+  and a cover dropped for ending outside `vocabulary.days`. Field names,
+  counts and days; never a name. Before this the file was logged as
+  `untrusted` in `vocabulary.log.jsonl` and nothing on the screen said
+  why a full first build was running. Tests in `test_esbridge.py`: the
+  wait over ninety simulated minutes of progress (not given up, a line
+  per change, the note once), the stall and the ceiling, the exit codes,
+  the broker's note, the grouped sentence.
+
+  **es-smoke runs any query the grammar accepts** (`--query JSON`,
+  `@file`, or `-` for stdin), because a person could otherwise only run
+  what a handful of flags build - no `text_groups`, no `not` or `any_of`,
+  no nested aggregation - against a real cluster without starting a
+  model. The query is sent **as written** through exactly the path every
+  query takes (`Broker._run` → `Bridge.run`: compile, vocabulary gate,
+  compile again, phrase spend, probe, scrub, decision log); the only
+  thing filled in is `index`, from `--index` or the first configured
+  pattern, as the flags do. Nothing in the CLI validates it: a bad query
+  is the grammar's refusal with its code. `--query` is not combined with
+  the query-building flags (`SystemExit`). **The summary stays safe to
+  copy into a report**: the `OK` line carries, for each aggregation the
+  query named, its type, field and bucket count (`srv:terms(agent.name)
+  buckets=5 other_docs=16`, `n:cardinality(job.id) value=28`), and for
+  `text_groups` `groups=shown/found read=sampled/total requests=N
+  strata=K exact=yes|no order_settled=S/shown other_docs=…`, with a
+  `NOTE` saying how far the reply says to trust it (exact: every
+  document read; estimated: documents read over how many slices and what
+  share of the scope, the largest margin, how many leading groups the
+  order is settled for, the two declared misses) and one for
+  `unbucketed`; the filters print as ops and field names only (`filters:
+  eq=1 not=1 any_of=1(2) fields=job.status,message,log.level`). **Never a
+  key, a group's text or a value**: those print with `--show` only, as
+  the page does, and `--show-readable-names` is unchanged. Zero hits on a
+  query with `not` or `any_of` skip the field probe, as before
+  (`field_probe` returns None for them). The stub path (`--stub`) takes
+  `--query` too. Tests: `test_print_smoke_summarises_a_grammar_query_as_counts_and_shows_texts_only_on_request`,
+  `test_es_smoke_cli_takes_a_grammar_query_through_the_same_checks`.
+
   Clients must tell a busy broker from a dead one: `broker_state` returns
   `running`/`busy`/`absent` (a failed connect is absent, a timeout with
   the socket file still there is busy), `cli._wait_for_vocabulary` treats
