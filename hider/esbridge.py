@@ -538,9 +538,14 @@ class Bridge:
 
     def __init__(self, config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
                  session: KibanaSession, *, log_path: str | Path | None = None,
+                 presence: dict | None = None,
                  index: elastic.VocabularyIndex | None = None) -> None:
         self.config = config
         self.scrubber = scrubber
+        #: (index, field) -> when the field was last seen present in that
+        #: index, on a page or by an empty-result check. Field names and
+        #: times only, so a broker may share one across its cases.
+        self.presence: dict[tuple[str, str], float] = presence if presence is not None else {}
         self.session = session
         self.log_path = Path(log_path) if log_path else None
         self._lock = threading.Lock()
@@ -599,7 +604,7 @@ class Bridge:
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
                 if compiled.group_read is not None:
-                    # a text_groups read: one to three requests, a page's
+                    # a text_groups read: two to four requests, a page's
                     # worth each, every reply scrubbed with its own plan
                     scrubbed, requests = esquery.read_text_groups(
                         lambda body: self.session.search(cluster, body), self.scrubber,
@@ -615,6 +620,18 @@ class Bridge:
                 outcome.hits_total = total.get("value") if isinstance(total, dict) else None
                 outcome.hits_shown = len(scrubbed.output.get("hits", {}).get("hits", []))
                 outcome.text_queries = len(compiled.text_queries)
+                if outcome.hits_shown:
+                    self._remember_fields(query.get("index"), scrubbed.output)
+                if outcome.hits_total == 0:
+                    # what the zero means: about the fields, never the value
+                    empty = self._explain_empty(cluster, query)
+                    if empty is not None:
+                        scrubbed.output["empty"] = empty
+                        row["empty_check"] = {"requests": empty["requests"],
+                                              "seconds": empty["seconds"],
+                                              "fields": {f: x["status"]
+                                                         for f, x in empty["fields"].items()},
+                                              "window_documents": empty.get("window_documents")}
                 row.update({"hits_total": outcome.hits_total, "hits_shown": outcome.hits_shown,
                             "dropped_fields": scrubbed.stats.get("dropped_fields", 0),
                             # how many labels and keep values this page made
@@ -649,6 +666,157 @@ class Bridge:
                 self.outcomes.append(outcome)
                 self._log(row)
         return outcome
+
+    # -- an empty result: what the zero means ------------------------------
+
+    def _remember_fields(self, index: Any, output: dict) -> None:
+        """Every field a page showed non-empty is present in this index:
+        remembered for PRESENCE_TTL_S, so a later zero on it needs no
+        window check. Field names and a time, nothing else."""
+        if not isinstance(index, str):
+            return
+        now = clock()
+        for h in output.get("hits", {}).get("hits", []) or []:
+            for path, value in _leaf_paths(h.get("_source") if isinstance(h, dict) else None):
+                if value not in (None, "", [], {}):
+                    self.presence[(index, path)] = now
+
+    def _presence_count(self, cluster: elastic.Cluster, query: dict,
+                        filters: list[dict]) -> int | None:
+        """Documents in the query's index and window matching ``filters``,
+        counted up to EMPTY_CHECK_CAP. The same compile as any query (label
+        rules, caps; the phrases are the query's own, already spent, so
+        nothing is charged), then one request with its total capped. None
+        when the check itself is refused or fails."""
+        probe: dict[str, Any] = {"index": query["index"], "size": 0, "filters": filters}
+        if "time_range" in query:
+            probe["time_range"] = query["time_range"]
+        try:
+            compiled = esquery.compile_query(probe, self.config, self.scrubber)
+            compiled.body["params"]["body"]["track_total_hits"] = EMPTY_CHECK_CAP
+            envelope = self.session.search(cluster, compiled.body)
+            out = self.scrubber.scrub_response(envelope, compiled.plan).output
+        except elastic.Refused:
+            return None
+        total = (out.get("hits") or {}).get("total") or {}
+        return total.get("value") if isinstance(total.get("value"), int) else None
+
+    def _explain_empty(self, cluster: elastic.Cluster, query: dict) -> dict | None:
+        """Why a filtered query found nothing, as facts about its fields.
+
+        Two questions per filtered field, each one capped count
+        (``_presence_count``), asked in an order that stops early:
+
+        1. Is the field filled **anywhere in this index and window**? A
+           field remembered present in the index within PRESENCE_TTL_S (a
+           page showed it, or an earlier check found it) costs no request.
+           A field absent from the whole window explains the zero on its
+           own - its filter cannot match here, whatever it says - and the
+           other fields are not asked about their scope, since that scope
+           is empty because of it.
+        2. Otherwise, is it filled on the documents the **other plain
+           filters** leave? Present: the filter on it matched none of them
+           (a real zero for that filter). Absent: the fields never meet on
+           one document in this window.
+
+        Fields inside ``any_of`` are checked like plain ones; ``not`` and
+        ``any_of`` filters are left out of the "other filters" scope. A
+        present field is confirmed at the first hundred documents and an
+        absent one has no postings, so the whole check is a few requests
+        and milliseconds where the old one counted every document in the
+        window per field (30-39 s a day on a real cluster). **Nothing here
+        is about the value**: statuses, counts and sentences name fields,
+        and a filter's own value never enters its field's count.
+        """
+        t0 = time.perf_counter()
+        plain = [f for f in query.get("filters") or [] if isinstance(f, dict)
+                 and "not" not in f and "any_of" not in f and isinstance(f.get("field"), str)]
+        inner = [x for f in query.get("filters") or [] if isinstance(f, dict)
+                 for x in (f.get("any_of") or []) if isinstance(x, dict)
+                 and isinstance(x.get("field"), str)]
+        fields = list(dict.fromkeys([f["field"] for f in plain] + [x["field"] for x in inner]))
+        index = query.get("index")
+        requests = 0
+        now = clock()
+        result: dict[str, dict] = {}
+        window_total: int | None = None
+        if not fields:
+            window_total = self._presence_count(cluster, query, [])
+            requests += 1
+        # 1. anywhere in the window
+        asked = False
+        for name in fields:
+            exists = {"field": name, "op": "exists"}
+            if now - self.presence.get((index, name), -1e18) < PRESENCE_TTL_S:
+                result[name] = {"status": "present_in_window", "in_index": "remembered within the hour"}
+                continue
+            n_win = self._presence_count(cluster, query, [exists])
+            requests += 1
+            asked = True
+            if n_win is None:
+                result[name] = {"status": "unknown"}
+            elif n_win > 0:
+                self.presence[(index, name)] = now
+                result[name] = {"status": "present_in_window",
+                                "in_index": (f">={EMPTY_CHECK_CAP}" if n_win >= EMPTY_CHECK_CAP
+                                             else n_win)}
+            else:
+                result[name] = {"status": "absent_in_window", "in_index": 0}
+        if fields and not asked:
+            # every field came from memory, which is about the index, not
+            # this window: one capped count says whether the window holds
+            # anything at all before the fields are called present here
+            window_total = self._presence_count(cluster, query, [])
+            requests += 1
+        if any(x["status"] == "absent_in_window" for x in result.values()):
+            # explained; is there anything in the window at all?
+            if window_total is None:
+                window_total = self._presence_count(cluster, query, [])
+                requests += 1
+        elif fields and window_total != 0 \
+                and all(x["status"] == "present_in_window" for x in result.values()):
+            # 2. on the documents the other plain filters leave
+            left: dict[str, int | None] = {}
+            for name in fields:
+                others = [f for f in plain if f.get("field") != name]
+                if not others:
+                    result[name]["status"] = "present"
+                    result[name]["scope"] = "window"
+                    continue
+                n_scope = self._presence_count(cluster, query, others + [{"field": name,
+                                                                          "op": "exists"}])
+                requests += 1
+                result[name]["scope"] = "other filters"
+                if n_scope is None:
+                    result[name]["status"] = "unknown"
+                elif n_scope > 0:
+                    result[name]["status"] = "present"
+                    result[name]["docs_with_field"] = (f">={EMPTY_CHECK_CAP}"
+                                                       if n_scope >= EMPTY_CHECK_CAP else n_scope)
+                else:
+                    # none carry it among what the others leave - or the
+                    # others leave nothing, in which case this field is not
+                    # the reason (one count per distinct set of others)
+                    key = json.dumps(others, sort_keys=True)
+                    if key not in left:
+                        left[key] = self._presence_count(cluster, query, others)
+                        requests += 1
+                    if left[key] == 0:
+                        result[name]["status"] = "others_empty"
+                    elif left[key] is None:
+                        result[name]["status"] = "unknown"
+                    else:
+                        result[name]["status"] = "absent_in_scope"
+                        result[name]["docs_with_field"] = 0
+                        result[name]["others_leave"] = (f">={EMPTY_CHECK_CAP}"
+                                                        if left[key] >= EMPTY_CHECK_CAP else left[key])
+        empty: dict[str, Any] = {"fields": result, "requests": requests,
+                                 "seconds": round(time.perf_counter() - t0, 3),
+                                 "meaning": _empty_meaning(result, window_total, bool(fields))}
+        if window_total is not None:
+            empty["window_documents"] = (f">={EMPTY_CHECK_CAP}" if window_total >= EMPTY_CHECK_CAP
+                                         else window_total)
+        return empty
 
     def _apply_vocabulary(self, cluster: elastic.Cluster) -> bool:
         """Give this case the names the bridge already read for the cluster.
@@ -866,6 +1034,55 @@ def _describe(query: dict, compiled: esquery.Compiled) -> dict:
     }
 
 
+def _leaf_paths(node: Any, prefix: str = ""):
+    """(dotted path, value) for every scalar or list leaf of a source."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                yield from _leaf_paths(v, path)
+            else:
+                yield path, v
+
+
+def _empty_meaning(fields: dict[str, dict], window_total: int | None, had_fields: bool) -> str:
+    """One sentence per finding, about fields and counts; the filter's
+    value is never mentioned."""
+    if window_total == 0:
+        return ("no document in this index and window at all: the 0 says nothing about the "
+                "filters")
+    if not had_fields:
+        return "no filter and no document: the window holds nothing"
+    absent = [n for n, x in fields.items() if x["status"] == "absent_in_window"]
+    if absent:
+        return ("; ".join(f"{n} is not filled on any document in this index and window: its "
+                          "filter cannot match here, whatever it says" for n in absent)
+                + "; the other filtered fields were not checked further, since that filter "
+                  "alone empties the result")
+    parts = []
+    present = [n for n, x in fields.items() if x["status"] == "present"]
+    if present and all(x["status"] in ("present", "others_empty") for x in fields.values()):
+        return ("; ".join(
+            f"{n} is filled on the documents the other filters leave"
+            + (f" ({fields[n]['docs_with_field']} carry it)" if "docs_with_field" in fields[n]
+               else "")
+            + ": the filter on it matched none of them" for n in present)
+            + " - a real zero for that filter (for a keep field, check its spellings with a "
+              "terms aggregation; for a phrase, try fewer words)")
+    for name, x in fields.items():
+        if x["status"] == "absent_in_scope":
+            parts.append(f"{name} is filled in this index ({x.get('in_index')} documents in the "
+                         f"window carry it) but on none of the {x.get('others_leave')} documents "
+                         "the other filters leave: the filtered fields never meet on one "
+                         "document here; drop or widen the other filters to find out")
+        elif x["status"] == "present":
+            parts.append(f"{name} is filled on the documents the other filters leave: the "
+                         "filter on it matched none of them")
+        elif x["status"] == "unknown":
+            parts.append(f"the check for {name} was refused; the 0 is unexplained")
+    return "; ".join(parts) if parts else "the 0 is unexplained"
+
+
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
@@ -975,38 +1192,12 @@ def field_probe(query: dict, *, max_buckets: int = elastic.DEFAULT_MAX_BUCKETS
 
 
 def run_smoke(run, query: dict, *, max_buckets: int = elastic.DEFAULT_MAX_BUCKETS) -> dict:
-    """One smoke run through ``run`` (query -> report), plus the zero-hit check.
-
-    Zero hits on a filtered query is ambiguous: nothing matches, or a field
-    it filtered holds nothing here (the wrong text field for this index, a
-    label field named differently on this cluster). The check tells them
-    apart with one more query (more when the buckets need splitting),
-    reported under ``field_probe``; ``print_smoke`` turns "nothing to
-    search" into EMPTY and exit code 3.
-    """
-    report = run(query)
-    built = field_probe(query, max_buckets=max_buckets)
-    if report.get("refused") or built is None or report.get("hits_total") != 0:
-        return report
-    probes, fields = built
-    got: dict[str, Any] = {}
-    window = None
-    for probe in probes:
-        checked = run(probe)
-        if checked.get("refused"):
-            report["field_probe"] = {"refused": checked["refused"]}
-            return report
-        window = checked.get("hits_total")
-        got.update(((checked.get("output") or {}).get("aggregations") or {})
-                   .get(PHRASE_FIELD_AGG, {}).get("buckets", {}))
-    report["field_probe"] = {"docs_in_window": window, "queries": len(probes), "fields": [
-        {"field": name,
-         "in_scope": got.get(f"s{i}", {}).get("doc_count") if f"s{i}" in got else window,
-         "with_field": got.get(f"f{i}", {}).get("doc_count"),
-         "in_window": got.get(f"w{i}", {}).get("doc_count") if f"w{i}" in got
-         else got.get(f"f{i}", {}).get("doc_count")}
-        for i, name in enumerate(fields)]}
-    return report
+    """One smoke run through ``run`` (query -> report). A zero-hit result
+    comes back already explained by the bridge (``output["empty"]``, see
+    ``Bridge._explain_empty``), so there is nothing to add here;
+    ``print_smoke`` turns "a filtered field is not filled here" into EMPTY
+    and exit code 3. ``max_buckets`` is kept for callers."""
+    return run(query)
 
 
 def seed_terms(config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
@@ -1363,12 +1554,12 @@ def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
                 cov = got.get("coverage")
                 notes.append(
                     f"{name}: counts are estimates from {got.get('sampled')} documents read over "
-                    f"{got.get('strata')} time slices ({round(100 * cov, 1) if cov is not None else '?'}% "
-                    f"of the scope), the newest of each slice scaled to the slice; margin "
+                    f"{got.get('strata')} time ranges ({round(100 * cov, 1) if cov is not None else '?'}% "
+                    f"of the scope), the newest of each range scaled to the range; margin "
                     f"(about 95%) up to {max(margins) if margins else '?'} on a group; the order "
                     f"is settled for the first {got.get('order_settled')} of {n} groups and not "
-                    "known beyond; a group rarer than one in twenty per slice may be missing, and "
-                    "a burst at the end of one slice is counted as that slice")
+                    "known beyond; a group rarer than one per range's read may be missing, and "
+                    "a burst at the end of one range is counted as that range")
             if got.get("unbucketed"):
                 notes.append(f"{name}: {got['unbucketed']} documents in scope have no time field "
                              "and were in no slice")
@@ -1390,23 +1581,24 @@ def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
     return parts, notes
 
 
-def _probe_findings(probe: dict) -> list[str]:
-    """Why a zero is empty, one line per reason; [] when the zero is real."""
-    if probe.get("refused"):
-        return [f"0 hits, and the check that the filtered fields hold documents was refused "
-                f"({probe['refused']['code']}): the 0 means unknown"]
-    if not probe.get("docs_in_window"):
+def _empty_findings(empty: dict) -> list[str]:
+    """Why a zero is EMPTY rather than a real zero, one line per reason;
+    [] when every filtered field is filled where the filters look (the
+    zero is real). Field names and counts only."""
+    fields = empty.get("fields") or {}
+    if empty.get("window_documents") == 0:
         return ["no document in this index and window at all: 0 hits says nothing"]
     out = []
-    for f in probe["fields"]:
-        hint = "; check the field name for this cluster" + (
-            " or pick another --phrase-field" if f.get("phrase") else "")
-        if f["in_scope"] and not f["with_field"]:
-            out.append(f"{f['field']} holds no documents among the {f['in_scope']} the other "
-                       f"filters leave: its filter cannot match anything here{hint}")
-        elif not f["in_scope"] and not f["in_window"]:
-            out.append(f"{f['field']} holds no documents in this index and window at all: its "
-                       f"filter cannot match anything here{hint}")
+    for name, x in fields.items():
+        if x["status"] == "absent_in_window":
+            out.append(f"{name} holds no documents in this index and window at all: its filter "
+                       f"cannot match anything here; check the field name for this cluster")
+        elif x["status"] == "absent_in_scope":
+            out.append(f"{name} holds no documents among the {x.get('others_leave')} the other "
+                       f"filters leave ({x.get('in_index')} in the window carry it): its filter "
+                       "cannot match anything here; drop or widen the other filters")
+        elif x["status"] == "unknown":
+            out.append(f"the check for {name} was refused: the 0 means unknown")
     return out
 
 
@@ -1436,11 +1628,8 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
     tr = query.get("time_range") or {}
     output = report.get("output") or {}
     phrases = _phrase_filters(query)
-    probe = report.get("field_probe")
-    if probe and not probe.get("refused") and phrases:
-        for f in probe["fields"]:
-            f["phrase"] = f["field"] == phrases[0]["field"]
-    findings = _probe_findings(probe) if probe is not None else []
+    empty = output.get("empty")
+    findings = _empty_findings(empty) if empty is not None else []
     buckets, notes = _bucket_summary(query, output, report.get("hits_total"))
     line = (f"{'EMPTY' if findings else 'OK':<9}cluster={cluster} index={query['index']} "
             f"since={tr.get('gte')} until={tr.get('lte')} hits_total={report['hits_total']} "
@@ -1448,11 +1637,9 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
             f"dropped_field_paths={len(report['dropped'])} seconds={report['seconds']}")
     if phrases:
         line += f" phrase_field={phrases[0]['field']} phrases={len(phrases)}"
-    if probe is not None and not probe.get("refused"):
-        if phrases:
-            pf = next(f for f in probe["fields"] if f["field"] == phrases[0]["field"])
-            line += f" phrase_field_docs={pf['with_field']}/{pf['in_scope']}"
-        line += f" fields_checked={len(probe['fields'])}"
+    if empty is not None:
+        line += (f" fields_checked={len(empty['fields'])} check_requests={empty['requests']} "
+                 f"check_seconds={empty['seconds']}")
     agg_parts, agg_notes = _agg_summary(query, output)
     print(line + (f" {buckets}" if buckets else "") + (f" {' '.join(agg_parts)}" if agg_parts else ""))
     shape = _filter_shape(query.get("filters"))
@@ -1521,6 +1708,15 @@ _MAX_REPLY = 64 << 20
 _SUN_PATH_MAX = 103  # macOS: 104 bytes including the terminating NUL
 _TIER2 = ("classifier", "spacy", "none")
 _MAX_TERMS = 20
+#: An empty result's check counts documents **carrying a filtered field**
+#: with track_total_hits capped here: enough to say "filled here", and
+#: Elasticsearch stops collecting at the cap, so a present field answers in
+#: milliseconds and an absent one (no postings for it in the window) at
+#: once. The old check counted every document in the window per field.
+EMPTY_CHECK_CAP = 100
+#: how long a field seen present in an index (on a page, or by a check) is
+#: remembered, so a later zero's window check for it costs no request
+PRESENCE_TTL_S = 3600.0
 #: seeded names a case may hold over its life: what it was opened with plus
 #: what es-seed adds while a session runs
 _MAX_SEEDS = 40
@@ -1631,6 +1827,31 @@ class Broker:
                 return self._open_case(req)
             if op == "close_case":
                 return {"ok": True, "closed": self.cases.close(req.get("token"))}
+            if op == "preflight":
+                # human-only, read-only: what stays readable on a cluster,
+                # in one report (see hider/espreflight.py). probes=False
+                # reads only what the bridge already holds: 0 requests.
+                from . import espreflight
+
+                probes = bool(req.get("probes", True))
+                show_values = bool(req.get("show_values", False))
+                names = ([req["cluster"]] if isinstance(req.get("cluster"), str)
+                         else [c.name for c in self.config.clusters])
+                reports = {}
+                for n in names:
+                    cl = self.config.cluster(n)
+                    if cl is None:
+                        return _fail("bad_cluster", "cluster must be one of the configured names")
+                    search = None
+                    if probes:
+                        self.open()
+                        sess = KibanaSession(self.transport, poll_interval=self.poll_interval,
+                                             poll_timeout=self.config.poll_timeout_s)
+                        search = (lambda body, _c=cl, _s=sess: _s.search(_c, body))
+                    reports[n] = espreflight.gather(
+                        self.config, n, self.vocabulary, search, now=clock(),
+                        tier2=req.get("tier2", "none"), show_values=show_values)
+                return {"ok": True, "preflight": reports}
             if op == "seed_case":
                 # the human adding a name to an open case, by the case's
                 # name over this 0600 socket: no token, no tool, no value in
@@ -1970,7 +2191,8 @@ class Broker:
         seeded = seed_terms(self.config, scrubber, terms)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
                                 poll_timeout=self.config.poll_timeout_s)
-        bridge = Bridge(self.config, scrubber, session, log_path=log, index=self.vocabulary)
+        bridge = Bridge(self.config, scrubber, session, log_path=log, index=self.vocabulary,
+                        presence=self.cases.presence)
         report = run_case(bridge, cluster.name, req.get("query"), show_names=show_names)
         report["seeded"] = seeded
         return report

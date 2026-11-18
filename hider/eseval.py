@@ -358,6 +358,14 @@ def generate(*, seed: int = 20261103, docs: int = 600, tenants: int = 8,
     return Fixture(out, ts, [x for xs in servers.values() for x in xs])
 
 
+#: What an ``exists`` scan **counted in full** costs per window-day, in
+#: seconds: an assumption stated as one, sized from the zero-hit check
+#: measured at 30 to 39 seconds on a one-day window (three exists buckets
+#: in one filters aggregation) against under a second for the query
+#: itself. A capped count that finds a match, or an exists on a field with
+#: no postings in the window, answers early (EXISTS_EARLY_SECONDS).
+EXISTS_SCAN_SECONDS_PER_DAY = 12.0
+EXISTS_EARLY_SECONDS = 0.2
 #: What one composite page over one field costs on a real cluster, in
 #: seconds: measured between 8 and 35. The stub charges these in turn so a
 #: build over the fixture reports a realistic time without the eval
@@ -2240,6 +2248,14 @@ SPLIT_OK_MESSAGE = "Nightly maintenance finished for {T} in {N}s"
 SPLIT_LOOKALIKE = ("Convoy rerouted along the Welland Cross Shipping lane after a closure, "
                    "8 pallets held")
 SPLIT_TEXT_PHRASE = "Replication stalled for"
+#: the tenant under a second field, in another spelling: a component that
+#: fills labels.tenant_full_name and neither the short field nor the text,
+#: inside SPLIT_TWO_FIELD_RANGE only (between the 3-day window and the
+#: lookalike), so the other split questions do not move
+SPLIT_FULL_NAME = "Welland Cross Shipping Limited"
+SPLIT_TWO_FIELD_DOCS = 6
+SPLIT_TWO_FIELD_RANGE = {"gte": "now-5d", "lte": "now-3d"}
+SPLIT_TWO_FIELD_ERROR = "Archive sweep failed, {N} mailboxes skipped"
 #: the first text-only failure is this many hours back: before any
 #: field-marked one, so the field scope gets the onset wrong too
 SPLIT_TEXT_FIRST_H = 70.0
@@ -2247,14 +2263,17 @@ SPLIT_FIELD_FIRST_H = 60.0
 
 
 def _split_doc(hours_ago: float, server: str, status: str, message: str,
-               tenant: str | None) -> Doc:
+               tenant: str | None, full_name: str | None = None) -> Doc:
     at = (NOW - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     src: dict = {"@timestamp": at, "agent": {"name": server},
                  "job": {"status": status, "status_message": message}}
     seeded = {}
     if tenant is not None:
-        src["labels"] = {"tenant_name": tenant}
+        src.setdefault("labels", {})["tenant_name"] = tenant
         seeded[tenant] = "ORG_NAME"
+    if full_name is not None:
+        src.setdefault("labels", {})["tenant_full_name"] = full_name
+        seeded[full_name] = "ORG_NAME"
     return Doc(SPLIT_INDEX, src, seeded)
 
 
@@ -2282,9 +2301,15 @@ def split_docs() -> list[Doc]:
                               SPLIT_OTHER))
         out.append(_split_doc(39.0 - 5 * i, "relay-07", "Succeeded",
                               fill(SPLIT_OK_MESSAGE, i), SPLIT_TENANT))
-    # the same words in another sense, five days back: the other tenant's
+    # the same words in another sense, six days back: the other tenant's
     # failure about a route, inside the wide window only
-    out.append(_split_doc(120.0, "relay-08", "Failed", SPLIT_LOOKALIKE, SPLIT_OTHER))
+    out.append(_split_doc(144.0, "relay-08", "Failed", SPLIT_LOOKALIKE, SPLIT_OTHER))
+    # the tenant under its second field alone, between four and five days
+    # back: no short name, no name in the text
+    for i in range(SPLIT_TWO_FIELD_DOCS):
+        out.append(_split_doc(96.0 + 4 * i, "relay-07", "Failed",
+                              SPLIT_TWO_FIELD_ERROR.replace("{N}", str(2 + i)), None,
+                              SPLIT_FULL_NAME))
     # a third tenant named only in text, sharing the text-only error
     for i in range(SPLIT_THIRD_DOCS):
         out.append(_split_doc(18.0 - i, "indexer-03", "Failed",
@@ -2316,6 +2341,7 @@ def split_map() -> elastic.ElasticConfig:
             "job.status": "keep",
             "job.status_message": "text",
             "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+            "labels.tenant_full_name": {"kind": "identifier", "type": "ORG_NAME"},
             "agent.name": {"kind": "identifier", "type": "SERVER_NAME"},
         },
     }
@@ -2423,6 +2449,106 @@ def burst_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture,
     cfg = burst_map()
     fx = Fixture(burst_docs(), [], [])
     engine = StubEngine(fx, (BURST_INDEX,))
+    engine.group_scan_s_per_mdoc = elastic.TEXT_GROUP_SCAN_S_PER_MDOC
+    vocab, _b = build_vocabulary(cfg, engine)
+    return cfg, fx, engine, vocab
+
+
+# ---------------------------------------------------------------------------
+# The dense day: a text_groups scope several times the sample, all of it
+# inside one time slice of the window it is asked over
+# ---------------------------------------------------------------------------
+#
+# The burst fixture shows a noisy last minute inside a wide scope; this one
+# shows the other failure of a time-spread sample: a day-wide question about
+# documents that all sit in one half hour. The day window cuts into 48
+# aligned 1800 s slices, the half hour is exactly one of them, and a uniform
+# read takes one slice's share - 20 documents of 3,000, the newest minute of
+# the half hour. A fixture of its own (not appended to ``generate``), in its
+# own index pattern with its own map, every name invented. Positions, not
+# draws.
+DENSE_INDEX = "logs-dense-*"
+DENSE_RANGE = {"gte": "now-24h", "lte": "now"}
+#: the half hour is one aligned slice of the day window (86400 s / 48)
+DENSE_SLICE_S = 1800
+#: the slice starts 23 hours before NOW, which is a multiple of 1800 s
+DENSE_START_S = 23 * 3600
+#: the steady commonest error, spread over the half hour
+DENSE_STEADY = 2_400
+#: the rarer steady error, spread the same way
+DENSE_RARE = 120
+#: the tail: every document in the half hour's last minute, which is what a
+#: newest-first read of the slice sees
+DENSE_TAIL = 480
+#: another tenant's successes over the whole day, outside the question's scope
+DENSE_OK = 200
+DENSE_TENANT = "Marrowgate Analytics"
+DENSE_OTHER = "Quillfort Risk Partners"
+DENSE_JOB = "Ledger Rebuild Nightly"
+DENSE_STEADY_MESSAGE = "Replica sync deadlocked for {TENANT}, waited {N}ms"
+DENSE_RARE_MESSAGE = "License revalidation failed for {TENANT}, sqlstate 40001"
+DENSE_TAIL_MESSAGE = "Connection pool exhausted for {TENANT} (retry {N})"
+DENSE_OK_MESSAGE = "Run completed for {TENANT} in {N}s"
+#: the question's answer, by group in true order: steady, tail, rare
+DENSE_TRUE_ORDER = (DENSE_STEADY, DENSE_TAIL, DENSE_RARE)
+
+
+def _dense_doc(at: datetime, i: int, template: str, status: str, tenant: str) -> Doc:
+    msg = template.replace("{TENANT}", tenant).replace("{N}", str(3 + i % 57))
+    return Doc(DENSE_INDEX, {
+        "@timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "job": {"name": DENSE_JOB, "status": status, "status_message": msg},
+        "labels": {"tenant_name": tenant},
+    }, {tenant: "ORG_NAME", DENSE_JOB: "JOB_NAME"})
+
+
+def dense_docs() -> list[Doc]:
+    """One tenant's day of failures, all inside one half hour: see above."""
+    slice_start = NOW - timedelta(seconds=DENSE_START_S)
+    out: list[Doc] = []
+    # the steady errors are spread over the half hour, none in its last minute
+    for n, template in ((DENSE_STEADY, DENSE_STEADY_MESSAGE), (DENSE_RARE, DENSE_RARE_MESSAGE)):
+        step = (DENSE_SLICE_S - 60.0) / n
+        for i in range(n):
+            out.append(_dense_doc(slice_start + timedelta(seconds=step * (i + 0.5)), i,
+                                  template, "Failed", DENSE_TENANT))
+    # the tail: every document in the half hour's last minute
+    for i in range(DENSE_TAIL):
+        at = slice_start + timedelta(seconds=DENSE_SLICE_S - 60.0 * (1 - (i + 0.5) / DENSE_TAIL))
+        out.append(_dense_doc(at, i, DENSE_TAIL_MESSAGE, "Failed", DENSE_TENANT))
+    # another tenant's successes, spread over the whole day: the scope's
+    # filters are what keep them out of the question
+    for i in range(DENSE_OK):
+        at = NOW - timedelta(seconds=86400.0 * (1 - (i + 0.5) / DENSE_OK))
+        out.append(_dense_doc(at, i, DENSE_OK_MESSAGE, "Succeeded", DENSE_OTHER))
+    return out
+
+
+def dense_map() -> elastic.ElasticConfig:
+    raw = {
+        "indices": [DENSE_INDEX],
+        "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "fields": {
+            "@timestamp": "keep",
+            "job.status": "keep",
+            "job.status_message": "text",
+            "job.name": {"kind": "identifier", "type": "JOB_NAME"},
+            "labels.tenant_name": {"kind": "identifier", "type": "ORG_NAME"},
+        },
+    }
+    return elastic.parse(raw, source="dense-fixture")
+
+
+def dense_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
+                                                  elastic.ClusterVocabulary]:
+    """The dense fixture on its own engine with its vocabulary built. The
+    engine charges the group-scan rate, so the question's figures carry the
+    read's simulated cost."""
+    cfg = dense_map()
+    fx = Fixture(dense_docs(), [], [])
+    engine = StubEngine(fx, (DENSE_INDEX,))
+    engine.group_scan_s_per_mdoc = elastic.TEXT_GROUP_SCAN_S_PER_MDOC
     vocab, _b = build_vocabulary(cfg, engine)
     return cfg, fx, engine, vocab
 
@@ -2563,6 +2689,24 @@ class StubEngine:
         #: distinct-count probes the vocabulary build asked for, by field
         self.probe_requests: dict[str, int] = {}
         self._range_s: float | None = None
+        #: Simulated cost of an ``exists`` scan **counted in full** over the
+        #: request's window, per window-day (see EXISTS_SCAN_SECONDS_PER_DAY):
+        #: what the old zero-hit check paid per bucket. Zero charges nothing.
+        self.exists_seconds_per_day: float = 0.0
+        #: how many exists scans were charged in full, and how many were
+        #: answered early (track_total_hits capped and a match found, or the
+        #: field has no postings at all)
+        self.exists_scans = 0
+        self.exists_early = 0
+        #: Simulated cost of a sampling pass - any request whose
+        #: aggregations carry a ``top_hits`` heap, which makes Elasticsearch
+        #: bucket every matching document - per million documents in scope
+        #: (see elastic.TEXT_GROUP_SCAN_S_PER_MDOC: an assumption sized from
+        #: one 52 s / 3M-document measurement). Zero (the default) charges
+        #: nothing, as with page_seconds.
+        self.group_scan_s_per_mdoc: float = 0.0
+        #: how many requests were charged as sampling passes
+        self.group_scans = 0
 
     # -- matching ----------------------------------------------------------
 
@@ -2725,7 +2869,14 @@ class StubEngine:
                      .strftime("%Y-%m-%dT%H:%M:%S.000Z"), "doc_count": len(v),
                      **self._aggs(v, sub, index)}
                     for k, v in sorted(buckets.items())]}
+            elif atype == "filter":
+                # the singular form: one clause, bucket-shaped reply
+                sel = [r for r in rows if self._match(r[1], a)]
+                out[name] = {"doc_count": len(sel), **self._aggs(sel, sub, index)}
             elif atype == "filters":
+                for clause in a["filters"].values():
+                    if _has_exists(clause):
+                        self._charge_exists_scan()
                 out[name] = {"buckets": {
                     fname: {"doc_count": len(sel), **self._aggs(sel, sub, index)}
                     for fname, clause in a["filters"].items()
@@ -2785,6 +2936,21 @@ class StubEngine:
         rows = [r for p in parts for r in self._rows(p)]
         rows = [r for r in rows if self._match(r[1], body.get("query", {"match_all": {}}))]
         total = len(rows)
+        cap = body.get("track_total_hits", True)
+        if _has_exists(body.get("query")):
+            # a capped count stops at the cap, and a field with no postings
+            # answers at once; only an uncapped count over a present field
+            # is a full scan (see EXISTS_SCAN_SECONDS_PER_DAY)
+            if isinstance(cap, int) and not isinstance(cap, bool) and (total >= cap or total == 0):
+                self.exists_early += 1
+                self.simulated_seconds += EXISTS_EARLY_SECONDS
+            else:
+                self._charge_exists_scan()
+        if self.group_scan_s_per_mdoc and _has_top_hits(body.get("aggs")):
+            # a sampling pass: the histogram or filter heaps visit every
+            # matching document, so the charge scales with the scope
+            self.group_scans += 1
+            self.simulated_seconds += self.group_scan_s_per_mdoc * total / 1_000_000.0
         aggs = self._aggs(rows, body.get("aggs", {}), index) if body.get("aggs") else None
         rows = self._sorted(rows, body.get("sort"))
         frm, size = body.get("from", 0), body.get("size", 10)
@@ -2793,12 +2959,37 @@ class StubEngine:
         resp: dict[str, Any] = {
             "took": 7, "timed_out": False,
             "_shards": {"total": 3, "successful": 3, "skipped": 0, "failed": 0},
-            "hits": {"total": {"value": total, "relation": "eq"}, "max_score": None,
+            "hits": {"total": ({"value": min(total, cap), "relation": "gte" if total > cap else "eq"}
+                               if isinstance(cap, int) and not isinstance(cap, bool)
+                               else {"value": total, "relation": "eq"}),
+                     "max_score": None,
                      "hits": [self._hit(index, i, flat, includes) for i, flat in page]},
         }
         if aggs is not None:
             resp["aggregations"] = aggs
         return resp
+
+    def _charge_exists_scan(self) -> None:
+        self.exists_scans += 1
+        if self.exists_seconds_per_day:
+            days = max((self._range_s or 86400.0) / 86400.0, 1.0 / 24)
+            self.simulated_seconds += self.exists_seconds_per_day * days
+
+
+def _has_exists(clause: Any) -> bool:
+    """Whether a compiled clause carries an ``exists`` anywhere."""
+    if isinstance(clause, dict):
+        return "exists" in clause or any(_has_exists(v) for v in clause.values())
+    if isinstance(clause, list):
+        return any(_has_exists(c) for c in clause)
+    return False
+
+
+def _has_top_hits(aggs: Any) -> bool:
+    """Whether an aggregation tree carries a ``top_hits`` anywhere."""
+    if isinstance(aggs, dict):
+        return "top_hits" in aggs or any(_has_top_hits(v) for v in aggs.values())
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -3809,9 +4000,10 @@ def _burst_scope(tier2: str) -> dict:
     an hour at a time and groups it with the same key. The groups are an
     estimate here, so what is checked is not equality but what the
     estimate may and may not do: every group's text is one the pages show,
-    nothing readable only in a group, no label made usable, one request of
-    at most the sample; and, reported, whether the week's order and the
-    pages' agree and how many true counts sit inside the reply's margin."""
+    nothing readable only in a group, no label made usable, two requests
+    (the capped count, then the strata pass) of at most the sample each;
+    and, reported, whether the week's order and the pages' agree and how
+    many true counts sit inside the reply's margin."""
     cfg, fx, engine, vocab = burst_world(tier2=tier2)
     truth = fx.truth
     scope = [{"field": "job.status", "op": "eq", "value": "Failed"}]
@@ -3896,12 +4088,12 @@ def _readable_values(text: str, truth: dict[str, str]) -> set[str]:
 
 
 def text_groups_page_equivalent(t: dict) -> bool:
-    """Exact rows equal the pages grouped, in at most two requests (the
-    strata read and, when a slice did not fit, the whole scope as one
-    page); the estimated row's groups are texts the pages show, in true
-    order, in one request of at most the sample. Every row: no label made
-    usable, nothing readable only in a group, never more documents in a
-    request than the sample."""
+    """Exact rows equal the pages grouped, in two requests (the capped
+    count, then the whole scope as one page); the estimated row's groups
+    are texts the pages show, in true order, in two requests (the capped
+    count, then the strata pass) of at most the sample each. Every row: no
+    label made usable, nothing readable only in a group, never more
+    documents in a request than the sample."""
     rows = t["scopes"]
     return bool(rows) and all(
         r.get("refused") is None and r["labels_made_usable"] == 0
@@ -3910,7 +4102,7 @@ def text_groups_page_equivalent(t: dict) -> bool:
         and r["readable_only_in_groups"] == 0 and r["sampled"] <= t["sample_cap"]
         and (r.get("equal_to_pages") and r["exact"] and r["group_requests"] <= 2
              if not r.get("estimated") else
-             r["keys_on_pages"] and r["order_equal"] and r["group_requests"] == 1
+             r["keys_on_pages"] and r["order_equal"] and r["group_requests"] == 2
              and not r["exact"] and r["total"] > t["sample_cap"])
         for r in rows)
 
@@ -5876,7 +6068,8 @@ def _text_groups_lines(g: dict | None, t: dict | None) -> list[str]:
             lines.append(
                 f"  {r['index']:<14} {r['field']:<18} {r['groups']} groups estimated from "
                 f"{r['sampled']} of {r['total']} docs over {r['strata']} time slices in "
-                f"{r['group_requests']} request (pages: {r['page_requests']}, {r['pages_read']} "
+                f"{r['group_requests']} request{'s' if r['group_requests'] != 1 else ''} "
+                f"(pages: {r['page_requests']}, {r['pages_read']} "
                 f"docs); every group's text {'is' if r['keys_on_pages'] else 'IS NOT'} on the "
                 f"pages, order {'equal to' if r['order_equal'] else 'DIFFERENT FROM'} the pages', "
                 f"{r['within_margin']} of {r['groups']} counts within "

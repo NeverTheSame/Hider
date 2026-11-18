@@ -101,10 +101,17 @@ def test_the_read_spreads_a_pages_worth_of_documents_over_the_scopes_time_span()
                                "time_range": {"gte": "now-7d", "lte": "now"},
                                "filters": [FAILED]}, CFG, _session())
     body = c.body["params"]["body"]
-    # one request, no hits of its own: a histogram over the span with the
-    # newest documents of each slice, a page's source for each
-    assert body["size"] == 0 and "sort" not in body and "from" not in body
-    strata = body["aggs"][elastic.STRATA_AGG]
+    # the read's first request: a count capped at the slow bound, no
+    # documents, no aggregations - cheap whatever the scope holds
+    assert body["size"] == 0 and "aggs" not in body and "sort" not in body
+    assert body["track_total_hits"] == elastic.TEXT_GROUP_SLOW_DOCS
+    assert c.plan.groups is None
+    # the sampling pass: a histogram over the span with the newest
+    # documents of each slice, a page's source for each
+    strata_body, strata_plan = c.group_read.strata_read(*c.group_read.window)
+    sb = strata_body["params"]["body"]
+    assert sb["size"] == 0 and "sort" not in sb and "from" not in sb
+    strata = sb["aggs"][elastic.STRATA_AGG]
     assert strata["date_histogram"] == {"field": "@timestamp", "fixed_interval": "12600s",
                                         "min_doc_count": 1}
     sample = strata["aggs"][elastic.STRATA_HITS_AGG]["top_hits"]
@@ -114,8 +121,9 @@ def test_the_read_spreads_a_pages_worth_of_documents_over_the_scopes_time_span()
     # at most 50 x 20 = the sample, never more per request than a page
     # of the whole scope would read
     assert c.group_read.strata * c.group_read.per_stratum == elastic.TEXT_GROUP_SAMPLE
-    assert c.plan.groups == elastic.GroupPlan("g", "message", 10, "strata", 50, 20)
-    assert c.plan.aggs[elastic.STRATA_AGG].subs[elastic.STRATA_HITS_AGG].type == "top_hits"
+    assert c.group_read.per_cap == min(elastic.TEXT_GROUP_MAX_PER_STRATUM, CFG.max_hits)
+    assert strata_plan.groups == elastic.GroupPlan("g", "message", 10, "strata", 50, 20)
+    assert strata_plan.aggs[elastic.STRATA_AGG].subs[elastic.STRATA_HITS_AGG].type == "top_hits"
     # the exact request is the whole scope as one page, the read this replaced
     exact_body, exact_plan = c.group_read.exact()
     eb = exact_body["params"]["body"]
@@ -146,6 +154,101 @@ def test_a_sites_lower_caps_shrink_the_slices_and_what_each_carries():
     # 10 slices of 30: a slice never carries more than a page, and never more
     # than Elasticsearch's inner result window allows
     assert (c.group_read.strata, c.group_read.per_stratum) == (10, 30)
+
+
+def test_the_respread_allocation_is_fair_deterministic_and_never_more_than_the_sample():
+    alloc = esquery._allocate
+    # one heavy slice takes the whole sample; a slice smaller than its
+    # share is read whole and its surplus goes where the documents are
+    assert alloc([11000], 1000) == [1000]
+    assert alloc([5, 3000, 7], 1000) == [5, 988, 7]
+    assert alloc([10, 10, 2000, 3000], 1000) == [10, 10, 490, 490]
+    # a uniform scope stays uniform; the remainder goes to the widest
+    # slices, oldest first on a tie
+    assert alloc([40] * 50, 1000) == [20] * 50
+    assert alloc([700, 500], 1000) == [500, 500]
+    assert alloc([999, 998, 997], 1000) == [334, 333, 333]
+    # a scope smaller than the sample is read whole
+    assert alloc([600, 300], 1000) == [600, 300]
+    for counts in ([11000], [5, 3000, 7], [40] * 50, [999, 998, 997]):
+        assert sum(alloc(counts, 1000)) <= 1000
+
+
+def test_a_scope_past_the_slow_bound_is_refused_before_the_sampling_pass():
+    s = _session()
+    c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS,
+                               "time_range": {"gte": "now-7d", "lte": "now"},
+                               "filters": [FAILED]}, CFG, s)
+    sent = []
+
+    def search(body):
+        sent.append(body)
+        return {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
+            "hits": {"total": {"value": elastic.TEXT_GROUP_SLOW_DOCS, "relation": "gte"},
+                     "hits": []}}}
+
+    with pytest.raises(elastic.Refused) as e:
+        esquery.read_text_groups(search, s, c.group_read)
+    # one early-terminated count reached the engine and nothing else; the
+    # refusal carries counts and what to do, never a value
+    assert e.value.code == "slow_read" and len(sent) == 1
+    assert "aggs" not in sent[0]["params"]["body"]
+    assert f"{elastic.TEXT_GROUP_SLOW_DOCS:,}" in e.value.message
+    assert "narrow" in e.value.message.lower()
+    # the windowless path refuses off its bounds request the same way
+    c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS}, CFG, _session())
+    sent.clear()
+
+    def bounds_search(body):
+        sent.append(body)
+        return {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
+            "hits": {"total": {"value": elastic.TEXT_GROUP_SLOW_DOCS, "relation": "gte"},
+                     "hits": []},
+            "aggregations": {"first": {"value": 0.0}, "last": {"value": 1000.0}}}}
+
+    with pytest.raises(elastic.Refused) as e:
+        esquery.read_text_groups(bounds_search, _session(), c.group_read)
+    assert e.value.code == "slow_read" and len(sent) == 1
+
+
+def test_a_respread_reply_wider_than_asked_is_withheld_before_a_document_is_read():
+    s = _session()
+    c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS,
+                               "time_range": {"gte": "now-7d", "lte": "now"}}, CFG, s)
+    body, plan = c.group_read.respread([(0, 150)], 12_600_000)
+    # 150 documents owed over the 100-per-range cap: two equal sub-ranges
+    aggs = body["params"]["body"]["aggs"]
+    assert [a["aggs"][elastic.STRATA_HITS_AGG]["top_hits"]["size"] for a in aggs.values()] == [75, 75]
+    assert plan.groups.phase == "respread" and plan.groups.ranges == (("s00", 75), ("s01", 75))
+
+    def reply(hits_per_range: dict[str, int], drop: str | None = None) -> dict:
+        aggs_node = {}
+        for name, size in plan.groups.ranges:
+            if name == drop:
+                continue
+            rows = [{"_index": eseval.backing_index("logs-app-*"), "_id": f"{name}-{j}",
+                     "_source": {"@timestamp": "2026-08-20T10:00:00.000Z",
+                                 "message": "Scheduler tick"}}
+                    for j in range(hits_per_range.get(name, 0))]
+            aggs_node[name] = {"doc_count": 200, elastic.STRATA_HITS_AGG: {
+                "hits": {"total": {"value": 200, "relation": "eq"}, "hits": rows}}}
+        return {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
+            "hits": {"total": {"value": 400, "relation": "eq"}, "hits": []},
+            "aggregations": aggs_node}}
+
+    harvested = []
+    s._harvest_hit = lambda h: harvested.append(h)
+    with pytest.raises(elastic.Refused) as e:
+        s.scrub_response(reply({"s00": 76, "s01": 0}), plan)
+    assert e.value.code == "size_cap" and harvested == []
+    with pytest.raises(elastic.Refused) as e:
+        s.scrub_response(reply({"s00": 75}, drop="s01"), plan)
+    assert e.value.code == "malformed" and harvested == []
+    # what fits is read, each range scaled by its own documents
+    s._harvest_hit = elastic.EsScrubber._harvest_hit.__get__(s)
+    g = s.scrub_response(reply({"s00": 75, "s01": 75}), plan).output["aggregations"]["g"]
+    assert g["sampled"] == 150 and g["strata"] == 2 and not g["exact"]
+    assert g["buckets"][0]["doc_count"] == 400
 
 
 def test_a_group_placeholder_in_a_phrase_is_refused_and_a_label_is_not():
@@ -225,7 +328,7 @@ def test_a_reply_wider_than_the_sample_is_withheld():
 # -- through the bridge, against the guessing run and the pages ----------------------
 
 
-def test_through_the_bridge_one_request_and_the_log_has_the_shape_only():
+def test_through_the_bridge_a_count_then_an_exact_read_and_the_log_has_the_shape_only():
     fx = eseval.Fixture(eseval.stream_name_docs(), [], [])
     cfg = eseval.stream_name_map()
     engine = eseval.StubEngine(fx, (eseval.STREAM_INDEX,))
@@ -234,15 +337,17 @@ def test_through_the_bridge_one_request_and_the_log_has_the_shape_only():
     n = len(engine.requests)
     out, refused, _dt, _c = case.call({"index": eseval.STREAM_INDEX, "time_range": eseval.STREAM_RANGE,
                                        "size": 0, "aggs": GROUPS})
-    assert refused is None and len(engine.requests) == n + 1
+    # the capped count said the scope fits one page, so it was read whole
+    assert refused is None and len(engine.requests) == n + 2
+    assert engine.requests[n]["body"]["track_total_hits"] == elastic.TEXT_GROUP_SLOW_DOCS
     assert sum(b["doc_count"] for b in out["aggregations"]["g"]["buckets"]) == 3
-    assert out["aggregations"]["g"]["exact"] and out["aggregations"]["g"]["requests"] == 1
+    assert out["aggregations"]["g"]["exact"] and out["aggregations"]["g"]["requests"] == 2
     rows = [json.loads(x) for x in (case.directory / "decisions.jsonl").read_text().splitlines()]
     row = [r for r in rows if "vocabulary" not in r][-1]
     assert row["aggs"] == [{"name": "g", "type": "text_groups", "field": "message", "aggs": []}]
     assert row["hits_shown"] == 0 and row["new_labels"] == 0
     # the read's account of itself, counts only
-    assert (row["requests"], row["sampled"], row["exact"], row["strata"]) == (1, 3, True, 1)
+    assert (row["requests"], row["sampled"], row["exact"], row["strata"]) == (2, 3, True, 1)
     assert eseval.STREAM_JOB not in json.dumps(out)
 
 
@@ -265,7 +370,9 @@ def test_groups_equal_the_pages_of_the_same_documents_grouped():
         if r.get("estimated"):
             continue
         assert r["groups"] < r["distinct_texts_on_pages"]       # what the engineer gives up
-        assert r["labels_made_usable"] == 0 and r["page_requests"] >= r["group_requests"]
+        # the read costs at most one request more than paging the scope:
+        # the capped count in front of the exact page
+        assert r["labels_made_usable"] == 0 and r["page_requests"] + 1 >= r["group_requests"]
         assert r["group_requests"] <= 2 and r["exact"]
 
 
@@ -297,8 +404,10 @@ def test_a_wide_scope_is_sampled_over_its_span_and_the_reply_says_how_far_to_tru
     out, refused, _dt, _c = case.call(BURST_Q)
     assert refused is None
     g = out["aggregations"]["errors"]
-    # one request, a page's worth of documents, from across the week
-    assert len(engine.requests) == n + 1 and g["requests"] == 1
+    # the capped count, then one sampling pass of a page's worth of
+    # documents from across the week; the sample already landed nearly
+    # whole, so no re-spread runs
+    assert len(engine.requests) == n + 2 and g["requests"] == 2
     assert g["sampled"] <= elastic.TEXT_GROUP_SAMPLE and g["strata"] == 49
     assert g["total"] == 2700 and not g["exact"] and 0.3 < g["coverage"] < 0.4
     # the week's order, with the steady error first although the newest
@@ -336,6 +445,74 @@ def test_without_a_time_range_the_bounds_come_from_one_more_request():
     assert g["strata"] >= 48 and not g["exact"]
 
 
+def test_documents_in_one_slice_of_the_window_get_the_sample_respread_over_them():
+    # one tenant's day: 3,000 failures inside one half hour of a day-wide
+    # window. The uniform pass lands one slice's share (20 documents); the
+    # re-spread reads the whole sample from inside the half hour, cut into
+    # ranges of at most per_cap, each scaled by its own document count.
+    cfg, _fx, engine, vocab = eseval.dense_world()
+    case = eseval.BridgeCase(cfg, engine, vocab, tier2="none")
+    tenant = case.scrubber.seed(eseval.DENSE_TENANT)
+    n = len(engine.requests)
+    out, refused, _dt, _c = case.call({
+        "index": eseval.DENSE_INDEX, "time_range": eseval.DENSE_RANGE, "size": 0,
+        "filters": [{"field": "labels.tenant_name", "op": "eq", "value": tenant},
+                    {"field": "job.status", "op": "eq", "value": "Failed"}],
+        "aggs": {"errors": {"type": "text_groups", "field": "job.status_message", "size": 10}}})
+    assert refused is None
+    g = out["aggregations"]["errors"]
+    # three requests: the capped count, the uniform pass, the re-spread
+    assert len(engine.requests) == n + 3 and g["requests"] == 3
+    assert g["sampled"] == elastic.TEXT_GROUP_SAMPLE and g["total"] == 3000 and not g["exact"]
+    # the re-spread request asked for the sample and nothing more, in
+    # ranges of at most per_cap documents each
+    respread = engine.requests[-1]["body"]["aggs"]
+    sizes = [a["aggs"][elastic.STRATA_HITS_AGG]["top_hits"]["size"] for a in respread.values()]
+    assert sum(sizes) == elastic.TEXT_GROUP_SAMPLE
+    assert max(sizes) <= min(elastic.TEXT_GROUP_MAX_PER_STRATUM, cfg.max_hits)
+    # all three groups, in the true order, where the uniform pass alone saw
+    # only the half hour's newest minute
+    assert [b["key"].split(" for ")[0] for b in g["buckets"]] == [
+        "Replica sync deadlocked", "Connection pool exhausted", "License revalidation failed"]
+    assert g["order_settled"] == 3
+    # no label made usable and no value in the reply
+    assert case.scrubber.shown == {tenant}
+    blob = json.dumps(out)
+    assert eseval.DENSE_TENANT not in blob and eseval.DENSE_JOB not in blob
+    assert "_slices" not in g
+    # asking again returns the same reply: the allocation reads counts, not
+    # anything typed, and the ranges are deterministic
+    again, refused, _dt, _c = case.call({
+        "index": eseval.DENSE_INDEX, "time_range": eseval.DENSE_RANGE, "size": 0,
+        "filters": [{"field": "labels.tenant_name", "op": "eq", "value": tenant},
+                    {"field": "job.status", "op": "eq", "value": "Failed"}],
+        "aggs": {"errors": {"type": "text_groups", "field": "job.status_message", "size": 10}}})
+    assert refused is None and again["aggregations"]["errors"] == g
+
+
+def test_declared_miss_a_burst_at_the_end_of_one_range_is_still_counted_as_that_range():
+    # the re-spread shrinks the newest-first bias from the whole sample to
+    # one range's share, and the margin's assumption (what was read in a
+    # range stands for the range) still does not cover a burst at a range's
+    # very end: the tail error is overcounted by the steady documents that
+    # share its range, and the steady one undercounted by the same amount
+    cfg, _fx, engine, vocab = eseval.dense_world()
+    case = eseval.BridgeCase(cfg, engine, vocab, tier2="none")
+    tenant = case.scrubber.seed(eseval.DENSE_TENANT)
+    out, _refused, _dt, _c = case.call({
+        "index": eseval.DENSE_INDEX, "time_range": eseval.DENSE_RANGE, "size": 0,
+        "filters": [{"field": "labels.tenant_name", "op": "eq", "value": tenant},
+                    {"field": "job.status", "op": "eq", "value": "Failed"}],
+        "aggs": {"errors": {"type": "text_groups", "field": "job.status_message", "size": 10}}})
+    by = {b["key"].split(" for ")[0]: b for b in out["aggregations"]["errors"]["buckets"]}
+    tail = by["Connection pool exhausted"]
+    assert tail["doc_count"] > eseval.DENSE_TAIL
+    assert tail["doc_count"] - tail["margin"] > eseval.DENSE_TAIL
+    # the bias is one range's share now; before the re-spread the same read
+    # put the whole scope's count on this group (3,000 against 480)
+    assert tail["doc_count"] - eseval.DENSE_TAIL < 200
+
+
 def test_a_scope_that_fits_the_sample_but_not_its_slices_is_read_whole_in_a_second_request():
     # three hundred failures in one minute, asked about over a week: the
     # slice they fall in holds more than its share, the scope fits a page
@@ -359,7 +536,7 @@ def test_a_strata_reply_wider_than_asked_is_withheld_before_a_document_is_read()
     s = _session()
     c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS,
                                "time_range": {"gte": "now-7d", "lte": "now"}}, CFG, s)
-    plan = c.plan
+    plan = c.group_read.strata_read(*c.group_read.window)[1]
 
     def reply(buckets: list[tuple[int, int]]) -> dict:
         bs = []

@@ -545,6 +545,32 @@ def _text_lookalike(op: Operator, cs: Any) -> Graded:
                            "same_words_another_sense": got - want})
 
 
+def _text_two_fields(op: Operator, cs: Any) -> Graded:
+    """A tenant known under two fields: the short name the case was seeded
+    with, and a full name another component writes to a second field, in
+    another spelling. The second spelling is its own value and its own
+    label - the engineer seeds it (es-seed, a human step) and the wider
+    scope carries each field with its own label. Asked with the first
+    label alone first: the zero is explained by the bridge, not left bare."""
+    plain = _split_q(op, _wider(op), tr=eseval.SPLIT_TWO_FIELD_RANGE)
+    first = op.ask(plain)
+    narrow = first["hits"]["total"]["value"]
+    explained = first.get("empty") or {}
+    full = op.human_seed(f"ORG_NAME={eseval.SPLIT_FULL_NAME}", "the full name from the ticket")
+    both = {"any_of": [_eq("labels.tenant_name", op.tenant), _eq("labels.tenant_full_name", full),
+                       {"field": "job.status_message", "op": "phrase", "value": op.tenant},
+                       {"field": "job.status_message", "op": "phrase", "value": full}]}
+    out = op.ask(_split_q(op, both, tr=eseval.SPLIT_TWO_FIELD_RANGE))
+    want = sum(1 for d in eseval.split_docs()
+               if d.source["job"]["status"] == FAILED
+               and d.source.get("labels", {}).get("tenant_full_name") == eseval.SPLIT_FULL_NAME)
+    return Graded(want, want, out["hits"]["total"]["value"],
+                  figures={"one_field_scope": narrow, "both_fields": out["hits"]["total"]["value"],
+                           "zero_explained": {f: x["status"] for f, x in
+                                              (explained.get("fields") or {}).items()},
+                           "check_requests": explained.get("requests")})
+
+
 def _text_which_tenants(op: Operator, cs: Any) -> Graded:
     """Which tenants does the text-only error hit: the honest query runs
     and cannot answer - the terms aggregation buckets the tenant field,
@@ -560,34 +586,29 @@ def _text_which_tenants(op: Operator, cs: Any) -> Graded:
     return Graded(None, None, [b["key"] for b in buckets])
 
 
-def _week_census(op: Operator, cs: Any) -> Graded:
-    """Which errors are commonest **this week**, over a scope wider than the
-    group sample, whose commonest error is not among the newest documents
-    (:func:`eseval.burst_docs`). The answer is the order of the groups, what
-    an engineer reads off to decide what to fix first; the counts are
-    reported beside it with how far the reply said to trust them."""
-    out = op.ask({"index": eseval.BURST_INDEX, "time_range": eseval.BURST_RANGE, "size": 0,
-                  "filters": [_eq("job.status", FAILED)],
-                  "aggs": {"errors": {"type": "text_groups", "field": "job.status_message",
-                                      "size": 10}}},
-                 gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"))
+def _census(op: Operator, query: dict, spec: tuple[tuple[str, int], ...],
+            tenant: str, agg_name: str = "errors") -> Graded:
+    """A text_groups question graded on the order of the groups - what an
+    engineer reads off to decide what to fix first - with the counts
+    reported beside it: how far the reply said to trust itself, and whether
+    it was right to. ``spec`` is (message template, true count) per group."""
+    s0 = op.engine.simulated_seconds
+    out = op.ask(query, gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"))
     truth: dict[str, int] = {}
-    for template, n in ((eseval.BURST_STEADY_MESSAGE, eseval.BURST_STEADY),
-                        (eseval.BURST_NOISY_MESSAGE, eseval.BURST_NOISY),
-                        (eseval.BURST_RARE_MESSAGE, eseval.BURST_RARE)):
+    for template, n in spec:
         # one instance of the template with a tenant in it, as a page would
         # show it, then the group key
         key = elastic.text_group_key(op.project(
-            template.replace("{TENANT}", eseval.BURST_TENANTS[0]).replace("{N}", "7"),
-            {eseval.BURST_TENANTS[0]: "ORG_NAME"}))
+            template.replace("{TENANT}", tenant).replace("{N}", "7"), {tenant: "ORG_NAME"}))
         truth[key] = n
     expected = [k for k, _n in sorted(truth.items(), key=lambda kv: (-kv[1], kv[0]))]
-    agg = out["aggregations"]["errors"]
+    agg = out["aggregations"][agg_name]
     got = [b["key"] for b in agg["buckets"]]
     # how the reply said to trust itself, against the truth: counts only
     fig: dict[str, Any] = {"total": out["hits"]["total"]["value"], "sampled": agg.get("sampled"),
                            "exact": agg.get("exact"), "requests": op.requests,
-                           "order_settled": agg.get("order_settled")}
+                           "order_settled": agg.get("order_settled"),
+                           "scan_seconds": round(op.engine.simulated_seconds - s0, 2)}
     errors, within = [], 0
     for b in agg["buckets"]:
         true = truth.get(b["key"], 0)
@@ -598,6 +619,36 @@ def _week_census(op: Operator, cs: Any) -> Graded:
                max_error_pct=round(100 * max(errors), 1) if errors else None,
                missing=len(set(truth) - set(got)))
     return Graded(expected, expected, got, figures=fig)
+
+
+def _week_census(op: Operator, cs: Any) -> Graded:
+    """Which errors are commonest **this week**, over a scope wider than the
+    group sample, whose commonest error is not among the newest documents
+    (:func:`eseval.burst_docs`)."""
+    return _census(op, {"index": eseval.BURST_INDEX, "time_range": eseval.BURST_RANGE, "size": 0,
+                        "filters": [_eq("job.status", FAILED)],
+                        "aggs": {"errors": {"type": "text_groups", "field": "job.status_message",
+                                            "size": 10}}},
+                   ((eseval.BURST_STEADY_MESSAGE, eseval.BURST_STEADY),
+                    (eseval.BURST_NOISY_MESSAGE, eseval.BURST_NOISY),
+                    (eseval.BURST_RARE_MESSAGE, eseval.BURST_RARE)),
+                   eseval.BURST_TENANTS[0])
+
+
+def _tenant_day_census(op: Operator, cs: Any) -> Graded:
+    """Which errors hit the tenant **today**, when the whole day's failures
+    sit in one half hour (:func:`eseval.dense_docs`): the scope is several
+    times the group sample and lands in one slice of the day window, so a
+    sample spread evenly over the window reads one slice's share of it."""
+    return _census(op, {"index": eseval.DENSE_INDEX, "time_range": eseval.DENSE_RANGE, "size": 0,
+                        "filters": [_eq("labels.tenant_name", op.tenant),
+                                    _eq("job.status", FAILED)],
+                        "aggs": {"errors": {"type": "text_groups", "field": "job.status_message",
+                                            "size": 10}}},
+                   ((eseval.DENSE_STEADY_MESSAGE, eseval.DENSE_STEADY),
+                    (eseval.DENSE_TAIL_MESSAGE, eseval.DENSE_TAIL),
+                    (eseval.DENSE_RARE_MESSAGE, eseval.DENSE_RARE)),
+                   eseval.DENSE_TENANT)
 
 
 def _except_top_error(op: Operator, cs: CaseFacts) -> Graded:
@@ -691,6 +742,12 @@ QUESTIONS: tuple[Question, ...] = (
              "wrong on purpose", _text_lookalike,
              own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
              honest="count over the wider scope, a week back"),
+    Question("text_two_fields", "magnitude",
+             "how many of the tenant's runs failed, when another component writes the tenant "
+             "under a second field in another spelling", _text_two_fields,
+             own_data=eseval.split_world, own_seed=eseval.SPLIT_TENANT,
+             honest="the engineer seeds the full name (es-seed), then any_of over each field "
+                    "with its own label and a phrase of each"),
     Question("text_which_tenants", "cross-tenant",
              "which tenants does the text-only error hit, when they are named only in text",
              _text_which_tenants, gap="text_names_not_enumerable",
@@ -703,6 +760,14 @@ QUESTIONS: tuple[Question, ...] = (
              gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"),
              honest="text_groups on job.status_message over every failed run of the week",
              own_data=eseval.burst_world, own_seed=eseval.BURST_TENANTS[0]),
+    Question("tenant_day_census", "text grouping",
+             "which errors hit the tenant today, when the whole day's failures sit in one "
+             "half hour: a sample spread evenly over the asked-about day lands one slice's "
+             "share on them", _tenant_day_census,
+             gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"),
+             honest="text_groups on job.status_message over the tenant's failed runs, last "
+                    "24 hours",
+             own_data=eseval.dense_world, own_seed=eseval.DENSE_TENANT),
     Question("except_top_error", "exclusion",
              "apart from the known error, what else is failing for the tenant",
              _except_top_error, gap="negation", gap_codes=("raw_dsl", "bad_filter"),
@@ -800,7 +865,9 @@ def _figures(f: dict[str, Any]) -> str:
     if "sampled" in f:
         parts.append(f"{f.get('sampled')} of {f.get('total')} docs read in {f.get('requests')} "
                      f"request{'s' if f.get('requests') != 1 else ''}, "
-                     f"{'exact' if f.get('exact') else 'estimated'}")
+                     f"{'exact' if f.get('exact') else 'estimated'}"
+                     + (f", {f['scan_seconds']}s simulated scan"
+                        if f.get("scan_seconds") is not None else ""))
     if "groups" in f:
         parts.append(f"{f['groups']} groups, {f.get('missing')} of the true groups missing, "
                      f"{f.get('within_margin')} of {f['groups']} counts within the reply's margin, "
@@ -810,6 +877,11 @@ def _figures(f: dict[str, Any]) -> str:
         parts.append(f"asked today's way (tenant field alone) first: "
                      f"{f['field_scope_against_full_truth']} against the full truth, "
                      f"{f.get('field_scope_items')} of {f.get('full_truth_items')} items")
+    if "one_field_scope" in f:
+        parts.append(f"asked with the first label alone: {f['one_field_scope']} hits, the zero "
+                     f"explained by the bridge as {f.get('zero_explained')} in "
+                     f"{f.get('check_requests')} check request(s); with both fields' labels "
+                     f"{f['both_fields']}")
     if "same_words_another_sense" in f:
         parts.append(f"counted {f.get('counted')}, about the tenant {f.get('about_the_tenant')}, "
                      f"the name's words in another sense {f['same_words_another_sense']} "

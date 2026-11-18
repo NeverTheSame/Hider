@@ -246,18 +246,29 @@ class Compiled:
 
 @dataclass(frozen=True)
 class GroupRead:
-    """How a ``text_groups`` query is read: one to three requests, each a
+    """How a ``text_groups`` query is read: two to four requests, each a
     page's worth of documents at most, built here and run by
     :func:`read_text_groups`.
 
-    1. **bounds** - only when the query gave no closed time range: the
-       scope's first and last timestamp (``min``/``max``, no documents).
-    2. **strata** - the scope's span cut into at most ``strata`` equal
-       slices, the newest ``per_stratum`` documents of each, in one
+    1. **count** (closed time range) or **bounds** (no closed range): how
+       many documents the scope holds, counted up to
+       :data:`elastic.TEXT_GROUP_SLOW_DOCS` - early-terminated, so it is
+       cheap either way - and, for bounds, the scope's first and last
+       timestamp (``min``/``max``, no documents). A scope at or past the
+       bound is refused ``slow_read`` here, before the sampling pass that
+       would mostly die at the session's completion ceiling anyway.
+    2. **exact** - the whole scope as one page of
+       :data:`elastic.TEXT_GROUP_SAMPLE` hits, when the count says it fits.
+    3. **strata** - otherwise: the scope's span cut into at most ``strata``
+       equal slices, the newest ``per_stratum`` documents of each, in one
        request: the sample is spread over the time the engineer asked
        about instead of being the newest moment of it.
-    3. **exact** - the whole scope as one page of :data:`elastic.TEXT_GROUP_SAMPLE`
-       hits, only when the strata read was not exact and the scope fits.
+    4. **respread** - only when the strata pass landed materially less than
+       the sample (documents concentrated in a few slices): the same sample
+       re-spread over where the first pass counted the documents, one
+       ``filter`` range per slice sized to the slice's share, a slice owed
+       more than ``per_cap`` cut into equal sub-ranges of at most
+       ``per_cap`` each. The asked sizes sum to at most the sample.
     """
 
     index: str
@@ -269,13 +280,24 @@ class GroupRead:
     window: tuple[float, float] | None
     strata: int
     per_stratum: int
+    #: most documents one time range may carry: Elasticsearch's default
+    #: inner result window, and never more than the site's page
+    per_cap: int = elastic.TEXT_GROUP_MAX_PER_STRATUM
 
     def _request(self, body: dict) -> dict:
         return {"params": {"index": self.index, "body": body}}
 
+    def count(self) -> tuple[dict, elastic.Plan]:
+        """How many documents the scope holds, counted up to the slow
+        bound: Elasticsearch stops collecting at the cap, so a scope wide
+        enough to refuse answers without paying for a full count."""
+        body = {"size": 0, "track_total_hits": elastic.TEXT_GROUP_SLOW_DOCS,
+                "query": self.query}
+        return self._request(body), elastic.Plan(self.index, {}, 0)
+
     def bounds(self) -> tuple[dict, elastic.Plan]:
         tf = self.time_field
-        body = {"size": 0, "track_total_hits": True, "query": self.query,
+        body = {"size": 0, "track_total_hits": elastic.TEXT_GROUP_SLOW_DOCS, "query": self.query,
                 "aggs": {"first": {"min": {"field": tf}}, "last": {"max": {"field": tf}}}}
         plan = elastic.Plan(self.index, {"first": elastic.AggPlan("min", tf),
                                          "last": elastic.AggPlan("max", tf)}, 0)
@@ -306,6 +328,43 @@ class GroupRead:
                                    per_stratum=self.per_stratum))
         return self._request(body), plan
 
+    def respread(self, slices: list[tuple[int, int]],
+                 interval_ms: int) -> tuple[dict, elastic.Plan]:
+        """The second sampling pass: one sibling ``filter`` aggregation per
+        time range, each with its own newest-first ``top_hits``, the sizes
+        the allocation over the first pass's per-slice document counts
+        (``slices``: one ``(slice start in epoch ms, documents to read)``
+        per non-empty slice). A slice owed more than ``per_cap`` is cut
+        into equal sub-ranges of at most ``per_cap`` each; the asked sizes
+        sum to at most the sample, so this request never carries more than
+        one page's worth. Each range's own ``doc_count`` comes back with
+        it, which is what keeps the estimate honest for sub-ranges the
+        documents do not fill evenly."""
+        tf = self.time_field
+        aggs: dict[str, Any] = {}
+        plans: dict[str, elastic.AggPlan] = {}
+        ranges: list[tuple[str, int]] = []
+        for key, owed in slices:
+            parts = max(1, math.ceil(owed / self.per_cap))
+            bounds = [key + round(j * interval_ms / parts) for j in range(parts)]
+            bounds.append(key + interval_ms)
+            for j in range(parts):
+                name = f"s{len(ranges):02d}"
+                size = owed // parts + (1 if j < owed % parts else 0)
+                ranges.append((name, size))
+                aggs[name] = {
+                    "filter": {"range": {tf: {"gte": bounds[j], "lt": bounds[j + 1]}}},
+                    "aggs": {elastic.STRATA_HITS_AGG: {"top_hits": {
+                        "size": size, "sort": [{tf: {"order": "desc"}}],
+                        "_source": {"includes": self.includes}}}}}
+                plans[name] = elastic.AggPlan(
+                    "filter", tf, None, {elastic.STRATA_HITS_AGG: elastic.AggPlan("top_hits")})
+        body = {"size": 0, "track_total_hits": True, "query": self.query, "aggs": aggs}
+        plan = elastic.Plan(self.index, plans, 0,
+                            dataclasses.replace(self.groups, phase="respread",
+                                                ranges=tuple(ranges)))
+        return self._request(body), plan
+
     def exact(self) -> tuple[dict, elastic.Plan]:
         body = {"size": elastic.TEXT_GROUP_SAMPLE, "track_total_hits": True, "query": self.query,
                 "_source": {"includes": self.includes},
@@ -315,10 +374,53 @@ class GroupRead:
         return self._request(body), plan
 
     def first(self) -> tuple[dict, elastic.Plan]:
-        """The read's first request: strata when the span is known, else bounds."""
+        """The read's first request: a capped count when the span is known,
+        else bounds (which carry the same capped count)."""
         if self.window is not None:
-            return self.strata_read(*self.window)
+            return self.count()
         return self.bounds()
+
+
+def _allocate(counts: list[int], sample: int) -> list[int]:
+    """How many documents to read from each slice: every slice up to a fair
+    share - the largest ``fair`` with ``sum(min(count, fair)) <= sample`` -
+    so a slice smaller than the share is read whole and the budget it does
+    not need goes to the slices that do; the remainder goes one each to the
+    widest slices, oldest first on a tie. Deterministic, and built only
+    from the first pass's document counts: nothing typed in a query reaches
+    it."""
+    lo, hi = 0, sample
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if sum(min(n, mid) for n in counts) <= sample:
+            lo = mid
+        else:
+            hi = mid - 1
+    alloc = [min(n, lo) for n in counts]
+    left = sample - sum(alloc)
+    for i in sorted(range(len(counts)), key=lambda i: (-counts[i], i)):
+        if left <= 0:
+            break
+        if counts[i] > alloc[i]:
+            alloc[i] += 1
+            left -= 1
+    return alloc
+
+
+def _group_total(out: dict) -> tuple[Any, str]:
+    total = (out.get("hits") or {}).get("total") or {}
+    return total.get("value"), total.get("relation", "eq")
+
+
+def _refuse_slow() -> elastic.Refused:
+    about = int(elastic.TEXT_GROUP_SLOW_DOCS / 1_000_000 * elastic.TEXT_GROUP_SCAN_S_PER_MDOC)
+    return elastic.Refused(
+        "slow_read",
+        f"text_groups: the scope holds at least {elastic.TEXT_GROUP_SLOW_DOCS:,} documents, "
+        f"and spreading the sample over it makes Elasticsearch bucket every one - about "
+        f"{about}s or more, past what the session waits for one search. Narrow the time "
+        f"range or add filters; a terms or date_histogram aggregation over the same scope "
+        f"is cheap and shows where the documents are.")
 
 
 def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber,
@@ -326,36 +428,73 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
     """Run a ``text_groups`` read: ``search`` takes a request document and
     returns the raw envelope; every reply goes through the scrubber with
     the plan of its own request. Returns the groups and how many requests
-    were made; the groups carry the count too."""
+    were made; the groups carry the count too.
+
+    The order (see :class:`GroupRead`): the capped count (or bounds), then
+    - a scope past :data:`elastic.TEXT_GROUP_SLOW_DOCS` refused
+    ``slow_read`` - the whole scope as one exact page when it fits the
+    sample, else the strata pass, and a second pass re-spreading the sample
+    over where the documents are when the first left more than a quarter of
+    it unused (:data:`elastic.TEXT_GROUP_RESPREAD_MIN`)."""
     n = 0
     lo_hi = read.window
+
+    def empty(out: dict) -> tuple[elastic.Scrubbed, int]:
+        # nothing in scope: no groups, the total as the reply gave it
+        agg = elastic.group_estimate([], read.groups.size, _group_total(out)[0])
+        agg["sample_cap"] = elastic.TEXT_GROUP_SAMPLE
+        agg["requests"] = n
+        return elastic.Scrubbed({"hits": {"total": out["hits"]["total"], "hits": []},
+                                 "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
+
     if lo_hi is None:
         body, plan = read.bounds()
         n += 1
         out = scrubber.scrub_response(search(body), plan).output
+        total, relation = _group_total(out)
+        if relation != "eq" or (isinstance(total, int) and total >= elastic.TEXT_GROUP_SLOW_DOCS):
+            raise _refuse_slow()
         first = (out.get("aggregations") or {}).get("first", {}).get("value")
         last = (out.get("aggregations") or {}).get("last", {}).get("value")
         if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
-            # nothing in scope: no groups, the total as the reply gave it
-            agg = elastic.group_estimate([], read.groups.size,
-                                         (out.get("hits") or {}).get("total", {}).get("value"))
-            agg["sample_cap"] = elastic.TEXT_GROUP_SAMPLE
-            agg["requests"] = n
-            return elastic.Scrubbed({"hits": {"total": out["hits"]["total"], "hits": []},
-                                     "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
+            return empty(out)
         lo_hi = (float(first) / 1000.0, float(last) / 1000.0)
-    body, plan = read.strata_read(*lo_hi)
-    n += 1
-    scrubbed = scrubber.scrub_response(search(body), plan)
-    agg = scrubbed.output["aggregations"][read.groups.name]
-    total = agg.get("total")
-    if not agg["exact"] and isinstance(total, int) and total <= elastic.TEXT_GROUP_SAMPLE:
-        # the scope fits one page but a slice did not fit its share: read
-        # it whole rather than estimate what is all there
+    else:
+        body, plan = read.count()
+        n += 1
+        out = scrubber.scrub_response(search(body), plan).output
+        total, relation = _group_total(out)
+        if relation != "eq" or (isinstance(total, int) and total >= elastic.TEXT_GROUP_SLOW_DOCS):
+            raise _refuse_slow()
+        if total == 0:
+            return empty(out)
+    if isinstance(total, int) and total <= elastic.TEXT_GROUP_SAMPLE:
+        # the scope fits one page: read it whole rather than estimate what
+        # is all there
         body, plan = read.exact()
         n += 1
         scrubbed = scrubber.scrub_response(search(body), plan)
         agg = scrubbed.output["aggregations"][read.groups.name]
+        agg["requests"] = n
+        return scrubbed, n
+    body, plan = read.strata_read(*lo_hi)
+    n += 1
+    scrubbed = scrubber.scrub_response(search(body), plan)
+    agg = scrubbed.output["aggregations"][read.groups.name]
+    slices = agg.pop("_slices", [])
+    if not agg["exact"] and slices and all(isinstance(k, int) for k, _c in slices):
+        # re-spread: the same sample sized to where the first pass counted
+        # the documents, only when it reads materially more than the first
+        # landed (elastic.TEXT_GROUP_RESPREAD_MIN)
+        alloc = _allocate([c for _k, c in slices], elastic.TEXT_GROUP_SAMPLE)
+        if sum(alloc) > agg["sampled"] * elastic.TEXT_GROUP_RESPREAD_MIN:
+            body, plan = read.respread(
+                [(k, a) for (k, _c), a in zip(slices, alloc) if a > 0],
+                read.interval_s(*lo_hi) * 1000)
+            n += 1
+            scrubbed = scrubber.scrub_response(search(body), plan)
+            agg = scrubbed.output["aggregations"][read.groups.name]
+    agg.pop("_slices", None)
     agg["requests"] = n
     return scrubbed, n
 
@@ -939,7 +1078,8 @@ class _Compiler:
             read = GroupRead(index, {"bool": {"filter": filters}} if filters else {"match_all": {}},
                              self.cfg.source_includes(), self.cfg.time_field, groups,
                              (self.window[0], self.window[1]) if self.window else None,
-                             strata, per_stratum)
+                             strata, per_stratum,
+                             min(elastic.TEXT_GROUP_MAX_PER_STRATUM, self.cfg.max_hits))
             body, plan = read.first()
             return Compiled(body, plan, list(self.text_queries), list(self.labels_used),
                             new_phrases, read)

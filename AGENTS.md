@@ -89,6 +89,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
                                                  # then build the name vocabulary: minutes on a large estate
 .venv/bin/python -m hider es-research --case c1 --term "<customer>"   # Claude Code, bridge tools only
 .venv/bin/python -m hider es-research --stub --case demo --prompt "..."  # the same on a synthetic Kibana
+.venv/bin/python -m hider es-preflight --cluster emea  # one read-only report: what stays readable on this
+                                                 # cluster, which declared limit each miss is, how big, what to do
 .venv/bin/python -m hider es-seed --case c1 --term "JOB_NAME=<job>"  # add a name to the open case; the session goes on
 .venv/bin/python -m hider es-review --case c1    # read a case back: numbers, phrase spend, probing signals (human-only)
 .venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
@@ -406,9 +408,12 @@ Listed with owners in the README's Limitations section and in
   any_of and none-of attackers split a positive batch with phrases they
   already paid for, which is free. Old forms: filters aggregation 145
   confirmed for 145 charged at 0.138 requests a guess, one phrase a query
-  150 for 150 at 3.66. New forms: any_of 145/145 at 0.80, one `not` a
+  150 for 150 at 4.65. New forms: any_of 145/145 at 1.16, one `not` a
   query against a phrase-free base count 150/150 at 3.667, eight `not`s at
-  once 145/145 at 0.807. So no form confirms more than the budget or more
+  once 145/145 at 0.807. (The per-guess request figures for the
+  zero-returning attackers rose when the empty-result check landed: a
+  zero-hit filter now pays its explanation's requests too, which makes
+  guessing dearer, not cheaper.) So no form confirms more than the budget or more
   than the old forms reached, none is cheaper per request than the
   filters aggregation, every guess costs one phrase, every refusal is
   `phrase_budget` with 0 requests and one message shape. And the counts
@@ -459,14 +464,43 @@ Listed with owners in the README's Limitations section and in
   group's count is its sampled count in each slice scaled by that slice's
   documents over its documents read (`elastic.group_estimate`): a slice
   read whole counts exactly, and a read in which every slice fits is
-  `exact`. When the scope fits the sample but a slice does not (a burst
-  inside a small scope), a **second request** reads the whole scope as
-  one page, as before. A query with no closed `time_range` costs **one
-  more request first**, `min`/`max` of the time field under the scope's
-  filters, so the slices cover the documents' span; nothing of it is
-  shown. The same question now scores **answered: 3 of 3 groups in the
-  week's order, 979 of 2,700 read over 49 slices in 1 request, every
-  count within the reply's margin, worst off by 1.3%**.
+  `exact`. **Every read starts with a capped count** (`track_total_hits`
+  at `elastic.TEXT_GROUP_SLOW_DOCS`, early-terminated, so it is cheap
+  whatever the scope holds; a query with no closed `time_range` carries it
+  on the `min`/`max` bounds request it already paid, so the slices cover
+  the documents' span - nothing of either is shown): a scope that **fits
+  the sample is read whole** as one page, always exact now, and a scope
+  past the slow bound is refused before anything expensive runs (below).
+  The same question now scores **answered: 3 of 3 groups in the week's
+  order, 979 of 2,700 read over 49 slices in 2 requests (the count and
+  the pass), every count within the reply's margin, worst off by 1.3%**.
+  **The sample is re-spread to where the documents are** when the even
+  spread misses them. The slices divide the *window*, so a day-wide
+  question about documents that all sit in one half hour put them in one
+  slice and read that slice's share: `esutility`'s `tenant_day_census`
+  (on `eseval.dense_docs`, a fixture of its own: one tenant's 3,000
+  failures inside one aligned half-hour slice of a day window - 2,400 of
+  a steady error and 120 of a rarer one over the half hour, 480 of a
+  third in its last minute - own index pattern and map, invented names)
+  scored **wrong: one of three groups, 20 of 3,000 read in one slice, the
+  last minute's error estimated at the whole 3,000 (525% off), the order
+  settled only for the one group it saw**. Now, when the uniform pass lands less
+  than its share (`elastic.TEXT_GROUP_RESPREAD_MIN`: a second pass runs
+  only when it would read at least a quarter more than the first landed,
+  so a well-spread scope like the burst week pays nothing), **one more
+  request re-spreads the same sample over the slices' own document
+  counts** (`esquery._allocate`: every slice up to a fair share, a slice
+  smaller than its share read whole, deterministic, built from the first
+  pass's counts alone - nothing typed in a query reaches it), each heavy
+  slice cut into equal sub-ranges of at most `per_cap`
+  (`index.max_inner_result_window`, never more than a page) documents,
+  one sibling `filter` range per sub-range with its own newest-first
+  `top_hits`, the asked sizes summing to at most the sample, each range
+  scaled by its own `doc_count`. The same question now scores **answered:
+  3 of 3 groups in the day's order, 1,000 of 3,000 read in 3 requests
+  over 10 sub-ranges, order settled for all 3** - and, reported honestly
+  beside it, **1 of 3 counts within the margin**: the declared
+  newest-first miss at its new, smaller scale (below).
   **How the reply says how far to trust itself**: `exact`; `sampled`,
   `total`, `coverage` (sampled/total), `strata` and `strata_read_whole`;
   per group `doc_count` (the estimate, or the count when exact),
@@ -481,29 +515,36 @@ Listed with owners in the README's Limitations section and in
   `requests`. The decision log row carries `requests`, `sampled`, `exact`
   and `strata`. The `es_schema` text tells Claude to read these before
   trusting the counts and the order. **Where it is still wrong**, each
-  declared: the read **within a slice is still newest-first**, so a burst
-  at the end of one slice is counted as that whole slice (pinned in
-  `test_estextgroups.py`: 20 noisy documents ending a slice of 1,000 are
-  estimated at 1,000, and the margin does not reach the truth) - on a
-  week a slice is 3.4 hours, so a noisy minute misattributes at most its
-  slice's share, which was the whole sample before; a group rarer than
-  about one document in twenty per slice is missed in that slice and
-  under-counted or absent overall (`sum_other_doc_count` and `groups` say
-  how much is unaccounted, not what); the margin assumes what was read in
-  a slice stands for the slice, which the burst case shows it need not;
-  on a scope of a hundred million documents the sample is 0.001% and a
-  group's margin is around ±3% of the total at a 30% share; and relative
-  ranges (`now-7d`) re-align the slices each call, so the edge slices'
-  newest twenty move between two calls of the same question. **Asking
-  the same question again** returns the same sample (the slices are
-  deterministic, the top_hits are the newest of each) and teaches nothing
-  new; shifting the window to walk other documents reads them as groups
-  at the same cost per request the newest-1,000 read had, and every one
-  of them is reachable by paging with a narrower range, so it is reach,
-  not information. **Cost**: one request for a scope with a closed range
-  (the same as before), two without one or when a slice overflowed a
-  scope that fits; the request itself is a histogram with a 20-deep heap
-  per slice over every matching document, the fetch is still 1,000 docs.
+  declared: the read **within a slice or sub-range is still
+  newest-first**, so a burst at the end of one is counted as that whole
+  range (pinned twice in `test_estextgroups.py`: 20 noisy documents
+  ending a slice of 1,000 are estimated at 1,000, and the margin does not
+  reach the truth; and on the dense fixture the last-minute error shares
+  a 3-minute sub-range with the steady one and is overcounted by that
+  range's share, 654 against 480, outside its margin) - the re-spread
+  shrinks what one burst can misattribute from the whole sample to one
+  sub-range's documents, and no further: documents concentrated in a
+  sliver narrower than a sub-range still read at most `per_cap` of it; a
+  group rarer than about one document per range's read is missed in that
+  range and under-counted or absent overall (`sum_other_doc_count` and
+  `groups` say how much is unaccounted, not what); the margin assumes
+  what was read in a range stands for the range, which both burst cases
+  show it need not; on a scope of a hundred million documents the sample
+  is 0.001% and a group's margin is around ±3% of the total at a 30%
+  share; and relative ranges (`now-7d`) re-align the slices each call, so
+  the edge slices' newest twenty move between two calls of the same
+  question. **Asking the same question again** returns the same sample
+  (the count, the slices and the allocation are deterministic, the
+  top_hits the newest of each range - pinned: the same question twice
+  returns the same groups and counts) and teaches nothing new; shifting the window to walk other
+  documents reads them as groups at the same cost per request the
+  newest-1,000 read had, and every one of them is reachable by paging
+  with a narrower range, so it is reach, not information. **Cost**: two
+  requests for a scope with a closed range (the capped count, then the
+  exact page or the sampling pass - one more than before), three when the
+  sample is re-spread, plus one for `min`/`max` without a closed range;
+  each sampling pass is a histogram or filter set with a heap per range
+  over every matching document, the fetch at most 1,000 docs per request.
   **The key**: every label, destroyed secret and token
   carrying a digit becomes one placeholder, `<*>` - **never a type**,
   because a label's type depends on how its value was first labelled (its
@@ -533,14 +574,15 @@ Listed with owners in the README's Limitations section and in
   group, and a group is a function of the pages of the same documents:
   the gate `text_groups_page_equivalent` (`eseval.run_text_groups_eval`)
   pages four scopes at `max_hits` in a second case, groups the texts with
-  the same key and gets the same groups and counts (exact, in at most two
-  requests), with 0 labels made usable and nothing readable in a group
-  that the pages do not show (the three one-word tenant names the skip
-  rules leave readable - the declared miss - are readable in both); and
-  on the burst scope (`eseval._burst_scope`, 2,700 documents paged an
-  hour at a time, 178 pages) every group's text is one the pages show,
-  the order is the pages' order, no label is made usable, one request of
-  at most the sample, and - reported, not gated - 3 of 3 counts within
+  the same key and gets the same groups and counts (exact, in two
+  requests: the capped count, then the whole scope as one page), with 0
+  labels made usable and nothing readable in a group that the pages do
+  not show (the three one-word tenant names the skip rules leave readable
+  - the declared miss - are readable in both); and on the burst scope
+  (`eseval._burst_scope`, 2,700 documents paged an hour at a time, 178
+  pages) every group's text is one the pages show, the order is the
+  pages' order, no label is made usable, two requests of at most the
+  sample each, and - reported, not gated - 3 of 3 counts within
   the margin. It is the query's only
   aggregation, at the top level, with query `size` 0 and no `from`,
   `sort` or sub-aggregations; the scope's filters are gated as every
@@ -557,11 +599,12 @@ Listed with owners in the README's Limitations section and in
   no wider than paging), the one-filter ones wrapped in `not` and
   `any_of` like the others. **Not a cheaper way to guess** (gate
   `text_groups_no_new_guesses`, the same guessing run): one phrase a query
-  with groups 150/150 at 3.66 requests a guess, an any_of whose groups show
-  which candidate matched 145/145 at 0.248 - exactly the any_of-with-a-page
-  attacker the forms before it allow, and the filters aggregation's 0.138
-  is still the cheapest; unchanged, every figure, by the typeless key and
-  the readable codes. **Costs**: the engineer no longer sees which
+  with groups 150/150 at 7.32 requests a guess, an any_of whose groups show
+  which candidate matched 145/145 at 0.50 - exactly the any_of-with-a-page
+  attacker the forms before it allow (0.39 with a page), and the filters
+  aggregation's 0.138 is still the cheapest; the capped count in front of
+  every group read makes the group attackers strictly dearer per guess,
+  and the typeless key and the readable codes move no figure. **Costs**: the engineer no longer sees which
   hidden value is in which message, nor what kind of value sat in a slot
   (tenant, id, server and user are all `<*>`; a page of one phrase shows
   them), nor numbers other than codes (on the fixture 313 distinct
@@ -569,16 +612,49 @@ Listed with owners in the README's Limitations section and in
   wider than the sample are estimates, with the reply saying so (`exact`,
   `margin`, `order_settled`, above); a leak in any sampled document
   withholds the whole reply, as it would that page; one request reads ten
-  pages' worth, scrubbed with tier 2. **What a real cluster needs that
+  pages' worth, scrubbed with tier 2.
+  **A read that would be slow is refused before it is sent.** The
+  sampling pass is a full bucketing pass over every document in scope,
+  **measured at 52 seconds for one day of errors, about 3 million
+  documents, on a real cluster** - a week of that is around six minutes,
+  which dies at the bridge's 120 s completion ceiling after spending the
+  cluster's time anyway. The stub now charges that pass at
+  `elastic.TEXT_GROUP_SCAN_S_PER_MDOC` (52/3 s per million documents in
+  scope, **an assumption sized from that one measurement and taken as
+  linear**; `StubEngine.group_scan_s_per_mdoc`, charged for any request
+  whose aggregations carry a `top_hits` heap), so the measure shows the
+  cost instead of implying the pass is free - the utility rows carry it
+  as `scan_seconds`. And the capped count in front of every read is the
+  gate: a scope of `elastic.TEXT_GROUP_SLOW_DOCS` (5 million, about 90 s
+  at the measured rate - three quarters of the ceiling) or more is
+  refused `slow_read` with the bound, the estimated seconds and what to
+  do instead - narrow the time range or add filters, and find where to
+  narrow with a terms or date_histogram over the same scope, which is
+  cheap. `es_schema` tells Claude the same. The costs of the rule: every
+  group question now pays one early-terminated count request first (the
+  reason exact scopes are 2 requests above); the refusal's spent phrases
+  are **not refunded**, as for any withheld page, because whether the
+  count crossed the bound can depend on what a phrase matched; and the
+  count says only "at least 5 million" - the same kind of number every
+  ordinary reply's `hits_total` already gives, so it opens no channel a
+  zero-filter count did not already have. A one-day scope slower than the
+  bound (10M+ documents a day) is still refused, which is the honest
+  direction; the site's way out is narrower questions, not a knob -
+  a constant, not a site-map setting, because a site that raised it would
+  be choosing timeouts.
+  **What a real cluster needs that
   the stub does not show**: a 1,000-hit reply with full `_source` is
   megabytes through Kibana (its payload limits apply) and tier 2 over
   1,000 texts takes seconds in the bridge; the strata request is a
-  `date_histogram` with a `top_hits` of 20 per bucket, which makes
-  Elasticsearch bucket every matching document and keep a 20-deep heap
-  per bucket per shard - a full pass over the scope with the time field's
-  doc values, seconds to tens of seconds on a hundred million documents,
-  the fetch phase still 1,000 documents; the async search runs for that
-  long and the bridge polls it, under the usual completion ceiling;
+  `date_histogram` with a `top_hits` of 20 per bucket, and the re-spread
+  a set of sibling `filter` ranges with their own `top_hits`, each of
+  which makes Elasticsearch bucket every matching document and keep a
+  heap per bucket per shard - a full pass over the scope with the time
+  field's doc values, the 52 s / 3M figure above, the fetch phase still
+  at most 1,000 documents; the async search runs for that long and the
+  bridge polls it, under the usual completion ceiling; the capped count
+  itself still has to find its first 5 million matches (cheaper than
+  counting all, not free, as with the empty check's capped counts);
   `fixed_interval` in seconds (`12600s`) is valid; `top_hits` size must
   fit `index.max_inner_result_window` (100 by default, the cap on
   `TEXT_GROUP_MAX_PER_STRATUM`); the exact read's `size` 1,000 must still
@@ -672,9 +748,9 @@ Listed with owners in the README's Limitations section and in
   `text_groups` `groups=shown/found read=sampled/total requests=N
   strata=K exact=yes|no order_settled=S/shown other_docs=…`, with a
   `NOTE` saying how far the reply says to trust it (exact: every
-  document read; estimated: documents read over how many slices and what
-  share of the scope, the largest margin, how many leading groups the
-  order is settled for, the two declared misses) and one for
+  document read; estimated: documents read over how many time ranges and
+  what share of the scope, the largest margin, how many leading groups
+  the order is settled for, the two declared misses) and one for
   `unbucketed`; the filters print as ops and field names only (`filters:
   eq=1 not=1 any_of=1(2) fields=job.status,message,log.level`). **Never a
   key, a group's text or a value**: those print with `--show` only, as
@@ -1687,6 +1763,161 @@ Listed with owners in the README's Limitations section and in
   `es_schema`'s `kinds.identifier` carry the wider scope, its costs and
   the one real figure (427 to 1).
 
+  **A tenant under two fields** (`text_two_fields`): another component
+  writes the tenant to `labels.tenant_full_name` in another spelling, with
+  neither the short field nor the name in the text (six failures in
+  `eseval.split_docs`, between three and five days back so no other split
+  question moves). The second spelling is its own value and its own
+  label: the engineer seeds it (`es-seed`, a human step the row shows),
+  and the honest ask is one `any_of` carrying **each field with its own
+  label** plus a phrase of each. Asked with the first label alone the
+  count is 0 - and that zero is explained, not bare (below): the
+  short-name field is not filled in that window at all. Nothing merges
+  the spellings; a tenant known under three fields needs three branches.
+
+  **An empty result says what it means.** A filtered query that finds
+  nothing was a bare `hits_total: 0` to the model, and to the person only
+  es-smoke ran a check - one `filters` aggregation with `exists` buckets
+  that **counted every document in the window** per filtered field (30 to
+  39 seconds on a one-day window against under a second for the query,
+  not in the seconds the summary reported, each probe its own query row),
+  and **skipped entirely** for a query using `not` or `any_of`, which is
+  the honest tenant ask. Measured before the change
+  (`test_esempty.py`, the `before_` tests, kept): the model's reply to a
+  zero on a field the index never fills had three keys and nothing about
+  why; the old check was 1 request of 4 full scans, 48 simulated seconds
+  on a day and 336 on a week (the stub charges
+  `eseval.EXISTS_SCAN_SECONDS_PER_DAY`, 12 s per exists scan per
+  window-day, sized from the measurement - an assumption stated as one);
+  the wider scope got no check. On a real cluster the level field is
+  missing from tens of millions of documents a day and the tenant field
+  from about a third, so "this field is not filled here" is a common
+  reason for a zero.
+  Now `Bridge._explain_empty` runs **inside the bridge** on every zero
+  (every tool, es-smoke, any filter shape) and the output carries
+  `empty`: per filtered field a status, counts and one `meaning`
+  sentence; the MCP payload carries it; the decision log row carries
+  `empty_check` (requests, seconds, `field -> status`, window documents).
+  **The questions, in an order that stops early**, each one count with
+  `track_total_hits` capped at `EMPTY_CHECK_CAP` (100): Elasticsearch
+  stops collecting at the cap, so a present field answers in
+  milliseconds and an absent one (no postings for it in the window) at
+  once - no full scan either way. (1) Is the field filled **anywhere in
+  this index and window**? A field absent from the window explains the
+  zero alone (`absent_in_window`: "its filter cannot match here, whatever
+  it says") and the other fields are not asked further. (2) Otherwise, is
+  it filled on the documents the **other plain filters** leave?
+  `present`: a real zero for that filter ("check a keep field's spellings
+  with a terms aggregation; try fewer words in a phrase");
+  `absent_in_scope`: the filtered fields never meet on one document;
+  `others_empty`: another filter emptied the result, this field is not
+  the reason (one count per distinct set of others). Fields inside
+  `any_of` are checked like plain ones; `not` and `any_of` are left out
+  of the "other filters" scope. **Remembered between queries**: every
+  field a page showed non-empty, and every field a check found present,
+  is remembered per index for `PRESENCE_TTL_S` (an hour) - field names
+  and times only, shared across a broker's cases - so a later zero skips
+  its window request; a zero whose fields all came from memory still asks
+  the window total once, because memory is about the index, not this
+  window. **Cost**: about one request per filtered field plus one, each
+  early-terminated: on the before-test's two-filter zero, 3 requests and
+  0.6 simulated seconds against 1 request and 48-336 before; the
+  19-field query in `test_esbridge.py` is 19-20 requests. The check's
+  time is **inside** the query's reported `seconds` and reported apart as
+  `empty.seconds`; es-smoke's line carries `fields_checked`,
+  `check_requests` and `check_seconds`, and prints EMPTY (exit 3) for an
+  absent field as before, OK for a real zero. **Nothing about the value**:
+  statuses, counts and sentences name fields, a filter's own value never
+  enters its field's count, and the tests assert the typed value is
+  absent from the explanation and the log. The model is told how to read
+  it (esmcp instructions rule 6): an absent field is not a negative
+  finding. **Still ambiguous**, declared: a `present` field says nothing
+  about *why* the filter missed (a keep field's other spelling, a phrase
+  the analyser splits differently, a label for a value with another
+  spelling in this index all look the same); a field remembered present
+  may be absent in *this* window (the status says `remembered within the
+  hour` and the window total is still asked); the "other filters" scope
+  excludes `not` and `any_of`, so a zero inside a wider scope is
+  explained against the plain filters only; `exists` counts a document
+  whose field holds an empty value as filled; and the check does not
+  distinguish "the field is filled on 1% of documents" from 100% - the
+  cap is enough to say filled, not how much. **es-review is unchanged**
+  by design: the check's requests are not query rows, and a typed phrase
+  whose field turned out absent is still counted as a zero-hit phrase
+  (explained is not excused; pinned in
+  `test_an_explained_zero_moves_no_review_signal`). `esbridge.field_probe`
+  is kept only for the before-tests and `run_smoke` no longer probes.
+  What the stub does not show: `track_total_hits: 100` against a real
+  shard still has to find the first hundred matching documents, which
+  for a rare but present field is a scan until they are found - cheaper
+  than counting all, not free; the measured 30-39 s was the full count.
+
+  **One report of what stays readable: es-preflight**
+  (`hider/espreflight.py`, broker op `preflight`, human-only, read-only,
+  nothing the model can call or read). Before letting a model session at
+  real logs someone has to judge what stays readable on that cluster, and
+  that judgement was spread over the VOCAB line, the READABLE line, the
+  build log and memory. The report puts it in one place: `HIDDEN` (the
+  vocabulary line - names per field, covered days, the on-disk file),
+  then findings, each naming **the declared limit it is, its size in
+  counts and field names, and what to do about it**, then the designed
+  channels, then a `VERDICT`.
+  **Two severities.** `STOP` means a customer name is readable to a model
+  session on this cluster right now: the vocabulary not serving or stale
+  (with days and slices left), a field **over the cap** (`field ~count >
+  cap`), a learnable field the map **omits** (with a live distinct count),
+  a **frozen** field (its range; names since readable), a **stuck**
+  returning field, and **names inside longer keep values** found on a
+  sampled page (count, field paths, labels). `KNOW` means a declared trade
+  with its size: the **skip rules'** counts by reason (ordinary words,
+  short - readable in text; seed per case), **readable words** harvested
+  on the sample (labels and fields), a withheld sample, and two fixed
+  design lines (the phrase/label/keep channels with their caps, and a
+  pointer to `hider eval` for the recognizer- and classifier-level misses,
+  which are the same on every cluster and deliberately not restated here).
+  **Which declared limits became a number, a warning, or were left out**:
+  numbered - cover days per field, over-cap, omitted (counted live),
+  frozen ranges, stuck attempts, skip counts, names-in-keep and readable
+  words on a sample; warning only - a bare name in a keep field tier 1
+  has no shape for (uncountable without knowing the names), names logged
+  in the gap between top-ups (the age is on the HIDDEN line); left out -
+  recognizer/tier-2 corpus misses (cluster-independent, one pointer
+  line), and the wider-scope query-honesty misses (lookalike senses, the
+  two-field tenant), which are about answer correctness, not about what
+  the model can read - the utility measure owns them.
+  **Cost.** `--no-probes` (and the short form below): **0 requests** -
+  the vocabulary index, a local apply for the skip counts, the site map.
+  With probes: one capped `cardinality` per omitted field per index
+  pattern over the vocabulary window, plus **one newest page per index
+  pattern** (`PREFLIGHT_SAMPLE` 50 documents over the last day), scrubbed
+  by a throwaway case exactly as a page would be - only counts, field
+  paths and labels leave it; the sampled names-in-keep check is a sample,
+  not a sweep, and says so. On the example map that is 3 requests clean,
+  15 with four omitted fields. Values print only under `--show-values`,
+  as es-review asks. The index *pattern* is printed (it is the site map's
+  own config, as es-smoke prints it) - a stream named after a customer is
+  therefore visible in the pattern itself, which is exactly the finding.
+  **Exit codes**: 0 no STOP findings, 1 at least one, 2 could not assess
+  (no bridge, refused) - never "clean" by silence.
+  **es-research shows the short form and requires a say-so**: before
+  opening a case it fetches the 0-request form (STOP lines only; its own
+  failure never blocks the case - advisory, the broker may predate the
+  op) and, when STOP findings exist, headless runs are refused
+  (`code=readable_findings`) unless `--accept-readable`, and interactive
+  runs ask `continue? [y/N]`. Costs, stated: the flag can become
+  reflexive on a cluster with a permanent over-cap field - the short form
+  still prints every time, which is the point; pipelines must add the
+  flag once, deliberately; and case-open gains one 0-request broker call.
+  Fixtures, each gap with its number and nothing reported that is not
+  there (`tests/test_espreflight.py`): over-cap `request.ref ~5500 >
+  5000` (STOP); the field added late - `BACKFILLING labels.tenant_name …
+  2 one-day slices left` under a `vocabulary_not_serving` STOP; the
+  ordinary words - `skip_rules` KNOW `ordinary_word: 2, short: 1`; the
+  job-named stream - `name_in_keep` STOP, 9 values in `_index`,
+  `data_stream.dataset`, `data_stream.namespace` on the newest 3
+  documents, the name only under `--show-values`; and the split fixture
+  reports **nothing**: 0 stop, 0 know, the channels still printed.
+
   **Operator utility (measured, not a gate).** Every gate below measures
   what the bridge hides or refuses; `esutility` measures whether an
   operator can still get answers through it, with no model. One case from
@@ -1716,15 +1947,17 @@ Listed with owners in the README's Limitations section and in
   `tests/test_esutility.py`. **What it does not cover:** a script is not
   Claude (whether a model finds these queries, or runs out of phrase
   budget over a long case, is not measured); the questions are a chosen
-  set, so "15 of 18 answered, 1 wrong, 2 blocked" (6 of 11 before `not`
+  set, so "17 of 20 answered, 1 wrong, 2 blocked" (6 of 11 before `not`
   and `any_of`, 8 before `text_groups`, whose question now asks with it,
   9 of 12 before the sample was spread over the span, 10 of 12 before
   the human step, 11 of 12 before the split-tenant questions, whose
-  `text_lookalike` is wrong **by design**) is not a rate of anything,
-  and the one human step is scripted here, not a person deciding whether
-  the name deserves seeding; one tenant over six hours of synthetic
+  `text_lookalike` is wrong **by design**, 15 of 18 before the two-field
+  tenant, 16 of 19 before the re-spread, whose `tenant_day_census` read
+  20 of 3,000 documents until the sample followed them) is not a rate of
+  anything, and the two human steps are scripted
+  here, not a person deciding whether the name deserves seeding; one tenant over six hours of synthetic
   data, so "per day" is one day, and the questions on their own data
-  (`week_census` on `eseval.burst_world`, the `text_*` six on
+  (`week_census` on `eseval.burst_world`, the `text_*` seven on
   `eseval.split_world`) are one invented shape each; `Bridge.run`
   directly, not the MCP tool layer; a vocabulary that always serves (no
   building or gap refusals); and nothing on the realistic estate's name

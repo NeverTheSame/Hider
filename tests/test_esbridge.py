@@ -543,20 +543,25 @@ def test_a_phrase_on_a_field_with_no_documents_is_empty_not_zero(stub, tmp_path,
     window = _expected(fixture, "logs-app-*", lambda f: True)
     rc, out, report = _smoke(b, capsys, phrase="returned HTTP", phrase_field="transaction.name")
     assert rc == 3 and out.startswith("EMPTY ")
-    assert "phrase_field=transaction.name" in out and "phrase_field_docs=0/" in out
-    assert f"transaction.name holds no documents among the {window}" in out
-    assert "pick another --phrase-field" in out
-    # the check is a second query, logged like any other
-    rows = (tmp_path / "decisions.jsonl").read_text().splitlines()
-    assert json.loads(rows[-1])["aggs"][0]["type"] == "filters"
+    assert "phrase_field=transaction.name" in out and "fields_checked=1" in out
+    assert "transaction.name holds no documents in this index and window at all" in out
+    assert "check the field name for this cluster" in out
+    # the check is the bridge's own, inside the query's row: statuses and
+    # counts, not a second query row
+    rows = [json.loads(x) for x in (tmp_path / "decisions.jsonl").read_text().splitlines()
+            if "vocabulary" not in x]
+    assert len(rows) == 1 and rows[0]["empty_check"]["fields"] == {
+        "transaction.name": "absent_in_window"}
+    assert rows[0]["empty_check"]["requests"] == 2 and window >= 1
 
 
 def test_a_phrase_that_matches_nothing_on_a_live_field_is_a_real_zero(stub, tmp_path, capsys, fixture):
     b = _bridge(stub, tmp_path)
     window = _expected(fixture, "logs-app-*", lambda f: "message" in f)
-    rc, out, _ = _smoke(b, capsys, phrase="zebra quokka nebula")
+    rc, out, report = _smoke(b, capsys, phrase="zebra quokka nebula")
     assert rc == 0 and out.startswith("OK ") and "hits_total=0" in out
-    assert f"phrase_field_docs={window}/{window}" in out
+    assert "fields_checked=1 check_requests=1" in out and window >= 1
+    assert report["output"]["empty"]["fields"]["message"]["status"] == "present"
 
 
 def test_an_empty_window_is_empty_not_zero(stub, tmp_path, capsys):
@@ -579,7 +584,7 @@ def test_eq_on_a_keep_field_narrows_and_on_a_missing_field_is_empty(stub, tmp_pa
     assert rc == 0 and out.startswith("OK ") and "fields_checked=1" in out
     # a listed field this index never fills (a label named differently here)
     rc, out, _ = _smoke(b, capsys, eq=[("job.status", "Failed"), ("transaction.result", "ok")])
-    assert rc == 3 and "transaction.result holds no documents among" in out
+    assert rc == 3 and "transaction.result holds no documents in this index and window" in out
     # two values nobody has, one of them on an empty field: still found
     rc, out, _ = _smoke(b, capsys, eq=[("data_stream.dataset", "nope"), ("transaction.result", "ok")])
     assert rc == 3 and "transaction.result holds no documents in this index and window" in out
@@ -722,12 +727,15 @@ def test_a_query_at_the_phrase_cap_gets_its_zero_hit_check(stub, tmp_path, capsy
                    if d.index == "logs-app-*")
     rc, out, report = _smoke(b, capsys, phrase=list(_CAP_WORDS[:8]), phrase_field="transaction.name",
                              eq=[("data_stream.dataset", dataset), ("log.level", "error")])
-    assert "refused" not in report["field_probe"], report["field_probe"]
+    empty = report["output"]["empty"]
+    assert "unknown" not in {x["status"] for x in empty["fields"].values()}, empty
     assert rc == 3 and "transaction.name holds no documents" in out
-    # many filtered fields: the check is split, and still not refused
+    # many filtered fields: one capped count each, none refused
     rc, out, report = _smoke(b, capsys, phrase=list(_CAP_WORDS[:8]),
                              eq=[("data_stream.dataset", dataset)] + _event_fields(17))
-    assert "refused" not in report["field_probe"] and report["field_probe"]["queries"] == 2
+    empty = report["output"]["empty"]
+    assert "unknown" not in {x["status"] for x in empty["fields"].values()}
+    assert len(empty["fields"]) == 19 and 19 <= empty["requests"] <= 20  # 19: a field remembered
     assert rc == 3 and "event.f00 holds no documents" in out
 
 
@@ -2313,7 +2321,7 @@ def test_print_smoke_summarises_a_grammar_query_as_counts_and_shows_texts_only_o
     assert ("errs:text_groups(job.status_message) groups=2/3 read=979/2700 requests=1 strata=49 "
             "exact=no order_settled=2/2 other_docs=199") in out
     assert "filters: eq=1 not=1 any_of=1(2) fields=job.status,message,log.level,event.outcome" in out
-    assert "NOTE     errs: counts are estimates from 979 documents read over 49 time slices (36.3%" in out
+    assert "NOTE     errs: counts are estimates from 979 documents read over 49 time ranges (36.3%" in out
     assert "margin (about 95%) up to 78" in out and "settled for the first 2 of 2" in out
     # no group text, no key, no value without --show
     assert "Throttled" not in out and "vault" not in out and "scheduler tick" not in out

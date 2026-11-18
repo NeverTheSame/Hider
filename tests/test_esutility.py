@@ -88,11 +88,19 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
          # newest documents, answered since the sample is spread over the
          # scope's time span
          "week_census",
+         # one tenant's day, all of it in one half hour: wrong (one slice's
+         # 20 documents, one of three groups, 525% off) when the sample was
+         # spread evenly over the asked-about day, answered since the
+         # re-spread puts the sample where the documents are
+         "tenant_day_census",
          # the tenant split between its field and the text: asked over the
          # wider scope (any_of of the field eq the label and a text phrase
          # made only of the label), where the field scope alone is wrong
          # against the full truth - the figures on each row show both
-         "text_onset", "text_servers", "text_per_day", "text_error_census"}
+         "text_onset", "text_servers", "text_per_day", "text_error_census",
+         # a tenant under two fields: the second spelling is seeded by the
+         # engineer (a human step) and carried as its own branch
+         "text_two_fields"}
     # the one deliberate wrong: the name's words in another sense are inside
     # the wider scope, and nothing mechanical can tell the senses apart
     assert {k for k, r in rows.items() if r["status"] == "wrong"} == {"text_lookalike"}
@@ -105,12 +113,35 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
     assert report["counts"]["wrong"] == 1
     assert rows["named_job"]["human_steps"] == ["es-seed JOB_NAME from the ticket"]
     assert rows["named_job"]["requests"] == rows["named_job"]["queries"] == 1
-    assert report["human_steps"] == 1
-    assert all(r["human_steps"] == [] for k, r in rows.items() if k != "named_job")
+    assert rows["text_two_fields"]["human_steps"] == ["es-seed ORG_NAME the full name from the ticket"]
+    tf = rows["text_two_fields"]["figures"]
+    assert tf["one_field_scope"] == 0 and tf["both_fields"] == 6
+    # the zero with one label was explained, not bare: in that window the
+    # short-name field is not filled at all (only the full-name field is),
+    # which is exactly what sends the engineer to the second field
+    assert tf["zero_explained"]["labels.tenant_name"] == "absent_in_window"
+    assert set(tf["zero_explained"].values()) <= {"present", "absent_in_scope", "others_empty",
+                                                  "present_in_window", "absent_in_window"}
+    assert tf["check_requests"] >= 1
+    assert report["human_steps"] == 2
+    assert all(r["human_steps"] == [] for k, r in rows.items()
+               if k not in ("named_job", "text_two_fields"))
     f = rows["week_census"]["figures"]
-    assert f["total"] > f["sampled"] and f["requests"] == 1 and not f["exact"]
+    assert f["total"] > f["sampled"] and f["requests"] == 2 and not f["exact"]
     assert f["missing"] == 0 and f["within_margin"] == f["groups"] == 3 == f["order_settled"]
     assert f["max_error_pct"] < 5
+    # the simulated cost of the sampling pass, at the measured 52 s / 3M rate
+    assert f["scan_seconds"] > 0
+    f = rows["tenant_day_census"]["figures"]
+    # the whole sample lands inside the half hour: the day answered from
+    # 1,000 of 3,000 documents in three requests, the order settled for all
+    # three groups where the even spread saw one group from 20 documents
+    assert (f["total"], f["sampled"], f["requests"]) == (3000, 1000, 3)
+    assert f["missing"] == 0 and f["groups"] == 3 == f["order_settled"] and not f["exact"]
+    # the declared miss, visible in the figures: a burst at the end of one
+    # range is counted as that range, and the margin does not cover it
+    assert f["within_margin"] < f["groups"] and f["max_error_pct"] < 40
+    assert f["scan_seconds"] > 0
     # the refused query (the last one a question asks) reaches nothing;
     # the steps before it, e.g. reading the page that names the error to
     # exclude, each make one request
@@ -122,7 +153,7 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
 def test_the_same_result_with_tier_2_on(world):
     fx, _e, vocab = world
     u = esutility.run_utility_eval(CFG, fx, vocab, tier2="classifier")
-    assert u["counts"] == {"answered": 15, "wrong": 1, "blocked": 2}
+    assert u["counts"] == {"answered": 17, "wrong": 1, "blocked": 2}
 
 
 def test_the_grader_tells_redaction_from_a_wrong_answer(world):
@@ -166,8 +197,9 @@ def test_the_section_carries_counts_and_codes_never_a_value(world, report):
     values = set(fx.truth) | {t.name for t in fx.tenants} | {j[0] for t in fx.tenants
                                                              for j in t.jobs}
     values |= set(eseval.BURST_TENANTS) | set(eseval.BURST_JOBS)
+    values |= {eseval.DENSE_TENANT, eseval.DENSE_OTHER, eseval.DENSE_JOB}
     values |= {eseval.SPLIT_TENANT, eseval.SPLIT_OTHER, eseval.SPLIT_THIRD,
-               "relay-07", "relay-08", "indexer-03"}
+               eseval.SPLIT_FULL_NAME, "relay-07", "relay-08", "indexer-03"}
     assert not [v for v in values if any(c.isalpha() for c in v) and v.lower() in blob]
     for key in esutility.GAPS:
         assert key == key.lower() and " " not in key

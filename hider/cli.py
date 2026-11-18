@@ -601,6 +601,34 @@ def _cmd_es_research(args: argparse.Namespace) -> int:
     return _es_research(args, esbridge.BrokerClient(sock, timeout=60), elastic.SESSIONS, cfg)
 
 
+def _cmd_es_preflight(args: argparse.Namespace) -> int:
+    """One read-only report of what stays readable on a cluster: what is
+    hidden, what is not, which declared limit each miss is, how big, and
+    what to do. For a person; nothing the model can call or read. Exit 0:
+    no stop findings; 1: at least one; 2: could not assess."""
+    from . import elastic, esbridge, espreflight
+
+    cfg = _es_config(args.config)
+    sock = esbridge.broker_socket(args.profile_dir or cfg.profile_dir)
+    if not esbridge.broker_running(sock):
+        print("REFUSED  code=session_expired: no bridge is running; start it with "
+              "es-login --cluster NAME")
+        return 2
+    try:
+        reply = esbridge.BrokerClient(sock, timeout=cfg.poll_timeout_s + 120).call(
+            "preflight", cluster=args.cluster, probes=not args.no_probes,
+            show_values=args.show_values)
+    except elastic.Refused as e:
+        print(f"REFUSED  code={e.code}: {e.message}")
+        return 2
+    reports = reply["preflight"]
+    if args.json:
+        print(json.dumps(reports, indent=2, default=str))
+    else:
+        print("\n".join(espreflight.format_report(reports, cfg)))
+    return 1 if any(r["stops"] for r in reports.values()) else 0
+
+
 def _cmd_es_seed(args: argparse.Namespace) -> int:
     """Add a name to an open case without ending its Claude session: the
     human's step, through the broker's socket only. Prints the labels and
@@ -654,6 +682,31 @@ def _es_research(args: argparse.Namespace, client, sessions_dir: Path, cfg) -> i
     prompt = None
     if args.prompt is not None:
         prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
+    from . import espreflight
+
+    # the short form of es-preflight, from what the bridge already holds
+    # (0 requests): the STOP findings only. With any, the person must say
+    # they know - a flag headless, a question interactively.
+    try:
+        pf = client.call("preflight", probes=False)["preflight"]
+    except Exception:
+        # advisory: the short form must never be the reason a case cannot
+        # open (an old broker without the op, a busy one). es-preflight is
+        # the command that fails loudly.
+        pf = {}
+    short, stops = espreflight.short_form(pf)
+    for line in short:
+        print(line, file=sys.stderr)
+    if stops and not args.accept_readable:
+        if prompt is None:
+            if input("names stay readable on this cluster (above); continue? [y/N] "
+                     ).strip().lower() != "y":
+                return 2
+        else:
+            print("REFUSED  code=readable_findings: names stay readable on this cluster "
+                  "(above). Run es-preflight for the full report; pass --accept-readable "
+                  "to proceed anyway.")
+            return 2
     try:
         opened = client.call("open_case", case=args.case, terms=args.term, tier2=args.tier2)
     except elastic.Refused as e:
@@ -1291,6 +1344,21 @@ def main(argv: list[str] | None = None) -> int:
                          "fails or stalls ends the wait anyway (exit 1)")
     lg.set_defaults(fn=_cmd_es_login)
 
+    pf = sub.add_parser("es-preflight", help="one read-only report of what stays readable on "
+                                             "a cluster before a model session: stops, knows, "
+                                             "counts and field names; for a person only")
+    pf.add_argument("--cluster", help="configured cluster name (default: all)")
+    pf.add_argument("--config")
+    pf.add_argument("--profile-dir")
+    pf.add_argument("--no-probes", action="store_true",
+                    help="skip the live probes (the omitted-field counts and the sampled "
+                         "newest page per index): 0 requests, only what the bridge holds")
+    pf.add_argument("--show-values", action="store_true",
+                    help="print the words behind the readable labels. Off by default: counts, "
+                         "field names and labels only")
+    pf.add_argument("--json", action="store_true", help="the full report as JSON")
+    pf.set_defaults(fn=_cmd_es_preflight)
+
     sd = sub.add_parser("es-seed", help="add a name to an open es-research case without ending "
                                         "its Claude session; the name stays in the bridge, you "
                                         "get the label to hand to Claude")
@@ -1336,6 +1404,9 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--prompt", help="ask one question headless ('-' reads stdin); without it "
                                      "Claude Code opens interactively")
     rs.add_argument("--yes", action="store_true", help="send the masked prompt without asking")
+    rs.add_argument("--accept-readable", action="store_true",
+                    help="open the case although es-preflight has STOP findings (names stay "
+                         "readable on the cluster); the short form is printed either way")
     rs.add_argument("--model")
     rs.add_argument("--max-budget-usd", type=float, help="with --prompt: stop spending at this")
     rs.add_argument("--timeout", type=int, default=1800, help="with --prompt: seconds")

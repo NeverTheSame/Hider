@@ -685,6 +685,28 @@ TEXT_GROUP_STRATA = 50
 #: documents read from one slice never exceed Elasticsearch's default
 #: ``index.max_inner_result_window``, which is what bounds a top_hits size
 TEXT_GROUP_MAX_PER_STRATUM = 100
+#: What the sampling pass costs per million documents in scope, in seconds.
+#: An **assumption sized from one measurement**: one strata request (a
+#: date_histogram with a top_hits heap per slice, a full pass over every
+#: matching document) over about 3 million documents in a one-day scope took
+#: 52 seconds on a real cluster, and the cost is taken as linear in the
+#: documents bucketed. The stub charges this rate so the eval shows the
+#: pass's cost instead of implying it is free.
+TEXT_GROUP_SCAN_S_PER_MDOC = 52.0 / 3.0
+#: A scope holding at least this many documents is refused ``slow_read``
+#: before the sampling pass is sent: at the rate above it is about 90
+#: seconds of Elasticsearch time, three quarters of the bridge's 120 s
+#: async-search completion ceiling (``esbridge.POLL_TIMEOUT_S``), so past it
+#: the read would mostly die at the ceiling after spending the time anyway.
+#: The read's first request is a count capped here, so a scope that proceeds
+#: has an exact total and a refused one cost one early-terminated count.
+TEXT_GROUP_SLOW_DOCS = 5_000_000
+#: A second sampling pass (the re-spread, see esquery.read_text_groups) runs
+#: only when it would read at least a quarter more documents than the first
+#: pass landed; below that the margins already carry the misallocation. The
+#: declared cost: up to a fifth of the sample can stay unused rather than
+#: paying another full pass over the scope for marginal counts.
+TEXT_GROUP_RESPREAD_MIN = 1.25
 #: aggregation names in the strata request (the bridge's own, never Claude's)
 STRATA_AGG = "strata"
 STRATA_HITS_AGG = "sample"
@@ -848,8 +870,10 @@ def group_estimate(strata: list[tuple[int, list[str | None]]], size: int,
 class GroupPlan:
     """A ``text_groups`` aggregation: its name, the text field, how many
     groups to return, and which request of the read this plan reads -
-    ``strata`` (the sample spread over time slices, under ``STRATA_AGG``)
-    or ``exact`` (the whole scope as one page of hits)."""
+    ``strata`` (the sample spread over time slices, under ``STRATA_AGG``),
+    ``respread`` (the sample re-spread over where the first pass counted
+    the documents, one sibling ``filter`` range per sub-slice) or ``exact``
+    (the whole scope as one page of hits)."""
 
     name: str
     field: str
@@ -859,6 +883,9 @@ class GroupPlan:
     #: from each; what the reply may carry at most
     strata: int = 0
     per_stratum: int = 0
+    #: respread phase: (aggregation name, documents asked) per time range,
+    #: in time order; what the reply may carry at most, per range and in all
+    ranges: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1395,6 +1422,8 @@ class EsScrubber(jsonscrub.JsonScrubber):
             # before anything is harvested: the slices and the documents in
             # them are capped as a page is, per slice and in all
             self._check_strata(aggs, plan.groups, len(rows))
+        elif plan.groups is not None and plan.groups.phase == "respread":
+            self._check_respread(aggs, plan.groups, len(rows))
         for h in rows:
             self._harvest_hit(h)
         if aggs:
@@ -1463,6 +1492,27 @@ class EsScrubber(jsonscrub.JsonScrubber):
         if read > TEXT_GROUP_SAMPLE:
             raise self._refuse("size_cap", "response withheld: more hits than the cap allows")
 
+    def _check_respread(self, aggs: Any, g: GroupPlan, top_rows: int) -> None:
+        """A respread reply carries every range it was asked for, at most
+        the documents each was asked for and at most the sample in all,
+        like a strata reply; anything wider is withheld before a document
+        of it is read."""
+        if not isinstance(aggs, dict):
+            raise self._refuse("malformed", "response withheld: the sample's ranges are missing")
+        read = top_rows
+        for name, size in g.ranges:
+            b = aggs.get(name)
+            if not isinstance(b, dict):
+                raise self._refuse("malformed", "response withheld: a range of the sample "
+                                                "is missing")
+            hits = _stratum_hits(b)
+            if len(hits) > size:
+                raise self._refuse("size_cap", "response withheld: more hits in a time range "
+                                               "than asked for")
+            read += len(hits)
+        if read > TEXT_GROUP_SAMPLE:
+            raise self._refuse("size_cap", "response withheld: more hits than the cap allows")
+
     def _text_groups(self, out: dict, g: GroupPlan) -> dict:
         """The scrubbed sample, as groups of its redacted text.
 
@@ -1481,8 +1531,17 @@ class EsScrubber(jsonscrub.JsonScrubber):
         total = out["hits"]["total"]
         total_n = total.get("value") if isinstance(total, dict) else None
         strata: list[tuple[int, list[str | None]]] = []
+        slices: list[tuple[Any, int]] = []
         if g.phase == "strata":
             for b in out["aggregations"][STRATA_AGG]["buckets"]:
+                hits = _stratum_hits(b)
+                n = b.get("doc_count")
+                n = n if isinstance(n, int) else len(hits)
+                strata.append((n, [_field_text(h, g.field) for h in hits]))
+                slices.append((b.get("key"), n))
+        elif g.phase == "respread":
+            for name, _size in g.ranges:
+                b = out["aggregations"][name]
                 hits = _stratum_hits(b)
                 n = b.get("doc_count")
                 strata.append((n if isinstance(n, int) else len(hits),
@@ -1493,6 +1552,11 @@ class EsScrubber(jsonscrub.JsonScrubber):
             strata.append((n, [_field_text(h, g.field) for h in rows]))
         agg = group_estimate(strata, g.size, total_n)
         agg["sample_cap"] = TEXT_GROUP_SAMPLE
+        if g.phase == "strata":
+            # the slices' starts and document counts, for the read's own
+            # re-spread decision only: esquery.read_text_groups pops it
+            # before anything leaves the bridge
+            agg["_slices"] = slices
         return {"hits": {"total": total, "hits": []}, "aggregations": {g.name: agg}}
 
     @staticmethod
@@ -1761,6 +1825,10 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 for b in buckets.values():
                     if isinstance(b, dict):
                         self._harvest_aggs(_sub_aggs(b), plan.subs)
+            if plan.type == "filter":
+                # a single-filter aggregation is bucket-shaped itself: its
+                # doc_count and sub-aggregations sit at the node's level
+                self._harvest_aggs(_sub_aggs(node), plan.subs)
             if plan.type == "top_hits":
                 inner = node.get("hits", {}).get("hits", [])
                 for h in inner if isinstance(inner, list) else []:
@@ -1815,6 +1883,10 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 row.update(self._rewrite_aggs(_sub_aggs(b), plan.subs))
                 out["buckets"][name] = row
             return out
+        if plan.type == "filter":
+            row: dict[str, Any] = {"doc_count": node.get("doc_count")}
+            row.update(self._rewrite_aggs(_sub_aggs(node), plan.subs))
+            return row
         if plan.type == "top_hits":
             inner = node.get("hits", {})
             rows = inner.get("hits", []) if isinstance(inner, dict) else []
