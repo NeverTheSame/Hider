@@ -71,3 +71,38 @@ def test_a_saved_vault_round_trips_the_answer(tmp_path, capsys):
     from hider import pseudonym
     v = pseudonym.EntityVault.load(vault_path)
     assert "Rachel Mbeki" in v.detokenize("<Person-01> asked for an update")
+
+
+def test_es_smoke_waits_out_the_longest_group_read(monkeypatch, capsys):
+    """Before: es-smoke waited poll_timeout + 120 - 420 s at the measured
+    300 s site - and said the bridge did not answer while it was still
+    mid-read (the first week read ran 835 s before the probe deadlines).
+    After: the wait is sized to outlive the worst read by construction -
+    the read budget plus one in-flight pass, plus the old margin."""
+    from hider import elastic, esbridge, eseval
+
+    cfg = elastic.load(elastic.EXAMPLE)
+    # the before, pinned as arithmetic: the old wait lost to the read
+    old_wait = eseval.MEASURED_SEARCH_LIMIT_S + 120
+    assert old_wait == 420 < 835
+    # the after: the wait covers the longest read a query can run
+    worst_read = (elastic.TEXT_GROUP_READ_BUDGET_LIMITS + 1) * cfg.poll_timeout_s
+    assert esbridge.search_wait_s(cfg) == worst_read + 120 > cfg.poll_timeout_s + 120
+
+    captured: list[float] = []
+    real = esbridge.BrokerClient
+
+    class Capturing(real):
+        def __init__(self, path, *, timeout):
+            captured.append(timeout)
+            super().__init__(path, timeout=timeout)
+
+        def call(self, op, **fields):
+            raise elastic.Refused("session_expired", "no bridge (test)")
+
+    monkeypatch.setattr(esbridge, "BrokerClient", Capturing)
+    rc = cli.main(["es-smoke", "--config", str(elastic.EXAMPLE), "--cluster", "emea"])
+    out = capsys.readouterr().out
+    assert rc != 0 and "session_expired" in out
+    # the es-smoke client was built with the sized wait, not the old formula
+    assert esbridge.search_wait_s(cfg) in captured

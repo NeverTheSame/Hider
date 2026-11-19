@@ -656,15 +656,33 @@ Listed with owners in the README's Limitations section and in
   produces, see `esbridge.clock`). Every piece's kept texts are already
   reduced to group keys (`_strata`, idempotent, so `mark_shown` and the
   leak check see only group text) and all pieces are combined into
-  **one** estimate, margins and scatter across every range. Bounds:
-  `TEXT_GROUP_MAX_PASSES` (12) sampling passes and
-  `TEXT_GROUP_MAX_TIMEOUTS` (3) spent limits per question; a timed-out
-  re-spread keeps its piece's finished first pass; when the read stops
-  early the reply's `covered`/`covered_share` say **exactly which newest
-  part of the window the groups describe** (contiguous by construction:
-  pieces are processed strictly newest first), the total is `gte`, and
-  only a read that covered nothing is refused `slow_read` (message: the
-  limit, the narrowest width tried, the waits spent, what to do).
+  **one** estimate, margins and scatter across every range.
+  **The waiting is bounded, because unbounded it was an hour**: with no
+  bound, `TEXT_GROUP_MAX_PASSES` (12) passes could each wait the full
+  site limit - 3,600 s at the measured 300 s site, pinned as the before
+  in `test_the_waiting_of_one_question_is_bounded_whatever_the_cluster_does`.
+  Now (`esquery.read_text_groups`, the bridge passing the site limit and
+  wall time; the eval its simulated clock): a pass over a width the read
+  knows nothing about is waited on for the **probe deadline**
+  (`TEXT_GROUP_PROBE_FLOOR_S`: `max(60 s, limit/5)`), the full limit only
+  for a width that already finished once in this read or for the **last
+  allowed attempt** (so a cluster slow at every width still gets one
+  full-length try); at most `TEXT_GROUP_MAX_TIMEOUTS` (3) timed-out
+  passes; and the read starts no new pass once
+  `TEXT_GROUP_READ_BUDGET_LIMITS` (3) limits of waiting are spent. **The
+  longest one question can take is budget plus one in-flight pass = four
+  limits: 1,200 s at a 300 s site, 480 s at the default.** The chosen
+  trade (waiting over requests, by decision): a pass that would have
+  finished between the probe deadline and the limit is split instead -
+  more requests, same answer, less waiting - and a probed-out width is
+  remembered as bad even though the full limit was never tried on it. A
+  timed-out re-spread keeps its piece's finished first pass; when the
+  read stops early the reply's `covered`/`covered_share` say **exactly
+  which newest part of the window the groups describe** (contiguous by
+  construction: pieces are processed strictly newest first), the total is
+  `gte`, and only a read that covered nothing is refused `slow_read`
+  (message: the deadline hit, the narrowest width tried, the waits spent,
+  what to do).
   **The bridge remembers what timed out** (`Bridge.group_spans`, shared
   across a broker's cases like `presence`, per index, the narrowest span
   that hit the limit, `GROUP_SPAN_TTL_S` an hour, spans and times only):
@@ -677,14 +695,18 @@ Listed with owners in the README's Limitations section and in
   by the week-in-pieces tests in `test_estextgroups.py` and `esutility`'s
   `slow_week_census`):
   **before, the week spent 300 s and returned nothing; now it answers
-  whole** - 2 probes pay the limit (the week, then its newest half), four
-  1.75-day pieces finish, **8 requests, ~835 simulated seconds, covered
-  100%, every count within margin (the narrow pieces read most slices
-  whole, worst count off under 1%)**; asked again on the same broker it
-  is **6 requests, ~235 seconds, 0 timeouts, identical groups**. A window
-  wider than the pass budget covers its newest pieces and says so
-  (30 days at 1.875-day pieces: 12 passes, `covered_share` 0.6875, total
-  `gte`). **Why several samples per question is still safe**: the
+  whole in about six minutes** - 2 probes pay their 60 s deadline (the
+  week, then its newest half), four 1.75-day pieces finish, **8 requests,
+  ~355 simulated seconds (835 when every probe paid the full limit),
+  covered 100%, every count within margin (the narrow pieces read most
+  slices whole, worst count off under 1%)**; asked again on the same
+  broker it is **6 requests, ~235 seconds, 0 timeouts, identical
+  groups**. A cluster slow at every width is refused after 60 + 60 +
+  300 = 420 s; one whose every pass finishes just under the limit is
+  stopped by the budget with honest partial coverage, total under four
+  limits. A window wider than the pass budget covers its newest pieces
+  and says so (30 days at 1.875-day pieces: 12 passes, `covered_share`
+  0.6875, total `gte`). **Why several samples per question is still safe**: the
   per-request cap is untouched (no request reads more than one sample,
   which is what keeps a group read no wider than paging), and the pieces
   are exactly the narrower questions the case could already ask one at a
@@ -703,17 +725,47 @@ Listed with owners in the README's Limitations section and in
   of a too-wide window still spend passes (the budget buys coverage, not
   cleverness); the span memory is per index, so a cheap narrow-filtered
   wide question splits like an expensive one (more requests, same
-  answer); after `GROUP_SPAN_TTL_S` the probing is paid again; and the
-  worst case is still `TEXT_GROUP_MAX_TIMEOUTS` spent limits before a
-  refusal (15 minutes at a 300 s limit), once per cluster per hour.
+  answer); after `GROUP_SPAN_TTL_S` the probing is paid again - two 60 s
+  probes, not spent limits, once per cluster per hour.
   **Costs otherwise unchanged**: the refusal's spent phrases are not
   refunded; the small fixtures' passes are charged at
   `elastic.TEXT_GROUP_SCAN_S_PER_MDOC` (52/3 s per million documents, a
   floor sized from the one-day point so the measure never implies the
   pass is free - the utility rows carry `scan_seconds`); and a pass that
-  would have finished just past the limit is lost as surely as one that
-  never would (the site's lever is `poll_timeout_s`, which bounds every
-  search - no group-read knob).
+  would have finished just past its deadline is lost as surely as one
+  that never would (the site's lever is `poll_timeout_s`, which bounds
+  every search - no group-read knob).
+  **The one-thread broker lives with a long read.** The broker's thread
+  owns the browser, so for the length of a search it used to answer
+  nothing - acceptable at one search of at most the limit, not at a read
+  of several (the same failure AGENTS already records for the vocabulary
+  build, which pumps between pages). Now the session's wait between polls
+  is the broker's **idle hook** (`KibanaSession(idle=...)`,
+  `Broker._search_idle`): during any search, a **ping is answered** (so
+  `broker_state`, es-login's health checks and es-logout's "never say no
+  bridge at a live one" keep working), a **stop is accepted** (it lands
+  when the search in flight finishes; the socket stays until then, which
+  is what es-logout watches), and **anything else is told `busy` at
+  once** - "the bridge is mid-search" - instead of hanging to its own
+  socket timeout; the browser is never touched from the hook. MCP tool
+  calls during another case's read wait in the backlog (one browser, one
+  thread - declared), and a model's own wide read simply **returns late,
+  not incrementally**, which `es_schema` says, with the four-limit bound
+  and the advice to prefer narrower ranges when latency matters; what the
+  model's harness does with a many-minute tool call is outside the
+  bridge's control. **Callers wait as long as the worst read**:
+  `esbridge.search_wait_s` = (budget + 1) limits + the old 120 s margin -
+  es-smoke used it to give up at `limit + 120` (420 s at the measured
+  site) and print "the bridge did not answer" while the bridge was still
+  reading a 835 s week. Before and after are pinned:
+  `test_before_a_long_read_left_the_broker_deaf` (no idle hook: a ping
+  mid-read times out, the bridge looks dead while only reading),
+  `test_a_ping_is_answered_and_others_told_busy_during_a_long_read` (the
+  ping answers, others get `busy`, the read's caller still gets the whole
+  covered answer), and
+  `test_es_smoke_waits_out_the_longest_group_read` in `test_cli.py`
+  (`idle_answers` is the measurement switch; nothing in the live path
+  sets it False).
   **What a real cluster needs that
   the stub does not show**: a 1,000-hit reply with full `_source` is
   megabytes through Kibana (its payload limits apply) and tier 2 over

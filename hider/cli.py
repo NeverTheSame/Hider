@@ -297,8 +297,11 @@ def _cmd_es_smoke(args: argparse.Namespace) -> int:
     if not cluster:
         raise SystemExit(f"--cluster is required; configured: {[c.name for c in cfg.clusters]}")
     q = _smoke_query(esbridge, cfg, args, size)
+    # the wait outlives the longest read a query can run (a wide text_groups
+    # read in window pieces), not just one search: it was poll_timeout + 120
+    # and gave up while the bridge was still reading
     client = esbridge.BrokerClient(esbridge.broker_socket(args.profile_dir or cfg.profile_dir),
-                                   timeout=cfg.poll_timeout_s + 120)
+                                   timeout=esbridge.search_wait_s(cfg))
     # es-smoke is the tool that shows where the bridge is, so it reports the
     # build rather than hiding behind it; a query before it is ready is
     # refused with vocabulary_building, and this says why.

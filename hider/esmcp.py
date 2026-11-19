@@ -346,17 +346,21 @@ _AGGS = {
         "the margin need not cover it. Costs 2 requests with a closed time_range (3 when "
         "the sample is re-spread); without one the span is read first (+1). Sampling makes "
         "Elasticsearch bucket every document in scope; a pass that does not finish within "
-        "the session's search time limit is retried over the window split into newest-first "
-        "pieces (each piece its own pass and sample; each timed-out probe costs the whole "
-        "limit, and the widths that timed out are remembered for about an hour, so asking "
-        "again soon skips them). Read the reply's covered/covered_share: when "
-        "covered_share < 1 the groups, counts and total describe only that newest part of "
-        "the asked window - the older part was NOT read and a group may be commoner there; "
-        "ask it as its own narrower time_range if it matters. Only a read that could cover "
-        "nothing is refused slow_read; then narrow the time range or add filters (a terms "
-        "or date_histogram over the same scope is cheap and shows where the documents "
-        "are). It is the query's only aggregation, takes no sub-aggregations, nothing in "
-        "it changes how the sample is read, and <*> is not a label."),
+        "its deadline is retried over the window split into newest-first pieces (each piece "
+        "its own pass and sample; an unknown width is probed at about a minute, not the "
+        "whole limit, and the widths that timed out are remembered for about an hour, so "
+        "asking again soon skips them). A wide read returns late, not incrementally: the "
+        "whole wait is bounded at four search limits (a budget of three, plus one pass in "
+        "flight), and nothing arrives until it returns - prefer a narrower time_range when "
+        "latency matters. Read the reply's covered/covered_share: when covered_share < 1 "
+        "the groups, counts and total describe only that newest part of the asked window - "
+        "the older part was NOT read (the deadlines or the budget stopped the read) and a "
+        "group may be commoner there; ask it as its own narrower time_range if it matters. "
+        "Only a read that could cover nothing is refused slow_read; then narrow the time "
+        "range or add filters (a terms or date_histogram over the same scope is cheap and "
+        "shows where the documents are). It is the query's only aggregation, takes no "
+        "sub-aggregations, nothing in it changes how the sample is read, and <*> is not a "
+        "label."),
     "additionalProperties": {"type": "object"},
 }
 

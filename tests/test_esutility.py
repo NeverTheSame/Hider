@@ -144,15 +144,18 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
     assert f["scan_seconds"] > 0
     f = rows["slow_week_census"]["figures"]
     # the measured slow cluster: the week answered whole in pieces - two
-    # probing passes paid the 300 s limit, then 1.75-day pieces finished;
-    # the counts are near-exact (narrow pieces read most slices whole) and
-    # the reply says it covered the entire window
+    # probing passes paid the 60 s probe deadline (not the 300 s limit),
+    # then 1.75-day pieces finished; the counts are near-exact (narrow
+    # pieces read most slices whole) and the reply says it covered the
+    # entire window
     assert f["covered_share"] == 1.0 and f["timeouts"] == 2 and f["passes"] >= 6
     assert f["requests"] >= 7 and not f["exact"]
     assert f["missing"] == 0 and f["within_margin"] == f["groups"] == 3 == f["order_settled"]
     assert f["max_error_pct"] < 1
-    # the waiting, in simulated seconds: two spent limits plus the pieces
-    assert 2 * 300 <= f["scan_seconds"] <= 2 * 300 + 6 * 52
+    # the waiting, in simulated seconds: two probe deadlines plus the
+    # pieces - about six minutes, against 835 s when every probe paid the
+    # full limit and the spent 300 s with nothing back before the pieces
+    assert 2 * 60 <= f["scan_seconds"] <= 2 * 60 + 6 * 52
     f = rows["tenant_day_census"]["figures"]
     # the whole sample lands inside the half hour: the day answered from
     # 1,000 of 3,000 documents in three requests, every count inside the

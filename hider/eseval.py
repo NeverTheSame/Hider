@@ -2570,9 +2570,11 @@ def slow_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, 
     """The burst week on the measured cluster's wall-time shape
     (:func:`measured_cluster_scan_wall`) under that site's 300 s search
     limit: one sampling pass over the week cannot finish, so the week
-    question must be read in window pieces or not at all. Its own engine,
-    so no other figure moves."""
-    cfg = burst_map()
+    question must be read in window pieces or not at all. The site map's
+    own search limit matches the engine's, so the probe deadlines and the
+    read budget are sized from the same number a real bridge would use.
+    Its own engine, so no other figure moves."""
+    cfg = dataclasses.replace(burst_map(), poll_timeout_s=MEASURED_SEARCH_LIMIT_S)
     fx = Fixture(burst_docs(), [], [])
     engine = StubEngine(fx, (BURST_INDEX,))
     engine.group_scan_wall = measured_cluster_scan_wall
@@ -2975,7 +2977,8 @@ class StubEngine:
 
     # -- entry point -------------------------------------------------------
 
-    def search(self, index: str, body: dict, *, ignore_unavailable: bool = False) -> dict:
+    def search(self, index: str, body: dict, *, ignore_unavailable: bool = False,
+               deadline_s: float | None = None) -> dict:
         """A raw Elasticsearch response for a compiled body. With
         ``ignore_unavailable`` a pattern the engine does not have matches no
         documents instead of failing, as in Elasticsearch."""
@@ -3008,13 +3011,16 @@ class StubEngine:
             self.group_scans += 1
             if self.group_scan_wall is not None:
                 wall = self.group_scan_wall(self._range_s, total)
-                if self.search_limit_s is not None and wall > self.search_limit_s:
-                    # the session's completion ceiling: the wait is spent,
+                bounds = [b for b in (self.search_limit_s, deadline_s) if b is not None]
+                limit = min(bounds) if bounds else None
+                if limit is not None and wall > limit:
+                    # the deadline (the session's ceiling, or the shorter
+                    # per-pass one the read asked for): the wait is spent,
                     # the search deleted, nothing read
-                    self.simulated_seconds += self.search_limit_s
+                    self.simulated_seconds += limit
                     raise elastic.Refused("incomplete", (
                         f"response withheld: search did not finish in "
-                        f"{self.search_limit_s:g}s; {elastic.INCOMPLETE_HINT}"))
+                        f"{limit:g}s; {elastic.INCOMPLETE_HINT}"))
                 self.simulated_seconds += wall
             else:
                 self.simulated_seconds += self.group_scan_s_per_mdoc * total / 1_000_000.0
@@ -3591,12 +3597,13 @@ class EngineSession:
     def probe(self, cluster) -> None:
         return None
 
-    def search(self, cluster, body: dict) -> dict:
+    def search(self, cluster, body: dict, deadline_s: float | None = None) -> dict:
         params = body["params"]
         return {"id": "x", "isPartial": False, "isRunning": False,
                 "rawResponse": self.engine.search(
                     params["index"], params["body"],
-                    ignore_unavailable=params.get("ignore_unavailable", False))}
+                    ignore_unavailable=params.get("ignore_unavailable", False),
+                    deadline_s=deadline_s)}
 
 
 #: The guessing run the per-case phrase budget exists to stop: 500 queries,
@@ -4357,6 +4364,10 @@ class SteppedSearchTransport:
         if method == "DELETE":
             self.searches.pop(path.rsplit("/", 1)[-1], None)
             return {"ok": True}
+        if path == esbridge.PROBE_PATH:
+            # the signed-in probe, as Kibana answers it (the body is
+            # discarded beyond the key's presence)
+            return {"username": "stub"}
         if path == esbridge.SEARCH_PATH:
             # Run it now and charge it now; then hand it back over as many
             # polls as its cost takes, which is what a real async search
@@ -4646,11 +4657,16 @@ class Session:
             self.scrubber.spend_phrases(compiled.new_phrases)
             if compiled.group_read is not None:
                 out = esquery.read_text_groups(
-                    lambda body: {"id": "x", "isPartial": False, "isRunning": False,
-                                  "rawResponse": self.engine.search(body["params"]["index"],
-                                                                    body["params"]["body"])},
+                    lambda body, deadline_s=None: {
+                        "id": "x", "isPartial": False, "isRunning": False,
+                        "rawResponse": self.engine.search(body["params"]["index"],
+                                                          body["params"]["body"],
+                                                          deadline_s=deadline_s)},
                     self.scrubber, compiled.group_read,
-                    slow_spans=self.group_spans)[0].output
+                    slow_spans=self.group_spans,
+                    search_limit_s=self.engine.search_limit_s,
+                    clock=((lambda: self.engine.simulated_seconds)
+                           if self.engine.search_limit_s else None))[0].output
             else:
                 raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
                 envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}

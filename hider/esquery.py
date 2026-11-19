@@ -483,13 +483,28 @@ def _coverage_fields(agg: dict, window: tuple[float, float], covered: tuple[floa
     agg["timeouts"] = timeouts
 
 
-def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber,
+def read_text_groups(search: Callable[..., Any], scrubber: elastic.EsScrubber,
                      read: GroupRead, *,
-                     slow_spans: dict | None = None) -> tuple[elastic.Scrubbed, int]:
+                     slow_spans: dict | None = None,
+                     search_limit_s: float | None = None,
+                     clock: Callable[[], float] | None = None) -> tuple[elastic.Scrubbed, int]:
     """Run a ``text_groups`` read: ``search`` takes a request document and
-    returns the raw envelope; every reply goes through the scrubber with
-    the plan of its own request. Returns the groups and how many requests
-    were made; the groups carry the count too.
+    an optional per-pass deadline in seconds (None: the session's own
+    limit) and returns the raw envelope; every reply goes through the
+    scrubber with the plan of its own request. Returns the groups and how
+    many requests were made; the groups carry the count too.
+
+    **The waiting is bounded** (``search_limit_s``: the site's search
+    limit; ``clock``: what the budget is measured on - the bridge passes
+    wall time, the eval the stub's simulated seconds; with either absent
+    nothing new applies): a pass over a width the read knows nothing about
+    is waited on for the probe deadline
+    (:data:`elastic.TEXT_GROUP_PROBE_FLOOR_S`, ``max(60, limit/5)``), the
+    full limit only for a width that already finished once in this read or
+    for the last allowed attempt; and the read starts no new pass once
+    :data:`elastic.TEXT_GROUP_READ_BUDGET_LIMITS` limits of waiting are
+    spent, returning what is covered. The longest one question can wait is
+    therefore budget + one in-flight pass = four limits.
 
     The order (see :class:`GroupRead`): the capped count (or bounds), then
     the whole scope as one exact page when it fits the sample, else the
@@ -512,6 +527,13 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
     passes = 0
     timeouts = 0
     lo_hi = read.window
+    #: probe deadline for a width the read knows nothing about; the budget
+    #: the whole read's waiting is held to
+    probe = (min(search_limit_s, max(elastic.TEXT_GROUP_PROBE_FLOOR_S, search_limit_s / 5.0))
+             if search_limit_s else None)
+    budget = (elastic.TEXT_GROUP_READ_BUDGET_LIMITS * search_limit_s
+              if search_limit_s and clock is not None else None)
+    t0 = clock() if clock is not None else 0.0
 
     def empty(out: dict) -> tuple[elastic.Scrubbed, int]:
         # nothing in scope: no groups, the total as the reply gave it
@@ -524,7 +546,7 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
     if lo_hi is None:
         body, plan = read.bounds()
         n += 1
-        out = scrubber.scrub_response(search(body), plan).output
+        out = scrubber.scrub_response(search(body, None), plan).output
         total, relation = _group_total(out)
         first = (out.get("aggregations") or {}).get("first", {}).get("value")
         last = (out.get("aggregations") or {}).get("last", {}).get("value")
@@ -534,7 +556,7 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
     else:
         body, plan = read.count()
         n += 1
-        out = scrubber.scrub_response(search(body), plan).output
+        out = scrubber.scrub_response(search(body, None), plan).output
         total, relation = _group_total(out)
         if total == 0:
             return empty(out)
@@ -545,7 +567,7 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
         body, plan = read.exact()
         n += 1
         try:
-            scrubbed = scrubber.scrub_response(search(body), plan)
+            scrubbed = scrubber.scrub_response(search(body, None), plan)
         except elastic.Refused as e:
             if e.code == _TIMEOUT_CODE:
                 raise _refuse_slow(e) from e
@@ -559,6 +581,7 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
 
     # -- the sampling stage, piece-wise over the window ---------------------
     lo, hi = lo_hi
+    ok_span = 0.0
     bad_span = math.inf
     if slow_spans is not None:
         known = slow_spans.get(read.index)
@@ -585,16 +608,29 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
         plo, phi = work.pop(0)
         span = phi - plo
         if span >= bad_span and span > 1.0:
-            # this width is known to hit the limit: split without paying it
+            # this width is known to hit its deadline: split without paying
             split(plo, phi)
             continue
         if passes >= elastic.TEXT_GROUP_MAX_PASSES:
             break
+        if budget is not None and clock() - t0 >= budget:
+            # the read has waited its budget: what is covered is returned,
+            # and the reply says how far that reaches
+            break
+        # a width that already finished once, and the last allowed attempt,
+        # get the session's full limit; an unknown width gets the probe
+        # deadline, so learning that a scope is slow costs minutes, not
+        # spent limits (the chosen trade: a pass that would have finished
+        # between the two is split instead - more requests, less waiting)
+        deadline = None
+        if probe is not None and span > ok_span \
+                and timeouts < elastic.TEXT_GROUP_MAX_TIMEOUTS - 1:
+            deadline = probe
         body, plan = read.strata_read(plo, phi, closed_end=phi >= hi)
         n += 1
         passes += 1
         try:
-            scrubbed = scrubber.scrub_response(search(body), plan)
+            scrubbed = scrubber.scrub_response(search(body, deadline), plan)
         except elastic.Refused as e:
             if e.code != _TIMEOUT_CODE:
                 raise
@@ -606,6 +642,7 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
                 break
             split(plo, phi)
             continue
+        ok_span = max(ok_span, span)
         piece = scrubbed.output["aggregations"][read.groups.name]
         slices = piece.pop("_slices", [])
         strata_piece = piece.pop("_strata", [])
@@ -616,7 +653,8 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
         # is never traded for an improvement pass
         if (not piece["exact"] and slices and all(isinstance(k, int) for k, _c in slices)
                 and timeouts < elastic.TEXT_GROUP_MAX_TIMEOUTS
-                and passes + len(work) < elastic.TEXT_GROUP_MAX_PASSES):
+                and passes + len(work) < elastic.TEXT_GROUP_MAX_PASSES
+                and (budget is None or clock() - t0 < budget)):
             alloc = _allocate([c for _k, c in slices], elastic.TEXT_GROUP_SAMPLE)
             if sum(alloc) > piece["sampled"] * elastic.TEXT_GROUP_RESPREAD_MIN:
                 body, plan = read.respread(
@@ -625,7 +663,7 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
                 n += 1
                 passes += 1
                 try:
-                    re_out = scrubber.scrub_response(search(body), plan)
+                    re_out = scrubber.scrub_response(search(body, None), plan)
                     re_agg = re_out.output["aggregations"][read.groups.name]
                     re_agg.pop("_slices", None)
                     strata_piece = re_agg.pop("_strata", strata_piece)

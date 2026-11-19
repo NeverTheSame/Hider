@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from hider import elastic, eseval, esquery
+from hider import elastic, esbridge, eseval, esquery
 
 CFG = elastic.load(elastic.EXAMPLE)
 GROUPS = {"g": {"type": "text_groups", "field": "message", "size": 10}}
@@ -213,23 +214,25 @@ def test_the_slow_rule_is_a_deadline_not_a_prediction():
     g = out["aggregations"]["g"]
     assert refused is None and g["timeouts"] == 0 and g["covered_share"] == 1.0 and took >= 47.0
     # the week's single pass does not finish: the window is split in half,
-    # newest first, until the pieces do, and the answer covers the week
+    # newest first, until the pieces do, and the answer covers the week.
+    # The probing costs the 60 s probe deadline per unknown width, not the
+    # whole limit, so learning the week is slow is minutes, not spent limits
     out, refused, took = ask({"gte": "now-7d", "lte": "now"})
     g = out["aggregations"]["g"]
     assert refused is None and g["timeouts"] == 2 and g["covered_share"] == 1.0
-    assert took >= 2 * 120.0 + 4 * 47.0
+    assert 2 * 60.0 + 4 * 47.0 <= took < 2 * 120.0 + 4 * 47.0
     # a query with no closed range reads the documents' own span (the
     # bounds request), which is the same week: pieces again
     out, refused, took = ask(None)
     assert refused is None and out["aggregations"]["g"]["covered_share"] == 1.0
-    # a cluster where even the pieces cannot finish: the read stops after
-    # TEXT_GROUP_MAX_TIMEOUTS waits and the refusal is actionable and
-    # value-free
+    # a cluster where even the pieces cannot finish: two probe waits, one
+    # full-length last try (so a cluster slow at every width still gets
+    # one), then the actionable, value-free refusal
     n = len(engine.requests)
     out, refused, took = ask({"gte": "now-7d", "lte": "now"},
                              wall=lambda window_s, docs: float("inf"))
     assert out is None and refused.code == "slow_read"
-    assert took == elastic.TEXT_GROUP_MAX_TIMEOUTS * 120.0
+    assert took == 60.0 + 60.0 + 120.0
     assert len(engine.requests) == n + 1 + elastic.TEXT_GROUP_MAX_TIMEOUTS
     assert "did not finish" in refused.message and "120s" in refused.message
     assert "Narrow the time range or add filters" in refused.message
@@ -252,9 +255,12 @@ def test_a_week_that_cannot_finish_in_one_pass_is_read_in_pieces_and_says_what_i
     first_wait = engine.simulated_seconds - s0
     assert refused is None
     g = out["aggregations"]["g"]
-    # two probes hit the limit (the week, then its newest half), then the
-    # week is covered whole in 1.75-day pieces, each pass its own sample
+    # two probes hit their 60 s deadline (the week, then its newest half),
+    # then the week is covered whole in 1.75-day pieces, each pass its own
+    # sample; the whole first ask waits about six minutes, not the 835 s
+    # it cost when every probe paid the full 300 s limit
     assert g["timeouts"] == 2 and g["covered_share"] == 1.0
+    assert 2 * 60.0 + 5 * 47.0 <= first_wait <= 2 * 60.0 + 6 * 47.0
     assert g["covered"] == g["window"] and g["passes"] >= 6
     assert out["hits"]["total"] == {"value": 2700, "relation": "eq"}
     assert [b["key"] for b in g["buckets"]] == sorted(truth, key=lambda k: -truth[k])
@@ -274,7 +280,7 @@ def test_a_week_that_cannot_finish_in_one_pass_is_read_in_pieces_and_says_what_i
     out2, refused2, _dt, _c = case.call(q)
     g2 = out2["aggregations"]["g"]
     assert refused2 is None and g2["timeouts"] == 0
-    assert engine.simulated_seconds - s1 < first_wait / 3
+    assert engine.simulated_seconds - s1 < first_wait
     assert [(b["key"], b["doc_count"]) for b in g2["buckets"]] == \
         [(b["key"], b["doc_count"]) for b in g["buckets"]]
     # no label made usable and no value anywhere
@@ -818,3 +824,162 @@ def test_codes_split_groups_and_numbers_that_are_not_codes_do_not():
         "Site returned HTTP 429 after <*> retries": 2,
         "Site returned HTTP 500 after <*> retries": 1,
         "Upload took <*> ms, <*> items": 2}
+
+
+def test_the_waiting_of_one_question_is_bounded_whatever_the_cluster_does():
+    # The number, before any bound existed: TEXT_GROUP_MAX_PASSES passes
+    # could each wait the full site limit - an hour at a 300 s site. Now:
+    # unknown widths are probed at max(60, limit/5) seconds, the read
+    # starts no pass past TEXT_GROUP_READ_BUDGET_LIMITS limits of waiting,
+    # and the worst question is budget + one in-flight pass = four limits
+    # (1,200 s at the measured site).
+    limit = eseval.MEASURED_SEARCH_LIMIT_S
+    worst_before = elastic.TEXT_GROUP_MAX_PASSES * limit
+    worst_after = (elastic.TEXT_GROUP_READ_BUDGET_LIMITS + 1) * limit
+    assert worst_before == 3600.0 and worst_after == 1200.0
+
+    q = {"index": eseval.BURST_INDEX, "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
+         "filters": [FAILED],
+         "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}}
+
+    def ask(wall):
+        cfg, _fx, engine, vocab = eseval.slow_world()
+        if wall is not None:
+            engine.group_scan_wall = wall
+        session = eseval.Session(cfg, engine, tier2="none", vocabulary=vocab)
+        s0 = engine.simulated_seconds
+        out, refused, _dt, _c = session.call(q)
+        return out, refused, round(engine.simulated_seconds - s0, 1)
+
+    # the measured cluster: learning the week is slow costs two 60 s
+    # probes, not two spent 300 s limits - the whole first ask is ~355 s
+    # against the 835 s it cost with full-limit probes
+    out, refused, took = ask(None)
+    assert refused is None and out["aggregations"]["g"]["covered_share"] == 1.0
+    assert took == 2 * 60.0 + 5 * 47.0 < 835.0
+    # a cluster slow at every width: two probes, one full-length last try,
+    # the refusal - 420 s in all, never an hour
+    out, refused, took = ask(lambda w, d: float("inf"))
+    assert refused is not None and refused.code == "slow_read" and took == 60 + 60 + 300
+    # a cluster whose every pass finishes just under the limit: the budget
+    # stops new passes at three limits of waiting, what is covered is
+    # returned and said, and the total stays under four limits
+    out, refused, took = ask(lambda w, d: 295.0)
+    g = out["aggregations"]["g"]
+    assert refused is None and 0 < g["covered_share"] < 1.0
+    assert out["hits"]["total"]["relation"] == "gte"
+    assert took <= worst_after
+
+
+def _liveness_world(tmp_path):
+    """A real Broker over the stepped async-search stub, its vocabulary
+    already built, and a group query whose sampling passes take many polls:
+    what the broker does on its one thread during a long read."""
+    import tempfile
+
+    cfg = eseval.burst_map()
+    fx = eseval.Fixture(eseval.burst_docs(), [], [])
+    engine = eseval.StubEngine(fx, (eseval.BURST_INDEX,))
+    vocab, _b = eseval.build_vocabulary(cfg, engine)
+    # a sampling pass costs ~500 simulated seconds, which the stepped
+    # transport hands over as ~100 polls: the read spans seconds of wall
+    # time, long enough to ping it mid-flight
+    engine.group_scan_s_per_mdoc = 500.0 / 0.0027
+    broker = esbridge.Broker(cfg, lambda: eseval.SteppedSearchTransport(engine),
+                             poll_interval=0.01,
+                             sessions_dir=tmp_path / "es")
+    broker.vocabulary.put("stub", vocab)
+    d = tempfile.mkdtemp(prefix="hg-", dir="/tmp")  # a socket path must fit 104 bytes
+    sock = Path(d) / "broker.sock"
+    q = {"index": eseval.BURST_INDEX, "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
+         "filters": [FAILED],
+         "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}}
+    return broker, sock, engine, q, d
+
+
+def _run_and_ping(broker, sock, engine, q, *, ping_timeout: float):
+    """Serve the broker, start a long group read, ping it mid-read; return
+    (the read's reply, what the ping did, what a non-ping op got)."""
+    import shutil
+    import threading
+
+    saved = esbridge.clock
+    esbridge.clock = lambda: eseval.NOW.timestamp()
+    serve = threading.Thread(target=broker.serve, args=(sock,), daemon=True)
+    serve.start()
+    try:
+        for _ in range(400):
+            if esbridge.broker_running(sock):
+                break
+            threading.Event().wait(0.01)
+        signed = esbridge.BrokerClient(sock, timeout=30).call("login", cluster="stub",
+                                                              timeout=5)
+        assert signed.get("signed_in") is True
+        result: dict = {}
+
+        def run():
+            try:
+                result["reply"] = esbridge.BrokerClient(sock, timeout=60).call(
+                    "run", cluster="stub", query=q, tier2="none")
+            except elastic.Refused as e:
+                result["refused"] = e
+
+        before = len(engine.requests)
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        for _ in range(1000):
+            if len(engine.requests) >= before + 2:
+                break
+            threading.Event().wait(0.005)
+        assert "reply" not in result and "refused" not in result, "the read ended too soon"
+        try:
+            ping = esbridge.BrokerClient(sock, timeout=ping_timeout).call("ping")
+        except elastic.Refused as e:
+            ping = e
+        try:
+            other = esbridge.BrokerClient(sock, timeout=ping_timeout).call(
+                "vocabulary", cluster="stub")
+        except elastic.Refused as e:
+            other = e
+        worker.join(30)
+        return result, ping, other
+    finally:
+        esbridge.clock = saved
+        try:
+            esbridge.BrokerClient(sock, timeout=5).call("stop")
+        except elastic.Refused:
+            pass
+        serve.join(10)
+        shutil.rmtree(sock.parent, ignore_errors=True)
+
+
+def test_before_a_long_read_left_the_broker_deaf(tmp_path):
+    # the before, kept behind the measurement switch nothing in the live
+    # path sets: with no idle hook the broker answers nothing for the
+    # whole read - a ping times out and the bridge looks dead while it is
+    # only reading (the vocabulary build had the same failure, and the
+    # serve loop already answers between its pages)
+    broker, sock, engine, q, d = _liveness_world(tmp_path)
+    broker.idle_answers = False
+    result, ping, other = _run_and_ping(broker, sock, engine, q, ping_timeout=0.4)
+    assert isinstance(ping, elastic.Refused) and ping.code == "unreachable"
+    assert isinstance(other, elastic.Refused)
+    # the read itself still finished and answered its own caller in full
+    assert "reply" in result and result["reply"]["report"]["refused"] is None
+
+
+def test_a_ping_is_answered_and_others_told_busy_during_a_long_read(tmp_path):
+    broker, sock, engine, q, d = _liveness_world(tmp_path)
+    result, ping, other = _run_and_ping(broker, sock, engine, q, ping_timeout=2.0)
+    # the ping answers mid-read, so es-login's health checks and
+    # broker_state keep working while a week is being read
+    assert isinstance(ping, dict) and ping.get("ok") is True
+    # anything heavier is told busy at once instead of hanging until its
+    # own socket timeout
+    assert isinstance(other, elastic.Refused) and other.code == "busy"
+    assert "mid-search" in other.message
+    # and the read's own caller still gets the whole answer
+    report = result["reply"]["report"]
+    assert report["refused"] is None
+    agg = report["output"]["aggregations"]["g"]
+    assert agg["covered_share"] == 1.0 and agg["requests"] >= 2

@@ -398,11 +398,15 @@ class KibanaSession:
     malformed outcome turned into a refusal."""
 
     def __init__(self, transport: Transport, *, poll_interval: float = POLL_INTERVAL_S,
-                 poll_timeout: float = POLL_TIMEOUT_S, sleep=time.sleep) -> None:
+                 poll_timeout: float = POLL_TIMEOUT_S, sleep=time.sleep, idle=None) -> None:
         self.transport = transport
         self.poll_interval = poll_interval
         self.poll_timeout = poll_timeout
         self._sleep = sleep
+        #: what to do between polls instead of sleeping: the broker passes
+        #: its own hook here so it keeps answering pings while a search
+        #: runs on its one thread (None: plain sleep)
+        self._idle = idle
 
     # -- reply validation --------------------------------------------------
 
@@ -485,27 +489,32 @@ class KibanaSession:
             except elastic.Refused:
                 pass
 
-    def search(self, cluster: elastic.Cluster, body: dict) -> dict:
+    def search(self, cluster: elastic.Cluster, body: dict,
+               deadline_s: float | None = None) -> dict:
         """Submit the compiled body, poll to completion, release the search.
 
         Returns the final envelope for ``EsScrubber.scrub_response``, which
         still applies its own checks (``isPartial``, ``timed_out``, error
-        bodies). A poll that does not finish inside ``poll_timeout`` deletes
-        the server-side search and refuses as ``incomplete``.
+        bodies). A poll that does not finish inside ``poll_timeout`` - or
+        inside ``deadline_s``, when the caller set a shorter one (a group
+        read's probe pass does) - deletes the server-side search and
+        refuses as ``incomplete``. Between polls the broker's idle hook
+        runs, when it gave one, so the broker answers while it waits.
         """
+        limit = min(self.poll_timeout, deadline_s) if deadline_s else self.poll_timeout
         data = self.submit(cluster, body)
         if elastic.error_class(data) is not None:
             return data  # the scrubber turns it into an upstream_error refusal
         sid = data.get("id")
-        deadline = time.monotonic() + self.poll_timeout
+        deadline = time.monotonic() + limit
         try:
             while data.get("isRunning") is True:
                 sid = self.search_id(data)
                 if time.monotonic() >= deadline:
                     raise elastic.Refused("incomplete", (
                         f"response withheld: search did not finish in "
-                        f"{self.poll_timeout:g}s; {elastic.INCOMPLETE_HINT}"))
-                self._sleep(self.poll_interval)
+                        f"{limit:g}s; {elastic.INCOMPLETE_HINT}"))
+                (self._idle or self._sleep)(self.poll_interval)
                 data = self.poll_once(cluster, sid, body)
                 if elastic.error_class(data) is not None:
                     return data
@@ -629,8 +638,11 @@ class Bridge:
                              if now - v[1] <= GROUP_SPAN_TTL_S}
                     try:
                         scrubbed, requests = esquery.read_text_groups(
-                            lambda body: self.session.search(cluster, body), self.scrubber,
-                            compiled.group_read, slow_spans=spans)
+                            lambda body, deadline_s=None: self.session.search(
+                                cluster, body, deadline_s),
+                            self.scrubber, compiled.group_read, slow_spans=spans,
+                            search_limit_s=getattr(self.config, "poll_timeout_s", None),
+                            clock=time.monotonic)
                     finally:
                         # keep what the timeouts taught even when the read
                         # was refused: that is what spares the next question
@@ -1852,6 +1864,65 @@ class Broker:
         self._build_log: list[dict] = []
         #: clusters signed in to this bridge, in sign-in order
         self._signed_in: list[elastic.Cluster] = []
+        #: the listening socket while serve() runs: what _search_idle
+        #: answers on between the polls of a long search
+        self._srv: socket.socket | None = None
+        #: the measurement switch behind the liveness before-test; nothing
+        #: in the live path sets it False
+        self.idle_answers = True
+
+    def _search_idle(self, seconds: float) -> None:
+        """What a session does between polls instead of sleeping: keep
+        answering on the one thread. A ping (and a stop) is handled as
+        ever; anything else gets ``busy`` at once, instead of hanging on a
+        broker that is mid-search until its own socket timeout - a long
+        text_groups read made that window minutes, not seconds. Nothing
+        here touches the browser."""
+        srv = self._srv
+        if srv is None or not self.idle_answers:
+            time.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    srv.settimeout(min(remaining, 0.2))
+                    conn, _ = srv.accept()
+                except (socket.timeout, TimeoutError, BlockingIOError):
+                    continue
+                except OSError:
+                    time.sleep(max(0.0, deadline - time.monotonic()))
+                    return
+                with conn:
+                    conn.settimeout(5.0)
+                    try:
+                        req = _recv(conn, _MAX_REQUEST)
+                    except (ValueError, OSError):
+                        reply = _fail("bad_request", "malformed request")
+                    else:
+                        op = req.get("op") if isinstance(req, dict) else None
+                        if op in ("ping", "stop"):
+                            # stop is accepted now and lands once the search
+                            # in flight finishes; es-logout keeps waiting on
+                            # the socket, which stays until then
+                            reply = self.handle(req)
+                        else:
+                            reply = _fail("busy", "the bridge is mid-search (a wide "
+                                                  "text_groups read can take minutes); only "
+                                                  "ping and stop answer until it finishes - "
+                                                  "try again")
+                    try:
+                        _send(conn, reply)
+                    except OSError:
+                        pass
+        finally:
+            try:
+                srv.settimeout(1.0)
+            except OSError:
+                pass
 
     def open(self) -> None:
         """Start the browser before listening, so a broken setup fails at
@@ -1970,7 +2041,8 @@ class Broker:
         if self.mcp is None:
             self.mcp = esmcp.McpHttpServer(self.config, self.cases, on_request=self._touch)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
-                                poll_timeout=self.config.poll_timeout_s)
+                                poll_timeout=self.config.poll_timeout_s,
+                                idle=self._search_idle)
         token, case, replaced = self.cases.open(req.get("case"), terms, tier2, session,
                                                 self.vocabulary)
         return {"ok": True, "url": self.mcp.url, "token": token, "replaced": replaced,
@@ -2241,7 +2313,8 @@ class Broker:
         scrubber = elastic.EsScrubber(self.config, tier2=tier2)
         seeded = seed_terms(self.config, scrubber, terms)
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
-                                poll_timeout=self.config.poll_timeout_s)
+                                poll_timeout=self.config.poll_timeout_s,
+                                idle=self._search_idle)
         bridge = Bridge(self.config, scrubber, session, log_path=log, index=self.vocabulary,
                         presence=self.cases.presence, group_spans=self.cases.group_spans)
         report = run_case(bridge, cluster.name, req.get("query"), show_names=show_names)
@@ -2264,6 +2337,7 @@ class Broker:
         os.chmod(path, 0o600)
         srv.listen(8)
         srv.settimeout(1.0)
+        self._srv = srv
         # One thread for both listeners: the private socket (es-login,
         # es-smoke, es-research) and, once a case is open, the MCP endpoint.
         # Playwright's sync API belongs to this thread, so every tool call
@@ -2296,6 +2370,7 @@ class Broker:
                     self._control(conn)
         finally:
             sel.close()
+            self._srv = None
             srv.close()
             try:
                 path.unlink()
@@ -2319,6 +2394,17 @@ class Broker:
                 _send(conn, reply)
             except OSError:
                 pass
+
+
+def search_wait_s(config: elastic.ElasticConfig) -> float:
+    """How long a client should wait on an op that may run a search: the
+    longest one group question can take - the read budget plus one pass in
+    flight, each pass bounded by the site's search limit - plus the margin
+    the single-search wait always had. es-smoke used to wait
+    ``poll_timeout + 120`` and gave up at 420 s on a 300 s site while the
+    bridge was still mid-read; this wait outlives the worst read by
+    construction."""
+    return (elastic.TEXT_GROUP_READ_BUDGET_LIMITS + 1) * config.poll_timeout_s + 120.0
 
 
 class BrokerClient:

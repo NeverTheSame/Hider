@@ -715,11 +715,28 @@ TEXT_GROUP_RESPREAD_MIN = 1.25
 #: safety argument rests on; the pieces are the narrower questions a case
 #: could already ask one at a time.
 TEXT_GROUP_MAX_PASSES = 12
-#: How many sampling passes may hit the search limit before the read stops
-#: probing: each one costs the whole limit, so this bounds the waiting. A
-#: timed-out width is remembered (per index, for a while) by the bridge, so
-#: later questions split past it without paying again.
+#: How many sampling passes may hit their deadline before the read stops
+#: probing. A timed-out width is remembered (per index, for a while) by the
+#: bridge, so later questions split past it without paying again.
 TEXT_GROUP_MAX_TIMEOUTS = 3
+#: A pass over a width the read knows nothing about is waited on for a
+#: **probe deadline**, not the site's whole search limit:
+#: ``max(60 s, limit / 5)`` (never more than the limit). Learning that a
+#: week is slow then costs about two minutes, not two spent limits; the
+#: declared cost is that a pass that would have finished between the probe
+#: deadline and the limit is split instead - more requests, same answer,
+#: less waiting, which is the chosen trade. The full limit is spent only on
+#: a pass whose width already finished once in this read, or on the last
+#: allowed attempt before the read gives up, so a cluster that is slow at
+#: every width still gets one full-length try.
+TEXT_GROUP_PROBE_FLOOR_S = 60.0
+#: A read stops starting new sampling passes once it has waited this many
+#: site search limits in all; what is covered by then is returned with
+#: ``covered`` saying so. With one pass possibly in flight at the limit,
+#: the longest one group question can wait is (this + 1) limits - 1,200 s
+#: at a 300 s site, 480 s at the default 120 s - against about an hour
+#: (12 passes x the limit) with no budget.
+TEXT_GROUP_READ_BUDGET_LIMITS = 3
 #: aggregation names in the strata request (the bridge's own, never Claude's)
 STRATA_AGG = "strata"
 STRATA_HITS_AGG = "sample"
