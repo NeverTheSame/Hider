@@ -1867,22 +1867,37 @@ class Broker:
         #: the listening socket while serve() runs: what _search_idle
         #: answers on between the polls of a long search
         self._srv: socket.socket | None = None
-        #: the measurement switch behind the liveness before-test; nothing
+        #: the measurement switch behind the liveness before-tests; nothing
         #: in the live path sets it False
         self.idle_answers = True
+        #: re-entrancy guard: the idle hook pumps one vocabulary step, and
+        #: nothing it causes may pump another
+        self._idling = False
 
     def _search_idle(self, seconds: float) -> None:
         """What a session does between polls instead of sleeping: keep
-        answering on the one thread. A ping (and a stop) is handled as
-        ever; anything else gets ``busy`` at once, instead of hanging on a
-        broker that is mid-search until its own socket timeout - a long
-        text_groups read made that window minutes, not seconds. Nothing
-        here touches the browser."""
+        the broker alive on its one thread. **One vocabulary step first**
+        (the same step the serve loop takes between connections), because a
+        model asking wide questions back to back kept the thread inside
+        reads for 20 minutes at a time and the top-up starved until the
+        cover fell behind the gap bound and every case was refused - the
+        failure the serve loop's own pumping already prevents between
+        requests. Then a ping (and a stop) is answered as ever, and
+        anything else gets ``busy`` at once instead of hanging on a broker
+        that is mid-search until its own socket timeout. The browser stays
+        on this thread throughout; the step and the case's poll share it,
+        so each stretches the other a little (declared)."""
+        deadline = time.monotonic() + seconds
+        if self.idle_answers and not self._idling:
+            self._idling = True
+            try:
+                self.pump_vocabulary()
+            finally:
+                self._idling = False
         srv = self._srv
         if srv is None or not self.idle_answers:
-            time.sleep(seconds)
+            time.sleep(max(0.0, deadline - time.monotonic()))
             return
-        deadline = time.monotonic() + seconds
         try:
             while True:
                 remaining = deadline - time.monotonic()

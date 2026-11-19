@@ -504,7 +504,20 @@ def test_the_environment_is_an_allowlist(monkeypatch):
     }
     env = esmcp.claude_env(base)
     assert set(env) == {"HOME", "PATH", "LANG", "LC_ALL", "ANTHROPIC_API_KEY",
-                        "CLAUDE_CODE_USE_BEDROCK", "HTTPS_PROXY", "NO_PROXY", "no_proxy"}
+                        "CLAUDE_CODE_USE_BEDROCK", "HTTPS_PROXY", "NO_PROXY", "no_proxy",
+                        # the launch's own sized MCP timeout knobs: one tool
+                        # call may run as long as the worst group read, and
+                        # Claude Code's HTTP defaults (60 s per call, 5 min
+                        # idle) would cut it while the bridge is still
+                        # reading. Durations only, never data.
+                        "MCP_TOOL_TIMEOUT", "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"}
+    assert int(env["MCP_TOOL_TIMEOUT"]) == esmcp.tool_wait_ms(None) >= 600_000
+    assert env["CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"] == env["MCP_TOOL_TIMEOUT"]
+    # an operator who set their own keeps it
+    own = esmcp.claude_env({**base, "MCP_TOOL_TIMEOUT": "9999999",
+                            "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "0", "MCP_TIMEOUT": "60000"})
+    assert own["MCP_TOOL_TIMEOUT"] == "9999999"
+    assert own["CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"] == "0" and own["MCP_TIMEOUT"] == "60000"
     assert env["NO_PROXY"] == ".corp.example,127.0.0.1,localhost"
     assert env["no_proxy"] == "127.0.0.1,localhost"
     assert not any(re.search(r"HIDER|ELASTIC|KIBANA|^ES_", k) for k in env)
@@ -535,6 +548,9 @@ def test_argv_names_only_the_bridge_tools_and_holds_no_secret(tmp_path):
         assert list(cfg["mcpServers"]) == [esmcp.SERVER_NAME]
         server = cfg["mcpServers"][esmcp.SERVER_NAME]
         assert server["type"] == "http" and server["url"].startswith("http://127.0.0.1:")
+        # the per-server tool timeout covers the worst group read, for
+        # Claude Code versions that honour it per server
+        assert server["timeout"] == esmcp.tool_wait_ms(None)
     finally:
         launch.cleanup()
     assert not launch.workspace.exists() and not launch.private.exists()

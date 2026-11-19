@@ -4966,13 +4966,19 @@ def run_mcp_eval(config: elastic.ElasticConfig, fx: Fixture, *, seed: int = 2026
     hostile_env = {"HOME": "/home/analyst", "PATH": "/usr/bin", "ANTHROPIC_API_KEY": "synthetic",
                    "HIDER_ELASTIC": "/site/elastic.json", "HIDER_VAULT_KEY": "k",
                    "KIBANA_SID": cookie, "ELASTIC_PASSWORD": "synthetic", "PYTHONPATH": "/repo"}
-    env = esmcp.claude_env(hostile_env)
+    env = esmcp.claude_env(hostile_env, config=cfg)
     launch = esmcp.prepare_launch("http://127.0.0.1:1/mcp", "t" * 43, config=cfg,
                                   session_json=base / "cases" / "es-eval" / "session.json")
     try:
         argv = esmcp.claude_argv(launch.mcp_config, "why <Org-01>?", settings=launch.settings)
         launch_checks = {
-            "env_allowlisted": set(env) == {"HOME", "PATH", "ANTHROPIC_API_KEY"},
+            # beyond the allowlisted survivors, the launch adds only its two
+            # sized MCP timeout knobs - durations, never data
+            "env_allowlisted": set(env) == {"HOME", "PATH", "ANTHROPIC_API_KEY",
+                                            "MCP_TOOL_TIMEOUT",
+                                            "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"}
+            and env["MCP_TOOL_TIMEOUT"].isdigit()
+            and int(env["MCP_TOOL_TIMEOUT"]) == esmcp.tool_wait_ms(cfg),
             "no_builtin_tools": argv[argv.index("--tools") + 1] == "",
             "only_bridge_tools": argv[argv.index("--allowedTools") + 1].split(",")
             == list(esmcp.ALLOWED_TOOLS),

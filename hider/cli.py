@@ -747,7 +747,7 @@ def _es_research(args: argparse.Namespace, client, sessions_dir: Path, cfg) -> i
         launch = esmcp.prepare_launch(opened["url"], token, config=cfg, session_json=session_json)
         argv = esmcp.claude_argv(launch.mcp_config, prompt, model=args.model,
                                  max_budget_usd=args.max_budget_usd, settings=launch.settings)
-        env = esmcp.claude_env()
+        env = esmcp.claude_env(config=cfg)
         if prompt is None:
             print("Claude Code with the hider-es tools only (no shell, no files, no web); "
                   "every prompt you type is checked first, and one holding a customer value or "

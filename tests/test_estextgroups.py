@@ -983,3 +983,77 @@ def test_a_ping_is_answered_and_others_told_busy_during_a_long_read(tmp_path):
     assert report["refused"] is None
     agg = report["output"]["aggregations"]["g"]
     assert agg["covered_share"] == 1.0 and agg["requests"] >= 2
+
+
+def _busy_broker(idle_answers: bool, tmp_path):
+    """A real Broker on the measured-slow cluster shape, its clock advancing
+    with the stub's simulated seconds: what an hour of back-to-back wide
+    questions does to the vocabulary top-up."""
+    import dataclasses
+    import tempfile
+
+    cfg = dataclasses.replace(eseval.burst_map(), poll_timeout_s=300.0)
+    fx = eseval.Fixture(eseval.burst_docs(), [], [])
+    engine = eseval.StubEngine(fx, (eseval.BURST_INDEX,))
+    vocab, _b = eseval.build_vocabulary(cfg, engine)
+    engine.search_limit_s = 300.0
+    # a week-ish pass never finishes, a piece takes almost the whole limit:
+    # one wide question holds the thread for 20-35 simulated minutes
+    engine.group_scan_wall = lambda w, d: float("inf") if (w or 1e18) > 2 * 86400 else 295.0
+    base = eseval.NOW.timestamp()
+    s0 = engine.simulated_seconds
+    esbridge.clock = lambda: base + engine.simulated_seconds - s0
+    broker = esbridge.Broker(cfg, lambda: eseval.SteppedSearchTransport(engine),
+                             poll_interval=0.0,
+                             sessions_dir=Path(tempfile.mkdtemp(prefix="hv-", dir="/tmp")))
+    broker.open()
+    broker.vocabulary.put("stub", vocab)
+    broker.start_vocabulary(cfg.clusters[0])
+    broker.idle_answers = idle_answers
+    return broker, engine, s0
+
+
+def test_the_vocabulary_top_up_survives_back_to_back_long_reads():
+    # Before (the idle_answers measurement switch): the broker's thread
+    # lives inside reads, the top-up only steps between them, the cover
+    # falls behind the one-hour gap bound and the gap rule - correctly -
+    # refuses every case: the person sees vocabulary_building with the gap
+    # and the bound. After: the idle hook pumps one vocabulary step per
+    # poll of the case's own search, so the top-up keeps pace inside the
+    # reads and nothing is ever refused.
+    q = {"index": eseval.BURST_INDEX, "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
+         "filters": [FAILED],
+         "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}}
+
+    def grind(idle_answers: bool):
+        broker, engine, s0 = _busy_broker(idle_answers, None)
+        outcomes = []
+        try:
+            for _ in range(6):
+                r = broker.handle({"schema": esbridge.BROKER_SCHEMA, "op": "run",
+                                   "cluster": "stub", "query": q, "tier2": "none"})
+                refused = r.get("report", {}).get("refused")
+                outcomes.append(refused)
+                if refused:
+                    break
+                broker.pump_vocabulary()  # the one step a busy loop gives it
+            held = broker.vocabulary.get("stub")
+            gap = esbridge.clock() - max(b for _a, b in held.covers.values())
+            return outcomes, gap, engine.simulated_seconds - s0
+        finally:
+            esbridge.clock = __import__("time").time
+
+    outcomes, gap, took = grind(idle_answers=False)
+    # three wide reads (~84 simulated minutes) starve the top-up; the
+    # fourth question is refused because the cover is behind the bound
+    assert [bool(o) for o in outcomes] == [False, False, False, True]
+    refused = outcomes[-1]
+    assert refused["code"] == "vocabulary_building"
+    assert "bound" in refused["message"] and gap > 3600.0
+    assert not any(t in refused["message"] for t in eseval.BURST_TENANTS + eseval.BURST_JOBS)
+
+    outcomes, gap, took = grind(idle_answers=True)
+    # the same six questions - almost three simulated hours of reading -
+    # all answered, the cover never more than about one pass behind
+    assert outcomes == [None] * 6
+    assert took > 2.5 * 3600.0 and gap < 600.0

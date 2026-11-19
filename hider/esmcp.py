@@ -746,17 +746,42 @@ _ENV_NAMES = frozenset({
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
     "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy",
     "CLAUDE_CONFIG_DIR",
+    # Claude Code's own MCP timeout knobs: an operator who sets them keeps
+    # them (they carry no data, only durations)
+    "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT",
 })
 _ENV_PREFIXES = ("LC_", "ANTHROPIC_", "CLAUDE_CODE_")
 _LOOPBACK_NO_PROXY = ("127.0.0.1", "localhost")
 
 
-def claude_env(base: dict[str, str] | None = None) -> dict[str, str]:
+def tool_wait_ms(config: "elastic.ElasticConfig | None" = None) -> int:
+    """How long one MCP tool call must be allowed to run, in milliseconds:
+    the longest group read (the read budget plus one in-flight pass, each
+    bounded by the site's search limit) plus the client margin - the same
+    number es-smoke waits (``esbridge.search_wait_s``)."""
+    limit = config.poll_timeout_s if config is not None else elastic.DEFAULT_POLL_TIMEOUT_S
+    return int(1000 * ((elastic.TEXT_GROUP_READ_BUDGET_LIMITS + 1) * limit + 120.0))
+
+
+def claude_env(base: dict[str, str] | None = None, *,
+               config: "elastic.ElasticConfig | None" = None) -> dict[str, str]:
     """The allowlisted environment. When a proxy is configured, loopback is
-    added to NO_PROXY so the bearer token never travels through it."""
+    added to NO_PROXY so the bearer token never travels through it.
+
+    Claude Code's HTTP MCP client cuts one tool call at 60 s and idles a
+    silent one out after five minutes by its documented defaults, while a
+    wide ``text_groups`` read may legitimately run four search limits
+    before it returns - the model would see a timed-out tool while the
+    bridge was still reading, the es-smoke failure again one layer up. So
+    the launch sizes ``MCP_TOOL_TIMEOUT`` and
+    ``CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`` to the worst read, unless the
+    operator set their own (both are allowlisted through)."""
     base = dict(os.environ if base is None else base)
     env = {k: v for k, v in base.items()
            if k in _ENV_NAMES or k.startswith(_ENV_PREFIXES)}
+    wait = str(tool_wait_ms(config))
+    env.setdefault("MCP_TOOL_TIMEOUT", wait)
+    env.setdefault("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT", wait)
     if any(k.lower() in ("https_proxy", "http_proxy") for k in env):
         for k in ("NO_PROXY", "no_proxy"):
             have = [h.strip() for h in env.get(k, "").split(",") if h.strip()]
@@ -815,8 +840,11 @@ def prepare_launch(url: str, token: str, *, config: elastic.ElasticConfig | None
     private = Path(tempfile.mkdtemp(prefix="hider-es-mcp-"))
     os.chmod(private, 0o700)
     path = private / "mcp.json"
+    # the per-server timeout is the belt to claude_env's braces: newer
+    # Claude Code honours it per server, older ones only the env var
     _private_json(path, {"mcpServers": {SERVER_NAME: {
-        "type": "http", "url": url, "headers": {"Authorization": f"Bearer {token}"}}}})
+        "type": "http", "url": url, "headers": {"Authorization": f"Bearer {token}"},
+        "timeout": tool_wait_ms(config)}}})
     settings = None
     if config is not None and session_json is not None:
         check = private / "prompt-check.json"

@@ -747,13 +747,43 @@ Listed with owners in the README's Limitations section and in
   when the search in flight finishes; the socket stays until then, which
   is what es-logout watches), and **anything else is told `busy` at
   once** - "the bridge is mid-search" - instead of hanging to its own
-  socket timeout; the browser is never touched from the hook. MCP tool
-  calls during another case's read wait in the backlog (one browser, one
-  thread - declared), and a model's own wide read simply **returns late,
-  not incrementally**, which `es_schema` says, with the four-limit bound
-  and the advice to prefer narrower ranges when latency matters; what the
-  model's harness does with a many-minute tool call is outside the
-  bridge's control. **Callers wait as long as the worst read**:
+  socket timeout; the browser is never touched from the hook (it stays on
+  this thread throughout). **The idle hook also pumps one vocabulary step
+  per poll**, because answering pings was not enough: a model asking wide
+  questions back to back keeps the thread inside reads for 20-35 minutes
+  at a time, the top-up only stepped between requests, and the gap rule -
+  correctly - then refused every case. Measured
+  (`test_the_vocabulary_top_up_survives_back_to_back_long_reads`, the
+  `idle_answers` switch again): **before, three back-to-back wide reads
+  (~84 simulated minutes) left the cover 5,025 s behind the 3,600 s bound
+  and the fourth question was refused `vocabulary_building`** - the
+  person sees the usual "ends 1.4h ago, past the 1.0h bound" message, and
+  refusing is right once the cover is behind, but nothing should let it
+  fall behind; **after, six reads over almost three simulated hours all
+  answer and the cover stays about one pass (~295 s) behind**. The cost:
+  the case's polls and the vocabulary's steps share the one thread, so
+  each stretches the other slightly, and a vocabulary step between polls
+  spends wall time the pass's deadline also counts (declared). MCP tool
+  calls during **another** case's read still wait in the backlog (one
+  browser, one thread - declared). **The model's own tool call survives
+  the read, now measured, not assumed**: Claude Code's HTTP MCP client
+  cuts one tool call at 60 s by default - probed empirically on 2.1.328
+  with a stub MCP server and a 90 s tool: **with default settings the
+  call died at 66 s and the model saw "The operation timed out." while
+  the server was still working; with the bridge's launch settings the
+  same call returned its result**. So the launch now sizes all three
+  knobs to the worst read (`esmcp.tool_wait_ms` = `search_wait_s` in ms):
+  `MCP_TOOL_TIMEOUT` and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` in
+  `claude_env` (set only when the operator has not set their own; both
+  and `MCP_TIMEOUT` are allowlisted through - durations, never data), and
+  a per-server `timeout` in the generated `mcp.json`, for versions that
+  honour it per server. Declared remainder: the idle-window knob
+  (documented default 5 minutes for HTTP, needs Claude Code ≥ 2.1.187) is
+  set but was probed only to 90 s - a tester should run one es-research
+  tool call that waits ~6 minutes to cross the idle default once; and a
+  wide read still **returns late, not incrementally**, which `es_schema`
+  says, with the four-limit bound and the advice to prefer narrower
+  ranges when latency matters. **Callers wait as long as the worst read**:
   `esbridge.search_wait_s` = (budget + 1) limits + the old 120 s margin -
   es-smoke used it to give up at `limit + 120` (420 s at the measured
   site) and print "the bridge did not answer" while the bridge was still
