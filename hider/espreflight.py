@@ -2,7 +2,7 @@
 
 Before letting a model session at real logs, someone has to decide whether
 what stays readable on that cluster is acceptable. The limits are declared
-one by one in AGENTS.md, but what they amount to on one cluster right now
+one by one in docs/es/ (AGENTS.md keeps the rules), but what they amount to on one cluster right now
 was spread over the VOCAB line, the READABLE line, the build log and the
 operator's memory. This gathers them into one read-only report: what is
 hidden, what is not, and for each thing that is not, **which declared limit

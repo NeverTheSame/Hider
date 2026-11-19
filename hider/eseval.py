@@ -453,7 +453,7 @@ DEFAULT_MAP_RANGE = {"gte": "now-4h", "lte": "now-3h"}
 #: gets the same treatment as the multi-word one; the skip rules
 #: (:meth:`elastic.EsScrubber.vocabulary_skip`) drop some of them on purpose,
 #: and those stay readable in message text. ``es-eval`` reports which, and
-#: AGENTS.md records it as a declared miss - the point of the spread is that
+#: docs/es/vocabulary.md records it as a declared miss - the point of the spread is that
 #: the number is measured rather than assumed.
 DEFAULT_MAP_ONE_WORD = ("Thornbury", "Brackenvault", "Meridian", "Larkspur",
                         "Archive", "Vault", "Ops", "Nimbus")
@@ -5541,7 +5541,7 @@ def run_eval(config: elastic.ElasticConfig | None = None, *, seed: int = 2026110
     default_vocab, default_build = build_vocabulary(cfg_default, engine)
     # Counts, reasons and field names only: the names themselves are planted
     # values, and the report must not carry one (the names live in
-    # DEFAULT_MAP_ONE_WORD and in AGENTS.md, where they are documentation).
+    # DEFAULT_MAP_ONE_WORD and in docs/es/vocabulary.md, where they are documentation).
     default_map = {"cases": 0, "shown": 0, "tenants_hidden": 0, "tenants_readable": 0,
                    "resources_readable": 0,
                    "fields_read": [r.pattern for r in cfg_default.vocabulary_rules],

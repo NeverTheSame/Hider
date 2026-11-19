@@ -245,7 +245,7 @@ Ordered by how much they worry me.
    leak. The failure mode to avoid is the opposite default, which is why the
    projection is server side and tested.
 3. **A credential-shaped value in a `text` field reaches tier 2 and gets
-   vaulted** instead of destroyed. The AGENTS known gap applies unchanged.
+   vaulted** instead of destroyed. The known gap in docs/detection-gaps.md applies unchanged.
    The pipeline test, not a recognizer test, is the one to write.
 4. **Correlation loss across fields.** `user.name` as `Anna Lind` and
    `message` as `anna.lind@...` get labels of different types. The register-
@@ -302,7 +302,7 @@ never leaves `hider.local.json`.
 
 The utility run needs a key once and is recorded to a cassette holding
 synthetic data only, hashes where a value is secret-shaped, read before
-commit. The same cassette constraint from AGENTS applies: changing a
+commit. The same cassette constraint from docs/detection-gaps.md applies: changing a
 template reshuffles the generator and invalidates it.
 
 ## What is built (offline core)

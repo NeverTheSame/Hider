@@ -2249,7 +2249,7 @@ class ClusterVocabulary:
         what a case asks about, and waiting for the whole retention period
         means waiting hours. A name logged only in a day not yet covered
         for its field is **not known** until the build reaches it - stated
-        in AGENTS.md and visible on the VOCAB line as each field's range.
+        in docs/es/vocabulary.md and visible on the VOCAB line as each field's range.
         """
         return all(self.field_serves(f, config, now) for f in self._read(config, read))
 

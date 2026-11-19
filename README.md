@@ -1318,7 +1318,9 @@ and turning the first real feedback entries into adversarial cases.
 
 - [`AGENTS.md`](AGENTS.md) is the orientation file for a new contributor or a
   coding agent: the invariants the tests enforce, where each kind of change
-  starts, the working rules, and the known gaps.
+  starts, the working rules, and the rules a change must not break. The
+  history, measurements and declared misses behind them are in
+  [`docs/detection-gaps.md`](docs/detection-gaps.md) and [`docs/es/`](docs/es/).
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) explains the two feedback channels. A
   missed or wrong redaction seen on a real bundle goes through the web UI's
   "Report a mistake" form and stays on your machine until it has been turned
