@@ -465,15 +465,17 @@ Listed with owners in the README's Limitations section and in
   documents over its documents read (`elastic.group_estimate`): a slice
   read whole counts exactly, and a read in which every slice fits is
   `exact`. **Every read starts with a capped count** (`track_total_hits`
-  at `elastic.TEXT_GROUP_SLOW_DOCS`, early-terminated, so it is cheap
-  whatever the scope holds; a query with no closed `time_range` carries it
-  on the `min`/`max` bounds request it already paid, so the slices cover
-  the documents' span - nothing of either is shown): a scope that **fits
-  the sample is read whole** as one page, always exact now, and a scope
-  past the slow bound is refused before anything expensive runs (below).
+  at `elastic.TEXT_GROUP_COUNT_CAP`, just past the sample: it only decides
+  whether the scope fits one page, and Elasticsearch stops counting at the
+  cap, so it is cheap on any scope; a query with no closed `time_range`
+  carries it on the `min`/`max` bounds request it already paid, so the
+  slices cover the documents' span - nothing of either is shown): a scope
+  that **fits the sample is read whole** as one page, always exact now.
   The same question now scores **answered: 3 of 3 groups in the week's
   order, 979 of 2,700 read over 49 slices in 2 requests (the count and
-  the pass), every count within the reply's margin, worst off by 1.3%**.
+  the pass), every count within the reply's margin, worst off by 1.3%**
+  (and, since the margins learnt honesty about time structure, the reply
+  claims the order settled for none - it underclaims; below).
   **The sample is re-spread to where the documents are** when the even
   spread misses them. The slices divide the *window*, so a day-wide
   question about documents that all sit in one half hour put them in one
@@ -498,40 +500,56 @@ Listed with owners in the README's Limitations section and in
   `top_hits`, the asked sizes summing to at most the sample, each range
   scaled by its own `doc_count`. The same question now scores **answered:
   3 of 3 groups in the day's order, 1,000 of 3,000 read in 3 requests
-  over 10 sub-ranges, order settled for all 3** - and, reported honestly
-  beside it, **1 of 3 counts within the margin**: the declared
-  newest-first miss at its new, smaller scale (below).
+  over 10 sub-ranges, every count within the stated margin, the order
+  settled for the leading group** (the boundary group's margin is widened
+  by the scatter term below to cover its newest-first bias, so the reply
+  stops claiming an order it cannot know from this sample).
   **How the reply says how far to trust itself**: `exact`; `sampled`,
   `total`, `coverage` (sampled/total), `strata` and `strata_read_whole`;
   per group `doc_count` (the estimate, or the count when exact),
   `sampled_count` (documents actually read in the group) and, when not
-  exact, `margin` - about 95%, a Jeffreys-adjusted binomial with the
-  finite-population correction per slice, so a group seen in every or in
-  no sampled document of a slice still has one - and `order_settled`, the
+  exact, `margin` - about 95%, **the larger of two terms**: a
+  Jeffreys-adjusted binomial with the finite-population correction per
+  slice (the noise if what was read in a slice stood for the slice; a
+  group seen in every or in no sampled document still has one), and a
+  **between-range scatter term** over the partially read ranges
+  (successive differences of the group's scaled per-range counts),
+  because the read within a range is newest-first, not random: a group
+  concentrated in a few partially read ranges owes its estimate to time
+  structure the sample cannot check, and its margin says so by being
+  about the size of the swing, while an evenly spread group keeps the
+  tight binomial one. The cost of that honesty is `order_settled` - the
   number of leading groups whose estimate minus margin is above the
   next's estimate plus margin (the first unshown group counts as next; a
-  tie is not settled even when exact); `unbucketed` when documents in
+  tie is not settled even when exact) - dropping to what the sample
+  really supports: the burst week reports settled 0 (from its sample
+  alone, the burst group could outnumber the steady one; the shown order
+  is in fact the true one - the reply underclaims, the safe direction),
+  the dense day settled 1. Also carried: `unbucketed` when documents in
   scope have no time field (they are in no slice and never read);
   `requests`. The decision log row carries `requests`, `sampled`, `exact`
   and `strata`. The `es_schema` text tells Claude to read these before
   trusting the counts and the order. **Where it is still wrong**, each
   declared: the read **within a slice or sub-range is still
   newest-first**, so a burst at the end of one is counted as that whole
-  range (pinned twice in `test_estextgroups.py`: 20 noisy documents
-  ending a slice of 1,000 are estimated at 1,000, and the margin does not
-  reach the truth; and on the dense fixture the last-minute error shares
-  a 3-minute sub-range with the steady one and is overcounted by that
-  range's share, 654 against 480, outside its margin) - the re-spread
-  shrinks what one burst can misattribute from the whole sample to one
-  sub-range's documents, and no further: documents concentrated in a
-  sliver narrower than a sub-range still read at most `per_cap` of it; a
-  group rarer than about one document per range's read is missed in that
-  range and under-counted or absent overall (`sum_other_doc_count` and
-  `groups` say how much is unaccounted, not what); the margin assumes
-  what was read in a range stands for the range, which both burst cases
-  show it need not; on a scope of a hundred million documents the sample
-  is 0.001% and a group's margin is around ±3% of the total at a 30%
-  share; and relative ranges (`now-7d`) re-align the slices each call, so
+  range - the re-spread shrinks what one burst can misattribute from the
+  whole sample to one sub-range's documents (on the dense fixture the
+  last-minute error shares a 3-minute sub-range with the steady one and
+  is overcounted by that range's share, 654 against 480, now inside its
+  scatter-widened margin), and when the whole read is **one** partial
+  range there is no between-range signal and the margin does not cover
+  the bias at all (pinned: 20 noisy documents ending a slice of 1,000
+  are estimated at 1,000, and the margin does not reach the truth);
+  documents concentrated in a sliver narrower than a sub-range still
+  read at most `per_cap` of it; a group rarer than about one document
+  per range's read is missed in that range and under-counted or absent
+  overall (`sum_other_doc_count` and `groups` say how much is
+  unaccounted, not what); the scatter term reads legitimate time
+  variation as uncertainty, so a genuinely bursty group gets a wide
+  margin even when its estimate happens to be right; on a scope of a
+  hundred million documents the sample is 0.001% and a group's margin is
+  at best around ±3% of the total at a 30% share; and relative
+  ranges (`now-7d`) re-align the slices each call, so
   the edge slices' newest twenty move between two calls of the same
   question. **Asking the same question again** returns the same sample
   (the count, the slices and the allocation are deterministic, the
@@ -613,35 +631,52 @@ Listed with owners in the README's Limitations section and in
   `margin`, `order_settled`, above); a leak in any sampled document
   withholds the whole reply, as it would that page; one request reads ten
   pages' worth, scrubbed with tier 2.
-  **A read that would be slow is refused before it is sent.** The
+  **A read that will not finish is stopped at the session's search limit
+  and refused with what to do; nothing is refused on a prediction.** The
   sampling pass is a full bucketing pass over every document in scope,
-  **measured at 52 seconds for one day of errors, about 3 million
-  documents, on a real cluster** - a week of that is around six minutes,
-  which dies at the bridge's 120 s completion ceiling after spending the
-  cluster's time anyway. The stub now charges that pass at
-  `elastic.TEXT_GROUP_SCAN_S_PER_MDOC` (52/3 s per million documents in
-  scope, **an assumption sized from that one measurement and taken as
-  linear**; `StubEngine.group_scan_s_per_mdoc`, charged for any request
-  whose aggregations carry a `top_hits` heap), so the measure shows the
-  cost instead of implying the pass is free - the utility rows carry it
-  as `scan_seconds`. And the capped count in front of every read is the
-  gate: a scope of `elastic.TEXT_GROUP_SLOW_DOCS` (5 million, about 90 s
-  at the measured rate - three quarters of the ceiling) or more is
-  refused `slow_read` with the bound, the estimated seconds and what to
-  do instead - narrow the time range or add filters, and find where to
-  narrow with a terms or date_histogram over the same scope, which is
-  cheap. `es_schema` tells Claude the same. The costs of the rule: every
-  group question now pays one early-terminated count request first (the
-  reason exact scopes are 2 requests above); the refusal's spent phrases
-  are **not refunded**, as for any withheld page, because whether the
-  count crossed the bound can depend on what a phrase matched; and the
-  count says only "at least 5 million" - the same kind of number every
-  ordinary reply's `hits_total` already gives, so it opens no channel a
-  zero-filter count did not already have. A one-day scope slower than the
-  bound (10M+ documents a day) is still refused, which is the honest
-  direction; the site's way out is narrower questions, not a knob -
-  a constant, not a site-map setting, because a site that raised it would
-  be choosing timeouts.
+  and its wall time **cannot be predicted from a document count** -
+  measured on one real cluster: one day of errors, about 3 million
+  documents, 52 seconds; three days, about 9.7 million, **47 seconds**; a
+  week **did not finish within that site's 300 s search limit** (the
+  default limit is 120 s). The first cut of this rule refused any scope
+  past a 5-million-document bound, which would have refused the measured
+  three-day read that finishes in 47 s and never consulted the site's
+  limit; it is gone. The rule is a **deadline**: the session already
+  bounds every search (`poll_timeout_s`, the site's own setting, default
+  120 s - a search past it is deleted server-side and nothing is read),
+  and a sampling pass that hits it is refused `slow_read` instead of the
+  generic timeout (`esquery.read_text_groups`, `_refuse_slow`), telling
+  the person and the model what happened and what to do: the limit was
+  spent and retrying the same scope pays it again; narrow the time range
+  or add filters, and find where to narrow with a terms or date_histogram
+  over the same scope, which is cheap. A timed-out **re-spread** keeps
+  the finished first pass's answer, with its own honest margins, instead
+  of refusing - a read that would finish always runs. `es_schema` tells
+  Claude the same. **Costs**: a read that will not finish burns the full
+  limit once before it is refused (there is no cheaper way to learn it;
+  asking again burns it again, which the refusal says); the refusal's
+  spent phrases are **not refunded**, as for any withheld page; and the
+  bridge remembers nothing about which scopes timed out, so the same
+  slow question costs the limit every time it is asked. **The stub shows
+  both shapes, each an assumption stated as one**: the small fixtures'
+  passes are charged at `elastic.TEXT_GROUP_SCAN_S_PER_MDOC` (52/3 s per
+  million documents, sized from the one-day point, a floor so the measure
+  never implies the pass is free - the utility rows carry it as
+  `scan_seconds`), and the measured cluster is
+  `eseval.measured_cluster_scan_wall` (`StubEngine.group_scan_wall` with
+  `search_limit_s`: the three measured points keyed on the request's own
+  range width and nothing between them - up to three days a pass
+  finishes, past that, or with no closed range at all, it never does),
+  under which the eval shows the day and the three-day reads running and
+  the week stopped at 120 s with the actionable refusal
+  (`test_the_slow_rule_is_a_deadline_not_a_prediction`). **Where the
+  deadline rule still gets it wrong**, declared: it spends the limit to
+  learn a scope is slow, every time; a pass that would have finished just
+  past the limit is lost as surely as one that never would (the site's
+  way out is raising `poll_timeout_s`, which bounds every search, not a
+  group-read knob); and the stub's cluster shape is three points - a real
+  cluster where a narrow range is the slow one (a cold tier, say) is not
+  modelled, and the deadline is exactly why the rule survives that too.
   **What a real cluster needs that
   the stub does not show**: a 1,000-hit reply with full `_source` is
   megabytes through Kibana (its payload limits apply) and tier 2 over
@@ -650,11 +685,11 @@ Listed with owners in the README's Limitations section and in
   a set of sibling `filter` ranges with their own `top_hits`, each of
   which makes Elasticsearch bucket every matching document and keep a
   heap per bucket per shard - a full pass over the scope with the time
-  field's doc values, the 52 s / 3M figure above, the fetch phase still
-  at most 1,000 documents; the async search runs for that long and the
-  bridge polls it, under the usual completion ceiling; the capped count
-  itself still has to find its first 5 million matches (cheaper than
-  counting all, not free, as with the empty check's capped counts);
+  field's doc values, the measured 52/47/never figures above, the fetch
+  phase still at most 1,000 documents; the async search runs for that
+  long and the bridge polls it, under the completion ceiling that is now
+  the slow rule; the capped count stops just past the sample, so it is
+  cheap on any scope (as with the empty check's capped counts);
   `fixed_interval` in seconds (`12600s`) is valid; `top_hits` size must
   fit `index.max_inner_result_window` (100 by default, the cap on
   `TEXT_GROUP_MAX_PER_STRATUM`); the exact read's `size` 1,000 must still

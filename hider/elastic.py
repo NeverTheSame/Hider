@@ -685,22 +685,21 @@ TEXT_GROUP_STRATA = 50
 #: documents read from one slice never exceed Elasticsearch's default
 #: ``index.max_inner_result_window``, which is what bounds a top_hits size
 TEXT_GROUP_MAX_PER_STRATUM = 100
-#: What the sampling pass costs per million documents in scope, in seconds.
-#: An **assumption sized from one measurement**: one strata request (a
-#: date_histogram with a top_hits heap per slice, a full pass over every
-#: matching document) over about 3 million documents in a one-day scope took
-#: 52 seconds on a real cluster, and the cost is taken as linear in the
-#: documents bucketed. The stub charges this rate so the eval shows the
-#: pass's cost instead of implying it is free.
+#: What the sampling pass costs per million documents in scope, in simulated
+#: seconds, on the small fixtures. Sized from one measurement (52 s for one
+#: day of about 3 million documents), and **wall time on a real cluster does
+#: not follow the document count** - the same cluster did three days, 9.7
+#: million documents, in 47 s, and a week never finished - so this rate is
+#: only what keeps the fixtures' sampling passes from looking free; the
+#: measured cluster's shape is the eval's own assumption
+#: (``eseval.measured_cluster_scan_wall``). Nothing predicts a pass's cost
+#: from a count: the rule is a deadline (``slow_read``, below), not a
+#: prediction.
 TEXT_GROUP_SCAN_S_PER_MDOC = 52.0 / 3.0
-#: A scope holding at least this many documents is refused ``slow_read``
-#: before the sampling pass is sent: at the rate above it is about 90
-#: seconds of Elasticsearch time, three quarters of the bridge's 120 s
-#: async-search completion ceiling (``esbridge.POLL_TIMEOUT_S``), so past it
-#: the read would mostly die at the ceiling after spending the time anyway.
-#: The read's first request is a count capped here, so a scope that proceeds
-#: has an exact total and a refused one cost one early-terminated count.
-TEXT_GROUP_SLOW_DOCS = 5_000_000
+#: The cap on the read's first request, a count: it only has to answer "does
+#: the scope fit one page", so Elasticsearch stops counting just past the
+#: sample and the request is cheap on any scope.
+TEXT_GROUP_COUNT_CAP = TEXT_GROUP_SAMPLE + 1
 #: A second sampling pass (the re-spread, see esquery.read_text_groups) runs
 #: only when it would read at least a quarter more documents than the first
 #: pass landed; below that the margins already carry the misallocation. The
@@ -787,13 +786,21 @@ def group_estimate(strata: list[tuple[int, list[str | None]]], size: int,
     A group's count is the sum over slices of its sampled count scaled by
     ``documents / read``, so a slice read whole contributes its true count
     and a slice read in part its share. ``exact`` when every slice was read
-    whole. When it is not, every group carries ``margin``: about 95% under
-    the assumption that what was read in a slice stands for the slice (a
-    Jeffreys-adjusted binomial, finite-population corrected, so a group
-    seen in every or in no sampled document of a slice still has one), and
-    ``order_settled`` says how many leading groups the margins keep apart
-    from the next. Counts only, no text but the keys, which are redacted
-    text already.
+    whole. When it is not, every group carries ``margin``: about 95%, the
+    **larger of two terms** - a Jeffreys-adjusted binomial with the
+    finite-population correction per slice (the noise if what was read in a
+    slice stood for the slice; a group seen in every or in no sampled
+    document still has one), and a **between-slice scatter term** over the
+    partially read slices (successive differences of the group's scaled
+    per-slice counts), because the read within a slice is newest-first,
+    not random: a group concentrated in a few partially read slices could
+    owe most of its estimate to that time structure, and its margin says
+    so by being about the size of the swing. A group read only in whole
+    slices, or spread evenly, keeps the tight binomial margin. One
+    partially read slice alone has no between-slice signal, so its
+    newest-first bias stays the declared uncovered miss. ``order_settled``
+    says how many leading groups the margins keep apart from the next.
+    Counts only, no text but the keys, which are redacted text already.
     """
     per_key: dict[str, list[int]] = {}
     for i, (_n_docs, texts) in enumerate(strata):
@@ -805,6 +812,9 @@ def group_estimate(strata: list[tuple[int, list[str | None]]], size: int,
     sampled = sum(len(texts) for _n, texts in strata)
     with_field_read = sum(1 for _n, texts in strata for t in texts if t is not None)
     exact = all(len(texts) >= n_docs for n_docs, texts in strata)
+    #: the partially read slices, in time order: where the newest-first
+    #: bias can live, and what the scatter term reads
+    partial = [i for i, (n_docs, texts) in enumerate(strata) if texts and len(texts) < n_docs]
     est: dict[str, float] = {}
     var: dict[str, float] = {}
     for key, counts in per_key.items():
@@ -817,6 +827,14 @@ def group_estimate(strata: list[tuple[int, list[str | None]]], size: int,
             if n < n_docs:
                 p = (c + 0.5) / (n + 1)
                 v += n_docs * n_docs * (1 - n / n_docs) * p * (1 - p) / n
+        if len(partial) >= 2:
+            # successive-difference scatter of the group's scaled counts
+            # over the partially read slices
+            e_part = [counts[i] * strata[i][0] / len(strata[i][1]) for i in partial]
+            k = len(e_part)
+            v_scatter = k / (2.0 * (k - 1)) * sum((a - b) ** 2
+                                                  for a, b in zip(e_part[1:], e_part))
+            v = max(v, v_scatter)
         est[key], var[key] = e, v
     ordered = sorted(est, key=lambda k: (-est[k], k))
     shown = ordered[:size]

@@ -101,10 +101,11 @@ def test_the_read_spreads_a_pages_worth_of_documents_over_the_scopes_time_span()
                                "time_range": {"gte": "now-7d", "lte": "now"},
                                "filters": [FAILED]}, CFG, _session())
     body = c.body["params"]["body"]
-    # the read's first request: a count capped at the slow bound, no
-    # documents, no aggregations - cheap whatever the scope holds
+    # the read's first request: a count capped just past the sample - it
+    # only decides whether the scope fits one page - no documents, no
+    # aggregations, cheap whatever the scope holds
     assert body["size"] == 0 and "aggs" not in body and "sort" not in body
-    assert body["track_total_hits"] == elastic.TEXT_GROUP_SLOW_DOCS
+    assert body["track_total_hits"] == elastic.TEXT_GROUP_COUNT_CAP
     assert c.plan.groups is None
     # the sampling pass: a histogram over the span with the newest
     # documents of each slice, a page's source for each
@@ -174,41 +175,70 @@ def test_the_respread_allocation_is_fair_deterministic_and_never_more_than_the_s
         assert sum(alloc(counts, 1000)) <= 1000
 
 
-def test_a_scope_past_the_slow_bound_is_refused_before_the_sampling_pass():
-    s = _session()
-    c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS,
-                               "time_range": {"gte": "now-7d", "lte": "now"},
-                               "filters": [FAILED]}, CFG, s)
-    sent = []
+def test_the_slow_rule_is_a_deadline_not_a_prediction():
+    # The three reads measured on one real cluster (eseval.MEASURED_SCAN_WALL,
+    # an assumption stated as one): one day, 3M documents, 52 s; three days,
+    # 9.7M, 47 s; a week never finished within the site's limit. Time does
+    # not follow the document count, so nothing refuses on a count: a read
+    # that finishes within the session's search limit runs whatever its
+    # scope holds, and one that does not is stopped at the limit and
+    # refused slow_read with what to do instead.
+    cfg = eseval.burst_map()
+    engine = eseval.StubEngine(eseval.Fixture(eseval.burst_docs(), [], []), (eseval.BURST_INDEX,))
+    engine.group_scan_wall = eseval.measured_cluster_scan_wall
+    engine.search_limit_s = 120.0
+    vocab, _b = eseval.build_vocabulary(cfg, engine)
 
-    def search(body):
-        sent.append(body)
-        return {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
-            "hits": {"total": {"value": elastic.TEXT_GROUP_SLOW_DOCS, "relation": "gte"},
-                     "hits": []}}}
+    def ask(tr: dict | None):
+        session = eseval.Session(cfg, engine, tier2="none", vocabulary=vocab)
+        q = {"index": eseval.BURST_INDEX, "size": 0,
+             "filters": [{"field": "job.status", "op": "eq", "value": "Failed"}],
+             "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}}
+        if tr:
+            q["time_range"] = tr
+        before = engine.simulated_seconds
+        out, refused, _dt, _c = session.call(q)
+        return out, refused, round(engine.simulated_seconds - before, 1)
 
-    with pytest.raises(elastic.Refused) as e:
-        esquery.read_text_groups(search, s, c.group_read)
-    # one early-terminated count reached the engine and nothing else; the
-    # refusal carries counts and what to do, never a value
-    assert e.value.code == "slow_read" and len(sent) == 1
-    assert "aggs" not in sent[0]["params"]["body"]
-    assert f"{elastic.TEXT_GROUP_SLOW_DOCS:,}" in e.value.message
-    assert "narrow" in e.value.message.lower()
-    # the windowless path refuses off its bounds request the same way
-    c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS}, CFG, _session())
-    sent.clear()
+    # one day (52 s a pass) and three days (47 s) finish and run, although
+    # the old document-count bound would have refused the three-day read
+    out, refused, took = ask({"gte": "now-1d", "lte": "now"})
+    assert refused is None and out["aggregations"]["g"]["requests"] >= 2 and took >= 52.0
+    out, refused, took = ask({"gte": "now-3d", "lte": "now"})
+    assert refused is None and out["aggregations"]["g"]["requests"] >= 2 and took >= 47.0
+    # the week does not finish: stopped at the limit, the wait spent, the
+    # refusal actionable and value-free
+    out, refused, took = ask({"gte": "now-7d", "lte": "now"})
+    assert out is None and refused.code == "slow_read" and took == 120.0
+    assert "did not finish" in refused.message and "120s" in refused.message
+    assert "Narrow the time range or add filters" in refused.message
+    assert "terms or date_histogram" in refused.message
+    assert not any(t in refused.message for t in eseval.BURST_TENANTS + eseval.BURST_JOBS)
+    # a query with no closed range reads the whole retention: on this
+    # cluster that never finishes either, and only the cheap bounds request
+    # and the stopped pass were paid
+    n = len(engine.requests)
+    out, refused, took = ask(None)
+    assert refused is not None and refused.code == "slow_read"
+    assert len(engine.requests) == n + 2 and took == 120.0
 
-    def bounds_search(body):
-        sent.append(body)
-        return {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
-            "hits": {"total": {"value": elastic.TEXT_GROUP_SLOW_DOCS, "relation": "gte"},
-                     "hits": []},
-            "aggregations": {"first": {"value": 0.0}, "last": {"value": 1000.0}}}}
 
-    with pytest.raises(elastic.Refused) as e:
-        esquery.read_text_groups(bounds_search, _session(), c.group_read)
-    assert e.value.code == "slow_read" and len(sent) == 1
+def test_a_respread_that_hits_the_limit_keeps_the_first_pass_answer():
+    cfg, _fx, engine, vocab = eseval.dense_world()
+    walls = iter([10.0, float("inf")])
+    engine.group_scan_wall = lambda window_s, docs: next(walls)
+    engine.search_limit_s = 120.0
+    session = eseval.Session(cfg, engine, tier2="none", vocabulary=vocab)
+    out, refused, _dt, _c = session.call({
+        "index": eseval.DENSE_INDEX, "time_range": eseval.DENSE_RANGE, "size": 0,
+        "filters": [{"field": "job.status", "op": "eq", "value": "Failed"}],
+        "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}})
+    # the improvement pass timed out: the finished first pass's answer,
+    # with its own honest margins, instead of a refusal
+    assert refused is None
+    g = out["aggregations"]["g"]
+    assert g["requests"] == 3 and g["sampled"] == 20 and not g["exact"]
+    assert all("margin" in b for b in g["buckets"])
 
 
 def test_a_respread_reply_wider_than_asked_is_withheld_before_a_document_is_read():
@@ -339,7 +369,7 @@ def test_through_the_bridge_a_count_then_an_exact_read_and_the_log_has_the_shape
                                        "size": 0, "aggs": GROUPS})
     # the capped count said the scope fits one page, so it was read whole
     assert refused is None and len(engine.requests) == n + 2
-    assert engine.requests[n]["body"]["track_total_hits"] == elastic.TEXT_GROUP_SLOW_DOCS
+    assert engine.requests[n]["body"]["track_total_hits"] == elastic.TEXT_GROUP_COUNT_CAP
     assert sum(b["doc_count"] for b in out["aggregations"]["g"]["buckets"]) == 3
     assert out["aggregations"]["g"]["exact"] and out["aggregations"]["g"]["requests"] == 2
     rows = [json.loads(x) for x in (case.directory / "decisions.jsonl").read_text().splitlines()]
@@ -415,8 +445,15 @@ def test_a_wide_scope_is_sampled_over_its_span_and_the_reply_says_how_far_to_tru
     assert [b["key"] for b in g["buckets"]] == sorted(truth, key=lambda k: -truth[k])
     for b in g["buckets"]:
         assert abs(b["doc_count"] - truth[b["key"]]) <= b["margin"], b
-        assert b["margin"] < truth[b["key"]] / 2
-    assert g["order_settled"] == 3
+    # the margins are honest about the time structure: the two evenly
+    # spread groups stay tight, the group concentrated in one slice
+    # carries a margin about the size of its own count - from the sample
+    # alone it could outnumber the steady one - so the order is reported
+    # as settled for none, not claimed off a false small margin
+    by = {b["key"].split()[0]: b for b in g["buckets"]}
+    assert by["Throttled"]["margin"] < 1400 / 10 and by["License"]["margin"] < 200
+    assert by["Connection"]["margin"] > 1000
+    assert g["order_settled"] == 0
     # the read it replaced: the newest documents in scope, as one page
     _b, exact_plan = _c.group_read.exact() if _c else (None, None)
     c = esquery.compile_query(BURST_Q, case.bridge.config, case.scrubber)
@@ -471,10 +508,12 @@ def test_documents_in_one_slice_of_the_window_get_the_sample_respread_over_them(
     assert sum(sizes) == elastic.TEXT_GROUP_SAMPLE
     assert max(sizes) <= min(elastic.TEXT_GROUP_MAX_PER_STRATUM, cfg.max_hits)
     # all three groups, in the true order, where the uniform pass alone saw
-    # only the half hour's newest minute
+    # only the half hour's newest minute; the margins keep only the leading
+    # group settled - the tail group is concentrated in one range, so from
+    # this sample alone it cannot be kept apart from the rare one
     assert [b["key"].split(" for ")[0] for b in g["buckets"]] == [
         "Replica sync deadlocked", "Connection pool exhausted", "License revalidation failed"]
-    assert g["order_settled"] == 3
+    assert g["order_settled"] == 1
     # no label made usable and no value in the reply
     assert case.scrubber.shown == {tenant}
     blob = json.dumps(out)
@@ -490,12 +529,14 @@ def test_documents_in_one_slice_of_the_window_get_the_sample_respread_over_them(
     assert refused is None and again["aggregations"]["errors"] == g
 
 
-def test_declared_miss_a_burst_at_the_end_of_one_range_is_still_counted_as_that_range():
+def test_a_burst_at_the_end_of_one_range_is_biased_and_the_margin_now_covers_it():
     # the re-spread shrinks the newest-first bias from the whole sample to
-    # one range's share, and the margin's assumption (what was read in a
-    # range stands for the range) still does not cover a burst at a range's
-    # very end: the tail error is overcounted by the steady documents that
-    # share its range, and the steady one undercounted by the same amount
+    # one range's share: the tail error is still overcounted by the steady
+    # documents that share its range, but the between-range scatter term
+    # widens its margin to about the size of the swing, so the stated
+    # margin covers the bias instead of claiming a false ±12. The one shape
+    # it cannot cover stays declared: a read that is a single partial range
+    # has no between-range signal (the single-slice test below).
     cfg, _fx, engine, vocab = eseval.dense_world()
     case = eseval.BridgeCase(cfg, engine, vocab, tier2="none")
     tenant = case.scrubber.seed(eseval.DENSE_TENANT)
@@ -507,10 +548,15 @@ def test_declared_miss_a_burst_at_the_end_of_one_range_is_still_counted_as_that_
     by = {b["key"].split(" for ")[0]: b for b in out["aggregations"]["errors"]["buckets"]}
     tail = by["Connection pool exhausted"]
     assert tail["doc_count"] > eseval.DENSE_TAIL
-    assert tail["doc_count"] - tail["margin"] > eseval.DENSE_TAIL
-    # the bias is one range's share now; before the re-spread the same read
-    # put the whole scope's count on this group (3,000 against 480)
+    # the bias is one range's share now (before the re-spread the same read
+    # put the whole scope's count on this group, 3,000 against 480), and it
+    # sits inside the stated margin - for every group
     assert tail["doc_count"] - eseval.DENSE_TAIL < 200
+    truth = {"Replica sync deadlocked": eseval.DENSE_STEADY,
+             "Connection pool exhausted": eseval.DENSE_TAIL,
+             "License revalidation failed": eseval.DENSE_RARE}
+    for head, b in by.items():
+        assert abs(b["doc_count"] - truth[head]) <= b["margin"], (head, b)
 
 
 def test_a_scope_that_fits_the_sample_but_not_its_slices_is_read_whole_in_a_second_request():
@@ -601,6 +647,24 @@ def test_exactness_margins_and_the_settled_order():
     agg = elastic.group_estimate([(4, ["a", "a", "b", "c"])], 1, 4)
     assert [b["key"] for b in agg["buckets"]] == ["a"] and agg["sum_other_doc_count"] == 2
     assert agg["groups"] == 3
+
+
+def test_the_margin_covers_time_concentration_between_partial_ranges():
+    # two partially read ranges: a group spread evenly keeps the tight
+    # binomial margin; one concentrated in a single range gets a margin
+    # about the size of its swing, because the newest-first read within a
+    # range is structure, not noise, and the estimate could owe most of
+    # itself to it
+    even = elastic.group_estimate([(100, ["a"] * 5 + ["b"] * 5)] * 2, 10, 200)
+    conc = elastic.group_estimate([(100, ["a"] * 10), (100, ["b"] * 10)], 10, 200)
+    even_m = {b["key"]: b["margin"] for b in even["buckets"]}
+    conc_m = {b["key"]: b["margin"] for b in conc["buckets"]}
+    assert conc_m["a"] > 2 * even_m["a"] and conc_m["a"] >= 100
+    assert conc["order_settled"] == 0
+    # a range read whole is exact and adds no scatter: the same
+    # concentration across two whole ranges has no margin at all
+    whole = elastic.group_estimate([(10, ["a"] * 10), (10, ["b"] * 10)], 10, 20)
+    assert whole["exact"] and not any("margin" in b for b in whole["buckets"])
 
 
 def test_declared_miss_a_burst_at_the_end_of_one_slice_is_counted_as_the_whole_slice():

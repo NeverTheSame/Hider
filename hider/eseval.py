@@ -2540,8 +2540,29 @@ def dense_map() -> elastic.ElasticConfig:
     return elastic.parse(raw, source="dense-fixture")
 
 
+#: Wall time of one text_groups sampling pass measured on one real cluster -
+#: **an assumption stated as one, three measured points and nothing between
+#: them**: one day of errors, about 3 million documents, took 52 s; three
+#: days, about 9.7 million, took 47 s; a week did not finish within that
+#: site's 300 s search limit (the default limit is 120 s). Wall time does
+#: not follow the document count, so the stub models this cluster by the
+#: width of the request's own time range alone: up to three days a pass
+#: finishes in under a minute, past that (and for a request with no range,
+#: which reads the whole retention) it never finishes.
+MEASURED_SCAN_WALL: tuple[tuple[float, float], ...] = ((1.0, 52.0), (3.0, 47.0))
+
+
+def measured_cluster_scan_wall(window_s: float | None, docs: int) -> float:
+    """``StubEngine.group_scan_wall`` shaped like the measured cluster."""
+    days = (window_s if window_s is not None else math.inf) / 86400.0
+    for upto, seconds in MEASURED_SCAN_WALL:
+        if days <= upto:
+            return seconds
+    return math.inf
+
+
 def dense_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
-                                                  elastic.ClusterVocabulary]:
+                                                 elastic.ClusterVocabulary]:
     """The dense fixture on its own engine with its vocabulary built. The
     engine charges the group-scan rate, so the question's figures carry the
     read's simulated cost."""
@@ -2701,10 +2722,21 @@ class StubEngine:
         #: Simulated cost of a sampling pass - any request whose
         #: aggregations carry a ``top_hits`` heap, which makes Elasticsearch
         #: bucket every matching document - per million documents in scope
-        #: (see elastic.TEXT_GROUP_SCAN_S_PER_MDOC: an assumption sized from
-        #: one 52 s / 3M-document measurement). Zero (the default) charges
-        #: nothing, as with page_seconds.
+        #: (see elastic.TEXT_GROUP_SCAN_S_PER_MDOC). A floor for the small
+        #: fixtures only: measured wall times do not follow the document
+        #: count (see measured_cluster_scan_wall). Zero (the default)
+        #: charges nothing, as with page_seconds.
         self.group_scan_s_per_mdoc: float = 0.0
+        #: A cluster whose sampling-pass wall time is its own shape:
+        #: ``(window seconds or None, documents in scope) -> seconds``,
+        #: taking precedence over the per-mdoc rate. With ``search_limit_s``
+        #: set, a pass whose wall time exceeds the limit is refused exactly
+        #: as the session's completion ceiling refuses it (``incomplete``,
+        #: the search deleted, the limit's seconds spent), which is how the
+        #: eval shows a read that will not finish.
+        self.group_scan_wall = None
+        #: the site's search time limit the session enforces (None: no limit)
+        self.search_limit_s: float | None = None
         #: how many requests were charged as sampling passes
         self.group_scans = 0
 
@@ -2946,11 +2978,22 @@ class StubEngine:
                 self.simulated_seconds += EXISTS_EARLY_SECONDS
             else:
                 self._charge_exists_scan()
-        if self.group_scan_s_per_mdoc and _has_top_hits(body.get("aggs")):
+        if _has_top_hits(body.get("aggs")) and (self.group_scan_wall or self.group_scan_s_per_mdoc):
             # a sampling pass: the histogram or filter heaps visit every
-            # matching document, so the charge scales with the scope
+            # matching document
             self.group_scans += 1
-            self.simulated_seconds += self.group_scan_s_per_mdoc * total / 1_000_000.0
+            if self.group_scan_wall is not None:
+                wall = self.group_scan_wall(self._range_s, total)
+                if self.search_limit_s is not None and wall > self.search_limit_s:
+                    # the session's completion ceiling: the wait is spent,
+                    # the search deleted, nothing read
+                    self.simulated_seconds += self.search_limit_s
+                    raise elastic.Refused("incomplete", (
+                        f"response withheld: search did not finish in "
+                        f"{self.search_limit_s:g}s; {elastic.INCOMPLETE_HINT}"))
+                self.simulated_seconds += wall
+            else:
+                self.simulated_seconds += self.group_scan_s_per_mdoc * total / 1_000_000.0
         aggs = self._aggs(rows, body.get("aggs", {}), index) if body.get("aggs") else None
         rows = self._sorted(rows, body.get("sort"))
         frm, size = body.get("from", 0), body.get("size", 10)

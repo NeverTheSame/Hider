@@ -252,11 +252,10 @@ class GroupRead:
 
     1. **count** (closed time range) or **bounds** (no closed range): how
        many documents the scope holds, counted up to
-       :data:`elastic.TEXT_GROUP_SLOW_DOCS` - early-terminated, so it is
-       cheap either way - and, for bounds, the scope's first and last
-       timestamp (``min``/``max``, no documents). A scope at or past the
-       bound is refused ``slow_read`` here, before the sampling pass that
-       would mostly die at the session's completion ceiling anyway.
+       :data:`elastic.TEXT_GROUP_COUNT_CAP` - early-terminated, so it is
+       cheap on any scope; it only decides whether the scope fits one
+       page - and, for bounds, the scope's first and last timestamp
+       (``min``/``max``, no documents).
     2. **exact** - the whole scope as one page of
        :data:`elastic.TEXT_GROUP_SAMPLE` hits, when the count says it fits.
     3. **strata** - otherwise: the scope's span cut into at most ``strata``
@@ -269,6 +268,16 @@ class GroupRead:
        ``filter`` range per slice sized to the slice's share, a slice owed
        more than ``per_cap`` cut into equal sub-ranges of at most
        ``per_cap`` each. The asked sizes sum to at most the sample.
+
+    A pass's cost cannot be predicted from a count (measured on one real
+    cluster: one day, 3M documents, 52 s; three days, 9.7M, 47 s; a week
+    never finished), so the slow rule is a **deadline, not a prediction**:
+    a sampling pass that does not finish within the session's search limit
+    (``poll_timeout_s``, the site's own ceiling) is deleted by the session
+    and refused here as ``slow_read`` with what to do instead. A read that
+    finishes within the limit always runs, whatever its scope counts; a
+    timed-out **respread** keeps the finished first pass's answer instead
+    of refusing.
     """
 
     index: str
@@ -288,16 +297,17 @@ class GroupRead:
         return {"params": {"index": self.index, "body": body}}
 
     def count(self) -> tuple[dict, elastic.Plan]:
-        """How many documents the scope holds, counted up to the slow
-        bound: Elasticsearch stops collecting at the cap, so a scope wide
-        enough to refuse answers without paying for a full count."""
-        body = {"size": 0, "track_total_hits": elastic.TEXT_GROUP_SLOW_DOCS,
+        """How many documents the scope holds, counted just past the
+        sample: it only decides whether the scope fits one page, and
+        Elasticsearch stops collecting at the cap, so it is cheap on any
+        scope."""
+        body = {"size": 0, "track_total_hits": elastic.TEXT_GROUP_COUNT_CAP,
                 "query": self.query}
         return self._request(body), elastic.Plan(self.index, {}, 0)
 
     def bounds(self) -> tuple[dict, elastic.Plan]:
         tf = self.time_field
-        body = {"size": 0, "track_total_hits": elastic.TEXT_GROUP_SLOW_DOCS, "query": self.query,
+        body = {"size": 0, "track_total_hits": elastic.TEXT_GROUP_COUNT_CAP, "query": self.query,
                 "aggs": {"first": {"min": {"field": tf}}, "last": {"max": {"field": tf}}}}
         plan = elastic.Plan(self.index, {"first": elastic.AggPlan("min", tf),
                                          "last": elastic.AggPlan("max", tf)}, 0)
@@ -412,15 +422,26 @@ def _group_total(out: dict) -> tuple[Any, str]:
     return total.get("value"), total.get("relation", "eq")
 
 
-def _refuse_slow() -> elastic.Refused:
-    about = int(elastic.TEXT_GROUP_SLOW_DOCS / 1_000_000 * elastic.TEXT_GROUP_SCAN_S_PER_MDOC)
+#: the session's refusal code for a search that hit the completion ceiling
+#: (``KibanaSession.search``): deleted server-side, nothing read
+_TIMEOUT_CODE = "incomplete"
+
+
+def _refuse_slow(e: elastic.Refused) -> elastic.Refused:
+    """The sampling pass hit the session's search limit: say what happened
+    and what to do, instead of the generic timeout. The time was already
+    spent (and the search deleted), so asking the same scope again pays the
+    whole wait again; the way forward is a narrower scope."""
+    limit = re.search(r"in ([0-9.]+s)", e.message)
     return elastic.Refused(
         "slow_read",
-        f"text_groups: the scope holds at least {elastic.TEXT_GROUP_SLOW_DOCS:,} documents, "
-        f"and spreading the sample over it makes Elasticsearch bucket every one - about "
-        f"{about}s or more, past what the session waits for one search. Narrow the time "
-        f"range or add filters; a terms or date_histogram aggregation over the same scope "
-        f"is cheap and shows where the documents are.")
+        "text_groups: sampling this scope makes Elasticsearch bucket every document in it, "
+        "and that did not finish within the session's search time limit"
+        + (f" ({limit.group(1)})" if limit else "")
+        + ". The search was stopped and nothing was read; asking the same scope again pays "
+          "the whole wait again. Narrow the time range or add filters; a terms or "
+          "date_histogram aggregation over the same scope is cheap and shows where the "
+          "documents are.")
 
 
 def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber,
@@ -431,11 +452,13 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
     were made; the groups carry the count too.
 
     The order (see :class:`GroupRead`): the capped count (or bounds), then
-    - a scope past :data:`elastic.TEXT_GROUP_SLOW_DOCS` refused
-    ``slow_read`` - the whole scope as one exact page when it fits the
-    sample, else the strata pass, and a second pass re-spreading the sample
-    over where the documents are when the first left more than a quarter of
-    it unused (:data:`elastic.TEXT_GROUP_RESPREAD_MIN`)."""
+    the whole scope as one exact page when it fits the sample, else the
+    strata pass, and a second pass re-spreading the sample over where the
+    documents are when the first left more than a quarter of it unused
+    (:data:`elastic.TEXT_GROUP_RESPREAD_MIN`). A sampling pass that hits
+    the session's search limit is refused ``slow_read`` with what to do
+    instead - except the respread, whose timeout keeps the finished first
+    pass's answer."""
     n = 0
     lo_hi = read.window
 
@@ -447,13 +470,21 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
         return elastic.Scrubbed({"hits": {"total": out["hits"]["total"], "hits": []},
                                  "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
 
+    def sampling_pass(body: dict, plan: elastic.Plan) -> elastic.Scrubbed:
+        # a full bucketing pass over the scope: a timeout here is the slow
+        # rule firing, not an upstream fault, and the refusal says so
+        try:
+            return scrubber.scrub_response(search(body), plan)
+        except elastic.Refused as e:
+            if e.code == _TIMEOUT_CODE:
+                raise _refuse_slow(e) from e
+            raise
+
     if lo_hi is None:
         body, plan = read.bounds()
         n += 1
         out = scrubber.scrub_response(search(body), plan).output
         total, relation = _group_total(out)
-        if relation != "eq" or (isinstance(total, int) and total >= elastic.TEXT_GROUP_SLOW_DOCS):
-            raise _refuse_slow()
         first = (out.get("aggregations") or {}).get("first", {}).get("value")
         last = (out.get("aggregations") or {}).get("last", {}).get("value")
         if not isinstance(first, (int, float)) or not isinstance(last, (int, float)):
@@ -464,22 +495,20 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
         n += 1
         out = scrubber.scrub_response(search(body), plan).output
         total, relation = _group_total(out)
-        if relation != "eq" or (isinstance(total, int) and total >= elastic.TEXT_GROUP_SLOW_DOCS):
-            raise _refuse_slow()
         if total == 0:
             return empty(out)
-    if isinstance(total, int) and total <= elastic.TEXT_GROUP_SAMPLE:
+    if isinstance(total, int) and relation == "eq" and total <= elastic.TEXT_GROUP_SAMPLE:
         # the scope fits one page: read it whole rather than estimate what
         # is all there
         body, plan = read.exact()
         n += 1
-        scrubbed = scrubber.scrub_response(search(body), plan)
+        scrubbed = sampling_pass(body, plan)
         agg = scrubbed.output["aggregations"][read.groups.name]
         agg["requests"] = n
         return scrubbed, n
     body, plan = read.strata_read(*lo_hi)
     n += 1
-    scrubbed = scrubber.scrub_response(search(body), plan)
+    scrubbed = sampling_pass(body, plan)
     agg = scrubbed.output["aggregations"][read.groups.name]
     slices = agg.pop("_slices", [])
     if not agg["exact"] and slices and all(isinstance(k, int) for k, _c in slices):
@@ -492,8 +521,14 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
                 [(k, a) for (k, _c), a in zip(slices, alloc) if a > 0],
                 read.interval_s(*lo_hi) * 1000)
             n += 1
-            scrubbed = scrubber.scrub_response(search(body), plan)
-            agg = scrubbed.output["aggregations"][read.groups.name]
+            try:
+                scrubbed = scrubber.scrub_response(search(body), plan)
+                agg = scrubbed.output["aggregations"][read.groups.name]
+            except elastic.Refused as e:
+                if e.code != _TIMEOUT_CODE:
+                    raise
+                # the improvement pass hit the limit: the finished first
+                # pass's answer, with its own honest margins, beats refusing
     agg.pop("_slices", None)
     agg["requests"] = n
     return scrubbed, n

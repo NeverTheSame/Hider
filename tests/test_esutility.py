@@ -128,19 +128,25 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
                if k not in ("named_job", "text_two_fields"))
     f = rows["week_census"]["figures"]
     assert f["total"] > f["sampled"] and f["requests"] == 2 and not f["exact"]
-    assert f["missing"] == 0 and f["within_margin"] == f["groups"] == 3 == f["order_settled"]
+    assert f["missing"] == 0 and f["within_margin"] == f["groups"] == 3
     assert f["max_error_pct"] < 5
+    # the burst group is concentrated in one slice, so its honest margin is
+    # about its own size and the reply claims the order settled for none -
+    # it underclaims (the order it shows is in fact the true one)
+    assert f["order_settled"] == 0
     # the simulated cost of the sampling pass, at the measured 52 s / 3M rate
     assert f["scan_seconds"] > 0
     f = rows["tenant_day_census"]["figures"]
     # the whole sample lands inside the half hour: the day answered from
-    # 1,000 of 3,000 documents in three requests, the order settled for all
-    # three groups where the even spread saw one group from 20 documents
+    # 1,000 of 3,000 documents in three requests, every count inside the
+    # stated margin (the boundary group's margin is widened by the scatter
+    # term to cover its newest-first bias), the order settled for the
+    # leading group only - where the even spread saw one group from 20
+    # documents and put the whole 3,000 on it
     assert (f["total"], f["sampled"], f["requests"]) == (3000, 1000, 3)
-    assert f["missing"] == 0 and f["groups"] == 3 == f["order_settled"] and not f["exact"]
-    # the declared miss, visible in the figures: a burst at the end of one
-    # range is counted as that range, and the margin does not cover it
-    assert f["within_margin"] < f["groups"] and f["max_error_pct"] < 40
+    assert f["missing"] == 0 and f["groups"] == 3 and not f["exact"]
+    assert f["within_margin"] == 3 and f["order_settled"] == 1
+    assert f["max_error_pct"] < 40
     assert f["scan_seconds"] > 0
     # the refused query (the last one a question asks) reaches nothing;
     # the steps before it, e.g. reading the page that names the error to
