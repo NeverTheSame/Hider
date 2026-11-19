@@ -561,8 +561,10 @@ Listed with owners in the README's Limitations section and in
   requests for a scope with a closed range (the capped count, then the
   exact page or the sampling pass - one more than before), three when the
   sample is re-spread, plus one for `min`/`max` without a closed range;
-  each sampling pass is a histogram or filter set with a heap per range
-  over every matching document, the fetch at most 1,000 docs per request.
+  up to `TEXT_GROUP_MAX_PASSES` + 1 when the window must be read in
+  pieces (the slow-read section below); each sampling pass is a histogram
+  or filter set with a heap per range over every matching document of its
+  piece, the fetch at most 1,000 docs per request.
   **The key**: every label, destroyed secret and token
   carrying a digit becomes one placeholder, `<*>` - **never a type**,
   because a label's type depends on how its value was first labelled (its
@@ -631,52 +633,87 @@ Listed with owners in the README's Limitations section and in
   `margin`, `order_settled`, above); a leak in any sampled document
   withholds the whole reply, as it would that page; one request reads ten
   pages' worth, scrubbed with tier 2.
-  **A read that will not finish is stopped at the session's search limit
-  and refused with what to do; nothing is refused on a prediction.** The
-  sampling pass is a full bucketing pass over every document in scope,
-  and its wall time **cannot be predicted from a document count** -
-  measured on one real cluster: one day of errors, about 3 million
-  documents, 52 seconds; three days, about 9.7 million, **47 seconds**; a
-  week **did not finish within that site's 300 s search limit** (the
-  default limit is 120 s). The first cut of this rule refused any scope
-  past a 5-million-document bound, which would have refused the measured
-  three-day read that finishes in 47 s and never consulted the site's
-  limit; it is gone. The rule is a **deadline**: the session already
-  bounds every search (`poll_timeout_s`, the site's own setting, default
-  120 s - a search past it is deleted server-side and nothing is read),
-  and a sampling pass that hits it is refused `slow_read` instead of the
-  generic timeout (`esquery.read_text_groups`, `_refuse_slow`), telling
-  the person and the model what happened and what to do: the limit was
-  spent and retrying the same scope pays it again; narrow the time range
-  or add filters, and find where to narrow with a terms or date_histogram
-  over the same scope, which is cheap. A timed-out **re-spread** keeps
-  the finished first pass's answer, with its own honest margins, instead
-  of refusing - a read that would finish always runs. `es_schema` tells
-  Claude the same. **Costs**: a read that will not finish burns the full
-  limit once before it is refused (there is no cheaper way to learn it;
-  asking again burns it again, which the refusal says); the refusal's
-  spent phrases are **not refunded**, as for any withheld page; and the
-  bridge remembers nothing about which scopes timed out, so the same
-  slow question costs the limit every time it is asked. **The stub shows
-  both shapes, each an assumption stated as one**: the small fixtures'
-  passes are charged at `elastic.TEXT_GROUP_SCAN_S_PER_MDOC` (52/3 s per
-  million documents, sized from the one-day point, a floor so the measure
-  never implies the pass is free - the utility rows carry it as
-  `scan_seconds`), and the measured cluster is
-  `eseval.measured_cluster_scan_wall` (`StubEngine.group_scan_wall` with
-  `search_limit_s`: the three measured points keyed on the request's own
-  range width and nothing between them - up to three days a pass
-  finishes, past that, or with no closed range at all, it never does),
-  under which the eval shows the day and the three-day reads running and
-  the week stopped at 120 s with the actionable refusal
-  (`test_the_slow_rule_is_a_deadline_not_a_prediction`). **Where the
-  deadline rule still gets it wrong**, declared: it spends the limit to
-  learn a scope is slow, every time; a pass that would have finished just
-  past the limit is lost as surely as one that never would (the site's
-  way out is raising `poll_timeout_s`, which bounds every search, not a
-  group-read knob); and the stub's cluster shape is three points - a real
-  cluster where a narrow range is the slow one (a cold tier, say) is not
-  modelled, and the deadline is exactly why the rule survives that too.
+  **A read whose pass cannot finish is re-read in newest-first window
+  pieces, and the reply says exactly what it covers; nothing is refused
+  on a prediction.** The sampling pass is a full bucketing pass over
+  every document in scope, and its wall time **cannot be predicted from
+  a document count** - measured on one real cluster: one day of errors,
+  about 3 million documents, 52 seconds; three days, about 9.7 million,
+  **47 seconds**; a week **did not finish within that site's 300 s
+  search limit** (the default limit is 120 s). The first cut of this rule
+  refused any scope past a 5-million-document bound, which would have
+  refused the measured three-day read; the second stopped at the limit
+  and refused with nothing, so the commonest question - a week of errors
+  - waited the whole limit and came back empty, with "narrow the scope"
+  but not how far, and every guess at how far cost another limit. Now the
+  deadline stands (the session bounds every search at `poll_timeout_s`,
+  the site's own setting; a search past it is deleted server-side and
+  nothing is read) and a strata pass that hits it **splits its window in
+  half and reads the halves newest first**, each piece its own strata
+  pass and re-spread, each piece's query carrying the piece's own range
+  clause (so the pass scans the piece, not the whole window - on the
+  cluster, not only in accounting; the one narrowing the bridge's clock
+  produces, see `esbridge.clock`). Every piece's kept texts are already
+  reduced to group keys (`_strata`, idempotent, so `mark_shown` and the
+  leak check see only group text) and all pieces are combined into
+  **one** estimate, margins and scatter across every range. Bounds:
+  `TEXT_GROUP_MAX_PASSES` (12) sampling passes and
+  `TEXT_GROUP_MAX_TIMEOUTS` (3) spent limits per question; a timed-out
+  re-spread keeps its piece's finished first pass; when the read stops
+  early the reply's `covered`/`covered_share` say **exactly which newest
+  part of the window the groups describe** (contiguous by construction:
+  pieces are processed strictly newest first), the total is `gte`, and
+  only a read that covered nothing is refused `slow_read` (message: the
+  limit, the narrowest width tried, the waits spent, what to do).
+  **The bridge remembers what timed out** (`Bridge.group_spans`, shared
+  across a broker's cases like `presence`, per index, the narrowest span
+  that hit the limit, `GROUP_SPAN_TTL_S` an hour, spans and times only):
+  a later wide question splits past the doomed widths without paying
+  them, and the pieces it lands on are the same halving tree, so **the
+  same question asked again returns the same groups and counts**.
+  Measured on the stub's cluster shape
+  (`eseval.measured_cluster_scan_wall` + `MEASURED_SEARCH_LIMIT_S`, the
+  three points and the 300 s limit, an assumption stated as one; pinned
+  by the week-in-pieces tests in `test_estextgroups.py` and `esutility`'s
+  `slow_week_census`):
+  **before, the week spent 300 s and returned nothing; now it answers
+  whole** - 2 probes pay the limit (the week, then its newest half), four
+  1.75-day pieces finish, **8 requests, ~835 simulated seconds, covered
+  100%, every count within margin (the narrow pieces read most slices
+  whole, worst count off under 1%)**; asked again on the same broker it
+  is **6 requests, ~235 seconds, 0 timeouts, identical groups**. A window
+  wider than the pass budget covers its newest pieces and says so
+  (30 days at 1.875-day pieces: 12 passes, `covered_share` 0.6875, total
+  `gte`). **Why several samples per question is still safe**: the
+  per-request cap is untouched (no request reads more than one sample,
+  which is what keeps a group read no wider than paging), and the pieces
+  are exactly the narrower questions the case could already ask one at a
+  time - the page-equivalence gate pages the same 2,700 documents in 178
+  requests - so pieces add reach the grammar already had, not
+  information; every pass is scrubbed and leak-checked as a page, groups
+  still make no label usable, and a pieced question costs strictly more
+  requests per phrase, so guessing gets dearer, never cheaper (the guess
+  gates run without piecing and stand unchanged). **Where the pieced
+  answer is weaker than one read**, declared: a group's counts join
+  across pieces but a document counted in one piece was sampled without
+  knowledge of the others (the estimate is per-range as always - in
+  practice the narrow pieces sample *better*); partial coverage is
+  honest but silent about the unread part - a group may be commoner
+  there, which the es-smoke NOTE and `es_schema` both say; empty pieces
+  of a too-wide window still spend passes (the budget buys coverage, not
+  cleverness); the span memory is per index, so a cheap narrow-filtered
+  wide question splits like an expensive one (more requests, same
+  answer); after `GROUP_SPAN_TTL_S` the probing is paid again; and the
+  worst case is still `TEXT_GROUP_MAX_TIMEOUTS` spent limits before a
+  refusal (15 minutes at a 300 s limit), once per cluster per hour.
+  **Costs otherwise unchanged**: the refusal's spent phrases are not
+  refunded; the small fixtures' passes are charged at
+  `elastic.TEXT_GROUP_SCAN_S_PER_MDOC` (52/3 s per million documents, a
+  floor sized from the one-day point so the measure never implies the
+  pass is free - the utility rows carry `scan_seconds`); and a pass that
+  would have finished just past the limit is lost as surely as one that
+  never would (the site's lever is `poll_timeout_s`, which bounds every
+  search - no group-read knob).
   **What a real cluster needs that
   the stub does not show**: a 1,000-hit reply with full `_source` is
   megabytes through Kibana (its payload limits apply) and tier 2 over
@@ -781,11 +818,14 @@ Listed with owners in the README's Limitations section and in
   query named, its type, field and bucket count (`srv:terms(agent.name)
   buckets=5 other_docs=16`, `n:cardinality(job.id) value=28`), and for
   `text_groups` `groups=shown/found read=sampled/total requests=N
-  strata=K exact=yes|no order_settled=S/shown other_docs=…`, with a
+  strata=K exact=yes|no order_settled=S/shown other_docs=…` (plus
+  `covered=NN%` when the read stopped before the whole window), with a
   `NOTE` saying how far the reply says to trust it (exact: every
   document read; estimated: documents read over how many time ranges and
   what share of the scope, the largest margin, how many leading groups
-  the order is settled for, the two declared misses) and one for
+  the order is settled for, the two declared misses; partial coverage:
+  which newest part of the window the groups describe and that a group
+  may be commoner in the unread part) and one for
   `unbucketed`; the filters print as ops and field names only (`filters:
   eq=1 not=1 any_of=1(2) fields=job.status,message,log.level`). **Never a
   key, a group's text or a value**: those print with `--show` only, as
@@ -1982,13 +2022,15 @@ Listed with owners in the README's Limitations section and in
   `tests/test_esutility.py`. **What it does not cover:** a script is not
   Claude (whether a model finds these queries, or runs out of phrase
   budget over a long case, is not measured); the questions are a chosen
-  set, so "17 of 20 answered, 1 wrong, 2 blocked" (6 of 11 before `not`
+  set, so "18 of 21 answered, 1 wrong, 2 blocked" (6 of 11 before `not`
   and `any_of`, 8 before `text_groups`, whose question now asks with it,
   9 of 12 before the sample was spread over the span, 10 of 12 before
   the human step, 11 of 12 before the split-tenant questions, whose
   `text_lookalike` is wrong **by design**, 15 of 18 before the two-field
   tenant, 16 of 19 before the re-spread, whose `tenant_day_census` read
-  20 of 3,000 documents until the sample followed them) is not a rate of
+  20 of 3,000 documents until the sample followed them, 17 of 20 before
+  the window pieces, whose `slow_week_census` spent the 300 s limit and
+  returned nothing) is not a rate of
   anything, and the two human steps are scripted
   here, not a person deciding whether the name deserves seeding; one tenant over six hours of synthetic
   data, so "per day" is one day, and the questions on their own data

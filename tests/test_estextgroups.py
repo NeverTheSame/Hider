@@ -181,15 +181,18 @@ def test_the_slow_rule_is_a_deadline_not_a_prediction():
     # 9.7M, 47 s; a week never finished within the site's limit. Time does
     # not follow the document count, so nothing refuses on a count: a read
     # that finishes within the session's search limit runs whatever its
-    # scope holds, and one that does not is stopped at the limit and
-    # refused slow_read with what to do instead.
+    # scope holds, and one that cannot is split into newest-first window
+    # pieces until the pieces finish (test below); only a read that could
+    # cover nothing is refused.
     cfg = eseval.burst_map()
     engine = eseval.StubEngine(eseval.Fixture(eseval.burst_docs(), [], []), (eseval.BURST_INDEX,))
     engine.group_scan_wall = eseval.measured_cluster_scan_wall
     engine.search_limit_s = 120.0
     vocab, _b = eseval.build_vocabulary(cfg, engine)
 
-    def ask(tr: dict | None):
+    def ask(tr: dict | None, wall=None):
+        if wall is not None:
+            engine.group_scan_wall = wall
         session = eseval.Session(cfg, engine, tier2="none", vocabulary=vocab)
         q = {"index": eseval.BURST_INDEX, "size": 0,
              "filters": [{"field": "job.status", "op": "eq", "value": "Failed"}],
@@ -200,27 +203,111 @@ def test_the_slow_rule_is_a_deadline_not_a_prediction():
         out, refused, _dt, _c = session.call(q)
         return out, refused, round(engine.simulated_seconds - before, 1)
 
-    # one day (52 s a pass) and three days (47 s) finish and run, although
-    # the old document-count bound would have refused the three-day read
+    # one day (52 s a pass) and three days (47 s) finish and run in one
+    # pass, although the old document-count bound would have refused the
+    # three-day read
     out, refused, took = ask({"gte": "now-1d", "lte": "now"})
-    assert refused is None and out["aggregations"]["g"]["requests"] >= 2 and took >= 52.0
+    g = out["aggregations"]["g"]
+    assert refused is None and g["timeouts"] == 0 and g["covered_share"] == 1.0 and took >= 52.0
     out, refused, took = ask({"gte": "now-3d", "lte": "now"})
-    assert refused is None and out["aggregations"]["g"]["requests"] >= 2 and took >= 47.0
-    # the week does not finish: stopped at the limit, the wait spent, the
-    # refusal actionable and value-free
+    g = out["aggregations"]["g"]
+    assert refused is None and g["timeouts"] == 0 and g["covered_share"] == 1.0 and took >= 47.0
+    # the week's single pass does not finish: the window is split in half,
+    # newest first, until the pieces do, and the answer covers the week
     out, refused, took = ask({"gte": "now-7d", "lte": "now"})
-    assert out is None and refused.code == "slow_read" and took == 120.0
+    g = out["aggregations"]["g"]
+    assert refused is None and g["timeouts"] == 2 and g["covered_share"] == 1.0
+    assert took >= 2 * 120.0 + 4 * 47.0
+    # a query with no closed range reads the documents' own span (the
+    # bounds request), which is the same week: pieces again
+    out, refused, took = ask(None)
+    assert refused is None and out["aggregations"]["g"]["covered_share"] == 1.0
+    # a cluster where even the pieces cannot finish: the read stops after
+    # TEXT_GROUP_MAX_TIMEOUTS waits and the refusal is actionable and
+    # value-free
+    n = len(engine.requests)
+    out, refused, took = ask({"gte": "now-7d", "lte": "now"},
+                             wall=lambda window_s, docs: float("inf"))
+    assert out is None and refused.code == "slow_read"
+    assert took == elastic.TEXT_GROUP_MAX_TIMEOUTS * 120.0
+    assert len(engine.requests) == n + 1 + elastic.TEXT_GROUP_MAX_TIMEOUTS
     assert "did not finish" in refused.message and "120s" in refused.message
     assert "Narrow the time range or add filters" in refused.message
     assert "terms or date_histogram" in refused.message
     assert not any(t in refused.message for t in eseval.BURST_TENANTS + eseval.BURST_JOBS)
-    # a query with no closed range reads the whole retention: on this
-    # cluster that never finishes either, and only the cheap bounds request
-    # and the stopped pass were paid
-    n = len(engine.requests)
-    out, refused, took = ask(None)
-    assert refused is not None and refused.code == "slow_read"
-    assert len(engine.requests) == n + 2 and took == 120.0
+
+
+def test_a_week_that_cannot_finish_in_one_pass_is_read_in_pieces_and_says_what_it_covers():
+    # the measured cluster under its 300 s limit (eseval.slow_world): the
+    # week question comes back with an answer instead of a spent limit
+    cfg, _fx, engine, vocab = eseval.slow_world()
+    case = eseval.BridgeCase(cfg, engine, vocab, tier2="none")
+    case.scrubber.seed(eseval.BURST_TENANTS[0])
+    truth = _truth_keys(case)
+    q = {"index": eseval.BURST_INDEX, "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
+         "filters": [FAILED],
+         "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}}
+    s0 = engine.simulated_seconds
+    out, refused, _dt, _c = case.call(q)
+    first_wait = engine.simulated_seconds - s0
+    assert refused is None
+    g = out["aggregations"]["g"]
+    # two probes hit the limit (the week, then its newest half), then the
+    # week is covered whole in 1.75-day pieces, each pass its own sample
+    assert g["timeouts"] == 2 and g["covered_share"] == 1.0
+    assert g["covered"] == g["window"] and g["passes"] >= 6
+    assert out["hits"]["total"] == {"value": 2700, "relation": "eq"}
+    assert [b["key"] for b in g["buckets"]] == sorted(truth, key=lambda k: -truth[k])
+    for b in g["buckets"]:
+        assert abs(b["doc_count"] - truth[b["key"]]) <= b["margin"], b
+    # per request never more than one sample; across the question more,
+    # which is exactly what asking the pieces one by one already allows
+    strata_reqs = [r["body"] for r in engine.requests if "aggs" in r["body"]
+                   and elastic.STRATA_AGG in r["body"].get("aggs", {})]
+    for body in strata_reqs:
+        top = body["aggs"][elastic.STRATA_AGG]["aggs"][elastic.STRATA_HITS_AGG]["top_hits"]
+        assert top["size"] * elastic.TEXT_GROUP_STRATA <= elastic.TEXT_GROUP_SAMPLE
+    assert g["sampled"] > elastic.TEXT_GROUP_SAMPLE
+    # the same case asks again: the bridge remembered which widths hit the
+    # limit, so no probe is paid and the groups are identical
+    s1 = engine.simulated_seconds
+    out2, refused2, _dt, _c = case.call(q)
+    g2 = out2["aggregations"]["g"]
+    assert refused2 is None and g2["timeouts"] == 0
+    assert engine.simulated_seconds - s1 < first_wait / 3
+    assert [(b["key"], b["doc_count"]) for b in g2["buckets"]] == \
+        [(b["key"], b["doc_count"]) for b in g["buckets"]]
+    # no label made usable and no value anywhere
+    assert case.scrubber.shown == {case.scrubber.known[eseval.jsonscrub_norm(
+        eseval.BURST_TENANTS[0])]}
+    blob = json.dumps(out) + json.dumps(out2)
+    assert not any(t in blob for t in eseval.BURST_TENANTS + eseval.BURST_JOBS)
+    assert "_strata" not in blob and "_slices" not in blob
+
+
+def test_a_window_wider_than_the_pass_budget_covers_its_newest_part_and_says_so():
+    # a 30-day window over the same cluster, with the doomed widths already
+    # remembered: the pieces tile newest-first until the pass budget runs
+    # out, and the reply says exactly which newest part the groups describe
+    cfg, _fx, engine, vocab = eseval.slow_world()
+    session = eseval.Session(cfg, engine, tier2="none", vocabulary=vocab)
+    session.group_spans[eseval.BURST_INDEX] = 3.5 * 86400.0
+    out, refused, _dt, _c = session.call({
+        "index": eseval.BURST_INDEX, "time_range": {"gte": "now-30d", "lte": "now"}, "size": 0,
+        "filters": [FAILED],
+        "aggs": {"g": {"type": "text_groups", "field": "job.status_message", "size": 10}}})
+    assert refused is None
+    g = out["aggregations"]["g"]
+    # 30 days halve to 1.875-day pieces (under the remembered 3.5-day bad
+    # width); the pass budget covers the newest 11 of 16 pieces (one pass
+    # went to the burst piece's re-spread), which hold every document, and
+    # the reply says so
+    assert g["timeouts"] == 0 and g["passes"] == elastic.TEXT_GROUP_MAX_PASSES
+    assert g["covered_share"] == round(11 / 16, 4)
+    assert g["covered"]["to"] == g["window"]["to"] > g["covered"]["from"] > g["window"]["from"]
+    assert out["hits"]["total"]["relation"] == "gte"
+    # the week's documents all sit inside the covered newest part
+    assert sum(b["doc_count"] for b in g["buckets"]) + g["sum_other_doc_count"] >= 2600
 
 
 def test_a_respread_that_hits_the_limit_keeps_the_first_pass_answer():
@@ -245,7 +332,7 @@ def test_a_respread_reply_wider_than_asked_is_withheld_before_a_document_is_read
     s = _session()
     c = esquery.compile_query({"index": "logs-app-*", "size": 0, "aggs": GROUPS,
                                "time_range": {"gte": "now-7d", "lte": "now"}}, CFG, s)
-    body, plan = c.group_read.respread([(0, 150)], 12_600_000)
+    body, plan = c.group_read.respread([(0, 150)], 12_600_000, 0.0, 12_600.0)
     # 150 documents owed over the 100-per-range cap: two equal sub-ranges
     aggs = body["params"]["body"]["aggs"]
     assert [a["aggs"][elastic.STRATA_HITS_AGG]["top_hits"]["size"] for a in aggs.values()] == [75, 75]

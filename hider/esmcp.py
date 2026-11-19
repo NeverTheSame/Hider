@@ -192,6 +192,9 @@ class CaseBook:
         #: which fields were seen present in which index, shared by every
         #: case of this broker (field names and times only)
         self.presence: dict = presence if presence is not None else {}
+        #: which window spans' sampling passes hit the search limit, per
+        #: index, shared the same way (spans and times only)
+        self.group_spans: dict = {}
 
     def open(self, name: str, terms: list[str], tier2: str,
              session: esbridge.KibanaSession,
@@ -222,7 +225,7 @@ class CaseBook:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         bridge = esbridge.Bridge(self.config, scrubber, session,
                                  log_path=directory / "decisions.jsonl", index=index,
-                                 presence=self.presence)
+                                 presence=self.presence, group_spans=self.group_spans)
         token = secrets.token_urlsafe(32)
         case = Case(name, directory, scrubber, bridge, _digest(token), seeded)
         case.save()
@@ -340,15 +343,20 @@ _AGGS = {
         "from the next: beyond it the order is NOT known from this sample, however it looks. "
         "A group rarer than about one document in its range's scaling may be missing; when "
         "the whole read is one time range, a burst at its end is counted as that range and "
-        "the margin need not cover it. Costs 2 requests with a closed time_range (3 when the "
-        "sample is re-spread); without one the span is read first (+1). Sampling makes "
-        "Elasticsearch bucket every document in scope, and a pass that does not finish "
-        "within the session's search time limit is refused slow_read after waiting it out - "
-        "the limit is spent either way, so do not retry the same scope: narrow the time "
-        "range or add filters (a terms or date_histogram over the same scope is cheap and "
-        "shows where the documents are). It is the query's only aggregation, takes no "
-        "sub-aggregations, nothing in it changes how the sample is read, and <*> is not a "
-        "label."),
+        "the margin need not cover it. Costs 2 requests with a closed time_range (3 when "
+        "the sample is re-spread); without one the span is read first (+1). Sampling makes "
+        "Elasticsearch bucket every document in scope; a pass that does not finish within "
+        "the session's search time limit is retried over the window split into newest-first "
+        "pieces (each piece its own pass and sample; each timed-out probe costs the whole "
+        "limit, and the widths that timed out are remembered for about an hour, so asking "
+        "again soon skips them). Read the reply's covered/covered_share: when "
+        "covered_share < 1 the groups, counts and total describe only that newest part of "
+        "the asked window - the older part was NOT read and a group may be commoner there; "
+        "ask it as its own narrower time_range if it matters. Only a read that could cover "
+        "nothing is refused slow_read; then narrow the time range or add filters (a terms "
+        "or date_histogram over the same scope is cheap and shows where the documents "
+        "are). It is the query's only aggregation, takes no sub-aggregations, nothing in "
+        "it changes how the sample is read, and <*> is not a label."),
     "additionalProperties": {"type": "object"},
 }
 

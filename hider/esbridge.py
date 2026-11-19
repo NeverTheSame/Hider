@@ -83,8 +83,11 @@ LOG_SCHEMA = "hider.es-bridge.v1"
 #: whether what it holds has gone stale. A module global because it is a
 #: hook for the harnesses, not per-request state: the stub fixtures sit at
 #: ``eseval.NOW`` rather than today, and nothing in the live path replaces
-#: it. It never changes what a *query* selects - a query's date math is
-#: sent as written and resolved by the cluster.
+#: it. A query's own date math is sent as written and resolved by the
+#: cluster; the one narrowing derived from this clock is the window pieces
+#: of a text_groups read (epoch-bound range clauses inside the typed
+#: window), so bridge-to-cluster clock skew can shift a piece's edges by
+#: the skew - the same declared wobble relative ranges already have.
 clock = time.time
 
 #: Stock Chrome profile roots. A profile_dir under one of these is the
@@ -539,6 +542,7 @@ class Bridge:
     def __init__(self, config: elastic.ElasticConfig, scrubber: elastic.EsScrubber,
                  session: KibanaSession, *, log_path: str | Path | None = None,
                  presence: dict | None = None,
+                 group_spans: dict | None = None,
                  index: elastic.VocabularyIndex | None = None) -> None:
         self.config = config
         self.scrubber = scrubber
@@ -546,6 +550,13 @@ class Bridge:
         #: index, on a page or by an empty-result check. Field names and
         #: times only, so a broker may share one across its cases.
         self.presence: dict[tuple[str, str], float] = presence if presence is not None else {}
+        #: index -> (narrowest window span in seconds whose text_groups
+        #: sampling pass hit the search limit, when). Spans and times only,
+        #: shared across a broker's cases like ``presence``, so a later
+        #: wide group question splits past the doomed widths without paying
+        #: the wait again. Pruned at GROUP_SPAN_TTL_S.
+        self.group_spans: dict[str, tuple[float, float]] = \
+            group_spans if group_spans is not None else {}
         self.session = session
         self.log_path = Path(log_path) if log_path else None
         self._lock = threading.Lock()
@@ -582,7 +593,10 @@ class Bridge:
                 # Compile first: a query the grammar refuses on its own keeps
                 # its declared code whether the vocabulary is ready, building
                 # or absent, and is refused before anything else happens.
-                compiled = esquery.compile_query(query, self.config, self.scrubber)
+                # Compiled on the bridge's clock, so the window bounds a
+                # group read pieces by sit where the fixtures (and the
+                # cluster) sit.
+                compiled = esquery.compile_query(query, self.config, self.scrubber, now=clock())
                 # Then the vocabulary (local, no request, once per case per
                 # cluster; refuses vocabulary_building until it serves). If
                 # this call is the one that applied it, compile again, so the
@@ -590,7 +604,8 @@ class Bridge:
                 # every later one is - a learnt name in a keep literal is
                 # refused here, with the same words, before any request.
                 if self._apply_vocabulary(cluster):
-                    compiled = esquery.compile_query(query, self.config, self.scrubber)
+                    compiled = esquery.compile_query(query, self.config, self.scrubber,
+                                                     now=clock())
                 row.update(_describe(query, compiled))
                 # Every check has passed and the query will be sent: charge
                 # its new phrases now, before the probe and the request, and
@@ -604,14 +619,33 @@ class Bridge:
                 # the whole {"params": {"index", "body"}} document: that is
                 # what /internal/search/ese takes
                 if compiled.group_read is not None:
-                    # a text_groups read: two to four requests, a page's
-                    # worth each, every reply scrubbed with its own plan
-                    scrubbed, requests = esquery.read_text_groups(
-                        lambda body: self.session.search(cluster, body), self.scrubber,
-                        compiled.group_read)
+                    # a text_groups read: a page's worth per request, every
+                    # reply scrubbed with its own plan; a wide window is
+                    # read in newest-first pieces when a pass hits the
+                    # search limit, with the timed-out widths remembered
+                    # across this broker's cases (spans only)
+                    now = clock()
+                    spans = {k: v[0] for k, v in self.group_spans.items()
+                             if now - v[1] <= GROUP_SPAN_TTL_S}
+                    try:
+                        scrubbed, requests = esquery.read_text_groups(
+                            lambda body: self.session.search(cluster, body), self.scrubber,
+                            compiled.group_read, slow_spans=spans)
+                    finally:
+                        # keep what the timeouts taught even when the read
+                        # was refused: that is what spares the next question
+                        now = clock()
+                        fresh = {k: ((v, now) if (old := self.group_spans.get(k)) is None
+                                     or v < old[0] else old)
+                                 for k, v in spans.items()}
+                        self.group_spans.clear()
+                        self.group_spans.update(fresh)
                     agg = scrubbed.output["aggregations"][compiled.group_read.groups.name]
                     row.update({"requests": requests, "sampled": agg.get("sampled"),
                                 "exact": agg.get("exact"), "strata": agg.get("strata")})
+                    for k in ("covered_share", "timeouts"):
+                        if agg.get(k) is not None:
+                            row[k] = agg[k]
                 else:
                     envelope = self.session.search(cluster, compiled.body)
                     scrubbed = self.scrubber.scrub_response(envelope, compiled.plan)
@@ -1539,12 +1573,24 @@ def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
         atype, field = spec.get("type"), spec.get("field")
         if atype == "text_groups":
             n = len(got.get("buckets") or [])
+            share = got.get("covered_share")
             parts.append(
                 f"{name}:text_groups({field}) groups={n}/{got.get('groups')} "
                 f"read={got.get('sampled')}/{got.get('total')} requests={got.get('requests')} "
                 f"strata={got.get('strata')} exact={'yes' if got.get('exact') else 'no'} "
                 f"order_settled={got.get('order_settled')}/{n} "
-                f"other_docs={got.get('sum_other_doc_count')}")
+                f"other_docs={got.get('sum_other_doc_count')}"
+                + (f" covered={round(100 * share, 1)}%" if isinstance(share, (int, float))
+                   and share < 1.0 else ""))
+            if isinstance(share, (int, float)) and share < 1.0:
+                cov = got.get("covered") or {}
+                notes.append(
+                    f"{name}: the groups describe only the newest "
+                    f"{round(100 * share, 1)}% of the asked window "
+                    f"(epoch ms {cov.get('from')} to {cov.get('to')}); the older part was "
+                    f"not read - {got.get('timeouts')} sampling pass(es) hit the search "
+                    "limit. The counts and the total are for the covered part alone; a "
+                    "group may be commoner in the unread part")
             if got.get("exact"):
                 notes.append(f"{name}: every document in scope was read; the counts are exact"
                              + (f", {n} of {got.get('groups')} groups shown" if n != got.get("groups")
@@ -1717,6 +1763,11 @@ EMPTY_CHECK_CAP = 100
 #: how long a field seen present in an index (on a page, or by a check) is
 #: remembered, so a later zero's window check for it costs no request
 PRESENCE_TTL_S = 3600.0
+#: how long the bridge trusts "a text_groups sampling pass over this span
+#: hit the search limit" per index: long enough that the week question asked
+#: through a working session never pays the probing twice, short enough that
+#: a cluster whose load has fallen is probed again within the hour
+GROUP_SPAN_TTL_S = 3600.0
 #: seeded names a case may hold over its life: what it was opened with plus
 #: what es-seed adds while a session runs
 _MAX_SEEDS = 40
@@ -2192,7 +2243,7 @@ class Broker:
         session = KibanaSession(self.transport, poll_interval=self.poll_interval,
                                 poll_timeout=self.config.poll_timeout_s)
         bridge = Bridge(self.config, scrubber, session, log_path=log, index=self.vocabulary,
-                        presence=self.cases.presence)
+                        presence=self.cases.presence, group_spans=self.cases.group_spans)
         report = run_case(bridge, cluster.name, req.get("query"), show_names=show_names)
         report["seeded"] = seeded
         return report

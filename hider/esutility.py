@@ -609,6 +609,9 @@ def _census(op: Operator, query: dict, spec: tuple[tuple[str, int], ...],
                            "exact": agg.get("exact"), "requests": op.requests,
                            "order_settled": agg.get("order_settled"),
                            "scan_seconds": round(op.engine.simulated_seconds - s0, 2)}
+    for k in ("covered_share", "timeouts", "passes"):
+        if agg.get(k) is not None:
+            fig[k] = agg[k]
     errors, within = [], 0
     for b in agg["buckets"]:
         true = truth.get(b["key"], 0)
@@ -625,6 +628,22 @@ def _week_census(op: Operator, cs: Any) -> Graded:
     """Which errors are commonest **this week**, over a scope wider than the
     group sample, whose commonest error is not among the newest documents
     (:func:`eseval.burst_docs`)."""
+    return _census(op, {"index": eseval.BURST_INDEX, "time_range": eseval.BURST_RANGE, "size": 0,
+                        "filters": [_eq("job.status", FAILED)],
+                        "aggs": {"errors": {"type": "text_groups", "field": "job.status_message",
+                                            "size": 10}}},
+                   ((eseval.BURST_STEADY_MESSAGE, eseval.BURST_STEADY),
+                    (eseval.BURST_NOISY_MESSAGE, eseval.BURST_NOISY),
+                    (eseval.BURST_RARE_MESSAGE, eseval.BURST_RARE)),
+                   eseval.BURST_TENANTS[0])
+
+
+def _slow_week_census(op: Operator, cs: Any) -> Graded:
+    """The same week question on the measured cluster's wall-time shape
+    (:func:`eseval.slow_world`): one sampling pass over the week cannot
+    finish within the site's 300 s search limit, so the window is read in
+    newest-first pieces, the timed-out widths remembered, and the reply
+    says what part of the window its groups describe."""
     return _census(op, {"index": eseval.BURST_INDEX, "time_range": eseval.BURST_RANGE, "size": 0,
                         "filters": [_eq("job.status", FAILED)],
                         "aggs": {"errors": {"type": "text_groups", "field": "job.status_message",
@@ -760,6 +779,15 @@ QUESTIONS: tuple[Question, ...] = (
              gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"),
              honest="text_groups on job.status_message over every failed run of the week",
              own_data=eseval.burst_world, own_seed=eseval.BURST_TENANTS[0]),
+    Question("slow_week_census", "text grouping",
+             "the same week question on the measured slow cluster, where one sampling pass "
+             "over the week cannot finish within the site's 300 s search limit: the window "
+             "is read in newest-first pieces and the reply says what it covers",
+             _slow_week_census,
+             gap="text_aggregation", gap_codes=("field_not_queryable", "bad_agg"),
+             honest="text_groups over the week, the window read in pieces when a sampling "
+                    "pass hits the search limit",
+             own_data=eseval.slow_world, own_seed=eseval.BURST_TENANTS[0]),
     Question("tenant_day_census", "text grouping",
              "which errors hit the tenant today, when the whole day's failures sit in one "
              "half hour: a sample spread evenly over the asked-about day lands one slice's "
@@ -867,7 +895,11 @@ def _figures(f: dict[str, Any]) -> str:
                      f"request{'s' if f.get('requests') != 1 else ''}, "
                      f"{'exact' if f.get('exact') else 'estimated'}"
                      + (f", {f['scan_seconds']}s simulated scan"
-                        if f.get("scan_seconds") is not None else ""))
+                        if f.get("scan_seconds") is not None else "")
+                     + (f", covered {round(100 * f['covered_share'], 1)}% of the window in "
+                        f"{f.get('passes')} passes, {f.get('timeouts')} of them hit the "
+                        f"search limit"
+                        if f.get("timeouts") else ""))
     if "groups" in f:
         parts.append(f"{f['groups']} groups, {f.get('missing')} of the true groups missing, "
                      f"{f.get('within_margin')} of {f['groups']} counts within the reply's margin, "

@@ -319,10 +319,27 @@ class GroupRead:
         ``strata`` even when the range sits across a boundary."""
         return max(1, math.ceil(max(hi - lo, 0.0) / max(self.strata - 2, 1)))
 
-    def strata_read(self, lo: float, hi: float) -> tuple[dict, elastic.Plan]:
+    def _windowed_query(self, lo: float, hi: float, closed_end: bool) -> dict:
+        """The read's query narrowed to one window piece: the piece's own
+        range clause, first in the filter, so the pass scans the piece and
+        not the whole window - on the cluster, not only in accounting. For
+        a single-piece read the piece is the window itself. Pieces are
+        half-open so none overlaps; the piece that ends at the window's own
+        top keeps that bound inclusive (``closed_end``), as the typed range
+        is."""
+        bounds: dict[str, int] = {"gte": int(lo * 1000)}
+        bounds["lte" if closed_end else "lt"] = int(hi * 1000)
+        rng = {"range": {self.time_field: bounds}}
+        if isinstance(self.query, dict) and "bool" in self.query:
+            return {"bool": {"filter": [rng] + list(self.query["bool"].get("filter", []))}}
+        return {"bool": {"filter": [rng]}}
+
+    def strata_read(self, lo: float, hi: float,
+                    closed_end: bool = True) -> tuple[dict, elastic.Plan]:
         tf = self.time_field
         body = {
-            "size": 0, "track_total_hits": True, "query": self.query,
+            "size": 0, "track_total_hits": True,
+            "query": self._windowed_query(lo, hi, closed_end),
             "aggs": {elastic.STRATA_AGG: {
                 "date_histogram": {"field": tf, "fixed_interval": f"{self.interval_s(lo, hi)}s",
                                    "min_doc_count": 1},
@@ -338,8 +355,8 @@ class GroupRead:
                                    per_stratum=self.per_stratum))
         return self._request(body), plan
 
-    def respread(self, slices: list[tuple[int, int]],
-                 interval_ms: int) -> tuple[dict, elastic.Plan]:
+    def respread(self, slices: list[tuple[int, int]], interval_ms: int,
+                 lo: float, hi: float, closed_end: bool = True) -> tuple[dict, elastic.Plan]:
         """The second sampling pass: one sibling ``filter`` aggregation per
         time range, each with its own newest-first ``top_hits``, the sizes
         the allocation over the first pass's per-slice document counts
@@ -369,7 +386,8 @@ class GroupRead:
                         "_source": {"includes": self.includes}}}}}
                 plans[name] = elastic.AggPlan(
                     "filter", tf, None, {elastic.STRATA_HITS_AGG: elastic.AggPlan("top_hits")})
-        body = {"size": 0, "track_total_hits": True, "query": self.query, "aggs": aggs}
+        body = {"size": 0, "track_total_hits": True,
+                "query": self._windowed_query(lo, hi, closed_end), "aggs": aggs}
         plan = elastic.Plan(self.index, plans, 0,
                             dataclasses.replace(self.groups, phase="respread",
                                                 ranges=tuple(ranges)))
@@ -427,25 +445,47 @@ def _group_total(out: dict) -> tuple[Any, str]:
 _TIMEOUT_CODE = "incomplete"
 
 
-def _refuse_slow(e: elastic.Refused) -> elastic.Refused:
-    """The sampling pass hit the session's search limit: say what happened
-    and what to do, instead of the generic timeout. The time was already
-    spent (and the search deleted), so asking the same scope again pays the
-    whole wait again; the way forward is a narrower scope."""
+def _refuse_slow(e: elastic.Refused, *, narrowest_s: float | None = None,
+                 timeouts: int = 0) -> elastic.Refused:
+    """The sampling passes hit the session's search limit and nothing was
+    covered: say what happened and what to do, instead of the generic
+    timeout. The time was already spent (and the searches deleted), so
+    asking the same scope again pays the whole wait again; the way forward
+    is a narrower scope."""
     limit = re.search(r"in ([0-9.]+s)", e.message)
+    tried = ""
+    if timeouts > 1 and narrowest_s is not None:
+        tried = (f" The window was split into newest-first pieces down to "
+                 f"{narrowest_s / 3600:.1f} hours wide and every piece tried hit the limit "
+                 f"({timeouts} waits spent).")
     return elastic.Refused(
         "slow_read",
         "text_groups: sampling this scope makes Elasticsearch bucket every document in it, "
         "and that did not finish within the session's search time limit"
         + (f" ({limit.group(1)})" if limit else "")
-        + ". The search was stopped and nothing was read; asking the same scope again pays "
-          "the whole wait again. Narrow the time range or add filters; a terms or "
-          "date_histogram aggregation over the same scope is cheap and shows where the "
-          "documents are.")
+        + "." + tried
+        + " Nothing was read; asking the same scope again pays the whole wait again. "
+          "Narrow the time range or add filters; a terms or date_histogram aggregation "
+          "over the same scope is cheap and shows where the documents are.")
+
+
+def _coverage_fields(agg: dict, window: tuple[float, float], covered: tuple[float, float],
+                     passes: int, timeouts: int) -> None:
+    """What part of the asked window the groups describe: epoch-ms ranges,
+    the covered share, and how many sampling passes the read made and how
+    many of them hit the search limit. Counts and timestamps only."""
+    lo, hi = window
+    clo, chi = covered
+    agg["window"] = {"from": int(lo * 1000), "to": int(hi * 1000)}
+    agg["covered"] = {"from": int(clo * 1000), "to": int(chi * 1000)}
+    agg["covered_share"] = round((chi - clo) / max(hi - lo, 1e-9), 4)
+    agg["passes"] = passes
+    agg["timeouts"] = timeouts
 
 
 def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber,
-                     read: GroupRead) -> tuple[elastic.Scrubbed, int]:
+                     read: GroupRead, *,
+                     slow_spans: dict | None = None) -> tuple[elastic.Scrubbed, int]:
     """Run a ``text_groups`` read: ``search`` takes a request document and
     returns the raw envelope; every reply goes through the scrubber with
     the plan of its own request. Returns the groups and how many requests
@@ -453,13 +493,24 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
 
     The order (see :class:`GroupRead`): the capped count (or bounds), then
     the whole scope as one exact page when it fits the sample, else the
-    strata pass, and a second pass re-spreading the sample over where the
-    documents are when the first left more than a quarter of it unused
-    (:data:`elastic.TEXT_GROUP_RESPREAD_MIN`). A sampling pass that hits
-    the session's search limit is refused ``slow_read`` with what to do
-    instead - except the respread, whose timeout keeps the finished first
-    pass's answer."""
+    sampling stage, **piece-wise over the window when one pass cannot
+    finish**: a strata pass that hits the session's search limit splits its
+    window in half and the halves are read newest first, each piece its own
+    strata pass (and its own re-spread under
+    :data:`elastic.TEXT_GROUP_RESPREAD_MIN`), every piece's kept texts
+    already reduced to group keys and all pieces combined into **one**
+    estimate at the end. At most :data:`elastic.TEXT_GROUP_MAX_PASSES`
+    sampling passes and :data:`elastic.TEXT_GROUP_MAX_TIMEOUTS` timed-out
+    ones per read; when the read stops early the reply's ``covered`` says
+    exactly which newest part of the window the groups describe, and only
+    a read that covered nothing is refused ``slow_read``. ``slow_spans``
+    (optional, the bridge's) remembers per index the narrowest window span
+    that hit the limit, so a later read splits past it without paying the
+    wait again; nothing typed in a query reaches any of it - the pieces
+    follow the window, the timeouts and that memory alone."""
     n = 0
+    passes = 0
+    timeouts = 0
     lo_hi = read.window
 
     def empty(out: dict) -> tuple[elastic.Scrubbed, int]:
@@ -469,16 +520,6 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
         agg["requests"] = n
         return elastic.Scrubbed({"hits": {"total": out["hits"]["total"], "hits": []},
                                  "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
-
-    def sampling_pass(body: dict, plan: elastic.Plan) -> elastic.Scrubbed:
-        # a full bucketing pass over the scope: a timeout here is the slow
-        # rule firing, not an upstream fault, and the refusal says so
-        try:
-            return scrubber.scrub_response(search(body), plan)
-        except elastic.Refused as e:
-            if e.code == _TIMEOUT_CODE:
-                raise _refuse_slow(e) from e
-            raise
 
     if lo_hi is None:
         body, plan = read.bounds()
@@ -499,39 +540,121 @@ def read_text_groups(search: Callable[[dict], Any], scrubber: elastic.EsScrubber
             return empty(out)
     if isinstance(total, int) and relation == "eq" and total <= elastic.TEXT_GROUP_SAMPLE:
         # the scope fits one page: read it whole rather than estimate what
-        # is all there
+        # is all there. A timeout here is the slow rule firing on a scope
+        # too small to piece by time.
         body, plan = read.exact()
         n += 1
-        scrubbed = sampling_pass(body, plan)
+        try:
+            scrubbed = scrubber.scrub_response(search(body), plan)
+        except elastic.Refused as e:
+            if e.code == _TIMEOUT_CODE:
+                raise _refuse_slow(e) from e
+            raise
         agg = scrubbed.output["aggregations"][read.groups.name]
+        agg.pop("_slices", None)
+        agg.pop("_strata", None)
+        _coverage_fields(agg, lo_hi, lo_hi, 1, 0)
         agg["requests"] = n
         return scrubbed, n
-    body, plan = read.strata_read(*lo_hi)
-    n += 1
-    scrubbed = sampling_pass(body, plan)
-    agg = scrubbed.output["aggregations"][read.groups.name]
-    slices = agg.pop("_slices", [])
-    if not agg["exact"] and slices and all(isinstance(k, int) for k, _c in slices):
-        # re-spread: the same sample sized to where the first pass counted
-        # the documents, only when it reads materially more than the first
-        # landed (elastic.TEXT_GROUP_RESPREAD_MIN)
-        alloc = _allocate([c for _k, c in slices], elastic.TEXT_GROUP_SAMPLE)
-        if sum(alloc) > agg["sampled"] * elastic.TEXT_GROUP_RESPREAD_MIN:
-            body, plan = read.respread(
-                [(k, a) for (k, _c), a in zip(slices, alloc) if a > 0],
-                read.interval_s(*lo_hi) * 1000)
-            n += 1
-            try:
-                scrubbed = scrubber.scrub_response(search(body), plan)
-                agg = scrubbed.output["aggregations"][read.groups.name]
-            except elastic.Refused as e:
-                if e.code != _TIMEOUT_CODE:
-                    raise
-                # the improvement pass hit the limit: the finished first
-                # pass's answer, with its own honest margins, beats refusing
-    agg.pop("_slices", None)
+
+    # -- the sampling stage, piece-wise over the window ---------------------
+    lo, hi = lo_hi
+    bad_span = math.inf
+    if slow_spans is not None:
+        known = slow_spans.get(read.index)
+        if isinstance(known, (int, float)):
+            bad_span = float(known)
+    work: list[tuple[float, float]] = [(lo, hi)]   # newest piece first, always
+    covered: list[tuple[float, float]] = []
+    strata_all: list = []
+    totals: int | None = 0
+    last_timeout: elastic.Refused | None = None
+    narrowest_tried = hi - lo
+
+    def split(plo: float, phi: float) -> None:
+        mid = plo + (phi - plo) / 2.0
+        work[:0] = [(mid, phi), (plo, mid)]
+
+    def note_timeout(span: float) -> None:
+        nonlocal bad_span
+        bad_span = min(bad_span, span)
+        if slow_spans is not None:
+            slow_spans[read.index] = bad_span
+
+    while work:
+        plo, phi = work.pop(0)
+        span = phi - plo
+        if span >= bad_span and span > 1.0:
+            # this width is known to hit the limit: split without paying it
+            split(plo, phi)
+            continue
+        if passes >= elastic.TEXT_GROUP_MAX_PASSES:
+            break
+        body, plan = read.strata_read(plo, phi, closed_end=phi >= hi)
+        n += 1
+        passes += 1
+        try:
+            scrubbed = scrubber.scrub_response(search(body), plan)
+        except elastic.Refused as e:
+            if e.code != _TIMEOUT_CODE:
+                raise
+            last_timeout = e
+            timeouts += 1
+            narrowest_tried = min(narrowest_tried, span)
+            note_timeout(span)
+            if timeouts >= elastic.TEXT_GROUP_MAX_TIMEOUTS or span <= 1.0:
+                break
+            split(plo, phi)
+            continue
+        piece = scrubbed.output["aggregations"][read.groups.name]
+        slices = piece.pop("_slices", [])
+        strata_piece = piece.pop("_strata", [])
+        t_piece = piece.get("total")
+        totals = totals + t_piece if isinstance(totals, int) and isinstance(t_piece, int) else None
+        # the piece's re-spread, under the shared pass budget: one pass
+        # stays reserved for every window piece still waiting, so coverage
+        # is never traded for an improvement pass
+        if (not piece["exact"] and slices and all(isinstance(k, int) for k, _c in slices)
+                and timeouts < elastic.TEXT_GROUP_MAX_TIMEOUTS
+                and passes + len(work) < elastic.TEXT_GROUP_MAX_PASSES):
+            alloc = _allocate([c for _k, c in slices], elastic.TEXT_GROUP_SAMPLE)
+            if sum(alloc) > piece["sampled"] * elastic.TEXT_GROUP_RESPREAD_MIN:
+                body, plan = read.respread(
+                    [(k, a) for (k, _c), a in zip(slices, alloc) if a > 0],
+                    read.interval_s(plo, phi) * 1000, plo, phi, closed_end=phi >= hi)
+                n += 1
+                passes += 1
+                try:
+                    re_out = scrubber.scrub_response(search(body), plan)
+                    re_agg = re_out.output["aggregations"][read.groups.name]
+                    re_agg.pop("_slices", None)
+                    strata_piece = re_agg.pop("_strata", strata_piece)
+                except elastic.Refused as e:
+                    if e.code != _TIMEOUT_CODE:
+                        raise
+                    # the improvement pass hit the limit: keep the piece's
+                    # finished first pass (its width did finish, so it is
+                    # not marked bad); the timeout still counts
+                    last_timeout = e
+                    timeouts += 1
+        strata_all += strata_piece
+        covered.append((plo, phi))
+        if timeouts >= elastic.TEXT_GROUP_MAX_TIMEOUTS:
+            break
+    if not covered:
+        raise _refuse_slow(last_timeout if last_timeout is not None
+                           else elastic.Refused(_TIMEOUT_CODE, "search did not finish"),
+                           narrowest_s=narrowest_tried, timeouts=timeouts)
+    agg = elastic.group_estimate(strata_all, read.groups.size, totals)
+    agg["sample_cap"] = elastic.TEXT_GROUP_SAMPLE
+    cov = (min(p for p, _q in covered), min(max(q for _p, q in covered), hi))
+    _coverage_fields(agg, (lo, hi), cov, passes, timeouts)
+    partial = agg["covered_share"] < 1.0
     agg["requests"] = n
-    return scrubbed, n
+    out_total = ({"value": totals, "relation": "gte" if partial else "eq"}
+                 if totals is not None else None)
+    return elastic.Scrubbed({"hits": {"total": out_total, "hits": []},
+                             "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
 
 
 class _Compiler:

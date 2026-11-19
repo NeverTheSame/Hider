@@ -88,6 +88,12 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
          # newest documents, answered since the sample is spread over the
          # scope's time span
          "week_census",
+         # the same week on the measured slow cluster, where one sampling
+         # pass cannot finish within the site's 300 s search limit:
+         # refused slow_read with the limit spent and nothing back when
+         # the rule was a bare deadline, answered since the window is read
+         # in newest-first pieces with the timed-out widths remembered
+         "slow_week_census",
          # one tenant's day, all of it in one half hour: wrong (one slice's
          # 20 documents, one of three groups, 525% off) when the sample was
          # spread evenly over the asked-about day, answered since the
@@ -136,6 +142,17 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
     assert f["order_settled"] == 0
     # the simulated cost of the sampling pass, at the measured 52 s / 3M rate
     assert f["scan_seconds"] > 0
+    f = rows["slow_week_census"]["figures"]
+    # the measured slow cluster: the week answered whole in pieces - two
+    # probing passes paid the 300 s limit, then 1.75-day pieces finished;
+    # the counts are near-exact (narrow pieces read most slices whole) and
+    # the reply says it covered the entire window
+    assert f["covered_share"] == 1.0 and f["timeouts"] == 2 and f["passes"] >= 6
+    assert f["requests"] >= 7 and not f["exact"]
+    assert f["missing"] == 0 and f["within_margin"] == f["groups"] == 3 == f["order_settled"]
+    assert f["max_error_pct"] < 1
+    # the waiting, in simulated seconds: two spent limits plus the pieces
+    assert 2 * 300 <= f["scan_seconds"] <= 2 * 300 + 6 * 52
     f = rows["tenant_day_census"]["figures"]
     # the whole sample lands inside the half hour: the day answered from
     # 1,000 of 3,000 documents in three requests, every count inside the
@@ -159,7 +176,7 @@ def test_the_measured_result_and_the_list_of_what_is_missing(report):
 def test_the_same_result_with_tier_2_on(world):
     fx, _e, vocab = world
     u = esutility.run_utility_eval(CFG, fx, vocab, tier2="classifier")
-    assert u["counts"] == {"answered": 17, "wrong": 1, "blocked": 2}
+    assert u["counts"] == {"answered": 18, "wrong": 1, "blocked": 2}
 
 
 def test_the_grader_tells_redaction_from_a_wrong_answer(world):

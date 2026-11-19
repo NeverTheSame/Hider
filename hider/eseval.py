@@ -2561,6 +2561,26 @@ def measured_cluster_scan_wall(window_s: float | None, docs: int) -> float:
     return math.inf
 
 
+#: the measured site's own search limit; the default limit is 120 s
+MEASURED_SEARCH_LIMIT_S = 300.0
+
+
+def slow_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
+                                                elastic.ClusterVocabulary]:
+    """The burst week on the measured cluster's wall-time shape
+    (:func:`measured_cluster_scan_wall`) under that site's 300 s search
+    limit: one sampling pass over the week cannot finish, so the week
+    question must be read in window pieces or not at all. Its own engine,
+    so no other figure moves."""
+    cfg = burst_map()
+    fx = Fixture(burst_docs(), [], [])
+    engine = StubEngine(fx, (BURST_INDEX,))
+    engine.group_scan_wall = measured_cluster_scan_wall
+    engine.search_limit_s = MEASURED_SEARCH_LIMIT_S
+    vocab, _b = build_vocabulary(cfg, engine)
+    return cfg, fx, engine, vocab
+
+
 def dense_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
                                                  elastic.ClusterVocabulary]:
     """The dense fixture on its own engine with its vocabulary built. The
@@ -2647,12 +2667,13 @@ def _query_range_seconds(body: dict) -> float | None:
     def walk(clause: Any) -> float | None:
         if not isinstance(clause, dict):
             return None
+        best = None
         for kind, spec in clause.items():
             if kind == "bool":
                 for c in spec.get("filter", []) if isinstance(spec, dict) else []:
                     got = walk(c)
                     if got is not None:
-                        return got
+                        best = got if best is None else min(best, got)
             elif kind == "range" and isinstance(spec, dict):
                 for f, bounds in spec.items():
                     if f != "@timestamp" or not isinstance(bounds, dict):
@@ -2660,8 +2681,11 @@ def _query_range_seconds(body: dict) -> float | None:
                     lo = _parse_time(bounds.get("gte") or bounds.get("gt"))
                     hi = _parse_time(bounds.get("lte") or bounds.get("lt"), round_up=True)
                     if lo is not None and hi is not None:
-                        return (hi - lo).total_seconds()
-        return None
+                        # several ranges intersect, so the narrowest is
+                        # what the request actually scans
+                        w = (hi - lo).total_seconds()
+                        best = w if best is None else min(best, w)
+        return best
 
     return walk(body.get("query"))
 
@@ -4605,6 +4629,9 @@ class Session:
         #: it over: already built, applied locally, no request of its own
         self.vocabulary = vocabulary
         self.vocabulary_applied = 0
+        #: per index, the narrowest window span whose sampling pass hit the
+        #: search limit, as the bridge keeps it (spans and nothing else)
+        self.group_spans: dict[str, float] = {}
 
     def call(self, query: dict) -> tuple[dict | None, elastic.Refused | None, float, esquery.Compiled | None]:
         t0 = time.perf_counter()
@@ -4622,7 +4649,8 @@ class Session:
                     lambda body: {"id": "x", "isPartial": False, "isRunning": False,
                                   "rawResponse": self.engine.search(body["params"]["index"],
                                                                     body["params"]["body"])},
-                    self.scrubber, compiled.group_read)[0].output
+                    self.scrubber, compiled.group_read,
+                    slow_spans=self.group_spans)[0].output
             else:
                 raw = self.engine.search(compiled.body["params"]["index"], compiled.body["params"]["body"])
                 envelope = {"id": "x", "isPartial": False, "isRunning": False, "rawResponse": raw}

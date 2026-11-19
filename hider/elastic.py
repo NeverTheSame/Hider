@@ -706,6 +706,20 @@ TEXT_GROUP_COUNT_CAP = TEXT_GROUP_SAMPLE + 1
 #: declared cost: up to a fifth of the sample can stay unused rather than
 #: paying another full pass over the scope for marginal counts.
 TEXT_GROUP_RESPREAD_MIN = 1.25
+#: How many sampling passes one group question may make in all - the
+#: window pieces (a pass that hits the search limit splits its window in
+#: half and the halves are read newest first), their re-spreads, and the
+#: timed-out attempts themselves. Past it the read stops and the reply says
+#: exactly which newest part of the window its groups describe
+#: (``covered``). Each pass reads at most one sample, which is the cap the
+#: safety argument rests on; the pieces are the narrower questions a case
+#: could already ask one at a time.
+TEXT_GROUP_MAX_PASSES = 12
+#: How many sampling passes may hit the search limit before the read stops
+#: probing: each one costs the whole limit, so this bounds the waiting. A
+#: timed-out width is remembered (per index, for a while) by the bridge, so
+#: later questions split past it without paying again.
+TEXT_GROUP_MAX_TIMEOUTS = 3
 #: aggregation names in the strata request (the bridge's own, never Claude's)
 STRATA_AGG = "strata"
 STRATA_HITS_AGG = "sample"
@@ -1575,6 +1589,13 @@ class EsScrubber(jsonscrub.JsonScrubber):
             # re-spread decision only: esquery.read_text_groups pops it
             # before anything leaves the bridge
             agg["_slices"] = slices
+        # the pass's strata with each text already reduced to its group key
+        # (idempotent, so no label or number survives into it): what lets
+        # read_text_groups combine several window pieces into one estimate.
+        # Popped there before anything leaves the bridge; being keyed is
+        # what keeps mark_shown and the leak check seeing only group text.
+        agg["_strata"] = [(n_docs, [None if t is None else text_group_key(t) for t in texts])
+                          for n_docs, texts in strata]
         return {"hits": {"total": total, "hits": []}, "aggregations": {g.name: agg}}
 
     @staticmethod
