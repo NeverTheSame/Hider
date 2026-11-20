@@ -2564,6 +2564,37 @@ def measured_cluster_scan_wall(window_s: float | None, docs: int) -> float:
 #: the measured site's own search limit; the default limit is 120 s
 MEASURED_SEARCH_LIMIT_S = 300.0
 
+#: Wall time of a count or histogram (no ``top_hits``) measured on one real
+#: cluster: a daily histogram of one error phrase took 33 s over 7 days, 85 s
+#: over 14 and 200 s over 30, against the 300 s limit, and **the same read
+#: varies about three times with the time of day**. Cumulative seconds by
+#: the age in days of the window's far end, the near end at NOW: a window
+#: costs ``cum(oldest age) - cum(newest age)``, so the cost grows with both
+#: width and age (days 7-30 back cost ~7 s each, the newest week ~4.7) and
+#: **adds up over time pieces** - a 30-day window read as pieces costs the
+#: same 200 s in total. Past 30 days the last slope continues. An
+#: assumption sized from three points; the busy-hour factor is
+#: ``StubEngine.count_load`` (1 by default, 3 for the measured swing).
+MEASURED_COUNT_WALL: tuple[tuple[float, float], ...] = (
+    (0.0, 0.0), (7.0, 33.0), (14.0, 85.0), (30.0, 200.0))
+
+
+def _count_cum(age_days: float) -> float:
+    pts = MEASURED_COUNT_WALL
+    if age_days <= 0:
+        return 0.0
+    for (a0, s0), (a1, s1) in zip(pts, pts[1:]):
+        if age_days <= a1:
+            return s0 + (s1 - s0) * (age_days - a0) / (a1 - a0)
+    (a0, s0), (a1, s1) = pts[-2], pts[-1]
+    return s1 + (s1 - s0) / (a1 - a0) * (age_days - a1)
+
+
+def measured_count_wall(newest_age_days: float, oldest_age_days: float) -> float:
+    """Seconds one count or histogram over a window takes on the measured
+    cluster's quiet hour (see MEASURED_COUNT_WALL)."""
+    return max(0.0, _count_cum(oldest_age_days) - _count_cum(newest_age_days))
+
 
 def slow_world(*, tier2: str = "none") -> tuple[elastic.ElasticConfig, Fixture, StubEngine,
                                                 elastic.ClusterVocabulary]:
@@ -2851,6 +2882,19 @@ class StubEngine:
         self.group_scan_wall = None
         #: the site's search time limit the session enforces (None: no limit)
         self.search_limit_s: float | None = None
+        #: Optional: the wall time of any request **without** a ``top_hits``
+        #: heap (a count, a histogram, terms, metrics) as
+        #: ``(newest age in days, oldest age in days) -> seconds`` on a quiet
+        #: hour, times ``count_load``; over ``search_limit_s`` (or the
+        #: caller's deadline) it is refused ``incomplete`` after charging
+        #: the wait, as the session refuses it. A request with no time range
+        #: never finishes. Early-terminated ``exists`` counts (the empty
+        #: check) are not charged. None (the default) changes nothing.
+        self.count_wall: Callable[[float, float], float] | None = None
+        self.count_load: float = 1.0
+        #: requests charged by count_wall, and how many hit the limit
+        self.count_reads = 0
+        self.count_timeouts = 0
         #: how many requests were charged as sampling passes
         self.group_scans = 0
 
@@ -3100,6 +3144,23 @@ class StubEngine:
                 self.simulated_seconds += EXISTS_EARLY_SECONDS
             else:
                 self._charge_exists_scan()
+        if self.count_wall is not None and not _has_top_hits(body.get("aggs")) \
+                and not _has_exists(body.get("query")):
+            if self._range_s is None or self._range_end is None:
+                wall = math.inf
+            else:
+                newest = max(0.0, (NOW - self._range_end).total_seconds() / 86400.0)
+                wall = self.count_wall(newest, newest + self._range_s / 86400.0) * self.count_load
+            bounds = [b for b in (self.search_limit_s, deadline_s) if b is not None]
+            limit = min(bounds) if bounds else None
+            self.count_reads += 1
+            if limit is not None and wall > limit:
+                self.count_timeouts += 1
+                self.simulated_seconds += limit
+                raise elastic.Refused("incomplete", (
+                    f"response withheld: search did not finish in "
+                    f"{limit:g}s; {elastic.INCOMPLETE_HINT}"))
+            self.simulated_seconds += wall
         if _has_top_hits(body.get("aggs")) and (self.group_scan_wall or self.group_scan_s_per_mdoc):
             # a sampling pass: the histogram or filter heaps visit every
             # matching document

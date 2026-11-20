@@ -399,3 +399,88 @@ wrong-type labels) is an `esquery.ORACLE_CASES` entry and must be
 refused with its declared code. **Add the case before the rule**, as
 with `adversarial.CASES`.
 
+**A count or histogram over a window too slow for one search answers
+anyway** (`esquery.read_in_pieces`, `Bridge.run`). Measured on one real
+cluster: a daily histogram of one error phrase took 33 seconds over 7
+days, 85 over 14 and 200 over 30 against a 300-second search limit, and the
+same read varies about three times with the time of day. Before, only
+`text_groups` was read in pieces: a count or histogram that hit the limit
+was refused `incomplete` with nothing, and the model's only move was to
+guess a narrower window, paying a full limit for each wrong guess.
+Shown in the stub first: `StubEngine.count_wall` (optional, None by
+default, so no other figure moves) charges any request without a
+`top_hits` heap by `eseval.measured_count_wall` - cumulative seconds by
+the age of the window's far end through those three points, so the cost
+grows with width and age and **adds up over time pieces** - times
+`StubEngine.count_load` (3 for the busy hour); over the limit it is
+refused `incomplete` after charging the wait. The shape is an assumption
+sized from three points. On `eseval.aged_docs` through the real `Bridge`
+(`tests/test_espieces.py`; before is `Bridge.split_reads = False`, the
+measurement switch, set by nothing in the live path):
+- before, busy hour, 30 days: **1 request, 300 s, refused `incomplete`**;
+  the model reads `refused (incomplete): response withheld: search did
+  not finish in 300s; narrow the query: ...`, and a guess of 21 days
+  pays another 300 s and is refused again;
+- after, busy hour, 30 days: **4 requests, 900 s, the exact answer** (every
+  day's bucket and the total equal to one unlimited search), 3 pieces, 1
+  timeout; twice the load: 3 requests, 700 s; asked again within the
+  hour: 3 requests, 600 s, 0 timeouts (the doomed whole window is skipped);
+- after, every read that finished before - 7, 14 and 30 days at the quiet
+  hour, 7 and 14 at twice and three times the load - **exactly as before**:
+  one request, the same seconds, no new key in the reply.
+The rule:
+- **One search first, with the full limit**, exactly as before. Only a
+  search that hits the limit - or a window at least as wide as one that hit
+  it on this index within `GROUP_SPAN_TTL_S` (the group reads' span memory,
+  key `count:<index>`, spans only) - is read in pieces. Not probed at a
+  minute as a group read is: a count's cost adds up over pieces, so
+  splitting saves no work, and probing would make a 200 s read that fits
+  pay minutes of timeouts and five requests instead of one.
+- **Newest-first pieces**, each the same query with the piece's own range
+  clause first in its filter (the cluster scans only the piece), half-open
+  so no document is counted twice. The first piece is half the width that
+  timed out; each next one is sized from the last finished piece's seconds
+  per day to finish in `PIECE_LIMIT_SHARE` (80%) of the limit, never as
+  wide as a width that timed out; a piece that times out is halved, down
+  to `PIECE_MIN_S` (a minute).
+- **Summed** when every aggregation adds up exactly over time
+  (`esquery._ADDITIVE`): the total, `date_histogram` buckets (fixed
+  interval, or calendar minute, hour or day) added by key - a bucket cut by
+  a piece boundary is two partial counts that add up, and an empty bucket
+  between two pieces is filled in as one search would show it - `filters`
+  buckets, `sum`, `value_count`, `min` and `max`. The reply carries
+  `pieces.read: summed`.
+- **Newest only** for everything that does not add up: `terms` (each
+  piece's top N drops a different tail), `cardinality` (distinct counts do
+  not add), `avg` and `percentiles` (need what Elasticsearch does not
+  return), `top_hits`, a week, month, quarter or year histogram (buckets of
+  unequal length), anything nesting one, and a page of hits. Instead of
+  nothing, the reply is the query over **the newest piece that finishes**,
+  exact for that piece, with `pieces.read: newest_only`, `not_split`
+  naming which aggregation (or `hits`) and why, and the total as `gte`.
+  Busy-hour 30-day cardinality: 2 requests, 577 s, the newest half.
+- **Bounded waiting**, as a group read's: no new piece once
+  `TEXT_GROUP_READ_BUDGET_LIMITS` (3) limits are spent, the first search
+  included; at most `TEXT_GROUP_MAX_TIMEOUTS` timeouts and
+  `TEXT_GROUP_MAX_PASSES` requests; four limits at most for one question.
+  A read stopped early returns the newest part it covered
+  (`covered`, `covered_share`, total `gte`); only one that covered nothing
+  is refused `slow_read`, naming the narrowest piece tried and the waits.
+- The MCP payload carries `pieces`, and the esmcp instructions (rule 6)
+  tell the model what summed, newest_only and covered_share mean. The
+  decision log row carries `requests`, `pieces`, `piece_read`,
+  `covered_share` and `timeouts`: counts and a mode word.
+**Costs, declared**: the first search still pays its full limit before
+any piece starts (300 s on the measurement) - the price of leaving every
+read that fits exactly as it was; a pieced read is never faster in total
+than one search would be if it had been allowed to finish (the work adds
+up), it is slower by that first limit, and it returns late, not
+incrementally; a newest-only answer is honest about its coverage but is
+not the asked question - the model is told to say so; a query with no
+closed time range (no start, or no end) is not pieced and is refused
+`incomplete` as before; piece sizing reads the wall clock, so a cluster
+whose load changes mid-read may time out a piece sized from a quieter
+one (it is halved and counted against the timeouts); the span memory is
+per index, so a cheap narrow-filtered question after an expensive one on
+the same index skips the whole-window try and is read in pieces (more
+requests, same answer). Not measured on a real cluster yet.

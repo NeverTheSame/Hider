@@ -242,6 +242,16 @@ class Compiled:
     #: set for a text_groups query: the read is several requests, and
     #: ``body``/``plan`` are its first (see :func:`read_text_groups`)
     group_read: "GroupRead | None" = None
+    #: the query's closed time range, epoch seconds, or None: what
+    #: :func:`read_in_pieces` cuts when one search cannot finish
+    window: tuple[float, float] | None = None
+    #: the top-level aggregations whose answer does **not** add up exactly
+    #: over time pieces (terms, cardinality, avg, percentiles, top_hits, a
+    #: week/month histogram, anything nesting one), and whether the query
+    #: shows hits; when either is set a slow window is answered from its
+    #: newest piece only, not summed
+    not_split: tuple[str, ...] = ()
+    has_hits: bool = False
 
 
 @dataclass(frozen=True)
@@ -693,6 +703,305 @@ def read_text_groups(search: Callable[..., Any], scrubber: elastic.EsScrubber,
                  if totals is not None else None)
     return elastic.Scrubbed({"hits": {"total": out_total, "hits": []},
                              "aggregations": {read.groups.name: agg}}, {"hits": 0}), n
+
+
+# ---------------------------------------------------------------------------
+# A count or histogram over a window too slow for one search
+# ---------------------------------------------------------------------------
+
+#: Aggregations whose answer over a window is exactly the combination of
+#: their answers over disjoint time pieces of it: counts and sums add, min
+#: and max take the extreme, a histogram's buckets add by key (a bucket cut
+#: by a piece boundary is two partial counts that add up to the whole), and
+#: a filters bucket adds. Everything else - terms (each piece's top N drops
+#: a different tail), cardinality (distinct counts do not add), avg and
+#: percentiles (need what Elasticsearch does not return), top_hits - does
+#: not, and is never summed.
+_ADDITIVE = {"sum", "value_count", "min", "max", "filters", "date_histogram"}
+#: calendar intervals of constant length in UTC: their buckets line up
+#: across pieces and an empty one between two pieces can be filled in;
+#: week, month, quarter and year are not split
+_FIXED_CALENDAR_S = {"minute": 60, "hour": 3600, "day": 86400}
+_UNIT_S = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}
+#: a piece's width is sized from the last finished piece's seconds per
+#: second of window to finish in this share of the search limit
+PIECE_LIMIT_SHARE = 0.8
+#: the narrowest piece tried before the read stops: a minute of window
+PIECE_MIN_S = 60.0
+
+
+def _histogram_step_s(spec: dict) -> float | None:
+    dh = spec.get("date_histogram") or {}
+    if "fixed_interval" in dh:
+        m = re.fullmatch(r"(\d+)(ms|s|m|h|d)", str(dh["fixed_interval"]))
+        return int(m.group(1)) * _UNIT_S[m.group(2)] if m else None
+    return _FIXED_CALENDAR_S.get(dh.get("calendar_interval"))
+
+
+def not_additive(agg_body: dict | None) -> tuple[str, ...]:
+    """The top-level aggregation names whose answer does not add up over
+    time pieces (see _ADDITIVE), a nested one counting against its parent."""
+    out = []
+    for name, spec in (agg_body or {}).items():
+        if not _agg_additive(spec):
+            out.append(name)
+    return tuple(out)
+
+
+def _agg_additive(spec: dict) -> bool:
+    kind = next((k for k in spec if k != "aggs"), None)
+    if kind not in _ADDITIVE:
+        return False
+    if kind == "date_histogram" and _histogram_step_s(spec) is None:
+        return False
+    return all(_agg_additive(s) for s in (spec.get("aggs") or {}).values())
+
+
+def _zeroed(node: Any, spec: dict) -> Any:
+    """An empty bucket's sub-aggregation, as Elasticsearch writes one."""
+    kind = next((k for k in spec if k != "aggs"), None)
+    if kind in ("sum", "value_count"):
+        return {**node, "value": 0}
+    if kind in ("min", "max"):
+        out = {k: v for k, v in node.items() if k != "value_as_string"}
+        return {**out, "value": None}
+    if kind == "filters":
+        return {**node, "buckets": {n: {**b, "doc_count": 0} for n, b in
+                                    (node.get("buckets") or {}).items()}}
+    if kind == "date_histogram":
+        return {**node, "buckets": []}
+    return node
+
+
+def _merge_agg(nodes: list[dict], spec: dict) -> dict:
+    kind = next((k for k in spec if k != "aggs"), None)
+    subs = spec.get("aggs") or {}
+    if kind in ("sum", "value_count"):
+        vals = [n.get("value") for n in nodes if isinstance(n.get("value"), (int, float))]
+        return {**nodes[0], "value": sum(vals) if vals else nodes[0].get("value")}
+    if kind in ("min", "max"):
+        have = [n for n in nodes if isinstance(n.get("value"), (int, float))]
+        if not have:
+            return dict(nodes[0])
+        return dict((min if kind == "min" else max)(have, key=lambda n: n["value"]))
+    if kind == "filters":
+        names: dict[str, list[dict]] = {}
+        for n in nodes:
+            for b, x in (n.get("buckets") or {}).items():
+                names.setdefault(b, []).append(x)
+        return {**nodes[0], "buckets": {b: _merge_bucket(xs, subs) for b, xs in names.items()}}
+    # date_histogram: buckets add by key, then any key between two pieces
+    # that both pieces left out (each fills zeros only inside its own first
+    # and last document) is filled with an empty bucket, so the merged
+    # answer is the one a single search over the window gives
+    by_key: dict[Any, list[dict]] = {}
+    for n in nodes:
+        for b in n.get("buckets") or []:
+            by_key.setdefault(b.get("key"), []).append(b)
+    merged = [_merge_bucket(by_key[k], subs) for k in sorted(by_key)]
+    step = _histogram_step_s(spec)
+    if step and merged and all(isinstance(b.get("key"), (int, float)) for b in merged):
+        filled = [merged[0]]
+        ms = int(step * 1000)
+        for b in merged[1:]:
+            k = filled[-1]["key"] + ms
+            while k < b["key"]:
+                gap = {"key": k, "doc_count": 0,
+                       **{s: _zeroed(filled[-1].get(s, {}), subs[s]) for s in subs}}
+                if "key_as_string" in b:
+                    gap["key_as_string"] = datetime.fromtimestamp(
+                        k / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                filled.append(gap)
+                k += ms
+            filled.append(b)
+        merged = filled
+    return {**nodes[0], "buckets": merged}
+
+
+def _merge_bucket(xs: list[dict], subs: dict) -> dict:
+    out = dict(xs[0])
+    out["doc_count"] = sum(int(x.get("doc_count") or 0) for x in xs)
+    for s, sspec in subs.items():
+        have = [x[s] for x in xs if isinstance(x.get(s), dict)]
+        if have:
+            out[s] = _merge_agg(have, sspec)
+    return out
+
+
+def _iso_s(t: float) -> str:
+    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
+                   compiled: "Compiled", time_field: str, *,
+                   slow_spans: dict | None = None,
+                   search_limit_s: float | None = None,
+                   clock: Callable[[], float] | None = None) -> tuple[elastic.Scrubbed, int]:
+    """Run a query that is not a group read, over a closed window, so that
+    **a window too slow for one search still answers**.
+
+    First the query as compiled, once, with the session's full limit: a
+    search that finishes is returned exactly as it always was (one
+    request, no new key in the reply). Only when it hits the limit - or
+    when a window at least as wide hit it within the hour on this index
+    (``slow_spans``, key ``count:<index>``, shared with the group reads'
+    memory) - is the window read in **newest-first pieces**, each piece the
+    same query with the piece's own range clause first in its filter (so
+    the cluster scans only the piece), half-open so no document is in two.
+
+    * **Summed** - every aggregation adds up exactly over time (see
+      _ADDITIVE) and the query shows no hits: the pieces' totals, buckets
+      and values are combined into the answer one search would give, and
+      ``pieces.read`` is ``summed``. The first piece is half the width that
+      timed out; each next piece is sized from the last finished one's
+      seconds per day to finish in PIECE_LIMIT_SHARE of the limit (never as
+      wide as a width that timed out); a piece that times out is halved.
+    * **Newest only** - anything else (terms, cardinality, avg,
+      percentiles, a week or month histogram, a page of hits): those do not
+      add up, so instead of nothing the reply is the query over the
+      **newest piece that finishes**, exact for that piece, and
+      ``pieces.read`` is ``newest_only`` with ``not_split`` naming why.
+
+    The waiting is bounded as a group read's is: no new piece starts once
+    elastic.TEXT_GROUP_READ_BUDGET_LIMITS limits of waiting are spent (the
+    first search included), at most elastic.TEXT_GROUP_MAX_TIMEOUTS
+    timeouts and elastic.TEXT_GROUP_MAX_PASSES requests; so one question
+    waits at most four limits. A read stopped early returns the newest part
+    it covered with ``covered``/``covered_share`` saying which, the total
+    as ``gte``; only a read that covered nothing is refused ``slow_read``.
+    Nothing typed in a query shapes any of it: the pieces follow the
+    window, the timeouts and the measured seconds alone.
+    """
+    params = compiled.body["params"]
+    index = params.get("index", "")
+    key = f"count:{index}"
+    lo, hi = compiled.window
+    n = 0
+    timeouts = 0
+    t0 = clock() if clock is not None else 0.0
+    budget = (elastic.TEXT_GROUP_READ_BUDGET_LIMITS * search_limit_s
+              if search_limit_s and clock is not None else None)
+    bad = math.inf
+    known = (slow_spans or {}).get(key)
+    if isinstance(known, (int, float)):
+        bad = float(known)
+    last_timeout: elastic.Refused | None = None
+
+    def note(span: float) -> None:
+        nonlocal bad
+        bad = min(bad, span)
+        if slow_spans is not None:
+            slow_spans[key] = bad
+
+    if hi - lo < bad:
+        n += 1
+        try:
+            return scrubber.scrub_response(search(compiled.body, None), compiled.plan), n
+        except elastic.Refused as e:
+            if e.code != _TIMEOUT_CODE:
+                raise
+            last_timeout = e
+            timeouts += 1
+            note(hi - lo)
+
+    summed = not compiled.not_split and not compiled.has_hits
+    body0 = params["body"]
+
+    def piece(plo: float, phi: float) -> dict:
+        bounds: dict[str, int] = {"gte": int(plo * 1000)}
+        bounds["lte" if phi >= hi else "lt"] = int(phi * 1000)
+        rng = {"range": {time_field: bounds}}
+        q = body0.get("query") or {}
+        fil = list(q["bool"].get("filter", [])) if isinstance(q, dict) and "bool" in q else []
+        return {"params": {**params, "body": {**body0, "query": {"bool": {"filter": [rng] + fil}}}}}
+
+    cursor = hi
+    width = min(bad, hi - lo) / 2.0
+    outs: list[dict] = []
+    first: elastic.Scrubbed | None = None
+    narrowest = hi - lo
+    while cursor > lo + 1e-6:
+        if n >= elastic.TEXT_GROUP_MAX_PASSES or timeouts >= elastic.TEXT_GROUP_MAX_TIMEOUTS:
+            break
+        if budget is not None and clock() - t0 >= budget:
+            break
+        w = min(width, cursor - lo)
+        if w >= bad:
+            w = bad / 2.0
+        plo = cursor - w
+        n += 1
+        t1 = clock() if clock is not None else 0.0
+        try:
+            got = scrubber.scrub_response(search(piece(plo, cursor), None), compiled.plan)
+        except elastic.Refused as e:
+            if e.code != _TIMEOUT_CODE:
+                raise
+            last_timeout = e
+            timeouts += 1
+            narrowest = min(narrowest, w)
+            note(w)
+            width = w / 2.0
+            if width < PIECE_MIN_S:
+                break
+            continue
+        took = (clock() - t1) if clock is not None else 0.0
+        if first is None:
+            first = got
+        outs.append(got.output)
+        cursor = plo
+        if not summed:
+            break
+        if took > 0 and search_limit_s:
+            width = PIECE_LIMIT_SHARE * search_limit_s * w / took
+        else:
+            width = w
+    if not outs:
+        e = last_timeout or elastic.Refused(_TIMEOUT_CODE, "search did not finish")
+        limit = re.search(r"in ([0-9.]+s)", e.message)
+        raise elastic.Refused(
+            "slow_read",
+            "this query over its time range did not finish within the session's search time "
+            "limit" + (f" ({limit.group(1)})" if limit else "") + ", and neither did the "
+            f"window read in newest-first pieces down to {narrowest / 3600:.1f} hours wide "
+            f"({timeouts} waits spent). Nothing was read; asking the same scope again pays the "
+            "whole wait again. Narrow the time range or add filters.")
+    share = round((hi - cursor) / max(hi - lo, 1e-9), 4)
+    if summed and len(outs) > 1:
+        base = outs[0]
+        totals = [((o.get("hits") or {}).get("total") or {}) for o in outs]
+        value = sum(int(x.get("value") or 0) for x in totals)
+        output = {**base, "hits": {**(base.get("hits") or {}), "total": {
+            "value": value,
+            "relation": "eq" if share >= 1.0 and all(x.get("relation", "eq") == "eq"
+                                                     for x in totals) else "gte"}}}
+        aggs = body0.get("aggs") or {}
+        if aggs:
+            output["aggregations"] = {name: _merge_agg([o["aggregations"][name] for o in outs],
+                                                       spec)
+                                      for name, spec in aggs.items()}
+    else:
+        output = dict(outs[0])
+        if share < 1.0:
+            t = (output.get("hits") or {}).get("total")
+            if isinstance(t, dict):
+                # the newest piece's own count: a lower bound for the window
+                output["hits"] = {**output["hits"], "total": {**t, "relation": "gte"}}
+    output["pieces"] = {
+        "read": "summed" if summed else "newest_only",
+        "window": [_iso_s(lo), _iso_s(hi)], "covered": [_iso_s(cursor), _iso_s(hi)],
+        "covered_share": share, "pieces": len(outs), "requests": n, "timeouts": timeouts,
+        **({"not_split": list(compiled.not_split) + (["hits"] if compiled.has_hits else [])}
+           if not summed else {}),
+        "note": ("one search over the whole window hit the time limit, so the window was "
+                 "read in newest-first pieces and "
+                 + ("added up: every count, bucket and value is exact for the covered part"
+                    if summed else
+                    "this answer is the newest piece alone - the aggregations named in "
+                    "not_split do not add up over pieces, so the older part was not combined")
+                 + ("" if share >= 1.0 else
+                    "; the older part of the window was NOT read (covered_share < 1), and "
+                    "the total is a lower bound"))}
+    return elastic.Scrubbed(output, (first.stats if first is not None else {})), n
 
 
 class _Compiler:
@@ -1297,7 +1606,9 @@ class _Compiler:
             body["aggs"] = agg_body
         plan = elastic.Plan(index, agg_plans, size, groups)
         return Compiled({"params": {"index": index, "body": body}}, plan,
-                        list(self.text_queries), list(self.labels_used), new_phrases)
+                        list(self.text_queries), list(self.labels_used), new_phrases,
+                        window=(self.window[0], self.window[1]) if self.window else None,
+                        not_split=not_additive(agg_body), has_hits=bool(size))
 
 
 _LABEL_SHAPES = elastic.EsScrubber._LABEL_SHAPES

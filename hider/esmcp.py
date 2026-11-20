@@ -118,6 +118,17 @@ Rules:
 6. A refusal carries a code and names a rule, never data. session_expired means the
    engineer has to sign in again (es-login); stop and tell them. incomplete means
    narrow the query: a shorter time window or a more specific filter.
+   A count or aggregation with a closed time_range whose one search hits the time
+   limit is read again in newest-first time pieces before anything is refused; the
+   reply then carries "pieces". read "summed": every count, histogram bucket, filters
+   bucket, sum, min, max and value_count is exact - do not re-ask narrower. read
+   "newest_only": an aggregation in not_split (terms, cardinality, avg, percentiles,
+   a week or month histogram, or a page of hits) does not add up over pieces, so the
+   answer covers only "covered" - say so, and ask the older part as its own range if
+   it matters. covered_share < 1 means the older part was not read at all and the
+   total is a lower bound. slow_read means even the pieces did not finish: narrow
+   the range or add filters. The wait is bounded at four search limits; a width
+   that timed out is remembered for about an hour, so asking again soon is cheaper.
    A result with hits_total 0 carries "empty": per filtered field, whether the field
    is filled at all in this index and window and on the documents the other filters
    leave (absent_in_window: that filter cannot match here, whatever it says - the
@@ -487,6 +498,10 @@ def _payload(tool: str, outcome: esbridge.Outcome) -> dict:
         payload["hits"] = hits.get("hits") or []
     if tool == "es_aggregate":
         payload["aggregations"] = out.get("aggregations") or {}
+    if "pieces" in out:
+        # one search hit the time limit and the window was read in pieces:
+        # how (summed or newest only), which part is covered, and why
+        payload["pieces"] = out["pieces"]
     if "empty" in out:
         # what a zero means, as facts about the filtered fields (never the
         # value): see Bridge._explain_empty

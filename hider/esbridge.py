@@ -577,6 +577,15 @@ class Bridge:
         self.index = index
         #: what the last applied vocabulary held per cluster: counts only
         self.vocabulary: dict[str, dict] = {}
+        #: measurement switch, set by nothing in the live path: with it off
+        #: a count or histogram whose one search hits the limit is refused
+        #: incomplete, as before esquery.read_in_pieces. Tests use it for
+        #: the "before" figures.
+        self.split_reads = True
+        #: what a piece read's waiting and piece sizing are measured on:
+        #: wall time in the live path; a harness on the stub passes the
+        #: engine's simulated seconds
+        self.read_clock = time.monotonic
 
     def cluster(self, name: str) -> elastic.Cluster:
         c = self.config.cluster(name) if isinstance(name, str) else None
@@ -659,6 +668,38 @@ class Bridge:
                     for k in ("covered_share", "timeouts"):
                         if agg.get(k) is not None:
                             row[k] = agg[k]
+                elif compiled.window is not None and self.split_reads:
+                    # a closed window: one search as always, and only if it
+                    # hits the limit, the window in newest-first pieces -
+                    # summed when every aggregation adds up over time, the
+                    # newest piece alone when one does not. The widths that
+                    # timed out are remembered beside the group reads'
+                    # (key count:<index>, spans only)
+                    now = clock()
+                    spans = {k: v[0] for k, v in self.group_spans.items()
+                             if now - v[1] <= GROUP_SPAN_TTL_S}
+                    try:
+                        scrubbed, requests = esquery.read_in_pieces(
+                            lambda body, deadline_s=None: self.session.search(
+                                cluster, body, deadline_s),
+                            self.scrubber, compiled, self.config.time_field,
+                            slow_spans=spans,
+                            search_limit_s=getattr(self.config, "poll_timeout_s", None),
+                            clock=self.read_clock)
+                    finally:
+                        now = clock()
+                        fresh = {k: ((v, now) if (old := self.group_spans.get(k)) is None
+                                     or v < old[0] else old)
+                                 for k, v in spans.items()}
+                        self.group_spans.clear()
+                        self.group_spans.update(fresh)
+                    pieces = scrubbed.output.get("pieces")
+                    if pieces is not None:
+                        # counts, shares and a mode word: never a value
+                        row.update({"requests": requests, "pieces": pieces["pieces"],
+                                    "piece_read": pieces["read"],
+                                    "covered_share": pieces["covered_share"],
+                                    "timeouts": pieces["timeouts"]})
                 else:
                     envelope = self.session.search(cluster, compiled.body)
                     scrubbed = self.scrubber.scrub_response(envelope, compiled.plan)
