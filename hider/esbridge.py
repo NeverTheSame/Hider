@@ -60,6 +60,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -582,6 +583,10 @@ class Bridge:
         #: incomplete, as before esquery.read_in_pieces. Tests use it for
         #: the "before" figures.
         self.split_reads = True
+        #: measurement switch, set by nothing in the live path: with it off
+        #: a terms aggregation is answered from the newest piece only, as
+        #: before esquery._merge_terms. Tests use it for the "before" figure.
+        self.split_terms = True
         #: what a piece read's waiting and piece sizing are measured on:
         #: wall time in the live path; a harness on the stub passes the
         #: engine's simulated seconds
@@ -678,6 +683,11 @@ class Bridge:
                     now = clock()
                     spans = {k: v[0] for k, v in self.group_spans.items()
                              if now - v[1] <= GROUP_SPAN_TTL_S}
+                    if not self.split_terms:
+                        terms = esquery.terms_names(compiled.body["params"]["body"].get("aggs"))
+                        compiled = dataclasses.replace(
+                            compiled, not_split=tuple(dict.fromkeys(compiled.not_split + terms)),
+                            align_s=None)
                     try:
                         scrubbed, requests = esquery.read_in_pieces(
                             lambda body, deadline_s=None: self.session.search(
@@ -1756,6 +1766,30 @@ def _empty_findings(empty: dict) -> list[str]:
     return out
 
 
+def pieces_line(p: dict) -> str:
+    """One line for a read made in time pieces (``esquery.read_in_pieces``):
+    summed (every figure exact), bounded (a terms list is lower bounds -
+    named), or newest_only (named aggregations answer for the newest piece
+    alone). Counts, a share and names the query chose."""
+    share = p.get("covered_share")
+    line = (f"PIECES   read={p.get('read')} pieces={p.get('pieces')} requests={p.get('requests')} "
+            f"timeouts={p.get('timeouts')} covered="
+            + (_pct(share) if isinstance(share, (int, float)) else "?"))
+    if p.get("bounded"):
+        line += f" bounded={','.join(p['bounded'])}"
+    if p.get("not_split"):
+        line += f" newest_only_for={','.join(p['not_split'])}"
+    if p.get("read") == "summed":
+        line += " (every figure exact for the covered part)"
+    elif p.get("read") == "bounded":
+        line += " (those terms counts are lower bounds; see doc_count_max, order_settled)"
+    else:
+        line += " (those answer for the newest piece only, not the window)"
+    if isinstance(share, (int, float)) and share < 1.0:
+        line += "; the older part of the window was NOT read"
+    return line
+
+
 def phrase_line(p: dict | None) -> str | None:
     """Where the case stands against its phrase budget. Counts only."""
     if not p:
@@ -1799,6 +1833,12 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
     shape = _filter_shape(query.get("filters"))
     if shape:
         print(f"         {shape}")
+    pieces = output.get("pieces")
+    if isinstance(pieces, dict):
+        # a read in time pieces: how many, what it cost, how much of the
+        # window it covers and how it was combined. Counts, a share, mode
+        # words and the query's own aggregation names - never a key.
+        print(pieces_line(pieces))
     if empty is not None:
         # a zero, real or not: the per-field statuses, so nobody has to
         # guess them from the count of fields checked. Field names and

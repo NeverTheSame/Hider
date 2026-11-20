@@ -2783,6 +2783,42 @@ def aged_docs() -> list[Doc]:
     return out
 
 
+#: Which servers failed this month: 30 days of failures from 12 invented
+#: relay servers in their own index pattern and map (not in ``generate``,
+#: nothing else reads it). Four fail every day; four fail only from 10 to
+#: 30 days back; four only from 20 to 30 days back - so the newest days
+#: alone name four servers of twelve. Counts per server per day are fixed.
+FAIL_INDEX = "logs-relay-*"
+FAIL_DAYS = 30
+FAIL_SERVERS: tuple[tuple[str, int, int, int], ...] = tuple(
+    [(f"relaybox-{i:02d}", c, 0, 30) for i, c in ((1, 20), (2, 15), (3, 10), (4, 5))]
+    + [(f"relaybox-{i:02d}", 8, 10, 30) for i in (5, 6, 7, 8)]
+    + [(f"relaybox-{i:02d}", 12, 20, 30) for i in (9, 10, 11, 12)])
+
+
+def fail_docs() -> list[Doc]:
+    out = []
+    for name, per_day, newest, oldest in FAIL_SERVERS:
+        for d in range(newest, oldest):
+            for j in range(per_day):
+                at = NOW - timedelta(days=d, seconds=300 + j * (86000 // per_day))
+                out.append(Doc(FAIL_INDEX, {"@timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                                            "log": {"level": "error"},
+                                            "message": "Relay job failed",
+                                            "agent": {"name": name}}, {}))
+    return out
+
+
+def fail_map() -> elastic.ElasticConfig:
+    return elastic.parse({
+        "indices": [FAIL_INDEX], "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "vocabulary": {"fields": []},
+        "fields": {"@timestamp": "keep", "log.level": "keep", "message": "text",
+                   "agent.name": {"kind": "identifier", "type": "SERVER_NAME"}},
+    }, source="relay-fixture")
+
+
 def aged_map() -> elastic.ElasticConfig:
     return elastic.parse({
         "indices": [AGED_INDEX], "time_field": "@timestamp",

@@ -122,10 +122,16 @@ Rules:
    limit is read again in newest-first time pieces before anything is refused; the
    reply then carries "pieces". read "summed": every count, histogram bucket, filters
    bucket, sum, min, max and value_count is exact - do not re-ask narrower. read
-   "newest_only": an aggregation in not_split (terms, cardinality, avg, percentiles,
-   a week or month histogram, or a page of hits) does not add up over pieces, so the
-   answer covers only "covered" - say so, and ask the older part as its own range if
-   it matters. covered_share < 1 means the older part was not read at all and the
+   "bounded": the same, except a terms named in "bounded" - a piece returned only
+   its top keys, so each key's doc_count is a lower bound, doc_count_max (when
+   present) the most it can be, only the first order_settled keys are certainly in
+   that order, and a server, job or level not listed could have up to unseen_max -
+   do not claim the list is complete or ranked past order_settled; raise size (up to
+   the cap) for an exact list. A terms under a date_histogram is exact per bucket.
+   "newest_only": an aggregation in not_split (cardinality, avg, percentiles, a terms
+   with its own sub-aggregation, a week or month histogram, or a page of hits) does
+   not add up over pieces, so the answer covers only "covered" - say so, and ask the
+   older part as its own range if it matters. covered_share < 1 means the older part was not read at all and the
    total is a lower bound. slow_read means even the pieces did not finish: narrow
    the range or add filters. The wait is bounded at four search limits; a width
    that timed out is remembered for about an hour, so asking again soon is cheaper.

@@ -1442,15 +1442,21 @@ class EsScrubber(jsonscrub.JsonScrubber):
 
     # -- the response ------------------------------------------------------
 
-    def scrub_response(self, raw: Any, plan: Plan) -> Scrubbed:
+    def scrub_response(self, raw: Any, plan: Plan, *, mark: bool = True) -> Scrubbed:
         """Scrub one Kibana async-search (or raw Elasticsearch) response.
 
         Raises :class:`Refused` rather than returning anything partial.
+
+        ``mark=False`` scrubs and leak-checks exactly as always but does not
+        mark what the output carries as shown, and leaves keep values marked
+        for a later :meth:`finish`: a piece of a time-pieced read whose keys
+        are merged before anything reaches Claude, so a key that does not
+        make the merged answer is never made usable.
         """
         t0 = time.time()
         self.responses += 1
         try:
-            return self._scrub_response(raw, plan, t0)
+            return self._scrub_response(raw, plan, t0, mark=mark)
         except Refused as e:
             self.refusals[e.code] = self.refusals.get(e.code, 0) + 1
             raise
@@ -1458,7 +1464,18 @@ class EsScrubber(jsonscrub.JsonScrubber):
     def _refuse(self, code: str, message: str) -> Refused:
         return Refused(code, message)
 
-    def _scrub_response(self, raw: Any, plan: Plan, t0: float) -> Scrubbed:
+    def finish(self, out: Any) -> Any:
+        """The last step of :meth:`scrub_response` for an output built from
+        pieces scrubbed with ``mark=False``: leak-checked again as a whole,
+        then every label and keep value it carries marked shown, and the
+        keep marks removed. Refuses ``leak`` as a page would."""
+        if self.leak_check(out):
+            raise self._refuse("leak", "response withheld: a known value survived redaction")
+        self.mark_shown(out)
+        return self._unmark(out)
+
+    def _scrub_response(self, raw: Any, plan: Plan, t0: float, *,
+                        mark: bool = True) -> Scrubbed:
         if not isinstance(raw, dict):
             raise self._refuse("malformed", "response withheld: not a JSON object")
         klass = error_class(raw)
@@ -1532,8 +1549,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
         # every keep value - is one the case may use from now on. After the
         # leak check: a page that is refused was never shown and teaches no
         # label. Before _unmark, which is what tells a keep value apart.
-        self.mark_shown(out)
-        out = self._unmark(out)
+        if mark:
+            self.mark_shown(out)
+            out = self._unmark(out)
         stats = {
             "hits": len(rows),
             "mapped_values": len(self.mapping),

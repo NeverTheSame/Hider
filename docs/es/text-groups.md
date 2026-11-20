@@ -450,11 +450,12 @@ The rule:
   between two pieces is filled in as one search would show it - `filters`
   buckets, `sum`, `value_count`, `min` and `max`. The reply carries
   `pieces.read: summed`.
-- **Newest only** for everything that does not add up: `terms` (each
-  piece's top N drops a different tail), `cardinality` (distinct counts do
-  not add), `avg` and `percentiles` (need what Elasticsearch does not
-  return), `top_hits`, a week, month, quarter or year histogram (buckets of
-  unequal length), anything nesting one, and a page of hits. Instead of
+- **Newest only** for everything that does not add up: `cardinality`
+  (distinct counts do not add), `avg` and `percentiles` (need what
+  Elasticsearch does not return), `top_hits`, a week, month, quarter or year
+  histogram (buckets of unequal length), anything nesting one, a page of
+  hits, and a **top-level terms with a sub-aggregation**. A terms without
+  one is merged (below); `terms` was on this list until then. Instead of
   nothing, the reply is the query over **the newest piece that finishes**,
   exact for that piece, with `pieces.read: newest_only`, `not_split`
   naming which aggregation (or `hits`) and why, and the total as `gte`.
@@ -484,3 +485,74 @@ one (it is halved and counted against the timeouts); the span memory is
 per index, so a cheap narrow-filtered question after an expensive one on
 the same index skips the whole-window try and is read in pieces (more
 requests, same answer). Not measured on a real cluster yet.
+
+**A terms over a slow window is merged across the pieces** (`esquery._merge_terms`,
+`esquery.split_plan`). Most investigation questions are a terms - which
+servers, which jobs, which levels - and answered from the newest piece only,
+"which servers failed this month" answered for the last fortnight.
+Measured on `eseval.fail_docs` (its own index pattern and map, not in
+`generate`: 12 invented relay servers, four failing every day, four only 10
+to 30 days back, four only 20 to 30 days back) at the busy hour through the
+real `Bridge` (`tests/test_espiecesterms.py`; before is `Bridge.split_terms =
+False`, the measurement switch, set by nothing in the live path):
+- before, a 30-day terms of size 12: `newest_only`, covered 50%, **8 of 12
+  servers, every count half the truth, the four that failed three weeks ago
+  absent** and nothing in the reply naming them; 2 requests, 577 s;
+- after, the same: `summed`, `pieced: exact`, **all 12 servers with the
+  counts and order one unlimited search gives**; 4 requests, 900 s;
+- after, size 10 (a cut list): `bounded`, 10 keys, each true count inside
+  `[doc_count, doc_count_max]`, `order_settled` 3 (the first three are in
+  the true order), `unseen_max` 112; one server the single search lists
+  (150) is below the cut, which is what `order_settled` 3 of 10 warns of;
+- after, size 3: `bounded`, the third key 281 to 304 (truth 300).
+**What is returned**:
+- each piece returns at most `size` keys and its tail
+  (`sum_other_doc_count`); a key's summed count is a **lower bound**, exact
+  when every piece either returned it or had no tail; its **upper bound**
+  adds, for every piece that had a tail and did not return it, the smaller
+  of that piece's smallest returned count and its tail; a key no piece
+  returned could have at most `unseen_max`, the sum of those;
+- the merged keys are ordered by lower bound and **cut to `size`** - never
+  more keys than the query asked for;
+- `pieced: exact` when every shown count is exact and nothing outside the
+  list could reach its last key (the list one search gives, up to its
+  tie order, which follows real values the bridge cannot see); otherwise
+  `pieced: bounded`, with `doc_count_max` on each uncertain key,
+  `order_settled` (leading keys no other key could pass) and `unseen_max`,
+  and `pieces.read: bounded` with the names; `sum_other_doc_count` is the
+  window's documents not in the shown keys;
+- **every piece is scrubbed and leak-checked as a reply**
+  (`EsScrubber.scrub_response(..., mark=False)`), and the merged answer is
+  leak-checked again and only then marked shown (`EsScrubber.finish`): a
+  key a piece returned that does not make the merged top `size` is **never
+  made usable** (pinned: a server label cut from a top 3 is refused
+  `unknown_label`). This holds for every summed read now, not only terms.
+**Which nested shapes, and why**:
+- **a terms under a date_histogram** is split, with the piece boundaries on
+  the histogram's own bucket boundaries (`Compiled.align_s`; epoch-aligned
+  as Elasticsearch aligns fixed and minute/hour/day intervals): every
+  bucket - and the terms in it - comes whole from one piece, so it is
+  exactly one search's answer for that bucket, no bound needed (pinned:
+  daily buckets of top-5 servers identical to one search). A piece is never
+  narrower than one bucket; a bucket that cannot finish ends the read.
+- **a top-level terms with a sub-aggregation is newest only**: when a piece
+  drops a key into its tail, that key's sub-buckets miss the piece's
+  documents and there is no bound to give on them, and whether a piece
+  dropped one is known only after reading; returning sub-buckets that are
+  silently partial is worse than one honest newest piece.
+- cardinality and percentiles stay newest only at any depth, as before;
+  two histograms that would need different alignments are newest only.
+**es-smoke** prints one `PIECES` line for any pieced read
+(`esbridge.pieces_line`): `read=summed|bounded|newest_only pieces=N
+requests=N timeouts=N covered=NN%`, then `bounded=<names>` or
+`newest_only_for=<names>` and a phrase saying what that means. Counts, a
+share, mode words and the query's own aggregation names - never a key.
+**Costs, declared**: the same pieces and requests as a summed count (the
+work adds up; the terms adds nothing to read); a bounded list is honest
+but not the asked list - the model is told not to claim it complete or
+ranked past `order_settled`, and that a larger `size` (up to `max_buckets`)
+turns most bounded lists exact; no second pass fetches exact counts for
+the uncertain keys (it would need a terms `include` the grammar forbids,
+and a request per piece - a possible later change, not made); an aligned
+read pays at least one bucket per piece, so an hourly histogram over 30
+days needs pieces of whole hours.

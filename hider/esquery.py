@@ -252,6 +252,9 @@ class Compiled:
     #: newest piece only, not summed
     not_split: tuple[str, ...] = ()
     has_hits: bool = False
+    #: seconds piece boundaries must fall on (a histogram with a terms
+    #: under it), or None; see :func:`split_plan`
+    align_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -738,23 +741,164 @@ def _histogram_step_s(spec: dict) -> float | None:
     return _FIXED_CALENDAR_S.get(dh.get("calendar_interval"))
 
 
-def not_additive(agg_body: dict | None) -> tuple[str, ...]:
-    """The top-level aggregation names whose answer does not add up over
-    time pieces (see _ADDITIVE), a nested one counting against its parent."""
-    out = []
+#: never combined over pieces, at any depth: their answers do not add up
+#: and no bound on them can be read from the pieces
+_NEVER_SPLIT = {"cardinality", "percentiles", "avg", "top_hits"}
+
+
+def split_plan(agg_body: dict | None) -> tuple[tuple[str, ...], float | None]:
+    """How a query's aggregations combine over time pieces: the top-level
+    names that do **not** (answered from the newest piece only), and the
+    width in seconds piece boundaries must fall on, if any.
+
+    * counts, sums, min, max, value_count, filters and a fixed-step
+      date_histogram of those add up exactly (see _ADDITIVE);
+    * a **top-level terms with no sub-aggregation** is merged across pieces
+      (see _merge_terms): exact when every piece returned every key it
+      needed to, bounded and said so otherwise;
+    * a terms **under a date_histogram** (with terms or additive aggs under
+      it) is split with the piece boundaries on the histogram's own bucket
+      boundaries, so every bucket comes whole from one piece and its terms
+      is exactly what one search would give - no bound needed;
+    * a **top-level terms with a sub-aggregation** is not split: when a piece
+      dropped a key into its tail, that key's sub-buckets miss the piece's
+      documents and no bound on them can be read, and whether a piece
+      dropped one is known only after reading;
+    * cardinality, percentiles, avg and top_hits are never split, at any
+      depth; nor is a week, month, quarter or year histogram (unequal
+      buckets), nor two histograms that would need different alignments.
+    """
+    bad: list[str] = []
+    steps: dict[str, float] = {}
     for name, spec in (agg_body or {}).items():
-        if not _agg_additive(spec):
-            out.append(name)
-    return tuple(out)
+        ok, need = _split_ok(spec, inside=False)
+        if not ok:
+            bad.append(name)
+        elif need:
+            if len(need) > 1:
+                bad.append(name)
+            else:
+                steps[name] = next(iter(need))
+    if len(set(steps.values())) > 1:
+        bad += sorted(steps)
+        steps = {}
+    return tuple(bad), (next(iter(steps.values())) if steps else None)
 
 
-def _agg_additive(spec: dict) -> bool:
+def terms_names(agg_body: dict | None) -> tuple[str, ...]:
+    """Top-level aggregation names with a terms anywhere under them."""
+    return tuple(n for n, s in (agg_body or {}).items() if _has_terms(s))
+
+
+def not_additive(agg_body: dict | None) -> tuple[str, ...]:
+    """The top-level names answered from the newest piece only (see
+    :func:`split_plan`)."""
+    return split_plan(agg_body)[0]
+
+
+def _split_ok(spec: dict, *, inside: bool) -> tuple[bool, set]:
+    """(combinable, the histogram steps piece boundaries must fall on)."""
     kind = next((k for k in spec if k != "aggs"), None)
-    if kind not in _ADDITIVE:
-        return False
-    if kind == "date_histogram" and _histogram_step_s(spec) is None:
-        return False
-    return all(_agg_additive(s) for s in (spec.get("aggs") or {}).values())
+    subs = spec.get("aggs") or {}
+    if kind in _NEVER_SPLIT or kind is None:
+        return False, set()
+    need: set = set()
+    if kind in ("sum", "value_count", "min", "max", "filters"):
+        ok = all((r := _split_ok(s, inside=inside))[0] and not need.update(r[1])
+                 for s in subs.values())
+        return ok, need
+    if kind == "terms":
+        if subs and not inside:
+            return False, set()
+        ok = all((r := _split_ok(s, inside=inside))[0] and not need.update(r[1])
+                 for s in subs.values())
+        return ok, need
+    if kind == "date_histogram":
+        step = _histogram_step_s(spec)
+        if step is None:
+            return False, set()
+        ok = True
+        for s in subs.values():
+            r = _split_ok(s, inside=True)
+            ok = ok and r[0]
+            need |= r[1]
+            if _has_terms(s):
+                need.add(step)
+        return ok, need
+    return False, set()
+
+
+def _has_terms(spec: dict) -> bool:
+    kind = next((k for k in spec if k != "aggs"), None)
+    return kind == "terms" or any(_has_terms(s) for s in (spec.get("aggs") or {}).values())
+
+
+def _merge_terms(nodes: list[dict], spec: dict) -> dict:
+    """A terms aggregation's answers over pieces, combined.
+
+    Each piece returned at most ``size`` keys and ``sum_other_doc_count``
+    for the rest (its tail). A key's summed count is a **lower bound**; it
+    is exact when every piece either returned the key or had no tail. Its
+    **upper bound** adds, for every piece that had a tail and did not
+    return the key, the smaller of that piece's smallest returned count and
+    its tail. A key no piece returned could have at most ``unseen_max``.
+    The merged keys are ordered by lower bound and cut to ``size``.
+
+    ``pieced`` is ``exact`` when every shown count is exact and nothing not
+    shown could reach the last shown key (so the list is the one a single
+    search returns, up to its tie order); otherwise ``bounded``, with
+    ``doc_count_max`` on each key whose count is a lower bound,
+    ``order_settled`` (how many leading keys no other key could pass) and
+    ``unseen_max``. One piece alone is that piece's own answer.
+    """
+    if len(nodes) == 1:
+        return dict(nodes[0])
+    size = int((spec.get("terms") or {}).get("size", 10))
+    low: dict[Any, int] = {}
+    seen_in: dict[Any, set] = {}
+    total = 0
+    err = 0
+    tails = []
+    for i, n in enumerate(nodes):
+        bs = n.get("buckets") or []
+        tail = int(n.get("sum_other_doc_count") or 0)
+        err += int(n.get("doc_count_error_upper_bound") or 0)
+        total += tail + sum(int(b.get("doc_count") or 0) for b in bs)
+        floor = min((int(b.get("doc_count") or 0) for b in bs), default=tail)
+        tails.append(min(floor, tail) if tail > 0 else 0)
+        for b in bs:
+            k = b.get("key")
+            low[k] = low.get(k, 0) + int(b.get("doc_count") or 0)
+            seen_in.setdefault(k, set()).add(i)
+    high = {k: low[k] + sum(c for i, c in enumerate(tails) if c and i not in seen_in[k])
+            for k in low}
+    unseen = sum(tails)
+    order = sorted(low, key=lambda k: (-low[k], str(k)))
+    shown, rest = order[:size], order[size:]
+    counts_exact = all(high[k] == low[k] for k in shown)
+    outside = max([high[k] for k in rest] + ([unseen] if unseen else []), default=0)
+    certain = not shown or outside < low[shown[-1]] or (not rest and not unseen)
+    settled = 0
+    for j, k in enumerate(shown):
+        later = max([high[x] for x in order[j + 1:]] + ([unseen] if unseen else []), default=-1)
+        if low[k] > later:
+            settled += 1
+        else:
+            break
+    exact = counts_exact and certain
+    buckets = []
+    for k in shown:
+        b = {"key": k, "doc_count": low[k]}
+        if high[k] != low[k]:
+            b["doc_count_max"] = high[k]
+        buckets.append(b)
+    out = {"doc_count_error_upper_bound": err,
+           "sum_other_doc_count": total - sum(low[k] for k in shown),
+           "buckets": buckets, "pieced": "exact" if exact else "bounded"}
+    if not exact:
+        out["order_settled"] = settled
+        out["unseen_max"] = unseen
+    return out
 
 
 def _zeroed(node: Any, spec: dict) -> Any:
@@ -770,6 +914,9 @@ def _zeroed(node: Any, spec: dict) -> Any:
                                     (node.get("buckets") or {}).items()}}
     if kind == "date_histogram":
         return {**node, "buckets": []}
+    if kind == "terms":
+        return {**node, "buckets": [], "sum_other_doc_count": 0,
+                "doc_count_error_upper_bound": 0}
     return node
 
 
@@ -784,6 +931,8 @@ def _merge_agg(nodes: list[dict], spec: dict) -> dict:
         if not have:
             return dict(nodes[0])
         return dict((min if kind == "min" else max)(have, key=lambda n: n["value"]))
+    if kind == "terms":
+        return _merge_terms(nodes, spec)
     if kind == "filters":
         names: dict[str, list[dict]] = {}
         for n in nodes:
@@ -905,6 +1054,7 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
             note(hi - lo)
 
     summed = not compiled.not_split and not compiled.has_hits
+    align = compiled.align_s if summed else None
     body0 = params["body"]
 
     def piece(plo: float, phi: float) -> dict:
@@ -929,10 +1079,20 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
         if w >= bad:
             w = bad / 2.0
         plo = cursor - w
+        if align:
+            # boundaries on the histogram's own bucket boundaries (epoch
+            # aligned, as Elasticsearch aligns them): every bucket, and the
+            # terms under it, comes whole from one piece
+            plo = max(lo, math.floor((cursor - max(w, align)) / align) * align)
+            w = cursor - plo
         n += 1
         t1 = clock() if clock is not None else 0.0
         try:
-            got = scrubber.scrub_response(search(piece(plo, cursor), None), compiled.plan)
+            # a summed piece is scrubbed and leak-checked as any reply, but
+            # nothing in it is marked shown until the merged answer is: a
+            # key that does not make the merged top N is never usable
+            got = scrubber.scrub_response(search(piece(plo, cursor), None), compiled.plan,
+                                          mark=not summed)
         except elastic.Refused as e:
             if e.code != _TIMEOUT_CODE:
                 raise
@@ -941,7 +1101,9 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
             narrowest = min(narrowest, w)
             note(w)
             width = w / 2.0
-            if width < PIECE_MIN_S:
+            if width < max(PIECE_MIN_S, align or 0.0):
+                # nothing narrower than a minute - or than one histogram
+                # bucket, when the pieces are aligned to them
                 break
             continue
         took = (clock() - t1) if clock is not None else 0.0
@@ -966,7 +1128,8 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
             f"({timeouts} waits spent). Nothing was read; asking the same scope again pays the "
             "whole wait again. Narrow the time range or add filters.")
     share = round((hi - cursor) / max(hi - lo, 1e-9), 4)
-    if summed and len(outs) > 1:
+    bounded: list[str] = []
+    if summed:
         base = outs[0]
         totals = [((o.get("hits") or {}).get("total") or {}) for o in outs]
         value = sum(int(x.get("value") or 0) for x in totals)
@@ -979,6 +1142,10 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
             output["aggregations"] = {name: _merge_agg([o["aggregations"][name] for o in outs],
                                                        spec)
                                       for name, spec in aggs.items()}
+            bounded = [name for name, node in output["aggregations"].items()
+                       if isinstance(node, dict) and node.get("pieced") == "bounded"]
+        # leak-checked again as a whole, then what it carries marked shown
+        output = scrubber.finish(output)
     else:
         output = dict(outs[0])
         if share < 1.0:
@@ -987,7 +1154,8 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
                 # the newest piece's own count: a lower bound for the window
                 output["hits"] = {**output["hits"], "total": {**t, "relation": "gte"}}
     output["pieces"] = {
-        "read": "summed" if summed else "newest_only",
+        "read": ("bounded" if bounded else "summed") if summed else "newest_only",
+        **({"bounded": bounded} if bounded else {}),
         "window": [_iso_s(lo), _iso_s(hi)], "covered": [_iso_s(cursor), _iso_s(hi)],
         "covered_share": share, "pieces": len(outs), "requests": n, "timeouts": timeouts,
         **({"not_split": list(compiled.not_split) + (["hits"] if compiled.has_hits else [])}
@@ -995,6 +1163,12 @@ def read_in_pieces(search: Callable[..., Any], scrubber: elastic.EsScrubber,
         "note": ("one search over the whole window hit the time limit, so the window was "
                  "read in newest-first pieces and "
                  + ("added up: every count, bucket and value is exact for the covered part"
+                    if summed and not bounded else
+                    "added up, but in the terms aggregations named in bounded a piece "
+                    "returned only its top keys, so a key's doc_count is a lower bound "
+                    "(doc_count_max is the most it can be), the order is known only for "
+                    "the first order_settled keys, and a key not shown could have up to "
+                    "unseen_max; every other count is exact"
                     if summed else
                     "this answer is the newest piece alone - the aggregations named in "
                     "not_split do not add up over pieces, so the older part was not combined")
@@ -1608,7 +1782,8 @@ class _Compiler:
         return Compiled({"params": {"index": index, "body": body}}, plan,
                         list(self.text_queries), list(self.labels_used), new_phrases,
                         window=(self.window[0], self.window[1]) if self.window else None,
-                        not_split=not_additive(agg_body), has_hits=bool(size))
+                        not_split=split_plan(agg_body)[0], has_hits=bool(size),
+                        align_s=split_plan(agg_body)[1])
 
 
 _LABEL_SHAPES = elastic.EsScrubber._LABEL_SHAPES
