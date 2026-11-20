@@ -200,6 +200,7 @@ as with `adversarial.CASES`).
 - **The cover is kept per field; a field is never claimed for days it was not read; a v1 file is untrusted and dropped.** Gate: `field_added_backfilled`; pin: `test_a_field_added_to_an_existing_cover_is_not_claimed_covered_for_days_it_was_not_read`, `test_two_fields_added_at_once_are_backfilled_together`.
 - **A field returning from over the cap is read but not waited for, never shares a slice with waited fields, and its failures are charged to it alone with a doubling retry** - else one id-like field takes every case down. Gate: `lapsed_decision_serves`; pin: `_FailingField` tests in `tests/test_esbridge.py`.
 - **An unchanged field set gets exactly the slices and request counts it had.** Pin: `tests/test_esbridge.py`.
+- **A failed extension slice (older days for fields that already serve) is charged to the extension, never the cluster: next try half as wide down to an hour, then a doubling delay; the width is saved; the VOCAB line says how far the cover reaches and why** - one slow old day was retried whole for ever and showed a healthy cover `stale`. Pin: `tests/test_esvocabage.py`.
 
 #### Readability, labels and keep fields (docs/es/readability.md)
 

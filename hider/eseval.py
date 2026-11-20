@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import elastic, entities, esquery
 
@@ -2692,6 +2692,87 @@ def _query_range_seconds(body: dict) -> float | None:
     return walk(body.get("query"))
 
 
+def _query_range_end(body: dict) -> datetime | None:
+    """The newest ``@timestamp`` bound of the request's range (the
+    narrowest, as for :func:`_query_range_seconds`), or None."""
+    ends: list[datetime] = []
+
+    def walk(clause: Any) -> None:
+        if not isinstance(clause, dict):
+            return
+        for kind, spec in clause.items():
+            if kind == "bool" and isinstance(spec, dict):
+                for c in spec.get("filter", []):
+                    walk(c)
+            elif kind == "range" and isinstance(spec, dict):
+                b = spec.get("@timestamp")
+                if isinstance(b, dict):
+                    hi = _parse_time(b.get("lte") or b.get("lt"), round_up=True)
+                    if hi is not None:
+                        ends.append(hi)
+
+    walk(body.get("query"))
+    return min(ends) if ends else None
+
+
+#: Slower storage for older days, as measured on one cluster: a one-day
+#: vocabulary slice took about 42 seconds for a recent day and 600 to 730
+#: for a day 10 to 20 days old; the slowest took 1,028 of a 1,200-second
+#: budget and two failed. ``(age in days of the range's newest end,
+#: seconds one vocabulary request costs per day of range)``, interpolated
+#: linearly. The per-request figure assumes a day slice of three requests
+#: (a distinct count and two pages, which is what ``aged_docs`` holds per
+#: day): 14s each is the 42s recent day, 200-243s the 600-730s middle,
+#: 343s the 1,028s day (24 to 25 days back). From 26 days back it is 650s
+#: a request, so a day there is over the 1,200s budget by its second
+#: request - the failed slices. **The shape is an assumption** sized from those points; so is
+#: the cost being proportional to the range's width (a half-day costs
+#: half), which is what scanning fewer documents of the same age would
+#: give, and is what makes a narrower slice fit.
+AGED_REQUEST_SECONDS: tuple[tuple[float, float], ...] = (
+    (0.0, 14.0), (2.0, 14.0), (10.0, 200.0), (20.0, 243.0), (24.0, 343.0),
+    (25.0, 343.0), (25.5, 650.0), (31.0, 650.0))
+
+#: The aged-storage fixture: its own index pattern and map, one name field,
+#: AGED_PER_DAY invented job names a day (two pages and a distinct count a
+#: day slice) over AGED_DAYS. Not in ``generate``; nothing else reads it.
+AGED_INDEX = "logs-aged-*"
+AGED_DAYS = 30
+AGED_PER_DAY = 1_200
+
+
+def aged_docs() -> list[Doc]:
+    out = []
+    n = AGED_DAYS * AGED_PER_DAY
+    for i in range(n):
+        at = NOW - timedelta(seconds=60.0 + i * (AGED_DAYS * 86400.0 - 120.0) / n)
+        out.append(Doc(AGED_INDEX, {"@timestamp": at.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                                    "log": {"level": "info"}, "message": "Run finished",
+                                    "job": {"name": f"Quarrytide Run {i:05d}"}}, {}))
+    return out
+
+
+def aged_map() -> elastic.ElasticConfig:
+    return elastic.parse({
+        "indices": [AGED_INDEX], "time_field": "@timestamp",
+        "clusters": {"stub": "https://kibana-stub.example.net"},
+        "vocabulary": {"days": AGED_DAYS, "fields": ["job.name"]},
+        "fields": {"@timestamp": "keep", "log.level": "keep", "message": "text",
+                   "job.name": {"kind": "identifier", "type": "JOB_NAME"}},
+    }, source="aged-fixture")
+
+
+def aged_request_seconds(age_days: float) -> float:
+    """:data:`AGED_REQUEST_SECONDS`, interpolated."""
+    pts = AGED_REQUEST_SECONDS
+    if age_days <= pts[0][0]:
+        return pts[0][1]
+    for (a0, s0), (a1, s1) in zip(pts, pts[1:]):
+        if age_days <= a1:
+            return s0 + (s1 - s0) * (age_days - a0) / (a1 - a0)
+    return pts[-1][1]
+
+
 def backing_index(pattern: str) -> str:
     """The backing index a hit from ``pattern`` names, as Elasticsearch
     names a data stream's write index."""
@@ -2728,6 +2809,13 @@ class StubEngine:
         self.page_seconds: tuple[float, ...] = ()
         #: what a page over a range wider than WIDE_RANGE_S costs
         self.wide_page_seconds: tuple[float, ...] = ()
+        #: Optional: a vocabulary request (the distinct count or a page)
+        #: costs ``aged(age in days of its range's newest end) * width in
+        #: days`` instead of the flat figures above - older days on slower
+        #: storage (see AGED_REQUEST_SECONDS). None (the default) changes
+        #: nothing for any other figure.
+        self.aged_seconds: Callable[[float], float] | None = None
+        self._range_end: datetime | None = None
         self.simulated_seconds = 0.0
         self._pages = 0
         #: how many pages were charged at the wide rate: a build that is
@@ -2883,7 +2971,9 @@ class StubEngine:
                     "buckets": bucket_rows,
                 }
             elif atype == "composite":
-                if self.page_seconds:
+                if self.aged_seconds is not None:
+                    self._charge_aged()
+                elif self.page_seconds:
                     # charged by how wide the request's range is: the same
                     # page costs 8-35s over a day and 31-297s over thirty
                     wide = (self._range_s or 0.0) > WIDE_RANGE_S
@@ -2946,7 +3036,11 @@ class StubEngine:
                                       "max_score": None,
                                       "hits": [self._hit(index, i, flat, inc) for i, flat in sel]}}
             elif atype == "cardinality":
-                if self.page_seconds and name == elastic.VOCABULARY_COUNT_AGG:
+                if self.aged_seconds is not None and name == elastic.VOCABULARY_COUNT_AGG:
+                    self._charge_aged()
+                    self.probe_requests[a["field"]] = \
+                        self.probe_requests.get(a["field"], 0) + 1
+                elif self.page_seconds and name == elastic.VOCABULARY_COUNT_AGG:
                     # the vocabulary's distinct-count probe, charged so the
                     # report shows what it costs rather than implying it is
                     # free (see PROBE_SECONDS)
@@ -2992,6 +3086,7 @@ class StubEngine:
         if len(parts) > 1 and body.get("size", 10):
             raise ValueError("stub: a search over several indices is aggregation-only")
         self._range_s = _query_range_seconds(body)
+        self._range_end = _query_range_end(body)
         rows = [r for p in parts for r in self._rows(p)]
         rows = [r for r in rows if self._match(r[1], body.get("query", {"match_all": {}}))]
         total = len(rows)
@@ -3041,6 +3136,16 @@ class StubEngine:
         if aggs is not None:
             resp["aggregations"] = aggs
         return resp
+
+    def _charge_aged(self) -> None:
+        """One vocabulary request on slower storage for older days (see
+        ``aged_seconds``): by the age of the range's newest end, scaled by
+        the range's width in days."""
+        end = self._range_end or NOW
+        age = max(0.0, (NOW - end).total_seconds() / 86400.0)
+        width = (self._range_s or 86400.0) / 86400.0
+        self.simulated_seconds += self.aged_seconds(age) * width
+        self._pages += 1
 
     def _charge_exists_scan(self) -> None:
         self.exists_scans += 1

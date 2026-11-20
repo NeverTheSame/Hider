@@ -482,6 +482,101 @@ is untouched: over the cap refuses the slice, no record is made, it is
 never returning (pinned). An unchanged field set never has a returning
 field, so its slices and request counts are as before.
 
+**Older days on slower storage: an extension slice that cannot fit the
+budget covers less each time.** Measured on one real cluster: a one-day
+slice took about 42 seconds for a recent day and 600-730 seconds for a
+day 10 to 20 days old; the slowest took 1,028 of the 1,200-second budget,
+and two failed. A failed slice was retried `VOCABULARY_RETRY_S` (60s)
+later over **the same range**, with no growing delay, and set the
+cluster's `failed`, so a cluster whose recent cover was fine was reported
+`stale` (`TOP-UP OVERDUE` on the VOCAB line) and the 60-second hold also
+held back its top-ups. One day that could not fit was retried for ever and
+the cover never reached `vocabulary.days`.
+Shown in the stub first: `StubEngine.aged_seconds` (optional, None by
+default, so no other figure moves) charges a vocabulary request by the age
+of its range's newest end, scaled by the range's width in days, from
+`eseval.AGED_REQUEST_SECONDS` - 14s a request for recent days (a 42s day
+slice of a count and two pages), 200-243s at 10-20 days (600-730s), 343s
+at 24-25 days (the 1,028s day), 650s from 26 days (over budget by its
+second request). **The shape and the width scaling are assumptions** sized
+from those points: a half-day is charged half, which is what scanning
+fewer documents of the same age gives and what makes a narrower slice
+fit. The fixture is `eseval.aged_docs` (own index pattern
+`logs-aged-*` and map `eseval.aged_map`, one listed field `job.name`,
+1,200 invented job names a day over 30 days, not in `generate`). The
+test drives the real `Broker` with `Broker.build_clock` set to the
+engine's simulated seconds (None, wall time, in the live path).
+Before (`Broker.extend_shrinks = False`, the measurement switch, set by
+nothing in the live path), 12 simulated hours
+(`test_before_an_old_day_that_cannot_fit_is_retried_whole_for_ever`):
+**21 failures, all charged to the cluster, every one over the same
+one-day range; the cover stuck at 26.0 days of 30; 42 report readings of
+`stale` while the cover served cases; 66 slices, 201 requests.**
+After (`test_after_a_failing_old_day_covers_less_each_time_and_the_cover_reaches_the_window`):
+**1 failure, charged to the extension; the next try reads half a day and
+fits; the cover reaches the whole 30 days; never `stale`, 0 cluster
+failures; the cover's end 60s behind at the close; 99 slices, 226
+requests.**
+The rule (`VocabularyIndex.note_extend_failure`, `note_extend_success`,
+`reach`; `Broker._end_slice`; `plan_vocabulary_slice(extend_width=,
+extend=)`):
+- **Only extension is affected**: a `back` slice whose fields all serve
+  already. A first build's slices, a backfill's first two days, forward
+  top-ups and catch-up slices, and returning fields are unchanged - each
+  still fails and retries as before.
+- **Charged to the extension, never the cluster**: no `failed`, no
+  `stale`, no 60-second hold on the cluster, so a top-up due right after
+  is not delayed by it (it ranks first anyway, as before).
+- **Covers less each time**: the next extension slice is half the width
+  that failed (24h, 12h, 6h, 3h, 1.5h, then the floor
+  `VOCABULARY_EXTEND_MIN_S`, an hour), after `VOCABULARY_RETRY_S`. At the
+  floor it cannot shrink, so the delay doubles instead, from 60s to
+  `VOCABULARY_EXTEND_RETRY_MAX_S` (an hour): 60s, 2, 4, 8, 16, 32 minutes,
+  then one an hour.
+- **The width that fitted is kept, not grown back**: older days only get
+  slower on that storage, so growing would pay the same failure again.
+  The width, attempt count, code, start time, retry time and edge are
+  **saved** in `vocabulary.json` under `extend` (widths, counts, a code
+  and times; never a value), so a restart does not pay the halvings again.
+- **No hole and nothing learnt from a partial read**: an extension slice
+  always ends at the cover's start, however narrow, so `merge` extends one
+  range; a failed slice is dropped whole, exactly as before.
+- **A fast cluster is unchanged**: with no extension failure the width is
+  a day and nothing is recorded, so slices and requests are exactly as
+  before (`test_a_fast_cluster_gets_the_same_slices_and_requests`, and the
+  es-eval figures above).
+**What the VOCAB line says** (`esbridge._reach_note`, from
+`report()["reach"]`, in es-login and es-smoke): once an extension slice
+has failed or been narrowed and the cover is short of `vocabulary.days`,
+`COVER REACHES <date> (Nd of 30d)` and why: `older days are slower to
+read; the last older slice failed (<code>), N attempts since A, next try B
+at <width>h`, or `older days read <width>h at a time (a day did not fit the
+budget)`, or, at the floor and still failing, `STOPS THERE - an older
+slice of 1h, the narrowest, did not fit vocabulary.budget_s (<code>), N
+attempts since A, next try B; names logged only before <date> are not
+known`. Nothing once the cover is complete. Pinned:
+`test_while_shrinking_the_vocab_line_says_how_far_and_why`,
+`test_a_day_that_cannot_fit_even_an_hour_stops_the_cover_and_says_so`
+(a transport that fails every request for days 26 back: widths 12h, 6h,
+3h, 1.5h, 1h, then the floor; cases served, never stale, the edge never
+moves, top-ups within a refresh plus a budget, no value in the line or
+the log).
+**Costs, declared**: an old day read in pieces costs more requests (each
+piece pays its own distinct count, and a page per 1,000 values of its
+own), and each failed attempt spends up to one budget of cluster time
+(on the measurement, 1,300 simulated seconds) - once per halving, not for
+ever; a cover that stops at the floor leaves names logged only before its
+edge unknown, which the line says; the narrowed width stays narrowed for
+the cluster (saved) even for older days that would have fitted a day,
+which only costs requests; a slice in flight still holds the one build
+thread for up to a budget, so a top-up waits behind it as before (the
+`stale` threshold is a refresh plus a budget, and the measurement stayed
+under it); and a first build's or a backfill's own back slice that cannot
+fit is **not** narrowed by this rule - it fails and retries as before,
+because those are what refuse cases and narrowing them is a separate
+decision. Not measured on a real cluster yet: a tester should watch the
+VOCAB line through one extension past the slow days.
+
 **Declared cost of the cap, new and the sharper one: a real name field
 with more distinct values than `vocabulary.max` is left unread under
 the default field set, so its values stay readable in message text.**

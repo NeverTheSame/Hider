@@ -1378,6 +1378,27 @@ def _stuck_note(v: dict) -> str:
                         f"next try {x['next_try']}" for f, x in sorted(stuck.items())))
 
 
+def _reach_note(v: dict) -> str:
+    """How far back the cover reaches and why it stops there, once an
+    extension slice (older days for fields that already serve) has failed
+    or been narrowed. Cases are served throughout; this says which days a
+    name can be known from. Ranges, widths, counts and a code only."""
+    r = v.get("reach")
+    if not r or r.get("complete"):
+        return ""
+    head = f" COVER REACHES {r['from']} ({r['days']}d of {r['wanted_days']}d)"
+    if r.get("stopped"):
+        return (head + f": STOPS THERE - an older slice of {r['width_h']:g}h, the narrowest, did "
+                f"not fit vocabulary.budget_s ({r['code']}), {r['attempts']} attempts since "
+                f"{r['since']}, next try {r['next_try']}; names logged only before "
+                f"{r['from']} are not known")
+    if r.get("attempts"):
+        return (head + f": older days are slower to read; the last older slice failed "
+                f"({r['code']}), {r['attempts']} attempts since {r['since']}, next try "
+                f"{r['next_try']} at {r['width_h']:g}h")
+    return head + f": older days read {r['width_h']:g}h at a time (a day did not fit the budget)"
+
+
 def _frozen_note(v: dict) -> str:
     """Fields read under an earlier field set and no longer read: their
     names are kept and still hidden, as far as the range says, and nothing
@@ -1432,7 +1453,7 @@ def vocabulary_line(v: dict | None) -> str | None:
                 + (f"; {_backfill_note(v['backfill'])}"
                    + ("" if v.get("serving") else ", cases refused")
                    if v.get("backfill") else "")
-                + _over_cap_note(v) + _frozen_note(v) + _stuck_note(v))
+                + _over_cap_note(v) + _frozen_note(v) + _stuck_note(v) + _reach_note(v))
     if v.get("state") == "failed":
         return (f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
                 + _over_cap_note(v))
@@ -1484,7 +1505,7 @@ def vocabulary_line(v: dict | None) -> str | None:
         line += f" NEAR CAP: {', '.join(v['near_cap'])}"
     if v.get("omitted"):
         line += (f" NOT READ (readable in text): {', '.join(sorted(v['omitted']))}")
-    line += _over_cap_note(v) + _frozen_note(v) + _stuck_note(v)
+    line += _over_cap_note(v) + _frozen_note(v) + _stuck_note(v) + _reach_note(v)
     return line
 
 
@@ -1858,6 +1879,18 @@ class Broker:
         self._notes: dict[str, list[str]] = {}
         #: when a cluster whose last slice failed may be tried again
         self._retry_at: dict[str, float] = {}
+        #: the slice in flight is an **extension** (older days for fields
+        #: that already serve): its failure is charged to the extension,
+        #: not the cluster (see ``VocabularyIndex.note_extend_failure``)
+        self._build_extension: tuple[float, float] | None = None
+        #: measurement switch, set by nothing in the live path: with it off
+        #: a failed extension slice is charged to the cluster and retried
+        #: whole, as before the rule. Tests use it for the "before" figure.
+        self.extend_shrinks = True
+        #: the clock a slice's budget is measured on: wall time (None) in
+        #: the live path; a harness on the stub passes the engine's
+        #: simulated seconds so a budget can be exceeded without waiting
+        self.build_clock = None
         #: the async search in flight for the build, if any: submitted on
         #: one serve-loop iteration, polled on later ones
         self._page: dict | None = None
@@ -2123,8 +2156,12 @@ class Broker:
         plan = self.vocabulary.next_slice(cluster.name, self.config, t)
         if plan is None:
             return
+        held_now = self.vocabulary.get(cluster.name)
+        self._build_extension = (plan.start, plan.until) if (
+            plan.kind == "back" and held_now is not None and plan.fields
+            and all(held_now.field_serves(f, self.config, t) for f in plan.fields)) else None
         self._build = elastic.VocabularyBuild(
-            self.config, plan.start, plan.until,
+            self.config, plan.start, plan.until, clock=self.build_clock,
             # fields an earlier slice (or an earlier run) counted and found
             # over the cap: not counted again, not paged
             over_cap=self.vocabulary.over_cap_fields(cluster.name, t),
@@ -2157,6 +2194,24 @@ class Broker:
             self.vocabulary.building.pop(cluster.name, None)
             self._drop_page()
             self._build = self._build_cluster = None
+            return
+        ext = self._build_extension
+        if ext is not None and self.extend_shrinks:
+            # older days on slower storage: the recent cover is fine, so the
+            # cluster is not failed, not stale and not held back; the next
+            # attempt at this edge covers half the range (see
+            # VocabularyIndex.note_extend_failure)
+            got = self.vocabulary.note_extend_failure(cluster.name, code, ext[1] - ext[0],
+                                                      ext[1], clock())
+            self._log_vocabulary(cluster.name, "extend_failed",
+                                 {**build.progress(), "refused": code,
+                                  "next_width_s": got["width"], "attempts": got["attempts"],
+                                  "retry_at": elastic._iso(got["retry_at"])})
+            self.vocabulary.in_progress.discard(cluster.name)
+            self.vocabulary.building.pop(cluster.name, None)
+            self._drop_page()
+            self._build = self._build_cluster = None
+            self._build_extension = None
             return
         self._log_vocabulary(cluster.name, "failed", {**build.progress(), "refused": code})
         self._build_failed[cluster.name] = code
@@ -2240,6 +2295,9 @@ class Broker:
         # the slice is whole: save it, and let the next iteration plan the
         # next slice. A restart resumes from here rather than starting over.
         how = self.vocabulary.put(cluster.name, build.result())
+        if self._build_extension is not None:
+            self.vocabulary.note_extend_success(cluster.name)
+            self._build_extension = None
         self.vocabulary.note_returning_progress(cluster.name, getattr(build, "only", None) or ())
         returned = self.vocabulary.settle_over_cap(cluster.name, self.config, clock())
         if returned:

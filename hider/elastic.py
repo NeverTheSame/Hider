@@ -197,6 +197,18 @@ VOCABULARY_RETURNING_RETRY_MAX_S = 3600.0
 #: STUCK. Cases are still served: its values were readable in text while
 #: it was over the cap and stay so; this only makes it loud.
 VOCABULARY_RETURNING_STUCK_S = 3600.0
+#: The narrowest **extension** slice: a slice reaching further back for
+#: fields that already serve cases. On a cluster whose older days sit on
+#: slower storage a one-day slice of an old day can cost more than
+#: ``vocabulary.budget_s`` (measured on one cluster: about 42s for a recent
+#: day, 600-730s for a day 10 to 20 days old, one at 1,028s of a 1,200s
+#: budget, two failed). A failed extension slice is retried at half its
+#: width, down to this floor; at the floor the retry delay doubles from
+#: VOCABULARY_RETRY_S to VOCABULARY_EXTEND_RETRY_MAX_S instead, and the
+#: VOCAB line says the cover stops there and why.
+VOCABULARY_EXTEND_MIN_S = 3600.0
+#: The longest wait between two attempts at an extension slice at its floor.
+VOCABULARY_EXTEND_RETRY_MAX_S = 3600.0
 #: A field at or above this share of its cap is reported as near it.
 VOCABULARY_NEAR_CAP = 0.8
 #: Identifier types a site may not read as a vocabulary, and why: one value
@@ -2354,6 +2366,12 @@ class VocabularyIndex:
         #: :meth:`returning` existed. ``es-eval`` uses it for the "before"
         #: half of the lapsed-decision figure.
         self.lapsed_waited = False
+        #: cluster -> the extension's state (see :meth:`note_extend_failure`):
+        #: ``width`` of the next extension slice, and while it is failing
+        #: ``attempts``, ``code``, ``since``, ``retry_at`` and the cover start
+        #: it failed at (``edge``). Saved, so a restart does not pay the
+        #: halvings again. Widths, counts, codes and times; never a value.
+        self.extend: dict[str, dict] = {}
         self.load()
 
     @property
@@ -2426,10 +2444,76 @@ class VocabularyIndex:
         held_back = {f for f in self.returning(cluster, config, now)
                      if (rec := self.returning_failure(cluster, f))
                      and float(rec.get("retry_at", 0.0)) > now}
+        ext = self.extend.get(cluster) or {}
         return plan_vocabulary_slice(config, self.clusters.get(cluster), now,
                                      [f for f in self.read_set(cluster, config, now)
                                       if f not in held_back],
-                                     waiting=self.wait_set(cluster, config, now))
+                                     waiting=self.wait_set(cluster, config, now),
+                                     extend_width=float(ext.get("width", VOCABULARY_SLICE_S)),
+                                     extend=float(ext.get("retry_at", 0.0)) <= now)
+
+    def note_extend_failure(self, cluster: str, code: str, width: float, edge: float,
+                            now: float) -> dict:
+        """An **extension** slice (older days for fields that already serve)
+        failed. Charged to the extension, never to the cluster: the recent
+        cover is fine, so nothing is marked failed or stale and top-ups are
+        not held back. The next attempt at the same edge covers **half**
+        the range that failed, down to :data:`VOCABULARY_EXTEND_MIN_S`; at
+        the floor it cannot shrink, so the delay doubles from
+        :data:`VOCABULARY_RETRY_S` to :data:`VOCABULARY_EXTEND_RETRY_MAX_S`
+        instead. Saved. Returns the record (widths, counts, code, times)."""
+        rec = self.extend.setdefault(cluster, {"width": VOCABULARY_SLICE_S})
+        if not rec.get("attempts"):
+            rec.update(attempts=0, since=float(now), at_floor=0)
+        rec["attempts"] = int(rec["attempts"]) + 1
+        rec["code"], rec["edge"] = str(code), float(edge)
+        if width <= VOCABULARY_EXTEND_MIN_S + 1.0:
+            rec["width"] = VOCABULARY_EXTEND_MIN_S
+            rec["at_floor"] = int(rec.get("at_floor", 0)) + 1
+            delay = min(VOCABULARY_EXTEND_RETRY_MAX_S,
+                        VOCABULARY_RETRY_S * 2 ** (rec["at_floor"] - 1))
+        else:
+            rec["width"] = max(VOCABULARY_EXTEND_MIN_S, float(width) / 2.0)
+            delay = VOCABULARY_RETRY_S
+        rec["retry_at"] = float(now) + delay
+        self.save()
+        return dict(rec)
+
+    def note_extend_success(self, cluster: str) -> None:
+        """An extension slice landed: the failure count is cleared and the
+        width that fitted is **kept** - older days only get slower on the
+        storage that motivated this, so growing back would pay the same
+        failure again. Saved."""
+        rec = self.extend.get(cluster)
+        if rec and rec.get("attempts"):
+            self.extend[cluster] = {"width": float(rec.get("width", VOCABULARY_SLICE_S))}
+            self.save()
+
+    def reach(self, cluster: str, config: ElasticConfig, now: float) -> dict | None:
+        """How far back the cover of the fields cases wait for reaches, and
+        why it stops there, when the extension has been narrowed or is
+        failing. None on a cluster whose extension never failed. Ranges,
+        widths, counts, a code and times; never a value."""
+        rec = self.extend.get(cluster)
+        held = self.clusters.get(cluster)
+        if not rec or held is None:
+            return None
+        wait = [f for f in self.wait_set(cluster, config, now) if f in held.covers]
+        if not wait:
+            return None
+        start = max(held.covers[f][0] for f in wait)
+        oldest = now - config.vocabulary_days * 86400.0
+        out = {"from": _iso(start), "days": round(max(0.0, now - start) / 86400.0, 2),
+               "wanted_days": config.vocabulary_days,
+               "complete": start <= oldest + 1.0,
+               "width_h": round(float(rec.get("width", VOCABULARY_SLICE_S)) / 3600.0, 2)}
+        if rec.get("attempts"):
+            out.update(attempts=int(rec["attempts"]), code=rec.get("code", ""),
+                       since=_iso(float(rec.get("since", now))),
+                       next_try=_iso(float(rec.get("retry_at", now))),
+                       stopped=float(rec.get("width", 0.0)) <= VOCABULARY_EXTEND_MIN_S + 1.0
+                       and int(rec.get("at_floor", 0)) > 0)
+        return out
 
     def put(self, cluster: str, vocab: ClusterVocabulary) -> str:
         """Fold a finished slice in, field by field. ``merged`` when every
@@ -2677,6 +2761,17 @@ class VocabularyIndex:
                     and isinstance(v.get("at"), (int, float))}
             if kept:
                 self.over_cap[str(name)] = kept
+        for name, rec in (raw.get("extend") or {}).items():
+            if isinstance(rec, dict) and isinstance(rec.get("width"), (int, float)):
+                keep = {"width": max(VOCABULARY_EXTEND_MIN_S,
+                                     min(VOCABULARY_SLICE_S, float(rec["width"])))}
+                if isinstance(rec.get("attempts"), int) and rec["attempts"] > 0:
+                    keep.update(attempts=int(rec["attempts"]), code=str(rec.get("code", "")),
+                                since=float(rec.get("since") or 0.0),
+                                retry_at=float(rec.get("retry_at") or 0.0),
+                                edge=float(rec.get("edge") or 0.0),
+                                at_floor=int(rec.get("at_floor") or 0))
+                self.extend[str(name)] = keep
 
     def save(self) -> None:
         path = self.path
@@ -2685,7 +2780,8 @@ class VocabularyIndex:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         body = {"schema": self.SCHEMA,
                 "clusters": {n: v.to_json() for n, v in self.clusters.items()},
-                "over_cap": {n: v for n, v in self.over_cap.items() if v}}
+                "over_cap": {n: v for n, v in self.over_cap.items() if v},
+                **({"extend": dict(self.extend)} if self.extend else {})}
         tmp = path.with_suffix(".tmp")
         old = os.umask(0o077)
         try:
@@ -2802,6 +2898,9 @@ class VocabularyIndex:
             "stuck": self.stuck(cluster, config, t),
             "building_fields": list(self.building.get(cluster, ())),
         }
+        reach = self.reach(cluster, config, t)
+        if reach is not None:
+            out["reach"] = reach
         if state == "stale" and failed is not None:
             out["refused"] = failed
         return out
@@ -2809,7 +2908,9 @@ class VocabularyIndex:
 
 def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | None",
                           now: float, read: Iterable[str] | None = None, *,
-                          waiting: Iterable[str] | None = None
+                          waiting: Iterable[str] | None = None,
+                          extend_width: float = VOCABULARY_SLICE_S,
+                          extend: bool = True
                           ) -> VocabularySlice | None:
     """The next one-day slice to read for a cluster, **per field**, or None
     if every field in ``read`` is complete and fresh.
@@ -2834,6 +2935,13 @@ def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
       minutes for that field once, which is no more than any field pays
       for any top-up; a **first** or **back** slice is shared by the
       fields that want exactly that range.
+
+    **Extension** - a ``back`` slice for fields that already serve - is
+    ``extend_width`` wide (a day unless an extension slice failed: see
+    :meth:`VocabularyIndex.note_extend_failure`), and is not planned at
+    all while ``extend`` is False (an extension waiting out its retry
+    delay). A back slice for a field that does not serve yet is always a
+    day: it is a first build's, and refusing cases is what it fixes.
 
     A field in ``read`` but not in ``waiting`` (back from over the cap,
     not yet waited for) never takes the first class: its slices rank after
@@ -2878,8 +2986,11 @@ def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
                           min(now, c[1] + VOCABULARY_SLICE_S), "forward"))
         elif c[0] > oldest + 1.0:
             serving = c[1] - c[0] >= want - 1.0
+            if serving and not extend:
+                continue
+            width = extend_width if serving else VOCABULARY_SLICE_S
             cands.append((0 if not serving else 2, f,
-                          max(oldest, c[0] - VOCABULARY_SLICE_S), c[0], "back"))
+                          max(oldest, c[0] - width), c[0], "back"))
     if not cands:
         return None
     if waiting is not None:
