@@ -201,6 +201,7 @@ as with `adversarial.CASES`).
 - **A field returning from over the cap is read but not waited for, never shares a slice with waited fields, and its failures are charged to it alone with a doubling retry** - else one id-like field takes every case down. Gate: `lapsed_decision_serves`; pin: `_FailingField` tests in `tests/test_esbridge.py`.
 - **An unchanged field set gets exactly the slices and request counts it had.** Pin: `tests/test_esbridge.py`.
 - **A failed extension slice (older days for fields that already serve) is charged to the extension, never the cluster: next try half as wide down to an hour, then a doubling delay; the width is saved; the VOCAB line says how far the cover reaches and why** - one slow old day was retried whole for ever and showed a healthy cover `stale`. Pin: `tests/test_esvocabage.py`.
+- **A catch-up slice with more than two days left that fails or passes a quarter of its budget jumps: the slice is dropped, the cover set aside (`held_over`, names still applied, never counted as cover), the newest days read as a first build, then the gap back to the set-aside range, joined into one range** - a slow two-week catch-up refused every case for hours, and one unfit day for ever. Pin: `tests/test_esvocabgap.py`; gate `catch_up_sliced` keeps its figures.
 
 #### Readability, labels and keep fields (docs/es/readability.md)
 
@@ -231,7 +232,7 @@ as with `adversarial.CASES`).
 - **es-preflight is human-only and read-only; exit 0 no STOP, 1 STOP, 2 could not assess - never clean by silence; values only under `--show-values`.** es-research shows the short form and needs `--accept-readable` (headless) or a `y` to continue past STOP. Pin: `tests/test_espreflight.py`.
 - **esutility never rewrites a question to fit the grammar; a human step is shown as one.** Pin: `tests/test_esutility.py`.
 - **Fixed documents for readability checks are appended after the RNG stream** (order in docs/es/preflight-utility-gates.md) so nothing existing moves; **every es-eval figure is the same from run to run** (labels picked from sorted lists).
-- **Measurement switches (`idle_answers`, `ordinary_words_case_wide`, `keep_parts_swept`, `lapsed_waited`, `merge(one_range=True)`) exist for "before" figures only; nothing in the live path sets them.**
+- **Measurement switches (`idle_answers`, `ordinary_words_case_wide`, `keep_parts_swept`, `lapsed_waited`, `merge(one_range=True)`, `extend_shrinks`, `catch_up_jumps`) exist for "before" figures only; nothing in the live path sets them.**
 - **`esbridge.clock` is replaced only by harnesses.**
 
 ### Other known limits (README Limitations)

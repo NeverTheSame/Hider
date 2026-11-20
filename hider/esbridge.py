@@ -49,6 +49,7 @@ thread, the one that owns the browser.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import selectors
@@ -1388,15 +1389,32 @@ def _reach_note(v: dict) -> str:
         return ""
     head = f" COVER REACHES {r['from']} ({r['days']}d of {r['wanted_days']}d)"
     if r.get("stopped"):
-        return (head + f": STOPS THERE - an older slice of {r['width_h']:g}h, the narrowest, did "
-                f"not fit vocabulary.budget_s ({r['code']}), {r['attempts']} attempts since "
-                f"{r['since']}, next try {r['next_try']}; names logged only before "
-                f"{r['from']} are not known")
+        why = ("did not fit vocabulary.budget_s" if r["code"] == "vocabulary"
+               else f"could not be read ({r['code']})")
+        return (head + f": STOPS THERE - an older slice of {r['width_h']:g}h, the narrowest, "
+                f"{why}, {r['attempts']} attempts since {r['since']}, next try "
+                f"{r['next_try']}; names logged only before {r['from']} are not known"
+                + (" except the ones read before the catch-up jump (below)"
+                   if v.get("held_over") else ""))
     if r.get("attempts"):
         return (head + f": older days are slower to read; the last older slice failed "
                 f"({r['code']}), {r['attempts']} attempts since {r['since']}, next try "
                 f"{r['next_try']} at {r['width_h']:g}h")
     return head + f": older days read {r['width_h']:g}h at a time (a day did not fit the budget)"
+
+
+def _held_over_note(v: dict) -> str:
+    """After a catch-up jump: the names read before the break are still
+    hidden, and the gap between that cover and the new one is not read
+    yet. Field names and ranges only."""
+    held = v.get("held_over") or {}
+    if not held:
+        return ""
+    return (" CATCH-UP JUMPED, GAP NOT READ YET (names logged only then are readable "
+            "until the build reaches their day): "
+            + ", ".join(f"{f} {x['gap'][0]} to {x['gap'][1]} ({x['gap_days']}d; names read "
+                        f"{x['names_from']} to {x['names_to']} still hidden)"
+                        for f, x in sorted(held.items())))
 
 
 def _frozen_note(v: dict) -> str:
@@ -1453,7 +1471,8 @@ def vocabulary_line(v: dict | None) -> str | None:
                 + (f"; {_backfill_note(v['backfill'])}"
                    + ("" if v.get("serving") else ", cases refused")
                    if v.get("backfill") else "")
-                + _over_cap_note(v) + _frozen_note(v) + _stuck_note(v) + _reach_note(v))
+                + _over_cap_note(v) + _frozen_note(v) + _stuck_note(v) + _reach_note(v)
+                + _held_over_note(v))
     if v.get("state") == "failed":
         return (f"VOCAB    build stopped: {v.get('refused')}; no case can run until one finishes"
                 + _over_cap_note(v))
@@ -1505,7 +1524,8 @@ def vocabulary_line(v: dict | None) -> str | None:
         line += f" NEAR CAP: {', '.join(v['near_cap'])}"
     if v.get("omitted"):
         line += (f" NOT READ (readable in text): {', '.join(sorted(v['omitted']))}")
-    line += _over_cap_note(v) + _frozen_note(v) + _stuck_note(v) + _reach_note(v)
+    line += (_over_cap_note(v) + _frozen_note(v) + _stuck_note(v) + _reach_note(v)
+             + _held_over_note(v))
     return line
 
 
@@ -1887,6 +1907,14 @@ class Broker:
         #: a failed extension slice is charged to the cluster and retried
         #: whole, as before the rule. Tests use it for the "before" figure.
         self.extend_shrinks = True
+        #: the slice in flight is a **catch-up** with more than a first
+        #: build's slices left: the fields whose cover a jump would set
+        #: aside (see ``_catch_up_jump``), else None
+        self._build_catch_up: tuple[str, ...] | None = None
+        #: measurement switch, set by nothing in the live path: with it off
+        #: a slow or failing catch-up slice is read through or retried as
+        #: before the rule. Tests use it for the "before" figures.
+        self.catch_up_jumps = True
         #: the clock a slice's budget is measured on: wall time (None) in
         #: the live path; a harness on the stub passes the engine's
         #: simulated seconds so a budget can be exceeded without waiting
@@ -2157,6 +2185,16 @@ class Broker:
         if plan is None:
             return
         held_now = self.vocabulary.get(cluster.name)
+        self._build_catch_up = None
+        if plan.kind == "forward" and held_now is not None:
+            bound = elastic.vocabulary_max_gap(self.config)
+            behind = tuple(f for f in plan.fields if (c := held_now.cover(f)) is not None
+                           and t - c[1] > bound)
+            if behind:
+                end = min(held_now.cover(f)[1] for f in behind)
+                left = math.ceil((t - end) / elastic.VOCABULARY_SLICE_S - 1e-9)
+                if left > elastic.VOCABULARY_SERVE_DAYS:
+                    self._build_catch_up = behind
         self._build_extension = (plan.start, plan.until) if (
             plan.kind == "back" and held_now is not None and plan.fields
             and all(held_now.field_serves(f, self.config, t) for f in plan.fields)) else None
@@ -2195,6 +2233,9 @@ class Broker:
             self._drop_page()
             self._build = self._build_cluster = None
             return
+        if self._build_catch_up and self.catch_up_jumps:
+            self._catch_up_jump(cluster, build, code)
+            return
         ext = self._build_extension
         if ext is not None and self.extend_shrinks:
             # older days on slower storage: the recent cover is fine, so the
@@ -2221,6 +2262,31 @@ class Broker:
         self._retry_at[cluster.name] = clock() + elastic.VOCABULARY_RETRY_S
         self._drop_page()
         self._build = self._build_cluster = None
+
+    def _catch_up_jump(self, cluster: elastic.Cluster, build, why: str) -> None:
+        """A catch-up through slow (or failing) days would keep every case
+        refused for longer than a first build takes. Abandon the slice -
+        nothing it read is kept, as with any slice that does not finish -
+        and set the cover of the fields it was for aside
+        (``VocabularyIndex.hold_over``): their names stay applied, and they
+        are read again as a first build is, newest day first, cases served
+        after two days, then back through the gap until the new cover
+        touches the old one. Not a failure: the cluster is not marked
+        failed or held back. Field names, ranges, counts and a code only."""
+        fields = self._build_catch_up or ()
+        moved = self.vocabulary.hold_over(cluster.name, fields)
+        self._log_vocabulary(cluster.name, "catch_up_jumped",
+                             {**build.progress(), "why": why, "held_over": moved})
+        self._note(cluster.name, (
+            f"the catch-up from {', '.join(f'{f} ending {r[1]}' for f, r in sorted(moved.items()))} "
+            f"was too slow to wait for ({why}); the newest days are read first, as a first build "
+            "is, and the gap behind them afterwards. Names read before the break stay hidden; "
+            "names logged only in the gap are readable until the build reaches their day"))
+        self.vocabulary.in_progress.discard(cluster.name)
+        self.vocabulary.building.pop(cluster.name, None)
+        self._drop_page()
+        self._build = self._build_cluster = None
+        self._build_catch_up = self._build_extension = None
 
     def _drop_page(self) -> None:
         """Release the async search in flight, if any."""
@@ -2290,6 +2356,10 @@ class Broker:
             return True
         self._save_over_cap(cluster, build)
         if build.pending():
+            if self._build_catch_up and self.catch_up_jumps and build.seconds > \
+                    elastic.VOCABULARY_CATCH_UP_SLOW_SHARE * self.config.vocabulary_budget_s:
+                self._catch_up_jump(cluster, build, "slow")
+                return True
             self._log_vocabulary(cluster.name, "progress", build.progress())
             return True
         # the slice is whole: save it, and let the next iteration plan the

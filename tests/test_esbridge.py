@@ -1713,6 +1713,11 @@ def test_a_gap_slice_that_fails_keeps_what_landed_and_is_retried(tmp_path):
     old, _b = eseval.build_vocabulary(cfg, engine, now - 10 * d, now - 7 * d)
     broker = esbridge.Broker(cfg, lambda: eseval.SteppedSearchTransport(engine),
                              poll_interval=0.0, sessions_dir=tmp_path)
+    # Pins the retry of a failed catch-up slice, which the live path still
+    # does when two or fewer slices are left. With more left (five here) a
+    # failure now jumps to the newest days instead (tests/test_esvocabgap.py);
+    # the switch keeps this the "before" of that rule.
+    broker.catch_up_jumps = False
     broker.open()
     broker.vocabulary.put("stub", old)
     broker.start_vocabulary(cluster)
@@ -2358,7 +2363,7 @@ def test_es_smoke_cli_takes_a_grammar_query_through_the_same_checks(capsys, tmp_
     rc = cli.main(base + ["--query", json.dumps(groups)])
     cap = capsys.readouterr()
     assert rc == 0, cap.out
-    assert re.search(r"errs:text_groups\(message\) groups=\d+/\d+ read=\d+/\d+ requests=1 strata=\d+ "
+    assert re.search(r"errs:text_groups\(message\) groups=\d+/\d+ read=\d+/\d+ requests=2 strata=\d+ "
                      r"exact=yes order_settled=\d+/\d+", cap.out)
     assert "filters: any_of=1(2) fields=job.status,log.level" in cap.out
     assert "NOTE     errs: every document in scope was read" in cap.out

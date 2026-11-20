@@ -577,6 +577,113 @@ because those are what refuse cases and narrowing them is a separate
 decision. Not measured on a real cluster yet: a tester should watch the
 VOCAB line through one extension past the slow days.
 
+**After a long break on a slow cluster the catch-up jumps to the newest
+days.** The catch-up reads forward from the cover's end one day at a time
+(above), and the gap rule refuses every case until it lands. After a break
+of more than a few days on a cluster whose older days are slow, that is
+every case refused for hours (about two hours for a two-week break with the
+costs measured on one cluster), and one catch-up day that cannot fit the
+budget was retried over the same range for ever, so no case was ever
+served. The extension rule above did not help: it narrows extension slices
+only, and a catch-up slice is a forward one.
+Measured on the real `Broker` with the aged stub costs (`eseval.AGED_REQUEST_SECONDS`,
+`eseval.aged_docs`, budget on simulated seconds), a cover of `job.name`
+from 30 to 14 days back and the bridge restarted 14 days later
+(`tests/test_esvocabgap.py`; before is `Broker.catch_up_jumps = False`, the
+measurement switch, set by nothing in the live path):
+- before (`test_before_a_two_week_break_refuses_every_case_through_the_slow_days`):
+  **first case served at 4,852 simulated seconds (81 minutes), every case
+  refused until then**; shorter than the two hours on the real cluster
+  because the stub's cost curve is an assumption;
+- before, one catch-up day 10 days back that always fails
+  (`test_before_one_catch_up_day_that_cannot_fit_refuses_every_case_for_ever`):
+  **no case served in six hours; 329 failures, every one the same day; 338
+  requests**;
+- after (`test_after_a_two_week_break_the_first_case_comes_about_as_soon_as_a_first_build`):
+  **first case at 510 seconds**, against **84 seconds** for a first build on
+  the same stub - the difference is the slow catch-up slice abandoned at a
+  quarter of its budget (two requests of about 213 seconds); 1 jump, 0
+  cluster failures, never `stale`; the gap read behind the new cover and
+  joined to the old one, **one range from 30 days back, at 5,277 seconds**;
+- after, the failing day (`test_after_one_catch_up_day_that_cannot_fit_cases_are_served_and_it_says_where`):
+  **first case at 510 seconds**, 0 cluster failures, never `stale`; the read
+  back stops at the day that cannot be read (the extension rule narrows it
+  to an hour, then backs off), and the line says both where the cover stops
+  and which gap is unread.
+The rule (`Broker._build_catch_up`, `Broker._catch_up_jump`,
+`VocabularyIndex.hold_over`, `ClusterVocabulary.held_over`,
+`VOCABULARY_CATCH_UP_SLOW_SHARE`):
+- **When**: a catch-up slice - forward, for fields whose cover is behind the
+  gap bound - with **more than `VOCABULARY_SERVE_DAYS` (two) one-day slices
+  left**, that either **fails** (any code) or has spent **more than a
+  quarter of `vocabulary.budget_s`** (300 seconds at the default) with
+  requests still to make. With two or fewer left, reading forward is no
+  slower than a first build, and the slice is read or retried as before.
+- **What**: the slice is abandoned and nothing it read is kept (the same
+  "nothing learnt from a partial read" as every slice); each of its fields'
+  cover is **set aside** (`held_over`) - its names stay in the vocabulary
+  and **stay applied**, but the range is not cover: nothing serves, counts
+  days or plans a top-up from it. The field is then read as a first build
+  is: the newest day, then the day behind it, cases served after two days;
+  then back through the gap as extension (narrowed on failure, above),
+  stopping exactly at the set-aside range's end, where `merge` joins the
+  two into **one range with no hole** and the set-aside record is gone. A
+  set-aside field's first new slice adds names; it never replaces them.
+- **Not a failure**: no `failed`, no `stale`, no retry hold on the cluster.
+  Logged as `catch_up_jumped` (fields, ranges, why: `slow` or the code),
+  and one `NOTE` for es-login.
+- **The gap rule is unchanged**: until the jump, the cover is behind and
+  every case is refused `catching_up`; after it, the field has no cover and
+  every case is refused `vocabulary_building` until its two newest days are
+  read - the first-build refusal. No case is served off a cover that is
+  behind.
+- **Never less safe than a first build**: when the first case is served the
+  field has exactly what a first build has (the newest two days) **plus**
+  every name read before the break (`test_at_the_first_served_case_it_is_at_least_as_safe_as_a_first_build`).
+- **A fast catch-up is exactly as before**: a catch-up slice that neither
+  fails nor passes a quarter of its budget is never touched; the
+  `catch_up_sliced` gate keeps its figures (7 slices, 35 requests, 433
+  seconds), and `test_a_fast_catch_up_is_read_forward_exactly_as_before`
+  compares slices, requests and time to first case with the switch on and
+  off.
+- **Saved**: `held_over` is written with the cluster in `vocabulary.json`
+  (ranges only; the names are the field's), restored as it is, and expires
+  with `vocabulary.days`: a set-aside range that falls out of the window is
+  dropped, with its names if the field has no new cover yet (as a dropped
+  cover is), or the range only if it has (the names are mixed in by then,
+  and hiding more is the safe direction).
+**What stays readable, and for how long**: names logged **only in the gap**
+- between the end of the set-aside cover and the start of the new one -
+are readable in message text from the first served case until the backward
+read reaches their day; the gap is read newest first, so the most recent
+gap days are hidden first. On the measurement that is up to **4,767
+seconds (about 79 minutes)** after the first case for the oldest gap day,
+about the old catch-up's length - the same names were readable before too,
+but nothing was served while they were. A gap day that cannot be read at
+all stays readable for as long as it fails, and the line says so. A first
+build leaves the same kind of days unread (every day older than two), so
+this is no wider than that.
+**What the VOCAB line says** (`esbridge._held_over_note`, from
+`report()["held_over"]`): `CATCH-UP JUMPED, GAP NOT READ YET (names logged
+only then are readable until the build reaches their day): <field> <from>
+to <to> (Nd; names read <a> to <b> still hidden)`, beside the usual
+`BACKFILLING` / `extending` wording; with the extension stopped as well,
+`COVER REACHES ... STOPS THERE ...` says where and why, and adds `except the
+ones read before the catch-up jump`.
+**Costs, declared**: the abandoned slice's work is lost (up to a quarter of a
+budget of cluster time, about 426 seconds on the measurement); a large but
+fast cluster whose catch-up slice takes more than a quarter of its budget
+also jumps (its first case comes sooner, and its gap is read behind it);
+**any** failure of a catch-up slice with more than two days left jumps,
+including a transient upstream error that a retry would have fixed - the
+cost is that the gap is read later (behind the first case) rather than
+first, never that a case is served with less than a first build; a field
+set aside twice keeps the newer range, and the older one's names stay
+(they are in the field already); the gap's back-read is extension, so its
+slices are the narrowed, never-failing-the-cluster kind above. Not
+measured on a real cluster: a tester should restart a bridge after a break
+of a week or more and watch the line.
+
 **Declared cost of the cap, new and the sharper one: a real name field
 with more distinct values than `vocabulary.max` is left unread under
 the default field set, so its values stay readable in message text.**

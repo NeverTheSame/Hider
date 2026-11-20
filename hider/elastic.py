@@ -207,6 +207,16 @@ VOCABULARY_RETURNING_STUCK_S = 3600.0
 #: VOCABULARY_RETRY_S to VOCABULARY_EXTEND_RETRY_MAX_S instead, and the
 #: VOCAB line says the cover stops there and why.
 VOCABULARY_EXTEND_MIN_S = 3600.0
+#: A **catch-up** slice (forward from a cover that is behind the gap bound)
+#: that has spent more than this share of ``vocabulary.budget_s`` with more
+#: than VOCABULARY_SERVE_DAYS one-day slices still to read before cases can
+#: run is abandoned (nothing it read is kept), and the fields it was for are
+#: read again newest day first, as a first build is, with their old cover
+#: set aside and still applied (VocabularyIndex.hold_over). A failed
+#: catch-up slice does the same. A quarter: well above a fast cluster's
+#: catch-up slice (75s worst on the es-eval fixture, about four minutes on
+#: a large fast estate), well below one slow old day (600-730s measured).
+VOCABULARY_CATCH_UP_SLOW_SHARE = 0.25
 #: The longest wait between two attempts at an extension slice at its floor.
 VOCABULARY_EXTEND_RETRY_MAX_S = 3600.0
 #: A field at or above this share of its cap is reported as near it.
@@ -2152,18 +2162,28 @@ class ClusterVocabulary:
     built_at: float = 0.0
     fields: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     covers: dict[str, tuple[float, float]] = dataclasses.field(default_factory=dict)
+    #: field -> the range of a cover set aside by a catch-up jump (see
+    #: :meth:`VocabularyIndex.hold_over`): its names are kept in ``fields``
+    #: and still applied, but the range is **not** cover - nothing serves,
+    #: counts days or plans a top-up from it. The field's new cover starts
+    #: at the newest day and is extended back until it touches this range,
+    #: when :meth:`merge` joins the two into one range with no hole.
+    held_over: dict[str, tuple[float, float]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.covers:
+        self.held_over = {f: (float(a), float(b)) for f, (a, b) in (self.held_over or {}).items()}
+        if not self.covers and not self.held_over:
             # a slice result: every field it read was read over its range
             self.covers = {f: (self.covered_from, self.covered_until) for f in self.fields}
             return
         self.covers = {f: (float(a), float(b)) for f, (a, b) in self.covers.items()}
         for f in self.fields:
-            self.covers.setdefault(f, (self.covered_from, self.covered_until))
+            if f not in self.held_over:
+                self.covers.setdefault(f, (self.covered_from, self.covered_until))
         # the range every held field covers; the record is ``covers``
-        self.covered_from = max(a for a, _ in self.covers.values())
-        self.covered_until = min(b for _, b in self.covers.values())
+        if self.covers:
+            self.covered_from = max(a for a, _ in self.covers.values())
+            self.covered_until = min(b for _, b in self.covers.values())
 
     @property
     def counts(self) -> dict[str, int]:
@@ -2199,10 +2219,13 @@ class ClusterVocabulary:
         for f, values in other.fields.items():
             oc = other.covers.get(f, (other.covered_from, other.covered_until))
             hc = covers.get(f)
-            if hc is not None and oc[0] <= hc[1] + 1.0 and oc[1] >= hc[0] - 1.0:
+            if (hc is not None and oc[0] <= hc[1] + 1.0 and oc[1] >= hc[0] - 1.0) \
+                    or (hc is None and f in self.held_over):
+                # extends the cover - or is a set-aside field's first new
+                # slice, whose names add to the ones kept, never replace them
                 have = set(fields.setdefault(f, []))
                 fields[f] += [v for v in values if v not in have and not have.add(v)]
-                covers[f] = (min(hc[0], oc[0]), max(hc[1], oc[1]))
+                covers[f] = oc if hc is None else (min(hc[0], oc[0]), max(hc[1], oc[1]))
             else:
                 fields[f] = list(values)
                 covers[f] = oc
@@ -2210,7 +2233,15 @@ class ClusterVocabulary:
         hi = max(self.covered_until, other.covered_until)
         if one_range:
             covers = {f: (lo, hi) for f in covers}
-        return ClusterVocabulary(lo, hi, other.built_at or self.built_at, fields, covers)
+        # a set-aside cover joins the field's cover once the two touch: one
+        # range, no hole, and the names were never dropped
+        held = dict(self.held_over)
+        for f, h in list(held.items()):
+            c = covers.get(f)
+            if c is not None and c[0] <= h[1] + 1.0 and c[1] >= h[0] - 1.0:
+                covers[f] = (min(c[0], h[0]), max(c[1], h[1]))
+                del held[f]
+        return ClusterVocabulary(lo, hi, other.built_at or self.built_at, fields, covers, held)
 
     def replaces(self, other: "ClusterVocabulary") -> bool:
         """Whether folding ``other`` in would replace any field's cover
@@ -2286,7 +2317,9 @@ class ClusterVocabulary:
         # per-field covers only: a cluster-level range would be a claim
         # about fields it was not read for
         return {"built_at": self.built_at, "fields": self.fields,
-                "covers": {f: [a, b] for f, (a, b) in self.covers.items()}}
+                "covers": {f: [a, b] for f, (a, b) in self.covers.items()},
+                **({"held_over": {f: [a, b] for f, (a, b) in self.held_over.items()}}
+                   if self.held_over else {})}
 
     @classmethod
     def from_json(cls, raw: Any) -> "ClusterVocabulary | None":
@@ -2296,16 +2329,20 @@ class ClusterVocabulary:
             covers = {str(f): (float(c[0]), float(c[1]))
                       for f, c in (raw.get("covers") or {}).items()
                       if isinstance(c, (list, tuple)) and len(c) == 2}
-            # a field with values but no cover is a claim with nothing
-            # behind it: dropped rather than guessed
+            held = {str(f): (float(c[0]), float(c[1]))
+                    for f, c in (raw.get("held_over") or {}).items()
+                    if isinstance(c, (list, tuple)) and len(c) == 2}
+            # a field with values but no cover (or set-aside cover) is a
+            # claim with nothing behind it: dropped rather than guessed
             fields = {str(f): [v for v in vs if isinstance(v, str)]
                       for f, vs in (raw.get("fields") or {}).items()
-                      if isinstance(vs, list) and str(f) in covers}
-            if not covers:
+                      if isinstance(vs, list) and (str(f) in covers or str(f) in held)}
+            if not covers and not held:
                 return None
-            lo = min(a for a, _ in covers.values())
-            hi = max(b for _, b in covers.values())
-            return cls(lo, hi, float(raw.get("built_at") or 0.0), fields, covers)
+            spans = list(covers.values()) or list(held.values())
+            lo = min(a for a, _ in spans)
+            hi = max(b for _, b in spans)
+            return cls(lo, hi, float(raw.get("built_at") or 0.0), fields, covers, held)
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -2479,6 +2516,34 @@ class VocabularyIndex:
         self.save()
         return dict(rec)
 
+    def hold_over(self, cluster: str, fields: Iterable[str]) -> dict[str, list[str]]:
+        """A **catch-up jump**: set the cover of each of ``fields`` aside
+        (``ClusterVocabulary.held_over``) so the field is read again as a
+        first build is - the newest day first, cases served after
+        :data:`VOCABULARY_SERVE_DAYS` - and then back through the gap until
+        the new cover touches the set-aside one and :meth:`ClusterVocabulary.merge`
+        joins them. The names read before the break are **kept and still
+        applied** throughout; only the claim of cover moves. Nothing is read
+        or learnt here. Returns the set-aside ranges (field -> [from, to]),
+        for the log; never a value. Saved."""
+        held = self.clusters.get(cluster)
+        if held is None:
+            return {}
+        moved = {f: held.covers[f] for f in fields if f in held.covers}
+        if not moved:
+            return {}
+        covers = {f: c for f, c in held.covers.items() if f not in moved}
+        # a field set aside twice keeps the newer range: the older one's
+        # names are in ``fields`` already, and its range would sit behind a
+        # hole the build will not read across
+        kept = {**held.held_over, **moved}
+        self.clusters[cluster] = ClusterVocabulary(
+            held.covered_from, held.covered_until, held.built_at,
+            {f: list(v) for f, v in held.fields.items()}, covers, kept)
+        self.catch_up_from.pop(cluster, None)
+        self.save()
+        return {f: [_iso(a), _iso(b)] for f, (a, b) in moved.items()}
+
     def note_extend_success(self, cluster: str) -> None:
         """An extension slice landed: the failure count is cleared and the
         width that fitted is **kept** - older days only get slower on the
@@ -2543,16 +2608,26 @@ class VocabularyIndex:
             return None
         oldest = now - config.vocabulary_days * 86400.0
         gone = {f: len(held.fields.get(f, [])) for f, (_a, b) in held.covers.items() if b < oldest}
-        if not gone:
+        # a set-aside cover past the window: a field with no cover of its
+        # own yet loses its names with it (as a dropped cover does); one
+        # with a new cover keeps its names (mixed with the new ones, and
+        # hiding more is the safe direction) and loses only the range
+        stale_held = {f for f, (_a, b) in held.held_over.items() if b < oldest}
+        gone.update({f: len(held.fields.get(f, [])) for f in stale_held if f not in held.covers})
+        if not gone and not stale_held:
             return None
         covers = {f: c for f, c in held.covers.items() if f not in gone}
-        if not covers:
+        kept_held = {f: h for f, h in held.held_over.items() if f not in stale_held}
+        if not covers and not kept_held:
             del self.clusters[cluster]
             self.catch_up_from.pop(cluster, None)
         else:
             self.clusters[cluster] = ClusterVocabulary(
                 held.covered_from, held.covered_until, held.built_at,
-                {f: v for f, v in held.fields.items() if f not in gone}, covers)
+                {f: v for f, v in held.fields.items() if f not in gone}, covers, kept_held)
+        self.save()
+        if not gone:
+            return None
         self.save()
         return gone
 
@@ -2901,6 +2976,16 @@ class VocabularyIndex:
         reach = self.reach(cluster, config, t)
         if reach is not None:
             out["reach"] = reach
+        if vocab.held_over:
+            # a catch-up jump: names read before the break still hidden, and
+            # the days between that cover and the new one not read yet -
+            # names logged only then are readable until the build gets there
+            out["held_over"] = {
+                f: {"names_from": _iso(a), "names_to": _iso(b),
+                    "gap": [_iso(b), _iso(vocab.covers[f][0] if f in vocab.covers else t)],
+                    "gap_days": round(max(0.0, (vocab.covers[f][0] if f in vocab.covers else t)
+                                          - b) / 86400.0, 2)}
+                for f, (a, b) in vocab.held_over.items()}
         if state == "stale" and failed is not None:
             out["refused"] = failed
         return out
@@ -2989,8 +3074,13 @@ def plan_vocabulary_slice(config: "ElasticConfig", held: "ClusterVocabulary | No
             if serving and not extend:
                 continue
             width = extend_width if serving else VOCABULARY_SLICE_S
-            cands.append((0 if not serving else 2, f,
-                          max(oldest, c[0] - width), c[0], "back"))
+            start = max(oldest, c[0] - width)
+            h = held.held_over.get(f) if held is not None else None
+            if h is not None and h[1] >= oldest and h[1] < c[0]:
+                # back through the gap after a catch-up jump: stop where the
+                # set-aside cover ends, so the two touch and join
+                start = max(start, h[1])
+            cands.append((0 if not serving else 2, f, start, c[0], "back"))
     if not cands:
         return None
     if waiting is not None:

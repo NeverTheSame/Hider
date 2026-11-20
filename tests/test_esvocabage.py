@@ -163,7 +163,7 @@ def test_a_day_that_cannot_fit_even_an_hour_stops_the_cover_and_says_so(tmp_path
     rep = got["report"]
     assert rep["reach"]["stopped"] is True
     line = esbridge.vocabulary_line(rep)
-    assert "STOPS THERE" in line and "vocabulary.budget_s" in line
+    assert "STOPS THERE" in line and "could not be read (upstream_error)" in line
     assert "Quarrytide" not in line and "Quarrytide" not in repr(got["log"])
     # top-ups kept their priority throughout
     assert got["cover_end_lag_s"] <= elastic.VOCABULARY_REFRESH_S + 1500.0
