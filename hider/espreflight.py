@@ -42,6 +42,14 @@ from . import elastic
 #: documents sampled per index pattern, newest first, over the last day
 PREFLIGHT_SAMPLE = 50
 PREFLIGHT_WINDOW_S = 86400.0
+#: An over-cap field this many times past ``vocabulary.max`` is reported as
+#: id-shaped: a wide *name* field lands near the cap (tens of thousands of
+#: tenants), an id lands orders of magnitude past it (a fresh value on
+#: nearly every document - 2-4 million against 50,000 measured on one real
+#: cluster). A heuristic, stated as one, costing 0 requests; the line says
+#: which fix each shape wants, because the fix for an id is the site map,
+#: never the cap.
+OVER_CAP_ID_RATIO = 10.0
 
 
 def _count_body(config: elastic.ElasticConfig, index: str, field: str, now: float) -> dict:
@@ -114,12 +122,25 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                 f"cover ends {report.get('age_s', 0) / 3600.0:.1f}h ago (top-up overdue)",
                 "let the top-up finish (es-login shows progress) or restart the bridge")
         for f, n in sorted((report.get("over_cap") or {}).items()):
+            cap = int(report.get("max") or config.vocabulary_max)
+            ratio = n / max(1, cap)
+            if ratio >= OVER_CAP_ID_RATIO:
+                size = (f"{f} ~{n} distinct values, about {ratio:.0f}x the cap {cap}: "
+                        "id-shaped (a name field lands near the cap, an id far past it)")
+                fix = ("fix the site map, not the cap: an id this wide is not a name field - "
+                       "type it as an id (a NO_VOCABULARY_TYPES type such as REQUEST_REF) or "
+                       "map it keep, so it is never a vocabulary candidate; raising "
+                       "vocabulary.max here would page millions of values at 1,000 a request")
+            else:
+                size = (f"{f} ~{n} distinct values, {ratio:.1f}x the cap {cap}: "
+                        "close to the cap, likely a wide name field")
+                fix = ("raise vocabulary.max (cost: a page per 1,000 values per slice), or "
+                       "list the field in vocabulary.fields to make the build refuse loudly")
             add("over_cap", "stop",
                 "a field wider than vocabulary.max is left unread; its values are readable "
                 "in message text",
-                f"{f} ~{n} distinct values > {report.get('max')}",
-                "raise vocabulary.max (a page per 1,000 values per slice) or list the field "
-                "in vocabulary.fields to make the build refuse loudly", field=f, count=n)
+                size, fix, field=f, count=n, cap=cap,
+                shape="id" if ratio >= OVER_CAP_ID_RATIO else "name")
         for f, rng in sorted((report.get("frozen") or {}).items()):
             add("frozen", "stop",
                 "a field that left the read set keeps only the names already read; values "
@@ -202,9 +223,10 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                 continue
             hits = scrubbed.output.get("hits", {}).get("hits", []) or []
             inside: dict[str, int] = {}
+            seen: set[tuple[int, str]] = set()
             labels: set[str] = set()
             values: set[str] = set()
-            for h in hits:
+            for i, h in enumerate(hits):
                 nodes = list(_leaves(h.get("_source") or {}))
                 if isinstance(h.get("_index"), str):
                     nodes.append(("_index", h["_index"]))
@@ -212,6 +234,7 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                     found = s._find_known(text)
                     if found:
                         inside[path] = inside.get(path, 0) + 1
+                        seen.add((i, path))
                         for _a, _b, v in found:
                             lab = s.known.get(v)
                             if lab:
@@ -220,16 +243,26 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                             else:
                                 values.add(v)
             if inside:
-                finding = {"index": pattern, "fields": dict(sorted(inside.items())),
-                           "labels": sorted(labels), "sampled": len(hits)}
+                # what a person decides on is the distinct names, not how
+                # many sampled documents repeat them: 2 names across the
+                # newest 50 documents read "58 to 200 values" before, and
+                # the number moved with the sample
+                docs_with = len({d for d, _p in seen})
+                finding = {"index": pattern, "names": len(labels),
+                           "fields": dict(sorted(inside.items())),
+                           "labels": sorted(labels), "documents": docs_with,
+                           "sampled": len(hits)}
                 if show_values:
                     finding["values"] = sorted(values)
+                in_index = " (one of them is the hit's own index name: the stream itself "                            "is named after the customer)" if "_index" in inside else ""
                 add("name_in_keep", "stop",
                     "a learnt name inside a longer keep value is readable (only a whole "
                     "keep value is replaced)",
-                    f"{pattern}: {sum(inside.values())} value(s) in "
-                    f"{', '.join(sorted(inside))} carry a learnt name, on the newest "
-                    f"{len(hits)} documents",
+                    f"{pattern}: {len(labels)} distinct learnt name(s) "
+                    f"({', '.join(sorted(labels))}) inside longer keep values, in "
+                    f"{', '.join(f'{p} on {c} doc(s)' for p, c in sorted(inside.items()))}"
+                    f"{in_index}; {docs_with} of the newest {len(hits)} documents carry one "
+                    "- a sample, so the document counts move between runs; the names do not",
                     "map the field as identifier, keep the stream out of indices, or seed "
                     "the name per case (--term)", **finding)
             if s.readable_words:
@@ -254,13 +287,13 @@ def gather(config: elastic.ElasticConfig, cluster: str,
 #: the same on every cluster, each a declared decision with its cap
 def _channel_lines(config: elastic.ElasticConfig) -> list[str]:
     return [
-        f"KNOW     by design, every cluster: a case may confirm up to {config.phrase_budget} "
+        f"DESIGN   by design, every cluster: a case may confirm up to {config.phrase_budget} "
         f"distinct text phrases by hit count ({config.max_phrases} per query); a page shows up "
         f"to {config.max_hits} labels and an aggregation up to {config.max_buckets} keys, all "
         "usable afterwards; keep-field literals are uncapped (a keep field is declared "
         "non-sensitive); a bare name in a keep field that tier 1 has no shape for passes "
         "(tier 2 stays off keep fields by design)",
-        "KNOW     recognizer- and classifier-level declared misses (unformatted phones, TLDs "
+        "DESIGN   recognizer- and classifier-level declared misses (unformatted phones, TLDs "
         "outside the list, the dotted-organisation head leak, a name beside a level word) are "
         "the same on every cluster: measured by `python -m hider eval`, not here",
     ]
@@ -293,15 +326,19 @@ def format_report(reports: dict[str, dict], config: elastic.ElasticConfig) -> li
             if f.get("values") or f.get("words"):
                 lines.append("VALUES   " + ", ".join(f.get("values") or f.get("words")))
         lines += _channel_lines(config)
+        # the verdict counts findings; the two DESIGN lines are not findings
+        # (they are the same on every cluster), so the counts match the
+        # KNOW-marked lines above
         if r["stops"]:
-            lines.append(f"VERDICT  {r['stops']} stop finding(s), {r['knows']} know: judge each "
-                         "STOP before letting a model session at this cluster")
+            lines.append(f"VERDICT  {r['stops']} stop finding(s), {r['knows']} know finding(s) "
+                         "on this cluster: judge each STOP before letting a model session at "
+                         "it (the DESIGN lines above hold everywhere)")
         elif r["knows"]:
-            lines.append(f"VERDICT  0 stop, {r['knows']} know finding(s): know them before you "
-                         "start")
+            lines.append(f"VERDICT  0 stop, {r['knows']} know finding(s) on this cluster: know "
+                         "them before you start (the DESIGN lines above hold everywhere)")
         else:
             lines.append("VERDICT  0 stop, 0 know findings: nothing readable to report beyond "
-                         "the designed channels above")
+                         "the DESIGN lines above, which hold on every cluster")
     return lines
 
 

@@ -128,7 +128,12 @@ early-terminated: on the before-test's two-filter zero, 3 requests and
 time is **inside** the query's reported `seconds` and reported apart as
 `empty.seconds`; es-smoke's line carries `fields_checked`,
 `check_requests` and `check_seconds`, and prints EMPTY (exit 3) for an
-absent field as before, OK for a real zero. **Nothing about the value**:
+absent field as before, OK for a real zero - and, on every zero, a
+`ZERO` line with **each filtered field's status by name**
+(`field=present field2=absent_in_window`), plus, on a real zero, the
+bridge's own `meaning` sentence, which used to print nothing: a person
+copying the report could only guess the statuses from the count of
+fields checked. Field names and status words, never a value. **Nothing about the value**:
 statuses, counts and sentences name fields, a filter's own value never
 enters its field's count, and the tests assert the typed value is
 absent from the explanation and the log. The model is told how to read

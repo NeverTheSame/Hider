@@ -14,17 +14,35 @@ counts and field names, and what to do about it**, then the designed
 channels, then a `VERDICT`.
 **Two severities.** `STOP` means a customer name is readable to a model
 session on this cluster right now: the vocabulary not serving or stale
-(with days and slices left), a field **over the cap** (`field ~count >
-cap`), a learnable field the map **omits** (with a live distinct count),
-a **frozen** field (its range; names since readable), a **stuck**
-returning field, and **names inside longer keep values** found on a
-sampled page (count, field paths, labels). `KNOW` means a declared trade
-with its size: the **skip rules'** counts by reason (ordinary words,
-short - readable in text; seed per case), **readable words** harvested
-on the sample (labels and fields), a withheld sample, and two fixed
-design lines (the phrase/label/keep channels with their caps, and a
-pointer to `hider eval` for the recognizer- and classifier-level misses,
-which are the same on every cluster and deliberately not restated here).
+(with days and slices left), a field **over the cap** - with its shape:
+a count `OVER_CAP_ID_RATIO` (10) or more times the cap is reported
+**id-shaped** and the fix offered is the site map (type it as a
+`NO_VOCABULARY_TYPES` id, or map it `keep`), never the cap, because a
+mistyped id of millions of values was being offered "raise
+vocabulary.max" (measured: ~2 and ~4 million against 50k on one real
+cluster); a count near the cap reads as a wide name field with the cap
+fix - a heuristic, stated as one, 0 requests; a learnable field the map
+**omits** (with a live distinct count), a **frozen** field (its range;
+names since readable), a **stuck** returning field, and **names inside
+longer keep values** found on a sampled page - reported as the
+**distinct names** (labels), the field paths with how many sampled
+documents carry one, and how many of the sampled documents carry any,
+with `_index` called out as the stream itself being named after the
+customer. It was the occurrence count summed over paths ("58 to 200
+value(s)" on one real cluster for 2 distinct names, moving between
+runs because the newest 50 are a sample); the line now leads with the
+2 and says the document counts move between runs and the names do not.
+`KNOW` means a declared trade with its size: the **skip rules'** counts
+by reason (ordinary words, short - readable in text; seed per case),
+**readable words** harvested on the sample (labels and fields), and a
+withheld sample. The two fixed design lines (the phrase/label/keep
+channels with their caps, and a pointer to `hider eval` for the
+recognizer- and classifier-level misses, which are the same on every
+cluster and deliberately not restated here) print as **`DESIGN`**, not
+`KNOW`: they are not findings, and a `VERDICT` saying "1 know" above
+three KNOW-prefixed lines made a tester count them by hand. The
+`VERDICT` counts findings only and says the DESIGN lines hold on every
+cluster.
 **Which declared limits became a number, a warning, or were left out**:
 numbered - cover days per field, over-cap, omitted (counted live),
 frozen ranges, stuck attempts, skip counts, names-in-keep and readable
@@ -63,9 +81,10 @@ there (`tests/test_espreflight.py`): over-cap `request.ref ~5500 >
 5000` (STOP); the field added late - `BACKFILLING labels.tenant_name …
 2 one-day slices left` under a `vocabulary_not_serving` STOP; the
 ordinary words - `skip_rules` KNOW `ordinary_word: 2, short: 1`; the
-job-named stream - `name_in_keep` STOP, 9 values in `_index`,
-`data_stream.dataset`, `data_stream.namespace` on the newest 3
-documents, the name only under `--show-values`; and the split fixture
+job-named stream - `name_in_keep` STOP, 1 distinct learnt name in
+`_index`, `data_stream.dataset`, `data_stream.namespace` (3 of the
+newest 3 documents carry one; it was "9 value(s)"), the name only under
+`--show-values`; and the split fixture
 reports **nothing**: 0 stop, 0 know, the channels still printed.
 
 **Operator utility (measured, not a gate).** Every gate below measures

@@ -1606,6 +1606,16 @@ def _filter_shape(filters: Any) -> str:
     return "filters: " + " ".join(parts) + " fields=" + ",".join(dict.fromkeys(fields))
 
 
+def _pct(share: float) -> str:
+    """A share as a percentage a person can act on: one decimal above 1%,
+    two significant digits below it - 980 of 66 million is 0.0015%, never
+    the "0.0%" that reads as nothing was read."""
+    p = 100.0 * share
+    if p >= 1.0:
+        return f"{p:.1f}%"
+    return f"{p:.2g}%" if p > 0 else "0%"
+
+
 def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
     """Every aggregation the query named, as type, field and bucket counts
     (the smoke flags' own aggregations are summarised by _bucket_summary).
@@ -1633,13 +1643,13 @@ def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
                 f"strata={got.get('strata')} exact={'yes' if got.get('exact') else 'no'} "
                 f"order_settled={got.get('order_settled')}/{n} "
                 f"other_docs={got.get('sum_other_doc_count')}"
-                + (f" covered={round(100 * share, 1)}%" if isinstance(share, (int, float))
+                + (f" covered={_pct(share)}" if isinstance(share, (int, float))
                    and share < 1.0 else ""))
             if isinstance(share, (int, float)) and share < 1.0:
                 cov = got.get("covered") or {}
                 notes.append(
                     f"{name}: the groups describe only the newest "
-                    f"{round(100 * share, 1)}% of the asked window "
+                    f"{_pct(share)} of the asked window "
                     f"(epoch ms {cov.get('from')} to {cov.get('to')}); the older part was "
                     f"not read - {got.get('timeouts')} sampling pass(es) hit the search "
                     "limit. The counts and the total are for the covered part alone; a "
@@ -1651,10 +1661,14 @@ def _agg_summary(query: dict, output: dict) -> tuple[list[str], list[str]]:
             else:
                 margins = [b.get("margin") for b in got.get("buckets") or [] if "margin" in b]
                 cov = got.get("coverage")
+                share_txt = "?" if cov is None else _pct(cov) + (
+                    f" of the scope, 1 document in {round(1 / cov):,} read" if 0 < cov < 0.01
+                    else " of the scope")
                 notes.append(
-                    f"{name}: counts are estimates from {got.get('sampled')} documents read over "
-                    f"{got.get('strata')} time ranges ({round(100 * cov, 1) if cov is not None else '?'}% "
-                    f"of the scope), the newest of each range scaled to the range; margin "
+                    f"{name}: counts are estimates from {got.get('sampled')} of "
+                    f"{got.get('total')} documents, read over "
+                    f"{got.get('strata')} time ranges ({share_txt}), the newest of each range "
+                    f"scaled to the range; margin "
                     f"(about 95%) up to {max(margins) if margins else '?'} on a group; the order "
                     f"is settled for the first {got.get('order_settled')} of {n} groups and not "
                     "known beyond; a group rarer than one per range's read may be missing, and "
@@ -1744,6 +1758,17 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
     shape = _filter_shape(query.get("filters"))
     if shape:
         print(f"         {shape}")
+    if empty is not None:
+        # a zero, real or not: the per-field statuses, so nobody has to
+        # guess them from the count of fields checked. Field names and
+        # status words only.
+        statuses = " ".join(f"{n}={x.get('status', '?')}"
+                            for n, x in (empty.get("fields") or {}).items())
+        print(f"ZERO     per filtered field: {statuses or 'no filtered fields'}")
+        if not findings and empty.get("meaning"):
+            # a real zero used to print OK and nothing else; say what the
+            # bridge concluded, in its own sentence
+            print(f"ZERO     {empty['meaning']}")
     for finding in findings:
         print(f"         {finding}")
     for note in notes + agg_notes:

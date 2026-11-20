@@ -582,6 +582,11 @@ def test_eq_on_a_keep_field_narrows_and_on_a_missing_field_is_empty(stub, tmp_pa
     # a value nobody has: a real zero, the field is there
     rc, out, _ = _smoke(b, capsys, eq=[("data_stream.dataset", "nope.nope")])
     assert rc == 0 and out.startswith("OK ") and "fields_checked=1" in out
+    # a real zero says each field's status and what the bridge concluded,
+    # instead of leaving the person to guess from the count of fields checked
+    assert "ZERO     per filtered field: data_stream.dataset=present" in out
+    assert "ZERO     data_stream.dataset is filled on the documents" in out
+    assert "a real zero for that filter" in out
     # a listed field this index never fills (a label named differently here)
     rc, out, _ = _smoke(b, capsys, eq=[("job.status", "Failed"), ("transaction.result", "ok")])
     assert rc == 3 and "transaction.result holds no documents in this index and window" in out
@@ -2306,6 +2311,25 @@ def _group_report(hits_total, agg):
                        "aggregations": {"errs": agg}}}
 
 
+def test_a_tiny_read_share_prints_its_real_percentage_not_zero(capsys):
+    """980 documents of 66 million printed "(0.0% of the scope)", which reads
+    as nothing was read; a share below 1% keeps two significant digits and
+    says how rare a read document is."""
+    agg = {"buckets": [{"key": "Request throttled by <*>", "doc_count": 33_000_000,
+                        "sampled_count": 490, "margin": 900_000}],
+           "sum_other_doc_count": 0, "sampled": 980, "groups": 1, "exact": False,
+           "total": 66_000_000, "coverage": 980 / 66_000_000, "strata": 49,
+           "strata_read_whole": 0, "order_settled": 1, "sample_cap": 1000, "requests": 2}
+    q = {"index": "logs-app-*", "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
+         "filters": [], "aggs": {"errs": {"type": "text_groups",
+                                          "field": "job.status_message", "size": 10}}}
+    assert esbridge.print_smoke("stub", q, _group_report(66_000_000, agg)) == 0
+    out = capsys.readouterr().out
+    assert "estimates from 980 of 66000000 documents" in out
+    assert "(0.0015% of the scope, 1 document in 67,347 read)" in out
+    assert "(0.0%" not in out
+
+
 def test_print_smoke_summarises_a_grammar_query_as_counts_and_shows_texts_only_on_request(capsys):
     q = {"index": "logs-app-*", "time_range": {"gte": "now-7d", "lte": "now"}, "size": 0,
          "filters": [{"field": "job.status", "op": "eq", "value": "Failed"},
@@ -2326,7 +2350,8 @@ def test_print_smoke_summarises_a_grammar_query_as_counts_and_shows_texts_only_o
     assert ("errs:text_groups(job.status_message) groups=2/3 read=979/2700 requests=1 strata=49 "
             "exact=no order_settled=2/2 other_docs=199") in out
     assert "filters: eq=1 not=1 any_of=1(2) fields=job.status,message,log.level,event.outcome" in out
-    assert "NOTE     errs: counts are estimates from 979 documents read over 49 time ranges (36.3%" in out
+    assert ("NOTE     errs: counts are estimates from 979 of 2700 documents, read over "
+            "49 time ranges (36.3% of the scope)") in out
     assert "margin (about 95%) up to 78" in out and "settled for the first 2 of 2" in out
     # no group text, no key, no value without --show
     assert "Throttled" not in out and "vault" not in out and "scheduler tick" not in out

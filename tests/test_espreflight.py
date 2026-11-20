@@ -42,11 +42,21 @@ def test_an_over_cap_field_is_a_stop_with_its_count():
     r = espreflight.gather(cfg, "stub", index, lambda b: sess.search(None, b), now=NOW)
     (f,) = _by_id(r, "over_cap")
     assert f["severity"] == "stop" and f["field"] == eseval.OVER_CAP_FIELD and f["count"] == 5500
-    assert "~5500 distinct values > 5000" in f["size"] and "vocabulary.max" in f["fix"]
+    # 1.1x the cap reads as a wide name field, with the cap fix
+    assert "~5500 distinct values, 1.1x the cap 5000" in f["size"]
+    assert f["shape"] == "name" and "raise vocabulary.max" in f["fix"]
     assert r["stops"] == 1
     text = "\n".join(espreflight.format_report({"stub": r}, cfg))
     assert "STOP " in text and "request.ref ~5500" in text and "VERDICT  1 stop" in text
     assert eseval.OVER_CAP_TENANT not in text and eseval.OVER_CAP_JOB not in text
+    # millions against a 50k-style cap is an id in a mistyped field: the fix
+    # offered is the site map, never the cap
+    index.note_over_cap("stub", "request.ref2", 2_000_000, NOW)
+    r2 = espreflight.gather(cfg, "stub", index, lambda b: sess.search(None, b), now=NOW)
+    (fid,) = [x for x in _by_id(r2, "over_cap") if x["field"] == "request.ref2"]
+    assert fid["shape"] == "id" and "about 400x the cap 5000" in fid["size"]
+    assert "id-shaped" in fid["size"]
+    assert "fix the site map, not the cap" in fid["fix"] and "NO_VOCABULARY_TYPES" in fid["fix"]
 
 
 def test_a_field_added_late_is_a_stop_with_its_slices_left():
@@ -99,8 +109,13 @@ def test_a_stream_named_after_a_job_is_a_stop_with_fields_and_counts_never_the_n
     r = espreflight.gather(cfg, "stub", index, search, now=NOW)
     (f,) = _by_id(r, "name_in_keep")
     assert f["severity"] == "stop" and f["sampled"] == 3
+    # what a person decides on: the distinct names (here 1), not the 9
+    # path-occurrences the sample happened to repeat them in
+    assert f["names"] == 1 and f["documents"] == 3
     assert f["fields"] == {"_index": 3, "data_stream.dataset": 3, "data_stream.namespace": 3}
-    assert "9 value(s)" in f["size"] and "identifier" in f["fix"]
+    assert "1 distinct learnt name(s)" in f["size"] and "identifier" in f["fix"]
+    assert "a sample, so the document counts move between runs" in f["size"]
+    assert "hit's own index name" in f["size"]       # _index is named apart
     # the index *pattern* is site-map config the person wrote and es-smoke
     # already prints; with it stripped, the name appears nowhere - not as a
     # value, not in a backing index, not behind a label

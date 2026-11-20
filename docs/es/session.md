@@ -75,8 +75,11 @@ buckets=5 other_docs=16`, `n:cardinality(job.id) value=28`), and for
 strata=K exact=yes|no order_settled=S/shown other_docs=…` (plus
 `covered=NN%` when the read stopped before the whole window), with a
 `NOTE` saying how far the reply says to trust it (exact: every
-document read; estimated: documents read over how many time ranges and
-what share of the scope, the largest margin, how many leading groups
+document read; estimated: documents read of how many, over how many
+time ranges and what share of the scope - a share under 1% keeps two
+significant digits and says how rare a read document is (`0.0015% of
+the scope, 1 document in 67,347 read`), where 980 of 66 million used
+to print `0.0%` - the largest margin, how many leading groups
 the order is settled for, the two declared misses; partial coverage:
 which newest part of the window the groups describe and that a group
 may be commoner in the unread part) and one for
