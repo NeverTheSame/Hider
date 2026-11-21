@@ -270,12 +270,59 @@ def test_a_bad_index_refusal_keeps_its_message_and_carries_shapes_for_a_person()
 def test_index_shape_counts_cap_at_five_shapes_and_count_the_rest():
     raw = {"rawResponse": {"hits": {"hits": [
         _hit(APP_DOC, index="tempestite" + "-x" * n) for n in range(7)]}}}
-    shapes = elastic._index_shape_counts(raw)
+    refuse_all = lambda name: False  # noqa: E731
+    shapes = elastic._index_shape_counts(raw, refuse_all)
     assert len(shapes) == 6
     assert all(s["hits"] == 1 for s in shapes[:5])
     assert shapes[5] == {"index_shape": "<other>", "hits": 2}
-    assert elastic._index_shape_counts({"rawResponse": {"hits": {"hits": "no"}}}) == []
-    assert elastic._index_shape_counts({}) == []
+    assert elastic._index_shape_counts({"rawResponse": {"hits": {"hits": "no"}}},
+                                       refuse_all) == []
+    assert elastic._index_shape_counts({}, refuse_all) == []
+
+
+@pytest.mark.parametrize("name,want", [
+    ("логи-клиент-000042", "L-L-9"),
+    ("café-münchen-2026.08.20", "L-L-9.9.9"),
+    ("tempestite-default-٣٤", "L-L-9"),
+    ("partial-.ds-données-default-2026.08.20-000042", "partial-.ds-L-L-9.9.9-9"),
+    ("tempestite default★", "L?L?"),
+])
+def test_index_shape_hides_letters_and_digits_of_any_script(name, want):
+    """The rule was ASCII-only once: a name in another alphabet was written
+    to the log whole (``логи-клиент-000042`` came out as ``логи-клиент-9``).
+    Letters and digits of any script are runs like any other, and whatever
+    is left that is not ASCII punctuation becomes ``?``."""
+    import string
+
+    shape = elastic.index_shape(name)
+    assert shape == want
+    rest = shape
+    for word in ("partial-", ".ds-"):
+        rest = rest.replace(word, "")
+    assert all(ch in "L9?" or ch in string.punctuation for ch in rest)
+
+
+def test_index_shapes_count_refused_names_only_wherever_the_reply_carries_them():
+    """An allowed and a refused name can share a shape, so a name the
+    allowlist admits is not counted: the line says what was refused. A hit
+    under an aggregation is read like a page's own (a group read is refused
+    there), and a document's own content never is."""
+    cfg = elastic.load(elastic.EXAMPLE)
+    allowed = ".ds-logs-app-default-2026.08.20-000001"
+    refused = ".ds-tempestite-billing-default-2026.08.20-000042"
+    assert cfg.index_allowed(allowed) and not cfg.index_allowed(refused)
+    assert elastic.index_shape(allowed) == elastic.index_shape(refused)
+    nested = {"_index": "partial-" + refused, "_id": "n1",
+              "_source": {"_index": "quokkastream-never-read"},
+              "fields": {"note": [{"_index": "quokkastream-never-read"}]}}
+    raw = {"rawResponse": {
+        "hits": {"hits": [_hit(APP_DOC, index=allowed), _hit(APP_DOC, index=allowed),
+                          _hit(APP_DOC, index=refused)]},
+        "aggregations": {"ranges": {"buckets": [
+            {"key": 1, "sample": {"hits": {"hits": [nested]}}}]}}}}
+    assert elastic._index_shape_counts(raw, cfg.index_allowed) == [
+        {"index_shape": ".ds-L-L-L-9.9.9-9", "hits": 1},
+        {"index_shape": "partial-.ds-L-L-L-9.9.9-9", "hits": 1}]
 
 
 def test_poll_timeout_defaults_and_bounds():

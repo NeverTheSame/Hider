@@ -117,6 +117,24 @@ def test_failed_slices_are_grouped_by_code(tmp_path):
     assert "upstream_error: 1" in p.stdout
 
 
+def test_older_day_and_returning_field_failures_are_reported_under_their_own_word(tmp_path):
+    """The bridge charges a failed older-day extension and a failed
+    returning field to themselves, under their own event words. They are
+    known words, and they are in the failure table apart from ``failed``."""
+    rows = [_row("failed", refused="vocabulary"),
+            _row("extend_failed", refused="vocabulary", next_width_s=43200, attempts=1),
+            _row("extend_failed", refused="vocabulary", next_width_s=21600, attempts=2),
+            _row("returning_failed", refused="upstream_error"),
+            _row("catch_up_jumped", why="slow"), _row("expired"), _row("returned")]
+    p = _run(_write_log(tmp_path, rows), "--json")
+    assert p.returncode == 0
+    report = json.loads(p.stdout)
+    assert report["unknown_event_words"] == {}
+    assert report["failed_slices_by_code"] == {
+        "vocabulary": 1, "extend_failed: vocabulary": 2,
+        "returning_failed: upstream_error": 1}
+
+
 def test_over_cap_rows_are_grouped_by_field(tmp_path):
     rows = [_row("over_cap", field="stub.ref", distinct=5500, max=5000),
             _row("over_cap", field="stub.ref", distinct=5600, max=5000),

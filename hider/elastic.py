@@ -65,7 +65,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import entities, jsonscrub, localcfg, paths, pipeline, pseudonym
 
@@ -303,7 +303,10 @@ def index_shape(name: str) -> str:
     """The shape of an index name, for a person reading a ``bad_index``
     refusal: which of Elasticsearch's own prefixes and stream markers it
     carried, with every other run of letters as ``L`` and of digits as
-    ``9``. No letter of the name, no first letter and no length survive."""
+    ``9``. No letter of the name, no first letter and no length survive -
+    in any script: a name written outside ASCII is hidden the same way,
+    and whatever is then neither a letter, a digit nor ASCII punctuation
+    (a combining mark, a symbol, a space) becomes ``?``."""
     rest = name
     head = ""
     for prefix in _INDEX_SHAPE_PREFIXES:
@@ -316,28 +319,41 @@ def index_shape(name: str) -> str:
             head += marker
             rest = rest[len(marker):]
             break
-    body = re.sub(r"[0-9]+", "9", re.sub(r"[A-Za-z]+", "L", rest))
+    body = re.sub(r"[^\W\d_]+", "L", rest)
+    body = re.sub(r"\d+", "9", body)
+    body = re.sub(r"[^L9!-/:-@\[-`{-~]+", "?", body)
     return head + body
 
 
-def _index_shape_counts(raw: Any) -> list[dict]:
-    """``_index`` shapes with the number of page hits carrying each, most
-    frequent first, at most five shapes and one count of the rest. The
-    decision log's record of a ``bad_index`` refusal."""
-    body = raw.get("rawResponse", raw) if isinstance(raw, dict) else None
-    hits = body.get("hits") if isinstance(body, dict) else None
-    rows = hits.get("hits") if isinstance(hits, dict) else None
-    if not isinstance(rows, list):
-        return []
+#: how many nodes of a refused reply are walked for index names: far more
+#: than a page of hits or a group read's ranges hold, and a bound all the same
+_INDEX_SHAPE_WALK_MAX = 100_000
+
+
+def _index_shape_counts(raw: Any, allowed: Callable[[str], bool]) -> list[dict]:
+    """Shapes of the *refused* ``_index`` names in a reply, with the number
+    of hits carrying each, most frequent first, at most five shapes and one
+    count of the rest. A name ``allowed`` admits is not counted: an allowed
+    and a refused name can share a shape, and the line must say what was
+    refused. Hits are read wherever the reply carries them - the page's own
+    and those under an aggregation (a ``top_hits``, a group read's ranges) -
+    and a document's own content (``_source``, ``fields``) is never read.
+    The decision log's record of a ``bad_index`` refusal."""
     counts: dict[str, int] = {}
-    for h in rows:
-        if not isinstance(h, dict):
-            continue
-        idx = h.get("_index")
-        if not isinstance(idx, str):
-            continue
-        shape = index_shape(idx)
-        counts[shape] = counts.get(shape, 0) + 1
+    stack: list[Any] = [raw.get("rawResponse", raw)] if isinstance(raw, dict) else []
+    walked = 0
+    while stack and walked < _INDEX_SHAPE_WALK_MAX:
+        node = stack.pop()
+        walked += 1
+        if isinstance(node, dict):
+            idx = node.get("_index")
+            if isinstance(idx, str) and not allowed(idx):
+                shape = index_shape(idx)
+                counts[shape] = counts.get(shape, 0) + 1
+            stack.extend(v for k, v in node.items()
+                         if k not in ("_source", "fields") and isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     out = [{"index_shape": shape, "hits": n} for shape, n in ordered[:5]]
     rest = sum(n for _, n in ordered[5:])
@@ -1530,7 +1546,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 # which index names were refused, as shapes with hit counts,
                 # for the decision log and the human surfaces only - never
                 # for anything a model receives
-                e.detail = {"index_shapes": _index_shape_counts(raw)}
+                e.detail = {"index_shapes": _index_shape_counts(raw, self.config.index_allowed)}
             raise
 
     def _refuse(self, code: str, message: str) -> Refused:

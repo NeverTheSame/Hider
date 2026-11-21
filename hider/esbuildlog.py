@@ -24,7 +24,14 @@ from statistics import median
 #: the event words the bridge writes today. Anything else is still counted,
 #: under its own word - never lumped into a clean-looking total.
 KNOWN_EVENTS = frozenset({"start", "progress", "slice", "failed",
-                          "over_cap", "untrusted"})
+                          "over_cap", "untrusted", "expired", "returned",
+                          "returning_failed", "extend_failed", "catch_up_jumped"})
+
+#: the event words that record a failed read. ``failed`` is a slice of the
+#: fields cases wait for; the other two are charged to an older-day
+#: extension or to a field returning from over the cap, and are reported
+#: under their own word so the three are never read as one figure.
+FAILURE_EVENTS = ("failed", "extend_failed", "returning_failed")
 
 #: age buckets for "how old the end of a slice's range was when the row was
 #: written", in days. A negative age (a range end after the row was written)
@@ -114,9 +121,11 @@ def analyze(rows: list[dict]) -> dict:
 
     failed: dict[str, int] = {}
     for r in rows:
-        if r.get("vocabulary") == "failed":
+        word = r.get("vocabulary")
+        if word in FAILURE_EVENTS:
             code = str(r.get("refused") or "no_code")
-            failed[code] = failed.get(code, 0) + 1
+            key = code if word == "failed" else f"{word}: {code}"
+            failed[key] = failed.get(key, 0) + 1
 
     over_cap: dict[str, int] = {}
     for r in rows:

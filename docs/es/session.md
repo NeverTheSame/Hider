@@ -23,8 +23,14 @@ to the person, never to the model: the decision-log row, es-smoke
 *shape* with the number of hits on the page that had it
 (`elastic.index_shape`: Elasticsearch's own prefixes as written, every
 other run of letters as `L`, of digits as `9`; at most five shapes and
-one count of the rest). No letter of a name survives. The refusal a
-model receives stays the same code and message.
+one count of the rest). No letter of a name survives, in any script:
+the rule was ASCII-only at first, and a name written in another
+alphabet came out whole; what is then neither a letter, a digit nor
+ASCII punctuation becomes `?`. Only refused names are counted - an
+allowed and a refused name can share a shape - and hits are read
+wherever the reply carries them, under an aggregation too (a group
+read is refused there), never from a document's own content. The
+refusal a model receives stays the same code and message.
 The stub enforces the same rules (cookie sessions, an
 IdP that refuses headless and fetches).
 **es-login waits for a healthy bridge however long its slices take.**

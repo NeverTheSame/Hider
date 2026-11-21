@@ -205,7 +205,7 @@ def test_index_shapes_of_a_bad_index_refusal_are_read_back_with_the_refusal_line
     r = esreview.review(_write(a, [_row(refused="bad_index", index_shapes=shapes), _row()]))
     assert r["numbers"]["index_shapes"] == [{"code": "bad_index", "shapes": shapes}]
     text = "\n".join(esreview.format_review(r))
-    assert "INDICES   bad_index: partial-.ds-L-L-9.9.9-9=3, .fs-L-L-9.9.9-9=1" in text
+    assert "INDICES  bad_index: partial-.ds-L-L-9.9.9-9=3, .fs-L-L-9.9.9-9=1" in text
     # a log without the key prints no such line
     b = tmp_path / "b"
     b.mkdir()

@@ -435,7 +435,7 @@ def format_review(r: dict) -> list[str]:
     for rs in n.get("refused_shapes") or []:
         out.append(f"REFUSED  {rs['code']}: " + json.dumps(rs["shape"], sort_keys=True))
     for is_ in n.get("index_shapes") or []:
-        out.append(f"INDICES   {is_['code']}: " + ", ".join(
+        out.append(f"INDICES  {is_['code']}: " + ", ".join(
             f"{s['index_shape']}={s['hits']}" for s in is_["shapes"]))
     out.append(f"USABLE   labels {n['labels_usable']}, keep values {n['keep_values_usable']}, "
                f"labels issued {n['labels_issued']}")
