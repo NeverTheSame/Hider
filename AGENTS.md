@@ -93,6 +93,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
                                                  # cluster, which declared limit each miss is, how big, what to do
 .venv/bin/python -m hider es-seed --case c1 --term "JOB_NAME=<job>"  # add a name to the open case; the session goes on
 .venv/bin/python -m hider es-review --case c1    # read a case back: numbers, phrase spend, probing signals (human-only)
+.venv/bin/python -m hider.esbuildlog             # read the vocabulary build log back: slices, seconds by age of range, failures, human-only
 .venv/bin/python -m hider es-logout              # stop the bridge; the Kibana session ends with it
 ```
 
