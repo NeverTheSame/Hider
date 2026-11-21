@@ -195,3 +195,20 @@ def test_names_the_engineer_added_mid_case_are_reported_and_a_guess_pattern_is_f
     r = esreview.review(_write(tmp_path, [_row()]))
     sig = next(s for s in r["signals"] if s["name"] == "mid_case_seeding")
     assert sig["flagged"] is False and r["numbers"]["names_added_mid_case"] == 0
+
+
+def test_index_shapes_of_a_bad_index_refusal_are_read_back_with_the_refusal_lines(tmp_path):
+    shapes = [{"index_shape": "partial-.ds-L-L-9.9.9-9", "hits": 3},
+              {"index_shape": ".fs-L-L-9.9.9-9", "hits": 1}]
+    a = tmp_path / "a"
+    a.mkdir()
+    r = esreview.review(_write(a, [_row(refused="bad_index", index_shapes=shapes), _row()]))
+    assert r["numbers"]["index_shapes"] == [{"code": "bad_index", "shapes": shapes}]
+    text = "\n".join(esreview.format_review(r))
+    assert "INDICES   bad_index: partial-.ds-L-L-9.9.9-9=3, .fs-L-L-9.9.9-9=1" in text
+    # a log without the key prints no such line
+    b = tmp_path / "b"
+    b.mkdir()
+    r2 = esreview.review(_write(b, [_row(refused="bad_index")]))
+    assert r2["numbers"]["index_shapes"] == []
+    assert "INDICES" not in "\n".join(esreview.format_review(r2))

@@ -218,6 +218,66 @@ def test_a_page_from_a_data_stream_is_scrubbed_and_a_foreign_stream_is_refused()
     assert e.value.code == "bad_index"
 
 
+@pytest.mark.parametrize("name,want", [
+    ("partial-.ds-tempestite-default-2026.08.20-000042",
+     "partial-.ds-L-L-9.9.9-9"),
+    ("restored-.ds-tempestite-default-2026.08.20-000042",
+     "restored-.ds-L-L-9.9.9-9"),
+    ("shrink-tempestite-default-2026.08.20-000042",
+     "shrink-L-L-9.9.9-9"),
+    ("downsample-tempestite-default-1h-2026.08.20",
+     "downsample-L-L-9L-9.9.9"),
+    ("tempestite-backup-.ds-logs-2026.08.20-000001",
+     "L-L-.L-L-9.9.9-9"),
+    (".fs-tempestite-default-2026.08.20-000042",
+     ".fs-L-L-9.9.9-9"),
+    ("tempestite-default-2026.08.20",
+     "L-L-9.9.9"),
+])
+def test_index_shape_keeps_only_declared_words_and_the_runs_of_the_rest(name, want):
+    """A refused index name is written as its shape: Elasticsearch's own
+    prefixes and stream markers as written, every other run of letters as L
+    and of digits as 9. No letter run of the name survives."""
+    shape = elastic.index_shape(name)
+    assert shape == want
+    declared = {"partial", "restored", "shrink", "downsample", "ds", "fs"}
+    for run in re.findall(r"[A-Za-z]{2,}", name):
+        if run not in declared:
+            assert run not in shape
+    assert name not in shape and name.lower() not in shape.lower()
+
+
+def test_a_bad_index_refusal_keeps_its_message_and_carries_shapes_for_a_person():
+    """The refusal a model receives is byte for byte what it always was; the
+    shapes travel beside it, on the exception, for the decision log and the
+    human surfaces only."""
+    s = _session()
+    hits = [_hit(APP_DOC, index="partial-.ds-tempestite-default-2026.08.20-000042"),
+            _hit(APP_DOC, index="partial-.ds-tempestite-default-2026.08.20-000042"),
+            _hit(APP_DOC, index=".fs-otherstream-default-2026.08.19-000007")]
+    with pytest.raises(elastic.Refused) as e:
+        s.scrub_response(_envelope(hits), PLAN)
+    assert e.value.code == "bad_index"
+    assert e.value.message == ("response withheld: a hit came from an index "
+                               "outside the allowlist")
+    assert e.value.detail == {"index_shapes": [
+        {"index_shape": "partial-.ds-L-L-9.9.9-9", "hits": 2},
+        {"index_shape": ".fs-L-L-9.9.9-9", "hits": 1}]}
+    blob = json.dumps(e.value.detail)
+    assert "tempestite" not in blob and "otherstream" not in blob
+
+
+def test_index_shape_counts_cap_at_five_shapes_and_count_the_rest():
+    raw = {"rawResponse": {"hits": {"hits": [
+        _hit(APP_DOC, index="tempestite" + "-x" * n) for n in range(7)]}}}
+    shapes = elastic._index_shape_counts(raw)
+    assert len(shapes) == 6
+    assert all(s["hits"] == 1 for s in shapes[:5])
+    assert shapes[5] == {"index_shape": "<other>", "hits": 2}
+    assert elastic._index_shape_counts({"rawResponse": {"hits": {"hits": "no"}}}) == []
+    assert elastic._index_shape_counts({}) == []
+
+
 def test_poll_timeout_defaults_and_bounds():
     raw = json.loads(elastic.EXAMPLE.read_text())
     raw.pop("poll_timeout_s", None)

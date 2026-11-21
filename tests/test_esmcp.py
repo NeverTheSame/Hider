@@ -918,3 +918,33 @@ def test_es_seed_cli_prints_labels_only_and_refuses_without_a_bridge(bridge, cap
     path.write_text(json.dumps(raw))
     assert cli.main(["es-seed", "--config", str(path), "--case", "c9", "--term", "x"]) == 2
     assert "code=session_expired" in capsys.readouterr().out
+
+
+def test_a_bad_index_refusal_reaches_the_model_as_code_and_message_only():
+    """The shapes of a refused page's index names are for a person (log,
+    es-smoke, es-review); the tool result a model receives is the refusal
+    text and nothing else."""
+    refusal = elastic.Refused("bad_index", "response withheld: a hit came from an index "
+                                           "outside the allowlist")
+    refusal.detail = {"index_shapes": [{"index_shape": "partial-.ds-L-L-9.9.9-9", "hits": 2}]}
+
+    class _Bridge:
+        def run(self, cluster, query, tool=None):
+            raise refusal
+
+    class _Case:
+        calls = 0
+        bridge = _Bridge()
+        pending_seeds: list = []
+
+        def save(self):
+            pass
+
+    cfg = elastic.load(elastic.EXAMPLE)
+    res = esmcp.call_tool(cfg, _Case(), "es_count", {"cluster": cfg.clusters[0].name,
+                                                     "index": cfg.indices[0]})
+    assert res["isError"] is True
+    text = res["content"][0]["text"]
+    assert text == ("refused (bad_index): response withheld: a hit came from an index "
+                    "outside the allowlist")
+    assert "index_shape" not in json.dumps(res) and "9.9.9" not in json.dumps(res)

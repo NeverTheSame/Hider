@@ -17,7 +17,15 @@ checks by stream. A backing index mounted from a snapshot carries
 same name and is checked by the same stream; on one real cluster every
 page older than about five days came from `partial-` indices and was
 refused `bad_index` before this. Shrunken, downsampled and
-failure-store indices stay refused. The stub enforces the same rules (cookie sessions, an
+failure-store indices stay refused. A `bad_index` refusal is explained
+to the person, never to the model: the decision-log row, es-smoke
+(`INDICES` line) and es-review carry each refused index name as a
+*shape* with the number of hits on the page that had it
+(`elastic.index_shape`: Elasticsearch's own prefixes as written, every
+other run of letters as `L`, of digits as `9`; at most five shapes and
+one count of the rest). No letter of a name survives. The refusal a
+model receives stays the same code and message.
+The stub enforces the same rules (cookie sessions, an
 IdP that refuses headless and fetches).
 **es-login waits for a healthy bridge however long its slices take.**
 `cli._wait_for_vocabulary` waited a fixed thirty minutes and then

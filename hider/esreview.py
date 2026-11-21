@@ -247,6 +247,10 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
         # from the site map, grammar and DSL key words, counts of the rest)
         "refused_shapes": [{"code": r["refused"], "shape": r["refused_shape"]}
                            for r in refused if r.get("refused_shape")],
+        # which index names a bad_index refusal was about, as shapes with
+        # hit counts (elastic.index_shape), for the same reason
+        "index_shapes": [{"code": r["refused"], "shapes": r["index_shapes"]}
+                         for r in refused if r.get("index_shapes")],
         "text_phrases_distinct": len(phrase_text),
         "text_phrases_zero_hit": len(zero_hit),
         "text_phrases_unjudged": len(unjudged_only),
@@ -430,6 +434,9 @@ def format_review(r: dict) -> list[str]:
                f"{n['hits_total']}; refusals: {refusals}")
     for rs in n.get("refused_shapes") or []:
         out.append(f"REFUSED  {rs['code']}: " + json.dumps(rs["shape"], sort_keys=True))
+    for is_ in n.get("index_shapes") or []:
+        out.append(f"INDICES   {is_['code']}: " + ", ".join(
+            f"{s['index_shape']}={s['hits']}" for s in is_["shapes"]))
     out.append(f"USABLE   labels {n['labels_usable']}, keep values {n['keep_values_usable']}, "
                f"labels issued {n['labels_issued']}")
     seed_sig = next((s for s in r["signals"] if s["name"] == "mid_case_seeding"), None)

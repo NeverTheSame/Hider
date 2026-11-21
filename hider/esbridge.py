@@ -760,6 +760,10 @@ class Bridge:
                     # this is how a case guessing at labels is visible at
                     # all, and a guess is refused before any request
                     row["label"] = e.label
+                if e.detail and e.detail.get("index_shapes"):
+                    # which index names a bad_index refusal was about, as
+                    # shapes with hit counts (elastic._index_shape_counts)
+                    row["index_shapes"] = e.detail["index_shapes"]
                 raise
             finally:
                 outcome.seconds = round(time.perf_counter() - t0, 3)
@@ -1436,9 +1440,14 @@ def run_case(bridge: Bridge, cluster: str, query: dict, *, show_names: bool = Fa
     try:
         o = bridge.run(cluster, query)
     except elastic.Refused as e:
-        return {"refused": {"code": e.code, "message": e.message},
-                "vocabulary": bridge.vocabulary.get(cluster),
-                "phrases": bridge.scrubber.phrase_report()}
+        report = {"refused": {"code": e.code, "message": e.message},
+                  "vocabulary": bridge.vocabulary.get(cluster),
+                  "phrases": bridge.scrubber.phrase_report()}
+        if e.detail and e.detail.get("index_shapes"):
+            # which index names the refusal was about, as shapes with hit
+            # counts; a decision, like the code - but never a name
+            report["refused"]["index_shapes"] = e.detail["index_shapes"]
+        return report
     s = bridge.scrubber
     # Names that are ordinary words: labelled in their own field, readable
     # as English on every other document. The label and the field it came
@@ -1904,6 +1913,10 @@ def print_smoke(cluster: str, query: dict, report: dict, *, show: bool = False) 
     pline = phrase_line(report.get("phrases"))
     if refused:
         print(f"REFUSED  cluster={cluster} code={refused['code']}: {refused['message']}")
+        shapes = refused.get("index_shapes")
+        if shapes:
+            print("INDICES  " + ", ".join(
+                f"{s['index_shape']}={s['hits']}" for s in shapes))
         if vline:
             print(vline)
         if pline:
