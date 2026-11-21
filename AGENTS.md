@@ -181,6 +181,7 @@ as with `adversarial.CASES`).
 #### Session, broker, MCP (docs/es/session.md)
 
 - **Only `esbridge` opens a connection, only from the broker's off-the-record Chrome; the SSO cookie never leaves it or reaches disk.** Every reply goes through `KibanaSession.parse_reply` (an expired session is a 200 login page). Pin: the stub enforces the same rules.
+- **A hit's index is checked by its stream, also with Elasticsearch's own `partial-` or `restored-` prefix in front; shrunken, downsampled and failure-store indices stay refused.** Pin: `test_data_stream_backing_indices_are_checked_by_their_stream`.
 - **Clients tell busy from dead** (`broker_state`: `running`/`busy`/`absent`); es-logout never says "no bridge" while the socket exists - else the process keeps the Kibana session.
 - **es-login has no wait ceiling by default; exit 0 serving, 1 failure or stall, 3 `--max-wait` reached while healthy.** Pin: `tests/test_esbridge.py` wait tests.
 - **es-smoke `--query` sends the query as written through the same path; its default summary carries counts, types and field names, never a key, group text or value** (only `--show` / `--show-readable-names`). Pin: `test_print_smoke_summarises_a_grammar_query_as_counts_and_shows_texts_only_on_request`, `test_es_smoke_cli_takes_a_grammar_query_through_the_same_checks`.

@@ -12,7 +12,12 @@ profile flushes even session cookies to its cookie database. An expired
 Kibana session is a 200 login page, not a 401, so every reply goes
 through `KibanaSession.parse_reply` first. A hit names its data-stream
 backing index (`.ds-<stream>-<date>-<gen>`), which `index_allowed`
-checks by stream. The stub enforces the same rules (cookie sessions, an
+checks by stream. A backing index mounted from a snapshot carries
+`partial-` (frozen tier) or `restored-` (cold tier) in front of the
+same name and is checked by the same stream; on one real cluster every
+page older than about five days came from `partial-` indices and was
+refused `bad_index` before this. Shrunken, downsampled and
+failure-store indices stay refused. The stub enforces the same rules (cookie sessions, an
 IdP that refuses headless and fetches).
 **es-login waits for a healthy bridge however long its slices take.**
 `cli._wait_for_vocabulary` waited a fixed thirty minutes and then

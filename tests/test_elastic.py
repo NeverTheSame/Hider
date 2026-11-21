@@ -188,6 +188,18 @@ def test_meta_fields_doc_id_is_labelled_and_index_checked():
     (".ds-logs-app-default-20260820-000001", False),
     (".fs-logs-app-default-2026.08.20-000001", False),  # failure store: not the stream
     ("downsample-1h-.ds-logs-app-default-2026.08.20-000001", False),
+    # partial-/restored- is Elasticsearch's own prefix for an index mounted
+    # from a snapshot; the prefix is stripped and the stream behind it decides
+    ("partial-.ds-logs-app-default-2026.08.20-000001", True),
+    ("restored-.ds-traces-apm-default-2026.08.20-1000000", True),
+    ("partial-.ds-logs-billing-default-2026.08.20-000001", False),  # stream not allowlisted
+    ("partial-.ds-logs-app-default", False),               # no backing suffix inside
+    ("restored-.ds-logs-app-default-2026.08.20-01", False),  # generation too short
+    ("shrink-.ds-logs-app-default-2026.08.20-000001", False),  # shrink stays refused
+    ("downsample-1m-.ds-logs-app-default-2026.08.20-000001", False),  # so does downsample
+    ("partial-.fs-logs-app-default-2026.08.20-000001", False),  # failure store inside
+    ("tempname-.ds-logs-app-default-2026.08.20-000001", False),  # unknown leading word
+
     (".ds-.kibana_security_session-2026.08.20-000001", False),
     ("logs-app", False),
 ])

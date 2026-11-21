@@ -253,6 +253,11 @@ ORDINARY_NAME_WORDS: frozenset[str] = jsonscrub.ORDINARY_NAME_WORDS
 INCOMPLETE_HINT = ("narrow the query: a shorter time window, a more specific phrase or an "
                    "exact filter, or one index pattern instead of a wide one")
 _BACKING_INDEX = re.compile(r"^\.ds-(?P<stream>.+)-\d{4}\.\d{2}\.\d{2}-\d{6,}$")
+
+#: strips a ``partial-`` or ``restored-`` management prefix so the backing
+#: index behind it is checked by its stream, exactly as it would be alone.
+_UNWRAP_INDEX_PREFIX = re.compile(r"^(?:partial|restored)-(?=\.ds-)")
+
 #: A keep value made only of digits and time punctuation (timestamps,
 #: durations, versions, counts rendered as strings). T and Z are the only
 #: letters an ISO timestamp carries, and no identifier fits this alphabet -
@@ -420,9 +425,13 @@ class ElasticConfig:
         starts with ``.ds-``: the name must have the backing-index suffix and
         the stream in front of it must match. A failure-store index
         (``.fs-``) or a downsampled one is not the stream and stays refused.
+        A ``partial-`` or ``restored-`` prefix in front of a backing index
+        name is stripped first, so the name behind it is checked by the
+        same stream.
         """
         if any(fnmatch.fnmatchcase(name, pat) for pat in self.indices):
             return True
+        name = _UNWRAP_INDEX_PREFIX.sub("", name)
         m = _BACKING_INDEX.match(name)
         return m is not None and any(fnmatch.fnmatchcase(m.group("stream"), pat)
                                      for pat in self.indices)
