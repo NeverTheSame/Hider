@@ -750,6 +750,11 @@ class Bridge:
             except elastic.Refused as e:
                 outcome.refused = e.code
                 row["refused"] = e.code
+                if "aggs" not in row and "filters" not in row:
+                    # refused before _describe could run: the grammar did not
+                    # take it, so log what was tried, as closed-vocabulary
+                    # shape only (see _refused_shape)
+                    row["refused_shape"] = _refused_shape(query, self.config)
                 if e.label is not None:
                     # the label Claude typed, never the value behind it:
                     # this is how a case guessing at labels is visible at
@@ -1130,6 +1135,97 @@ def _describe(query: dict, compiled: esquery.Compiled) -> dict:
         # the phrase as Claude wrote it: labels, not values. The declared channel.
         "text_queries": compiled.text_queries,
     }
+
+
+#: Key names a refused query's shape may carry when they are not the
+#: grammar's own: the Elasticsearch DSL words a model reaches for. A fixed
+#: list, so a key the model invented - which could be anything it typed - is
+#: counted, never written.
+_DSL_WORDS = frozenset({
+    "terms", "date_histogram", "histogram", "cardinality", "min", "max", "avg", "sum",
+    "value_count", "percentiles", "top_hits", "filters", "filter", "composite", "range",
+    "significant_terms", "stats", "extended_stats", "multi_terms", "rare_terms", "missing",
+    "field", "fields", "size", "interval", "fixed_interval", "calendar_interval", "order",
+    "min_doc_count", "include", "exclude", "script", "shard_size", "aggs", "aggregations",
+    "type", "percents", "sort", "format", "time_zone", "extended_bounds", "hard_bounds",
+    "query", "bool", "must", "should", "must_not", "term", "match", "match_phrase",
+    "query_string", "wildcard", "prefix", "regexp", "exists", "gte", "gt", "lte", "lt",
+    "value", "op", "not", "any_of", "index", "time_range", "from", "_source",
+})
+
+
+def _refused_shape(query: Any, config: "elastic.ElasticConfig") -> dict:
+    """The shape of a query the grammar refused, for the decision log: what
+    the model tried, so a refusal that recurs can be explained.
+
+    Only closed vocabularies are written: field names and the index only if
+    the site map lists them (else ``<unlisted>``), ops and aggregation
+    types only if the grammar knows them (else ``<other>``, or ``<missing>``
+    when absent), key names only if they are the grammar's own or on
+    ``_DSL_WORDS``. Everything the model chose freely - aggregation and
+    filter-bucket names, values, phrases, labels, an invented key - is
+    counted (``other_keys``), never written. Nesting is followed to the
+    grammar's own depth plus one."""
+    fields = {r.pattern for r in getattr(config, "fields", ())}
+
+    def fname(v: Any) -> str | None:
+        if v is None:
+            return None
+        return v if isinstance(v, str) and v in fields else "<unlisted>"
+
+    def keys(d: dict) -> dict:
+        known = sorted(k for k in d if isinstance(k, str) and k in _DSL_WORDS)
+        return {"keys": known, "other_keys": len(d) - len(known)}
+
+    def filt(f: Any, depth: int = 0) -> Any:
+        if not isinstance(f, dict):
+            return {"not_an_object": type(f).__name__}
+        out: dict[str, Any] = keys(f)
+        if "field" in f:
+            out["field"] = fname(f.get("field"))
+        if "op" in f:
+            out["op"] = f["op"] if f.get("op") in esquery._FILTER_OPS else "<other>"
+        if depth < 1 and isinstance(f.get("not"), dict):
+            out["not"] = filt(f["not"], depth + 1)
+        if depth < 1 and isinstance(f.get("any_of"), list):
+            out["any_of"] = [filt(x, depth + 1) for x in f["any_of"][:50]]
+        return out
+
+    def agg(spec: Any, depth: int) -> Any:
+        if not isinstance(spec, dict):
+            return {"not_an_object": type(spec).__name__}
+        out: dict[str, Any] = keys(spec)
+        t = spec.get("type")
+        out["type"] = ("<missing>" if "type" not in spec else
+                       t if isinstance(t, str) and t in esquery._AGG_TYPES else "<other>")
+        if "field" in spec:
+            out["field"] = fname(spec.get("field"))
+        # Elasticsearch's own form, {"terms": {"field": ...}}: the inner
+        # object's keys and field, under its DSL word
+        inner = {k: v for k, v in spec.items() if k in _DSL_WORDS and k not in
+                 ("aggs", "aggregations", "field", "type") and isinstance(v, dict)}
+        if inner:
+            out["dsl"] = {k: {**keys(v), **({"field": fname(v.get("field"))} if "field" in v
+                                            else {})} for k, v in inner.items()}
+        sub = spec.get("aggs", spec.get("aggregations"))
+        if isinstance(sub, dict) and depth < esquery.MAX_AGG_DEPTH:
+            out["aggs"] = [agg(s, depth + 1) for s in sub.values()]
+        return out
+
+    if not isinstance(query, dict):
+        return {"not_an_object": type(query).__name__}
+    shape: dict[str, Any] = keys(query)
+    if "index" in query:
+        shape["index"] = query["index"] if query.get("index") in config.indices else "<unlisted>"
+    if isinstance(query.get("filters"), list):
+        shape["filters"] = [filt(f) for f in query["filters"][:50]]
+    if isinstance(query.get("aggs"), dict):
+        shape["aggs"] = [agg(s, 0) for s in query["aggs"].values()]
+    elif "aggs" in query:
+        shape["aggs"] = {"not_an_object": type(query["aggs"]).__name__}
+    if "size" in query:
+        shape["size_is_int"] = isinstance(query["size"], int) and not isinstance(query["size"], bool)
+    return shape
 
 
 def _leaf_paths(node: Any, prefix: str = ""):

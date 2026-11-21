@@ -80,6 +80,10 @@ _AGG_TYPES = _METRICS | {"terms", "date_histogram", "cardinality", "top_hits", "
 #: into a phrase it is refused rather than searched for as a word
 _GROUP_PLACEHOLDER = re.compile(r"<\*>|<[A-Za-z_]+>")
 _QUERY_KEYS = {"index", "time_range", "filters", "size", "from", "sort", "aggs"}
+#: Elasticsearch aggregation names outside the grammar, which a model writes
+#: in Elasticsearch's {name: {...}} form; only used to word a refusal
+_DSL_AGG_WORDS = {"histogram", "filter", "composite", "range", "significant_terms", "stats",
+                  "extended_stats", "multi_terms", "rare_terms", "missing", "scripted_metric"}
 _LABEL_WORD = re.compile(r"<[A-Za-z][A-Za-z_]*-\d+>")
 
 _GUID_FAMILY = {"GUID", "SESSION_GUID", "TENANT_ID", "OBJECT_GUID", "DOC_ID"}
@@ -1590,6 +1594,14 @@ class _Compiler:
         if not isinstance(spec, dict):
             raise self.refuse("bad_agg", f"{what}: an aggregation is an object")
         atype = spec.get("type")
+        if atype is None and any(k in _AGG_TYPES or k in _DSL_AGG_WORDS for k in spec):
+            # Elasticsearch's own form: say the grammar's, with its example;
+            # still refused, never translated
+            raise self.refuse("bad_agg", (
+                f"{what}: write each aggregation with its type under \"type\", e.g. "
+                '{"by_server": {"type": "terms", "field": "<field>", "size": 10}} - not '
+                'Elasticsearch\'s {"terms": {"field": ...}} form, which this grammar does not '
+                f"take. Types: {sorted(_AGG_TYPES)}"))
         if atype not in _AGG_TYPES:
             raise self.refuse("bad_agg", f"{what}: type must be one of {sorted(_AGG_TYPES)}")
         if atype == "text_groups":
@@ -1982,6 +1994,11 @@ ORACLE_CASES: tuple[OracleCase, ...] = (
     OracleCase("terms-on-doc-id", "document ids as bucket keys enumerate the index",
                {"index": _IDX, "size": 0, "aggs": {"d": {"type": "terms", "field": "_id"}}},
                "unknown_field"),
+    OracleCase("dsl-form-aggregation", "Elasticsearch's own {terms: {field}} form is not the "
+               "grammar's {type, field}: refused, not translated (the model run's first "
+               "aggregation in every case)",
+               {"index": _IDX, "size": 0, "aggs": {"by": {"terms": {"field": _SERVER, "size": 5}}}},
+               "bad_agg"),
     OracleCase("scripted-metric", "a scripted metric runs arbitrary code over the values",
                {"index": _IDX, "size": 0, "aggs": {"s": {"type": "scripted_metric",
                                                          "map_script": "x"}}}, "bad_agg"),

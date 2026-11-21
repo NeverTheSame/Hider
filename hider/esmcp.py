@@ -336,6 +336,10 @@ _AGGS = {
     "type": "object",
     "description": (
         "name -> aggregation; names are short lowercase words, nesting at most 3 deep. "
+        "Every aggregation is an object with its type under \"type\": "
+        '{"by_server": {"type": "terms", "field": "agent.name", "size": 10}} - '
+        'NOT Elasticsearch\'s {"by_server": {"terms": {"field": ...}}} form, which is '
+        "refused. "
         "terms {field, size, aggs}: buckets by count, identifier keys come back as labels. "
         "date_histogram {field: the time field, interval: 5m|1h|1d|week|..., aggs}: needs "
         "time_range with a start and an end. filters {filters: {name: [filter, ...]}, aggs}. "

@@ -221,3 +221,114 @@ stream so nothing existing moves: `UNMARKED_JOBS`, `UNMARKED_NAMES`,
 their own, so no other query, build or count pays for them; they hold
 no ground truth either - `OVER_CAP_TRUTH` is that gate's own).
 
+
+**A model asked the questions (`hider/esmodel.py`): an observation, not a
+figure.** `esutility` asks by code and knows the honest query; nothing
+measured whether a model finds the queries, reads `covered_share`,
+`order_settled` or a bounded list, or runs out of phrase budget.
+`python -m hider.esmodel [--only KEY ...] --max-budget-usd N --out FILE`
+asks questions of Claude Code through **the real es-research launch**
+(`cli._es_research`, the function `es-research --stub --prompt` runs: the
+short preflight, `open_case`, the prompt check and masking,
+`esmcp.prepare_launch` / `claude_argv` / `claude_env`, the four tools,
+`--max-budget-usd`, `close_case`) on a StubKibana, with no cluster. Only its
+surroundings differ from `_es_research_stub`: the fixture is the one each
+question's truth comes from, the case directory is kept until the score is
+taken, and the unmasked answer es-research prints and saves is discarded
+unread.
+**The questions** (`esmodel.QUESTIONS`): `servers` and `onset` on the
+es-eval utility case (`generate(seed=20261103, docs=600)` - the same base
+documents and case tenant as es-eval, without the back catalogue and estate
+appended after the RNG stream); `top_servers_month` (a top ten with how
+certain the order is) and `distinct_servers_month` on `eseval.fail_docs` at
+the busy hour, where one search over the month never finishes, so every
+reply is pieced and may be partial or bounded.
+**The stub serves a pieced reply over HTTP now**: an engine search past its
+limit stays `isRunning` until the session's own deadline deletes it, as on
+Kibana (`eseval._NEVER_FINISHES`; before, StubKibana dropped the
+connection). Reached only by an engine with `count_wall` or
+`group_scan_wall`, which no es-eval StubKibana has, so no gate or figure
+moves. The relay world's limit is `esmodel.RELAY_POLL_S` real seconds (the
+engine's 300 s is simulated); at 2 s the read's real-time budget ran out
+after the newest half every time, so it is 5 s.
+**Scoring a free-text answer without a second model**: the prompt names the
+*shape of the answer* - one fenced ```answer block of JSON, labels as the
+tools show them, null where it cannot answer - and never the query, the
+aggregation, the field or the size (pinned:
+`test_the_prompts_name_the_answer_shape_never_the_query`). Only that block
+is scored, by fixed rules in label space: `answered`, `wrong` (including
+claiming more than the reply supports - a lower bound stated as exact, an
+order called certain past what is true, a part-window count presented as
+the window's), `blocked` (null, or an honest "this covers only part").
+A reply without a parseable block is `wrong` (`no_answer_block`).
+**What a run records** (`out/`, gitignored, one JSON line per question):
+status and cause, the parsed answer block, the masked answer as es-research
+saves it, **the expected answer in the case's label space** (a value the
+model never saw as `<not shown N>`), the shape of every query (tool, index,
+filter fields and ops, aggregation types and fields, refusal code, how a
+pieced read was combined - never a phrase's text), es-review's numbers
+(queries by tool, refusals by code, phrases used against the budget,
+labels issued), es-research's status lines, dollars, seconds, model, Claude
+Code version. `esmodel.masked_only` searches every row for every value
+behind a label of the case and replaces a row carrying one with a stub row;
+none of the run below was withheld, and a separate check found no case
+value in the file.
+**Observed, 2026-11-20, Claude Code 2.1.330, default model, one ask per
+question (top_servers_month twice), $1.50 cap each: 5 of 5 answered,
+$0.88 and 3.9 minutes in total** (plus $0.39 and 1.2 minutes on two asks
+lost to a harness bug - es-research's `research_dir` stamps a new directory
+per call, so the first version read an empty one - not recorded):
+- `onset` answered, to the millisecond - **without the honest query**: no
+  `min` aggregation; it paged the failures newest first and read the
+  oldest. 7 queries, $0.28, 61 s.
+- `servers` answered (5 servers, exact counts) with the honest terms on
+  `agent.name`, after a terms on `host.name` and four on `job.status`. 8
+  queries, $0.22, 44 s.
+- `distinct_servers_month` answered 12, whole window: the month read came
+  back `covered_share` 0.5 and **the model read it, asked the older half
+  itself and added the halves**, saying so; it never used cardinality. 5
+  queries, $0.11, 48 s.
+- `top_servers_month` answered twice (`order_claims_true`): exact counts,
+  first three called certain, the ties named as ties, "no single correct
+  top ten". The first read came back `covered_share` 0.5 (2 s limit) and
+  then 0.75 (5 s), and **both times the model fetched the missing part and
+  added it**. $0.17 / $0.10, 39 / 43 s.
+- Every question met 1 or 2 `bad_agg` refusals first (its first
+  aggregation each time); the decision log does not record a refused
+  query's shape, so which shape is not known - es-review cannot say
+  either.
+- Phrase budget: 0 or 1 of 150 per case; nowhere near it on questions
+  this short.
+- The model noted each time that the cluster's "now" (the fixture's clock,
+  2026-08-20) is not today - a stub artefact, harmless to the score.
+**A bounded list, received and read** (second round, same day, version
+and model; `top3_servers_wide` on `esmodel.wide_world`: the 12 relay
+servers plus 80 minor ones, more than `max_buckets` 50, so no terms the
+grammar accepts returns every key): the month read came back **`bounded`**
+(covered 75%; the model fetched the older part itself, exact). The model
+read it right: it quoted a `doc_count_max` ("30, at most 32" on four minor
+servers), used `order_settled` (the first four in the newer part) and the
+most an unlisted server could have, and concluded the top three are exact
+and in certain order - true (600, 450, 300). $0.17, 45 s. It was first
+scored `wrong` (`claimed_complete_but_is_not`) by a **scorer bug**: the
+model wrote `failures_max` equal to `failures` to say exact, and the scorer
+took any maximum as a bound; fixed (a maximum equal to the count is exact,
+pinned in `tests/test_esmodel.py`) and the recorded row re-scores from the
+file to `answered`. The `bad_agg` that opened every case is explained and
+fixed (`docs/es/review-and-seed.md`): before 1 refusal and 6 queries on
+`servers`, after 0 and 5. This round: 3 asks, **$0.69, 2.3 minutes**.
+**Not measured, and why**: a bounded list read where the order is *not*
+settled at the top (here the top three were exact); also unmeasured: an `estimated`
+text_groups reply (the burst world is not wired in yet), a long case that
+nears the phrase budget, other models, and more than one ask per question.
+**Can it be reproduced?** The **scoring** can: `esmodel.rescore(row)`
+re-scores a row from the file alone (its masked answer against its
+recorded label-space truth, no mapping, model or stub; pinned by
+`test_a_row_never_carries_a_value_and_rescores_from_the_file_alone`), and
+the five rows above re-score to the same statuses (one cause renamed since:
+`bounded_read_honestly` claimed a bounded reply that never happened, now
+`order_claims_true`). The **run** cannot: the model chooses its queries and
+words afresh each time, at a cost, and there is no cassette (the tool calls
+go both ways). So "5 of 5" is **an observation of one model on one day,
+n=1 per question** - to be reported with its date, model and version, and
+never as a figure beside esutility's 18 of 21.

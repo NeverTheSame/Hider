@@ -243,6 +243,10 @@ def review(case_dir: str | Path, *, show_values: bool = False) -> dict:
                            or r.get("aggs")),
         "hits_total": sum(r.get("hits_total") or 0 for r in shown),
         "refusals": by_code,
+        # what a refused query was, as closed-vocabulary shape (field names
+        # from the site map, grammar and DSL key words, counts of the rest)
+        "refused_shapes": [{"code": r["refused"], "shape": r["refused_shape"]}
+                           for r in refused if r.get("refused_shape")],
         "text_phrases_distinct": len(phrase_text),
         "text_phrases_zero_hit": len(zero_hit),
         "text_phrases_unjudged": len(unjudged_only),
@@ -424,6 +428,8 @@ def format_review(r: dict) -> list[str]:
     tools = ", ".join(f"{t}={k}" for t, k in sorted(n["by_tool"].items()))
     out.append(f"QUERIES  {n['queries']} ({tools}); pages shown {n['pages_shown']}, hits total "
                f"{n['hits_total']}; refusals: {refusals}")
+    for rs in n.get("refused_shapes") or []:
+        out.append(f"REFUSED  {rs['code']}: " + json.dumps(rs["shape"], sort_keys=True))
     out.append(f"USABLE   labels {n['labels_usable']}, keep values {n['keep_values_usable']}, "
                f"labels issued {n['labels_issued']}")
     seed_sig = next((s for s in r["signals"] if s["name"] == "mid_case_seeding"), None)

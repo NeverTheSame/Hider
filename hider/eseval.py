@@ -3281,6 +3281,11 @@ def kibana_error(status: int, message: str) -> dict:
             "message": message}
 
 
+#: a pending search whose engine wall time is past its limit: polled, it
+#: stays isRunning until the client gives up and deletes it
+_NEVER_FINISHES: dict = {}
+
+
 class StubKibana:
     """``POST /internal/search/ese`` with an async id, then poll.
 
@@ -3419,6 +3424,14 @@ class StubKibana:
                         404, f"[index_not_found_exception] no such index [{params['index']}]"))
                 except ValueError as e:
                     return self._reply(400, kibana_error(400, f"[parsing_exception] {e}"))
+                except elastic.Refused as e:
+                    if e.code != "incomplete":
+                        raise
+                    # the engine's simulated wall time is over its search
+                    # limit (count_wall, group_scan_wall): as on Kibana, the
+                    # async search keeps running past the client's wait, so
+                    # the session's own poll deadline is what ends it
+                    result = _NEVER_FINISHES
                 sid = uuid.uuid4().hex
                 stub.pending[sid] = result
                 self._reply(200, {"id": sid, "isPartial": True, "isRunning": True,
@@ -3458,7 +3471,7 @@ class StubKibana:
                 result = stub.pending.get(sid)
                 if result is None:
                     return self._reply(404, kibana_error(404, f"search id [{sid}] not found"))
-                if stub.slow:
+                if stub.slow or result is _NEVER_FINISHES:
                     return self._reply(200, {"id": sid, "isPartial": True, "isRunning": True,
                                              "rawResponse": {"hits": {"hits": []}}})
                 self._reply(200, {"id": sid, "isPartial": False, "isRunning": False,

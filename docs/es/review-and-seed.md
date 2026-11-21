@@ -132,3 +132,42 @@ broker: token kept, label in the next result and in `es_schema`, no
 one name mid-case (the customer naming a job), which es-review
 reports and does not flag, gated in `review_flags_guessing`.
 
+
+**A refused query is logged as its shape** (`esbridge._refused_shape`,
+row key `refused_shape`; es-review prints one `REFUSED <code>: <shape>`
+line per refusal and `numbers.refused_shapes`). The log used to keep only
+the code of a query the grammar refused before `_describe` could run, so
+when the model run (`esmodel`) showed a `bad_agg` as the first aggregation
+of every case, neither a person nor es-review could say what was tried.
+**What counts as shape when the grammar did not understand the query**:
+only closed vocabularies are written - a field name or the index only if
+the site map lists it (else `<unlisted>`), a filter op or aggregation type
+only if the grammar knows it (else `<other>`, or `<missing>` when the key is
+absent), key names only if they are the grammar's own or on the fixed
+`_DSL_WORDS` list of Elasticsearch DSL words; Elasticsearch's own
+`{"terms": {...}}` form is shown under `dsl` with its inner keys and field.
+Everything the model chose freely - aggregation and filter-bucket names,
+values, phrases, labels, an invented key - is **counted** (`other_keys`),
+never written. Nesting is followed to the grammar's depth; lists to 50.
+Pinned by `tests/test_esrefused.py`: an Elasticsearch-style aggregation
+named `contoso_servers` with a phrase and an invented key logs `type:
+<missing>`, `dsl.terms.keys: [field, size]`, `other_keys: 1`,
+`field: agent.name`, and none of the name, the phrase or the key; an
+unlisted index, an invented type and an unlisted field log as `<unlisted>`
+/ `<other>`; an accepted query logs no `refused_shape`.
+**What could still leak through it**, declared: which listed fields, ops,
+types and DSL words the model tried, and how many other keys and list
+entries a query had - nothing it typed as free text. A site that lists a
+field named after a customer has a customer name in its site map already,
+and that name appears here as it does in every accepted row.
+**What it found**: the model's first aggregation in every case was
+Elasticsearch's form - `{"<name>": {"terms": {"field": ..., "size": ...}}}`,
+`type` missing - because the tool schema described each type as `terms
+{field, size, aggs}`, which reads as Elasticsearch's. Fixed in the wording,
+not the grammar: the `es_aggregate` schema now opens with one example in the
+grammar's form and says the Elasticsearch form is refused; the `bad_agg`
+refusal for a spec with no `type` and an aggregation word as a key gives the
+grammar's form with the example. Still refused, never translated - oracle
+case `dsl-form-aggregation` (`bad_agg`). Measured with the model on the same
+question (`servers`): **before, 1 `bad_agg` and 6 queries; after, 0
+refusals and 5 queries**, answered both times.

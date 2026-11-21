@@ -219,6 +219,7 @@ as with `adversarial.CASES`).
 
 #### Review and seeding (docs/es/review-and-seed.md)
 
+- **A query the grammar refused is logged as closed-vocabulary shape (`refused_shape`): listed fields, grammar ops and types, grammar and `_DSL_WORDS` key names; every free choice (names, values, phrases, labels, invented keys) only counted** - a recurring `bad_agg` could not be explained from a code alone. Pin: `tests/test_esrefused.py`; oracle `dsl-form-aggregation` keeps the Elasticsearch form refused.
 - **es-review is human-only, read-only, prints counts/labels/codes by default (values only under `--show-values`), and reports a missing log as no review, never clean.** Gate: `review_flags_guessing`.
 - **es-seed is a human step over the broker socket by case name; `es_seed` is never a tool; the value reaches Claude nowhere and the log carries an `event: seed` row with labels only; at most `_MAX_SEEDS` (40).** Pin: `tests/test_esmcp.py`, `test_a_mid_case_seed_is_logged_as_a_label_never_a_value_and_capped`, `tests/test_esreview.py`.
 
@@ -232,6 +233,7 @@ as with `adversarial.CASES`).
 
 - **es-preflight is human-only and read-only; exit 0 no STOP, 1 STOP, 2 could not assess - never clean by silence; values only under `--show-values`.** es-research shows the short form and needs `--accept-readable` (headless) or a `y` to continue past STOP. Pin: `tests/test_espreflight.py`.
 - **esutility never rewrites a question to fit the grammar; a human step is shown as one.** Pin: `tests/test_esutility.py`.
+- **`esmodel` asks questions of Claude Code through the real es-research launch; a row carries labels, counts, codes and the masked answer only (`masked_only`), re-scores from the file alone (`rescore`), and its tally is an observation of one model on one day, never a figure** - a model run has no cassette. Pin: `tests/test_esmodel.py`.
 - **Fixed documents for readability checks are appended after the RNG stream** (order in docs/es/preflight-utility-gates.md) so nothing existing moves; **every es-eval figure is the same from run to run** (labels picked from sorted lists).
 - **Measurement switches (`idle_answers`, `ordinary_words_case_wide`, `keep_parts_swept`, `lapsed_waited`, `merge(one_range=True)`, `extend_shrinks`, `catch_up_jumps`, `split_reads`, `split_terms`) exist for "before" figures only; nothing in the live path sets them.**
 - **`esbridge.clock` is replaced only by harnesses.**
