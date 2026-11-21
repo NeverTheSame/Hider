@@ -346,13 +346,27 @@ knobs to the worst read (`esmcp.tool_wait_ms` = `search_wait_s` in ms):
 `claude_env` (set only when the operator has not set their own; both
 and `MCP_TIMEOUT` are allowlisted through - durations, never data), and
 a per-server `timeout` in the generated `mcp.json`, for versions that
-honour it per server. Declared remainder: the idle-window knob
-(documented default 5 minutes for HTTP, needs Claude Code ≥ 2.1.187) is
-set but was probed only to 90 s - a tester should run one es-research
-tool call that waits ~6 minutes to cross the idle default once; and a
-wide read still **returns late, not incrementally**, which `es_schema`
-says, with the four-limit bound and the advice to prefer narrower
-ranges when latency matters. **Callers wait as long as the worst read**:
+honour it per server. **The idle-window default is crossed and
+survived, measured on 2.1.330**: the probe re-run with a 390 s (6.5
+minute) tool - a stub MCP server answering the real wire shapes, no
+cluster, launched exactly as es-research launches it (the same
+`claude_env`, `claude_argv` and generated `mcp.json`, which carried
+timeout 600000 ms, the default site's `tool_wait_ms`) - crossed the
+documented 5-minute HTTP idle default in silence and **the model
+received the tool's full text at 392 s; claude exited 0 at 395 s**, no
+timeout anywhere. So the next limit a long read can hit is
+`esmcp.tool_wait_ms` itself - (read budget + 1) search limits + 120 s,
+i.e. 600 s at the default 120 s site and 1,320 s (22 minutes) at a
+300 s site, set by the launch in all three knobs - and by construction
+no read reaches it: every pieced read (count, histogram, terms,
+text_groups) is bounded at four limits = `tool_wait_ms` − 120 s. Still
+not measured: a wait past 390 s (the full 1,320 s at a 300 s site),
+the interactive (non-headless) session on the same knobs, an operator
+who exported a **shorter** `MCP_TOOL_TIMEOUT` of their own (allowlisted
+through and kept, so their setting can reintroduce the cut), and
+versions other than 2.1.330. A wide read still **returns late, not
+incrementally**, which `es_schema` says, with the four-limit bound and
+the advice to prefer narrower ranges when latency matters. **Callers wait as long as the worst read**:
 `esbridge.search_wait_s` = (budget + 1) limits + the old 120 s margin -
 es-smoke used it to give up at `limit + 120` (420 s at the measured
 site) and print "the bridge did not answer" while the bridge was still
