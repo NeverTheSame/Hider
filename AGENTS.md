@@ -147,6 +147,7 @@ miss is a decision, not a bug: do not "fix" one without reading its doc.
 - **Do not close the dotted-organisation head leak by lowering the three-label floor** - trades a false positive for a real miss; it is the whole 99.65% vs 100% gap. Pin: adversarial cases on `Wood.Partners.Group`, `Newtonsoft.JsonSerializationException`.
 - **Two over-destructions are intent** (every cookie value; any line that is only a 40+ char base64 run). Pin: intent tests.
 - **Keep the train/eval vocabulary disjoint.** Pin: `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary`.
+- **`redact` sweeps every pseudonymised value across the whole file after the per-line pass, with `hider/sweep.py`, the function the gateway uses; there is no second sweep, secrets are never swept, each swept occurrence is an event with `tier: "sweep"`** - a value found on one line stayed readable on another. Pin: `test_redact_hides_a_value_on_the_line_where_it_stands_without_its_cue`, `test_redact_sweep_never_touches_a_secret`, `test_redact_and_the_gateway_sweep_with_one_function`.
 
 ### Elasticsearch research
 

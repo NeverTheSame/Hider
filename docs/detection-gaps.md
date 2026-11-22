@@ -197,3 +197,25 @@ Listed with owners in the README's Limitations section and in
 - The utility number is one model, one 40-line excerpt, fifteen questions.
 - The gateway serialises redaction; fine for a workstation, the first thing
   to change for a shared deployment.
+
+## `redact` sweeps the whole file
+
+`python -m hider redact` reads a file line by line, so a value that tier 1
+reads only behind a cue (a case number after the word "case", a key before a
+value) or that tier 2 reads in one sentence and not in a table cell stayed
+readable on the lines where it stood bare. After the per-line pass `redact`
+now replaces every remaining occurrence of a pseudonymised value with its
+label, using `hider/sweep.py`, the same function the gateway runs on a
+request. Each replacement is a decision event with `tier: "sweep"`; offsets
+in it are into the output line as the sweep read it. `--sweep tier1` limits
+it to values tier 1 found and `--sweep off` removes it, both for measurement;
+the default is `all`.
+
+What it does not do, by design: a secret is destroyed, never vaulted, so a
+bare repeat of one on another line is not swept (tier 1 owns every credential
+shape, see AGENTS.md). A name a person lowercased is not swept, the accepted
+trade documented in `sweep.known_values_rx`. A tier 2 false positive (an
+ordinary word taken for a name) is now replaced everywhere in the file, not
+once; that is the price of sweeping values tier 2 alone found, and the reason
+`--sweep tier1` exists. Shorter forms of a value (an 8-hex prefix of a GUID,
+a host without its suffix) are not the vault's value and are not swept.

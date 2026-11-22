@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Iterator
 
 from . import llm_backend, pipeline, pseudonym
+from . import sweep as sweep_mod
 
 #: Headers that must not be forwarded verbatim: hop-by-hop fields, and the
 #: ones whose value this gateway owns.
@@ -383,51 +384,12 @@ class RedactionGateway:
 
     # -- the sweep ---------------------------------------------------------
 
-    def _known_values_rx(self) -> re.Pattern | None:
-        # Every value the vault holds, however short (a four-character floor
-        # used to let a short identifier the tiers missed cross to the
-        # provider, with the leftover check sharing the floor so nothing was
-        # refused). Two match modes, by what the value is:
-        #
-        # * Shaped values (GUIDs, IPs, hosts, URLs, case numbers, ...) match
-        #   case-insensitively. They never collide with ordinary words, and
-        #   loggers and users re-case them freely.
-        # * Person and org values match case-sensitively, against the casing
-        #   the vault stored plus its Title/UPPER forms. These are the values
-        #   that are also words: a vault that has learned the person "Bill"
-        #   must not rewrite "please bill the extra hours". The accepted
-        #   trade, chosen deliberately: a name the user lowercases
-        #   ("call ann") is not swept and crosses to the provider.
-        #
-        # The leftover check (``_known_values_in``) uses this same pattern,
-        # so what the sweep skips it skips too: a lowercase name cannot 503,
-        # and anything this pattern matches is either replaced by ``sweep``
-        # or refused. Costs in both directions are measured in
-        # ``test_sweep_wordlike_values_are_case_sensitive_and_measured``.
-        shaped: list[str] = []
-        wordlike: set[str] = set()
-        for e in self.pipe.vault.entries.values():
-            v = e["value"]
-            if not v:
-                continue
-            if e["type"] in ("PERSON_NAME", "ORG_NAME"):
-                wordlike.update({v, v.title(), v.upper()})
-            else:
-                shaped.append(v)
-        parts = []
-        if shaped:
-            parts.append("(?i:" + "|".join(
-                map(re.escape, sorted(shaped, key=len, reverse=True))) + ")")
-        if wordlike:
-            parts.append("|".join(
-                map(re.escape, sorted(wordlike, key=len, reverse=True))))
-        if not parts:
-            return None
-        return re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(parts) + r")(?![A-Za-z0-9])")
+    # The pattern, the match modes and the replacement live in ``sweep.py``,
+    # shared with ``hider redact``; the leftover check below uses the same
+    # pattern, so what the sweep skips it skips too.
 
     def _known_values_in(self, text: str) -> list[str]:
-        rx = self._known_values_rx()
-        return [m.group(0) for m in rx.finditer(text)] if rx else []
+        return sweep_mod.known_values_in(self.pipe.vault, text)
 
     def sweep(self, text: str, *, unit: str = "") -> tuple[str, list[dict]]:
         """Replace any identifier the vault already knows with its pseudonym.
@@ -438,28 +400,7 @@ class RedactionGateway:
         survives and the value never crosses. Secrets are never in the vault
         (they are destroyed), so this sweep is identifiers only.
         """
-        rx = self._known_values_rx()
-        if rx is None:
-            return text, []
-        by_value = {e["value"].casefold(): (e["label"], e["type"])
-                    for e in self.pipe.vault.entries.values()
-                    if not e["type"].startswith("_")}
-        events: list[dict] = []
-
-        def repl(m: re.Match) -> str:
-            hit = by_value.get(m.group(0).casefold())
-            if hit is None:
-                return m.group(0)
-            label, etype = hit
-            events.append({
-                "schema": "hider.redaction.v1", "unit": unit, "line": 0,
-                "start": m.start(), "end": m.end(), "entity_type": etype,
-                "action": "pseudonymised", "tier": "sweep", "score": 1.0,
-                "marker": label, "replacement": label,
-            })
-            return label
-
-        return rx.sub(repl, text), events
+        return sweep_mod.sweep(self.pipe.vault, text, unit=unit)
 
     # -- upstream ----------------------------------------------------------
 

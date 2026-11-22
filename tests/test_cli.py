@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from hider import cli
+from hider import cli, pipeline
 
 NOTE = ("Rachel Mbeki at Contoso Group escalated case 08123456 for "
         "session 6cafd2ac-dd19-d991-291a-8d565940996d\n")
@@ -154,3 +154,101 @@ def test_es_smoke_waits_out_the_longest_group_read(monkeypatch, capsys):
     assert rc != 0 and "session_expired" in out
     # the es-smoke client was built with the sized wait, not the old formula
     assert esbridge.search_wait_s(cfg) in captured
+
+
+# ---------------------------------------------------------------------------
+# redact sweeps a value found once across the whole file
+# ---------------------------------------------------------------------------
+
+def _redact_file(tmp_path, capsys, text, extra=None):
+    import json as _json
+
+    src = tmp_path / "bundle.md"
+    src.write_text(text, encoding="utf-8")
+    log = tmp_path / "decisions.jsonl"
+    vault_path = tmp_path / "vault.json"
+    rc = cli.main(["redact", str(src), "--log", str(log), "--vault", str(vault_path)]
+                  + (extra or []))
+    out = capsys.readouterr().out
+    events = [_json.loads(r) for r in log.read_text().splitlines() if r.strip()]
+    return rc, out, events, vault_path
+
+
+def test_redact_hides_a_value_on_the_line_where_it_stands_without_its_cue(tmp_path, capsys):
+    """Tier 1 reads a case number only after the word "case". The table row
+    below has the number and no cue; the per-line pass left it readable."""
+    text = ("Escalated case 08123456 to the night desk\n"
+            "| 08123456 | open | 2 |\n"
+            "no number on this line\n")
+    rc, out, events, _ = _redact_file(tmp_path, capsys, text, ["--tier2", "none"])
+    lines = out.splitlines()
+    assert rc == 0 and len(lines) == 3
+    assert "08123456" not in out
+    label = lines[0].split("case ")[1].split(" ")[0]
+    assert label.startswith("<") and lines[1] == f"| {label} | open | 2 |"
+    assert lines[2] == "no number on this line"
+    swept = [e for e in events if e["tier"] == "sweep"]
+    assert [(e["line"], e["entity_type"], e["action"]) for e in swept] == [
+        (1, "SUPPORT_CASE_NUMBER", "pseudonymised")]
+    assert swept[0]["replacement"] == label
+
+
+def test_redact_sweeps_a_value_inside_a_link_and_inside_backticks(tmp_path, capsys):
+    text = ("Escalated case 08123456 to the night desk\n"
+            "see [ticket](https://portal.example.test/t/08123456?x=1) and `08123456`\n"
+            "**08123456**, then 08123456.\n")
+    _, out, events, _ = _redact_file(tmp_path, capsys, text, ["--tier2", "none"])
+    assert "08123456" not in out
+    label = out.splitlines()[0].split("case ")[1].split(" ")[0]
+    assert f"/t/{label}?x=1) and `{label}`" in out
+    assert f"**{label}**, then {label}." in out
+    assert sum(e["tier"] == "sweep" for e in events) == 4
+
+
+def test_redact_sweep_never_touches_a_secret(tmp_path, capsys):
+    secret = "Zq7mXp2LrT9nV4kS"
+    text = f"password: {secret}\nthe value {secret} again\n"
+    _, out, events, vault_path = _redact_file(tmp_path, capsys, text, ["--tier2", "none"])
+    assert out.splitlines()[0] == "password: <REDACTED:API_KEY>"
+    assert [e["action"] for e in events if e["tier"] != "sweep"] == ["destroyed"]
+    assert not [e for e in events if e["tier"] == "sweep"]
+    assert secret not in vault_path.read_text() and secret not in str(events)
+
+
+def test_redact_sweep_switch_limits_the_sweep_to_values_tier_one_found(tmp_path, capsys):
+    """Tier 2 hides the name where it is written in full and misses the
+    upper-cased cell; tier 1 hides the case number only after its cue."""
+    text = ("Rachel Mbeki at Contoso Group escalated case 08123456 today\n"
+            "| RACHEL MBEKI | CONTOSO GROUP | 08123456 |\n")
+
+    _, out, events, _ = _redact_file(tmp_path, capsys, text)  # default: all
+    assert "RACHEL" not in out and "CONTOSO" not in out and "08123456" not in out
+    assert sorted(e["entity_type"] for e in events if e["tier"] == "sweep") == [
+        "ORG_NAME", "PERSON_NAME", "SUPPORT_CASE_NUMBER"]
+
+    tmp2 = tmp_path / "t1"
+    tmp2.mkdir()
+    _, out, events, _ = _redact_file(tmp2, capsys, text, ["--sweep", "tier1"])
+    second = out.splitlines()[1]
+    assert "08123456" not in second          # found by tier 1: swept
+    assert "RACHEL MBEKI" in second and "CONTOSO GROUP" in second  # tier 2 only: left
+    assert [e["entity_type"] for e in events if e["tier"] == "sweep"] == ["SUPPORT_CASE_NUMBER"]
+
+    tmp3 = tmp_path / "off"
+    tmp3.mkdir()
+    _, out, events, _ = _redact_file(tmp3, capsys, text, ["--sweep", "off"])
+    assert "08123456" in out.splitlines()[1]
+    assert not [e for e in events if e["tier"] == "sweep"]
+
+
+def test_redact_and_the_gateway_sweep_with_one_function(tmp_path):
+    from hider import proxy, pseudonym, sweep
+
+    vault = pseudonym.EntityVault(key=b"k")
+    vault.pseudonym("PERSON_NAME", "Diego Ferreira")
+    vault.pseudonym("SUPPORT_CASE_NUMBER", "08123456")
+    gw = proxy.RedactionGateway("http://127.0.0.1:1",
+                                pipeline.Pipeline([pipeline.RegexTier()], vault=vault))
+    text = "ask Diego Ferreira about 08123456, DIEGO FERREIRA too"
+    assert gw.sweep(text, unit="u") == sweep.sweep(vault, text, unit="u")
+    assert gw._known_values_in(text) == sweep.known_values_in(vault, text)

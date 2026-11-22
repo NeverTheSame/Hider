@@ -28,6 +28,7 @@ from . import (
     proxy,
     pseudonym,
     report,
+    sweep,
 )
 
 OUT = Path(__file__).resolve().parent.parent / "out"
@@ -1065,6 +1066,16 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         out.append(r.text)
         events.extend(r.events)
         degraded += int(r.degraded)
+    if args.sweep != "off":
+        # A value found on one line is replaced wherever else it stands, by
+        # the gateway's own sweep. "tier1" limits it to the labels tier 1 gave.
+        labels = (None if args.sweep == "all" else
+                  {e["replacement"] for e in events
+                   if e["tier"] == "tier1" and e["action"] == "pseudonymised"})
+        unit = args.path or "<stdin>"
+        for i, line in enumerate(out):
+            out[i], swept = sweep.sweep(vault, line, unit=unit, line=i, labels=labels)
+            events.extend(swept)
     sys.stdout.write("\n".join(out) + "\n")
     if args.log:
         Path(args.log).write_text(
@@ -1445,6 +1456,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
                    help="tier 2 backend for free-text names: the trained "
                         "classifier (default), local spaCy NER, or none")
+    r.add_argument("--sweep", choices=["all", "tier1", "off"], default="all",
+                   help="after the per-line pass, replace every remaining occurrence of "
+                        "a pseudonymised value across the whole file: all values "
+                        "(default), only values tier 1 found, or none (measurement)")
     r.set_defaults(fn=_cmd_redact)
 
     p = sub.add_parser("proxy", help="run the redacting OpenAI-compatible gateway")
