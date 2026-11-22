@@ -1073,8 +1073,9 @@ def _cmd_redact(args: argparse.Namespace) -> int:
                   {e["replacement"] for e in events
                    if e["tier"] == "tier1" and e["action"] == "pseudonymised"})
         unit = args.path or "<stdin>"
+        sweeper = sweep.Sweeper(vault, labels)  # compiled once for the whole file
         for i, line in enumerate(out):
-            out[i], swept = sweep.sweep(vault, line, unit=unit, line=i, labels=labels)
+            out[i], swept = sweeper.sweep(line, unit=unit, line=i)
             events.extend(swept)
     sys.stdout.write("\n".join(out) + "\n")
     if args.log:

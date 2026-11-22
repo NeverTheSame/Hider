@@ -219,3 +219,19 @@ ordinary word taken for a name) is now replaced everywhere in the file, not
 once; that is the price of sweeping values tier 2 alone found, and the reason
 `--sweep tier1` exists. Shorter forms of a value (an 8-hex prefix of a GUID,
 a host without its suffix) are not the vault's value and are not swept.
+
+Measured once, on one real support-case note (markdown, 126 lines, 51
+values a reader listed by hand; an observation, not a figure): with no sweep
+15 values were hidden; with the sweep 19. The 7 replacements made for values
+tier 1 had found were all right (a case number standing bare in a table, a
+path, a link). Of the 12 made for values only tier 2 had found, 1 was a real
+first name and 11 were tier 2's own wrong guesses repeated. The 30 values
+still readable were never found by any tier - site shapes with no rule and
+no site profile - which no sweep can help.
+
+A label already in the text is never matched into (`sweep.Sweeper`): a
+vaulted word that is also the word inside a label turned `<Person-01>` into
+`<<Org-01>-01>` in that run and, the code being shared, could in the gateway
+too. Every label the vault issued, anything shaped like one and every
+destroyed-secret marker is skipped by the sweep and by the gateway's
+leftover check alike. Pin: `tests/test_sweep.py`.
