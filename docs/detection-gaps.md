@@ -328,10 +328,19 @@ hidden address or login is inside a label and does not count, which is why the
 check reads the finished text and not the original. A word the vault stored in
 lowercase has no lowercase twin and is replaced as before.
 
-The trade, stated: a real name the note writes once in lowercase in prose keeps
-its capitalised form readable too, where the pass used to hide it. That is
-never worse than `--name-parts off`, and it is the same choice the sweep makes
-for a lowercased name. `--name-parts all` is the pass without this rule, for
+Measured on the same six notes, `--name-parts all` against `on`: replacements
+on words that are not names 255 to 30 (28 words to 4), replacements on names
+217 to 210, name-part events 472 to 240. No listed value changed between
+hidden, part and whole; occurrences hidden went from 2,324 to 2,317 of 2,990.
+The seven lost are one first name whose lowercase form stands once in the
+note, inside a hyphen-joined word of a metadata field, so that occurrence was
+readable before the rule as well. The four wrong words left never stand in
+lowercase in their note. Again a tester's observation on real data.
+
+The trade, stated: a real name the note writes once in lowercase, alone and
+outside a label, keeps its capitalised form readable too, where the pass used
+to hide it. That is never worse than `--name-parts off`, and it is the same
+choice the sweep makes for a lowercased name. `--name-parts all` is the pass without this rule, for
 whoever prefers the over-redaction and for measuring one against the other.
 
 What is still wrong after it: a capitalised pair that is not a name and never
