@@ -252,3 +252,116 @@ def test_redact_and_the_gateway_sweep_with_one_function(tmp_path):
     text = "ask Diego Ferreira about 08123456, DIEGO FERREIRA too"
     assert gw.sweep(text, unit="u") == sweep.sweep(vault, text, unit="u")
     assert gw._known_values_in(text) == sweep.known_values_in(vault, text)
+
+
+# ---------------------------------------------------------------------------
+# redact --term: a name a person gives, hidden whatever its length or casing
+# ---------------------------------------------------------------------------
+
+def _term_events(events):
+    return [e for e in events if e["tier"] == "term"]
+
+
+def test_redact_term_is_hidden_in_a_sentence_a_table_cell_and_a_link(tmp_path, capsys):
+    text = ("HarborRidge asked for a call back tonight\n"
+            "| HarborRidge | open | 2 |\n"
+            "see [portal](https://harborridge.example.test/t/1)\n")
+    rc, out, events, _ = _redact_file(tmp_path, capsys, text, ["--term", "HarborRidge"])
+    assert rc == 0 and len(out.splitlines()) == 3
+    assert "harborridge" not in out.lower()
+    term = _term_events(events)
+    assert [e["line"] for e in term] == [0, 1, 2]
+    label = term[0]["replacement"]
+    assert label.startswith("<") and label.endswith(">")
+    # the per-line pass that runs after the term left every label as it was
+    assert out.count(label) == 3 and "<<" not in out
+    assert out.splitlines()[1] == f"| {label} | open | 2 |"
+    assert f"[portal](https://{label}.example.test/t/1)" in out
+
+
+def test_redact_term_matches_in_any_casing(tmp_path, capsys):
+    text = "HarborRidge, harborridge and HARBORRIDGE all rang\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text,
+                                     ["--term", "HarborRidge", "--tier2", "none"])
+    label = _term_events(events)[0]["replacement"]
+    assert out == f"{label}, {label} and {label} all rang\n"
+    assert len(_term_events(events)) == 3
+
+
+def test_redact_term_of_three_letters_is_hidden(tmp_path, capsys):
+    text = "HRX opened a ticket, then hrx closed it\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text,
+                                     ["--term", "HRX", "--tier2", "none"])
+    label = _term_events(events)[0]["replacement"]
+    assert out == f"{label} opened a ticket, then {label} closed it\n"
+
+
+def test_redact_term_is_not_matched_inside_a_longer_word(tmp_path, capsys):
+    text = "HRXtra xhrx hrx2 2hrx and HRX.\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text,
+                                     ["--term", "HRX", "--tier2", "none", "--sweep", "off"])
+    term = _term_events(events)
+    # a letter or digit directly before or after keeps the word as it was
+    assert len(term) == 1
+    label = term[0]["replacement"]
+    assert out == f"HRXtra xhrx hrx2 2hrx and {label}.\n"
+
+
+def test_redact_term_that_contains_another_term_wins_whatever_the_order(tmp_path, capsys):
+    text = "Harbor Ridge Marine wrote, and Harbor Ridge phoned\n"
+    for n, order in enumerate((["Harbor Ridge", "Harbor Ridge Marine"],
+                               ["Harbor Ridge Marine", "Harbor Ridge"])):
+        sub = tmp_path / f"o{n}"
+        sub.mkdir()
+        extra = ["--tier2", "none"]
+        for t in order:
+            extra += ["--term", t]
+        _, out, events, _ = _redact_file(sub, capsys, text, extra)
+        term = _term_events(events)
+        assert len(term) == 2
+        long_label, short_label = term[0]["replacement"], term[1]["replacement"]
+        assert long_label != short_label
+        assert (term[0]["start"], term[0]["end"]) == (0, len("Harbor Ridge Marine"))
+        assert out == f"{long_label} wrote, and {short_label} phoned\n"
+        assert "Marine" not in out
+
+
+def test_redact_term_is_hidden_with_the_sweep_and_tier_two_switched_off(tmp_path, capsys):
+    text = "Contoso Group sent a note about HRX\n"
+    _, out, events, _ = _redact_file(
+        tmp_path, capsys, text,
+        ["--term", "Contoso Group", "--term", "HRX", "--tier2", "none", "--sweep", "off"])
+    assert "Contoso" not in out and "HRX" not in out
+    assert [e["tier"] for e in events] == ["term", "term"]
+    assert all(e["entity_type"] == "ORG_NAME" for e in events)
+
+
+def test_redact_term_decision_log_holds_the_tier_and_the_label_and_not_the_term(
+        tmp_path, capsys):
+    text = "Contoso Group and HarborRidge, then contoso group again\n"
+    _, out, events, _ = _redact_file(
+        tmp_path, capsys, text,
+        ["--term", "Contoso Group", "--term", "HarborRidge", "--tier2", "none"])
+    log_text = (tmp_path / "decisions.jsonl").read_text()
+    assert "contoso" not in log_text.lower() and "harborridge" not in log_text.lower()
+    term = _term_events(events)
+    assert len(term) == 3
+    sweep_keys = {"schema", "unit", "line", "start", "end", "entity_type", "action",
+                  "tier", "score", "marker", "replacement"}
+    for e in term:
+        assert set(e) == sweep_keys
+        assert e["entity_type"] == "ORG_NAME" and e["action"] == "pseudonymised"
+        assert e["marker"] == e["replacement"] and e["replacement"] in out
+    # one label for one term, however it was written
+    assert term[0]["replacement"] == term[2]["replacement"] != term[1]["replacement"]
+
+
+@pytest.mark.parametrize("term", ["", "   "])
+def test_redact_with_an_empty_term_is_refused_with_exit_code_2(tmp_path, capsys, term):
+    src = tmp_path / "note.log"
+    src.write_text("Contoso Group wrote\n", encoding="utf-8")
+    rc = cli.main(["redact", str(src), "--term", "HRX", "--term", term])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "--term" in captured.err and "empty" in captured.err

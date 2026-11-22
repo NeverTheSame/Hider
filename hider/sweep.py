@@ -154,6 +154,48 @@ class Sweeper:
         return "".join(out), events
 
 
+class TermReplacer:
+    """Names a person gave, hidden wherever they stand, compiled once per file.
+
+    ``terms`` maps each term to the label the vault issued for it. A term
+    matches in any casing, whatever its length, and only as a whole: no letter
+    or digit directly before or after it, the boundary the sweep uses. When one
+    term contains another the longer wins. Every replacement is a decision
+    event shaped like the sweep's, with ``tier: "term"``; no event carries the
+    term.
+    """
+
+    def __init__(self, terms: dict[str, str]) -> None:
+        self.by_term = {t.casefold(): label for t, label in terms.items()}
+        self.rx = None
+        if self.by_term:
+            self.rx = re.compile(
+                r"(?<![A-Za-z0-9])(?:"
+                + "|".join(map(re.escape, sorted(self.by_term, key=len, reverse=True)))
+                + r")(?![A-Za-z0-9])", re.IGNORECASE)
+
+    def replace(self, text: str, *, unit: str = "", line: int = 0) -> tuple[str, list[dict]]:
+        if self.rx is None:
+            return text, []
+        out: list[str] = []
+        events: list[dict] = []
+        last = 0
+        for m in self.rx.finditer(text):
+            label = self.by_term[m.group(0).casefold()]
+            out += [text[last:m.start()], label]
+            last = m.end()
+            events.append({
+                "schema": "hider.redaction.v1", "unit": unit, "line": line,
+                "start": m.start(), "end": m.end(), "entity_type": "ORG_NAME",
+                "action": "pseudonymised", "tier": "term", "score": 1.0,
+                "marker": label, "replacement": label,
+            })
+        if not events:
+            return text, []
+        out.append(text[last:])
+        return "".join(out), events
+
+
 def known_values_in(vault: pseudonym.EntityVault, text: str,
                     labels: Collection[str] | None = None) -> list[str]:
     """The known values still readable in ``text``, outside every label."""

@@ -1054,15 +1054,30 @@ def _cmd_generate(args: argparse.Namespace) -> int:
 
 
 def _cmd_redact(args: argparse.Namespace) -> int:
+    terms = [t.strip() for t in args.term]
+    if not all(terms):
+        print("redact: --term takes a name to hide; an empty --term is refused",
+              file=sys.stderr)
+        return 2
     _announce_profile()
     vault = pseudonym.EntityVault()
     pipe = pipeline.Pipeline(_build_tiers(args.tier2), vault=vault)
+    # Each term gets its label before the first line is read, so every line
+    # sees the same label whatever the other switches are.
+    first_spelling: dict[str, str] = {}
+    for t in terms:
+        first_spelling.setdefault(t.casefold(), t)
+    labelled = {t: vault.pseudonym("ORG_NAME", t) for t in first_spelling.values()}
+    replacer = sweep.TermReplacer(labelled)
     text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
+    unit = args.path or "<stdin>"
     events: list[dict] = []
     out = []
     degraded = 0
     for i, line in enumerate(text.splitlines()):
-        r = pipe.redact(line, unit=args.path or "<stdin>", line_no=i)
+        line, named = replacer.replace(line, unit=unit, line=i)
+        events.extend(named)
+        r = pipe.redact(line, unit=unit, line_no=i)
         out.append(r.text)
         events.extend(r.events)
         degraded += int(r.degraded)
@@ -1072,7 +1087,6 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         labels = (None if args.sweep == "all" else
                   {e["replacement"] for e in events
                    if e["tier"] == "tier1" and e["action"] == "pseudonymised"})
-        unit = args.path or "<stdin>"
         sweeper = sweep.Sweeper(vault, labels)  # compiled once for the whole file
         for i, line in enumerate(out):
             out[i], swept = sweeper.sweep(line, unit=unit, line=i)
@@ -1454,6 +1468,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("path", nargs="?")
     r.add_argument("--log", help="write the JSONL decision log here")
     r.add_argument("--vault", help="save the pseudonym vault here")
+    r.add_argument("--term", action="append", default=[],
+                   help="a customer term to always hide, whatever its length (repeatable)")
     r.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
                    help="tier 2 backend for free-text names: the trained "
                         "classifier (default), local spaCy NER, or none")

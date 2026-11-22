@@ -148,6 +148,7 @@ miss is a decision, not a bug: do not "fix" one without reading its doc.
 - **Two over-destructions are intent** (every cookie value; any line that is only a 40+ char base64 run). Pin: intent tests.
 - **Keep the train/eval vocabulary disjoint.** Pin: `test_training_vocabulary_is_disjoint_from_the_eval_vocabulary`.
 - **`redact` sweeps every pseudonymised value across the whole file after the per-line pass, with `hider/sweep.py`, the function the gateway uses; there is no second sweep, secrets are never swept, each swept occurrence is an event with `tier: "sweep"`** - a value found on one line stayed readable on another. Pin: `test_redact_hides_a_value_on_the_line_where_it_stands_without_its_cue`, `test_redact_sweep_never_touches_a_secret`, `test_redact_and_the_gateway_sweep_with_one_function`.
+- **`redact --term` labels each term `ORG_NAME` before the first line is read and replaces it, with `sweep.TermReplacer`, before the line reaches the tiers, so it holds with `--sweep off` and `--tier2 none`; any casing, any length, whole words only, the longer term wins, an empty term exits 2, each replacement is an event with `tier: "term"` and no event carries the term** - tiers find a name by shape, and an abbreviation or an ordinary-word name has none. Pin: the `test_redact_term_*` tests in `tests/test_cli.py`.
 
 ### Elasticsearch research
 

@@ -235,3 +235,21 @@ vaulted word that is also the word inside a label turned `<Person-01>` into
 too. Every label the vault issued, anything shaped like one and every
 destroyed-secret marker is skipped by the sweep and by the gateway's
 leftover check alike. Pin: `tests/test_sweep.py`.
+
+## `redact --term`: a name a person already knows
+
+The tiers find a customer's name only by its shape or its sentence, so a name
+that is also an ordinary word, or a three-letter abbreviation, stays readable.
+`scrub-json` has taken `--term` for this since the web UI; `redact` now takes
+it too (repeatable). Each term gets an `ORG_NAME` label from the vault before
+the first line is read, and `sweep.TermReplacer` replaces it on every line
+before the line goes to the tiers, so the switches do not matter: it works
+with `--sweep off` and `--tier2 none`. A term matches in any casing, whatever
+its length, and only as a whole word (no letter or digit directly before or
+after it); where one term contains another the longer wins. An empty term
+ends the command with exit code 2. Each replacement is an event with
+`tier: "term"`, in the shape of the sweep's, and no event carries the term.
+The per-line pass leaves a label already in the line as it is, so the terms
+run first. What it does not do: a term is not a prefix pattern (`scrub-json`'s
+`NAME*` form is not taken), and a shorter form of a name (a surname alone) is
+a different term and has to be given.
