@@ -365,3 +365,79 @@ def test_redact_with_an_empty_term_is_refused_with_exit_code_2(tmp_path, capsys,
     assert rc == 2
     assert captured.out == ""
     assert "--term" in captured.err and "empty" in captured.err
+
+
+# Invented lines where the name stands inside a shape tier 1 reads. Replacing
+# the name before tier 1 ran broke each of these shapes.
+_TERM_SHAPES = (
+    "mail from anna.novak@contoso.com about the backup\n"
+    "login CONTOSO\\anna.novak failed twice\n"
+    "site https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/plan.docx\n"
+    "tenant contoso.onmicrosoft.com was throttled\n"
+    "share \\\\contoso-fs01\\finance\\q3 is offline\n"
+    "host contoso-fs01.corp.contoso.com timed out\n"
+    "Contoso Group asked for a call, cc anna.novak@contoso.com\n"
+    "file C:\\Users\\anna.novak\\Documents\\Contoso\\plan.docx was locked\n"
+    "see https://graph.microsoft.com/v1.0/sites/contoso/drives for the list\n"
+)
+
+
+@pytest.mark.parametrize("tier2", ["none", "classifier"])
+def test_redact_term_takes_nothing_from_tier_one_and_leaves_no_term_readable(
+        tmp_path, capsys, tier2):
+    plain_dir, term_dir = tmp_path / "plain", tmp_path / "terms"
+    plain_dir.mkdir()
+    term_dir.mkdir()
+    _, _, plain_events, _ = _redact_file(plain_dir, capsys, _TERM_SHAPES, ["--tier2", tier2])
+    _, out, events, _ = _redact_file(
+        term_dir, capsys, _TERM_SHAPES,
+        ["--tier2", tier2, "--term", "Contoso", "--term", "Contoso Group"])
+
+    def tier_one(evs):
+        return {(e["line"], e["start"], e["end"], e["entity_type"])
+                for e in evs if e["tier"] == "tier1"}
+
+    # every span tier 1 found without a term it finds with one
+    assert tier_one(plain_events) and tier_one(plain_events) <= tier_one(events)
+    # no term is readable, in any casing
+    assert "contoso" not in out.lower() and "contoso group" not in out.lower()
+    # and what stood around the name inside a shape is still hidden
+    for word in ("anna.novak", "Finance", "finance", "q3", "fs01"):
+        assert word not in out
+    assert "<<" not in out
+
+
+def test_redact_term_inside_a_label_is_replaced_only_where_the_label_kept_it(tmp_path, capsys):
+    import re as _re
+
+    text = ("file C:\\Users\\anna.novak\\Documents\\Contoso\\plan.docx was locked\n"
+            "tenant contoso.onmicrosoft.com was throttled, Org and user notified\n")
+    _, out, _events, _ = _redact_file(
+        tmp_path, capsys, text,
+        ["--tier2", "none", "--term", "Contoso", "--term", "Org",
+         "--term", "tenant", "--term", "user"])
+    first, second = out.splitlines()
+    # the profile path's label kept the folder name from the original: replaced.
+    # "user" stands in that label too, but not in the original: left alone.
+    assert _re.fullmatch(
+        r"file C:\\Users\\user-01\\Documents\\<Org-\d+>\\plan\.docx was locked", first)
+    # "tenant" and "Org" inside labels are left, in prose they are replaced
+    assert _re.fullmatch(
+        r"<Org-\d+> tenant-01\.onmicrosoft\.example was throttled, "
+        r"<Org-\d+> and <Org-\d+> notified", second)
+    assert "<<" not in out
+
+
+def test_redact_term_half_inside_a_tier_one_span_hides_the_piece_tier_one_left(tmp_path, capsys):
+    text = "ops@contoso.com Harbor desk called\nthe Harbor office is closed\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text,
+                                     ["--tier2", "none", "--term", "com Harbor"])
+    term = _term_events(events)
+    assert len(term) == 1
+    label = term[0]["replacement"]
+    first, second = out.splitlines()
+    assert "Harbor" not in out and "contoso" not in out.lower()
+    assert first.endswith(f" {label} desk called")
+    # the piece is a value of its own, so the default sweep hides it elsewhere
+    assert second == f"the {label} office is closed"
+

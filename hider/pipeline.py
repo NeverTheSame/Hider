@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Protocol, Sequence
 
-from . import classifier, entities, paths, pseudonym, recognizers
+from . import classifier, entities, paths, pseudonym, recognizers, sweep
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,44 @@ class RegexTier:
                      "recognizer_name", "") if getattr(r, "recognition_metadata", None) else "")
             for r in recognizers.analyze(text, self.recognizers)
         ]
+
+
+class TermTier:
+    """Names a person gave (``redact --term``), claimed where tier 1 left them.
+
+    It runs after tier 1 and before tier 2, and reads only the residue. Tier 1
+    reads the raw line first, so an address, a login or a site URL that holds
+    the name is hidden whole: replacing the name before tier 1 ran turned
+    ``anna.novak@contoso.com`` into ``anna.novak@<Org-01>.com``, the
+    shape was gone and the person stayed readable. Tier 2 reads what is left
+    after this tier, so it cannot take half of a multi-word name first.
+
+    A name tier 1 covered in part is claimed for the part it left, trimmed of
+    blanks: that piece is hidden as a value of its own, and the default sweep
+    then hides the same piece elsewhere in the file. Hiding more of a name a
+    person asked to hide is the safe direction.
+    """
+
+    name = "term"
+    cost_per_1k_chars = 0.0
+
+    def __init__(self, terms: Iterable[str]) -> None:
+        self.rx = sweep.term_rx(terms)
+
+    def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        if self.rx is None:
+            return []
+        spans: list[Span] = []
+        for m in self.rx.finditer(text):
+            for start, end in residue:
+                s, e = max(m.start(), start), min(m.end(), end)
+                while s < e and text[s].isspace():
+                    s += 1
+                while e > s and text[e - 1].isspace():
+                    e -= 1
+                if s < e:
+                    spans.append(Span(s, e, "ORG_NAME", 1.0, self.name, detector="term"))
+        return spans
 
 
 # ---------------------------------------------------------------------------

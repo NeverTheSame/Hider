@@ -242,14 +242,42 @@ The tiers find a customer's name only by its shape or its sentence, so a name
 that is also an ordinary word, or a three-letter abbreviation, stays readable.
 `scrub-json` has taken `--term` for this since the web UI; `redact` now takes
 it too (repeatable). Each term gets an `ORG_NAME` label from the vault before
-the first line is read, and `sweep.TermReplacer` replaces it on every line
-before the line goes to the tiers, so the switches do not matter: it works
-with `--sweep off` and `--tier2 none`. A term matches in any casing, whatever
-its length, and only as a whole word (no letter or digit directly before or
-after it); where one term contains another the longer wins. An empty term
-ends the command with exit code 2. Each replacement is an event with
-`tier: "term"`, in the shape of the sweep's, and no event carries the term.
-The per-line pass leaves a label already in the line as it is, so the terms
-run first. What it does not do: a term is not a prefix pattern (`scrub-json`'s
-`NAME*` form is not taken), and a shorter form of a name (a surname alone) is
-a different term and has to be given.
+the first line is read. A term matches in any casing, whatever its length, and
+only as a whole word (no letter or digit directly before or after it); where
+one term contains another the longer wins. An empty term ends the command with
+exit code 2. Each replacement is an event with `tier: "term"`, in the shape of
+the sweep's, and no event carries the term. The switches do not matter: it
+works with `--sweep off` and `--tier2 none`.
+
+**Where the terms run, and why not first.** The first cut replaced a term on
+the raw line before the tiers read it. A name inside a shape then broke the
+shape: `anna.novak@contoso.com` became `anna.novak@<Org-01>.com`, tier 1
+no longer saw an address, and the person stayed readable; the same for
+`CONTOSO\anna.novak`, a SharePoint site URL (its folders and file name
+came back) and a UNC share. Hiding the name un-hid everything around it. Now
+the terms are a layer of their own, `pipeline.TermTier`, **after tier 1 and
+before tier 2**: tier 1 reads the raw line and hides a shape whole, the term
+layer claims the name wherever tier 1 left it, and tier 2 reads only what is
+left, so it cannot take half of a multi-word name first. Pinned on nine
+invented lines, with tier 2 off and on: every span tier 1 finds without a term
+it finds with one, and no term is readable in the output.
+
+**The last pass.** One place the layer cannot see: a span tier 1 took whole
+whose pseudonym keeps part of the original (a customer folder in a Windows
+profile tail, a declared miss above). `sweep.TermReplacer` therefore reads the
+finished text once more, after the sweep and whatever `--sweep` says, and
+replaces a term still readable. It does not match into a label (`<Org-01>`
+stays one label with the term "Org", `tenant-01.example` with the term
+"tenant"), with one exception, which is the reason for the pass: a label the
+vault issued whose original value held the term too. Cost: that label no
+longer unmasks as one piece.
+
+**A term tier 1 covered in part** is claimed for the piece tier 1 left: the
+piece is hidden as a value of its own and the default sweep then hides the
+same piece elsewhere in the file. More of a name a person asked to hide is
+hidden, never less.
+
+What it does not do: a term is not a prefix pattern (`scrub-json`'s `NAME*`
+form is not taken), a shorter form of a name (a surname alone) is a different
+term and has to be given, and a multi-word term matches with exactly the
+blanks it was given.

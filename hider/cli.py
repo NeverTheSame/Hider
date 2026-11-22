@@ -1061,22 +1061,25 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         return 2
     _announce_profile()
     vault = pseudonym.EntityVault()
-    pipe = pipeline.Pipeline(_build_tiers(args.tier2), vault=vault)
+    tiers = _build_tiers(args.tier2)
+    if terms:
+        # After tier 1, so a shape that holds the name (an address, a login, a
+        # site URL) is still read and hidden whole; before tier 2, so it cannot
+        # take half of the name first.
+        tiers.insert(1, pipeline.TermTier(terms))
+    pipe = pipeline.Pipeline(tiers, vault=vault)
     # Each term gets its label before the first line is read, so every line
     # sees the same label whatever the other switches are.
     first_spelling: dict[str, str] = {}
     for t in terms:
         first_spelling.setdefault(t.casefold(), t)
     labelled = {t: vault.pseudonym("ORG_NAME", t) for t in first_spelling.values()}
-    replacer = sweep.TermReplacer(labelled)
     text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
     unit = args.path or "<stdin>"
     events: list[dict] = []
     out = []
     degraded = 0
     for i, line in enumerate(text.splitlines()):
-        line, named = replacer.replace(line, unit=unit, line=i)
-        events.extend(named)
         r = pipe.redact(line, unit=unit, line_no=i)
         out.append(r.text)
         events.extend(r.events)
@@ -1091,6 +1094,13 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         for i, line in enumerate(out):
             out[i], swept = sweeper.sweep(line, unit=unit, line=i)
             events.extend(swept)
+    if labelled:
+        # Last, whatever --sweep says: a name inside a span tier 1 took whole
+        # and whose pseudonym keeps part of the original is still readable.
+        last = sweep.TermReplacer(labelled, vault)
+        for i, line in enumerate(out):
+            out[i], named = last.replace(line, unit=unit, line=i)
+            events.extend(named)
     sys.stdout.write("\n".join(out) + "\n")
     if args.log:
         Path(args.log).write_text(
