@@ -281,3 +281,33 @@ What it does not do: a term is not a prefix pattern (`scrub-json`'s `NAME*`
 form is not taken), a shorter form of a name (a surname alone) is a different
 term and has to be given, and a multi-word term matches with exactly the
 blanks it was given.
+
+## `redact --name-parts`: a part of a person name that stands alone
+
+The vault holds "Anna Novak"; a later line says "Novak confirmed". The sweep
+matches the whole value, so the surname stayed readable, and so did a first
+name on its own. After the sweep (and after the term pass), `redact` now reads
+the finished text once more with `sweep.NamePartReplacer`. For every vault
+entry of type `PERSON_NAME` with two or more words it takes each word of four
+or more letters that is not on `jsonscrub.ORDINARY_NAME_WORDS`, gives that word
+a label of its own from the vault (type `PERSON_NAME`, never the full name's
+label), and replaces it where it stands, with the sweep's own matcher: case
+sensitive against the stored, Title and UPPER forms, whole words only, never
+inside a label. Each replacement is an event with `tier: "name_part"`, in the
+shape of the sweep's, and no event carries the word. `--name-parts off`
+switches it off (default on).
+
+Why a pass of its own, last: it reads the finished output and can only add a
+replacement, so nothing tier 1 found is touched, which a replacement before
+tier 1 could not promise (the `--term` lesson above). The gateway is
+unchanged. Pinned on invented lines in `tests/test_sweep.py` and
+`tests/test_cli.py`, including that every tier 1 span found with the pass off
+is found with it on.
+
+What it does not do: a part shorter than four letters is left, an ordinary word
+used as a name part is left (the same list and the same reason as everywhere
+else), a lowercased part ("novak") is left like any other lowercased name, and
+a name the vault never held as a multi-word `PERSON_NAME` has no parts to hide.
+A part that is also a common word that is not on the list is hidden wherever
+it stands alone, in prose too: the safe direction, and a reason to read the
+output before trusting it.

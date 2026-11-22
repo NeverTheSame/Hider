@@ -65,3 +65,66 @@ def test_one_sweeper_for_many_lines_gives_what_a_sweep_per_line_gives():
     out, events = only_case.sweep(lines[2], line=2)
     assert out == f"| {case} | Person |" and len(events) == 1 and events[0]["line"] == 2
     assert sweep.Sweeper(pseudonym.EntityVault()).sweep("anything") == ("anything", [])
+
+
+# ---------------------------------------------------------------------------
+# NamePartReplacer: a part of a multi-word person name that stands alone
+# ---------------------------------------------------------------------------
+
+def _person(name: str) -> tuple[pseudonym.EntityVault, str]:
+    vault = pseudonym.EntityVault()
+    return vault, vault.pseudonym("PERSON_NAME", name)
+
+
+def test_a_surname_standing_alone_is_hidden_after_the_full_name_was_found_elsewhere():
+    vault, full = _person("Anna Novak")
+    text = "Novak confirmed the restore, Novak's mailbox is back, NOVAK again"
+    out, events = sweep.NamePartReplacer(vault).replace(text, unit="u", line=3)
+    assert "novak" not in out.casefold()
+    assert len(events) == 3 and {e["line"] for e in events} == {3}
+    assert all(e["tier"] == "name_part" and e["entity_type"] == "PERSON_NAME"
+               and e["action"] == "pseudonymised" for e in events)
+    assert all(text[e["start"]:e["end"]].casefold() == "novak" for e in events)
+
+
+def test_a_first_name_standing_alone_is_hidden():
+    vault, _ = _person("Lena Moreau")
+    out, events = sweep.NamePartReplacer(vault).replace("Lena asked for a call")
+    assert out.startswith("<Person-") and out.endswith("> asked for a call")
+    assert len(events) == 1
+
+
+def test_a_part_shorter_than_four_letters_is_left_alone():
+    vault, _ = _person("Anna Fox")
+    out, events = sweep.NamePartReplacer(vault).replace("Fox confirmed, Anna did not")
+    assert out.startswith("Fox confirmed, <Person-") and len(events) == 1
+
+
+def test_a_part_that_is_an_ordinary_word_is_left_alone():
+    vault, _ = _person("Ivan Archive")
+    out, events = sweep.NamePartReplacer(vault).replace("the Archive was restored, Ivan too")
+    assert out.startswith("the Archive was restored, <Person-") and len(events) == 1
+
+
+def test_a_part_inside_a_label_is_left_alone_and_a_longer_word_is_not_a_part():
+    vault, full = _person("Marta Person")
+    assert full == "<Person-01>"
+    text = f"{full} wrote; Person confirmed; Personnel and Persons stayed"
+    out, events = sweep.NamePartReplacer(vault).replace(text)
+    assert len(events) == 1 and events[0]["replacement"] != full
+    assert out == (f"{full} wrote; {events[0]['replacement']} confirmed; "
+                   f"Personnel and Persons stayed")
+    assert "<<" not in out
+
+
+def test_a_part_gets_a_label_of_its_own_not_the_full_names():
+    vault, full = _person("Anna Novak")
+    out, events = sweep.NamePartReplacer(vault).replace(f"{full} and Novak and Anna")
+    labels = [e["replacement"] for e in events]
+    assert len(labels) == 2 and full not in labels and labels[0] != labels[1]
+    assert out == f"{full} and {labels[0]} and {labels[1]}"
+    for label in labels:
+        assert vault.by_label[label] in {"Novak", "Anna"}
+        assert next(e for e in vault.entries.values() if e["label"] == label)["type"] == "PERSON_NAME"
+    for e in events:
+        assert "Novak" not in str(e) and "Anna" not in str(e)

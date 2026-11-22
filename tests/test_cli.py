@@ -228,7 +228,8 @@ def test_redact_sweep_switch_limits_the_sweep_to_values_tier_one_found(tmp_path,
 
     tmp2 = tmp_path / "t1"
     tmp2.mkdir()
-    _, out, events, _ = _redact_file(tmp2, capsys, text, ["--sweep", "tier1"])
+    _, out, events, _ = _redact_file(tmp2, capsys, text,
+                                     ["--sweep", "tier1", "--name-parts", "off"])
     second = out.splitlines()[1]
     assert "08123456" not in second          # found by tier 1: swept
     assert "RACHEL MBEKI" in second and "CONTOSO GROUP" in second  # tier 2 only: left
@@ -441,3 +442,88 @@ def test_redact_term_half_inside_a_tier_one_span_hides_the_piece_tier_one_left(t
     # the piece is a value of its own, so the default sweep hides it elsewhere
     assert second == f"the {label} office is closed"
 
+
+
+# ---------------------------------------------------------------------------
+# redact --name-parts: a part of a multi-word person name that stands alone
+# ---------------------------------------------------------------------------
+
+def _name_part_events(events):
+    return [e for e in events if e["tier"] == "name_part"]
+
+
+def test_redact_hides_a_surname_alone_after_the_full_name_was_found_on_another_line(
+        tmp_path, capsys):
+    text = ("Escalated by Anna Novak to the night desk\n"
+            "Novak confirmed the restore finished\n")
+    rc, out, events, _ = _redact_file(tmp_path, capsys, text)
+    first, second = out.splitlines()
+    assert rc == 0 and first.startswith("Escalated by <Person-")
+    assert "Novak" not in out
+    parts = _name_part_events(events)
+    assert [(e["line"], e["entity_type"]) for e in parts] == [(1, "PERSON_NAME")]
+    assert second == f"{parts[0]['replacement']} confirmed the restore finished"
+
+
+def test_redact_hides_a_first_name_alone(tmp_path, capsys):
+    text = ("Escalated by Lena Moreau to the night desk\n"
+            "Lena asked for a call back tonight\n")
+    _, out, events, _ = _redact_file(tmp_path, capsys, text)
+    assert "Lena" not in out and "Moreau" not in out
+    assert [e["line"] for e in _name_part_events(events)] == [1]
+
+
+def test_redact_leaves_a_part_shorter_than_four_letters(tmp_path, capsys):
+    text = "Escalated by Anna Fox to the night desk\nFox confirmed, Anna did not\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text)
+    assert out.splitlines()[1].startswith("Fox confirmed, <Person-")
+    assert len(_name_part_events(events)) == 1
+
+
+def test_redact_leaves_a_part_that_is_an_ordinary_word(tmp_path, capsys):
+    text = "Escalated by Ivan Archive to the night desk\nthe Archive was restored, Ivan too\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text)
+    assert out.splitlines()[1].startswith("the Archive was restored, <Person-")
+    assert len(_name_part_events(events)) == 1
+
+
+def test_redact_leaves_a_part_inside_a_label_and_gives_the_part_its_own_label(
+        tmp_path, capsys):
+    text = "Escalated by Marta Person to the night desk\nPerson confirmed it\n"
+    _, out, events, _ = _redact_file(tmp_path, capsys, text)
+    first, second = out.splitlines()
+    full = first.removeprefix("Escalated by ").split(" ")[0]
+    part = _name_part_events(events)[0]["replacement"]
+    assert "<<" not in out
+    assert full.startswith("<Person-") and part.startswith("<Person-") and part != full
+    assert second == f"{part} confirmed it"
+
+
+def test_redact_name_parts_off_leaves_the_part_readable(tmp_path, capsys):
+    text = ("Escalated by Anna Novak to the night desk\n"
+            "Novak confirmed the restore finished\n")
+    _, out, events, _ = _redact_file(tmp_path, capsys, text, ["--name-parts", "off"])
+    assert out.splitlines()[1] == "Novak confirmed the restore finished"
+    assert _name_part_events(events) == []
+
+
+def test_redact_name_parts_loses_nothing_tier_one_found(tmp_path, capsys):
+    text = ("mail from anna.novak@contoso.com about the backup\n"
+            "Escalated by Anna Novak to the night desk\n"
+            "login CONTOSO\\anna.novak failed twice\n"
+            "Novak confirmed the restore, Anna agreed\n"
+            "| Novak | open |\n"
+            "file C:\\Users\\anna.novak\\Documents\\plan.docx was locked\n")
+    off_dir, on_dir = tmp_path / "off", tmp_path / "on"
+    off_dir.mkdir()
+    on_dir.mkdir()
+    _, _, off_events, _ = _redact_file(off_dir, capsys, text, ["--name-parts", "off"])
+    _, out, on_events, _ = _redact_file(on_dir, capsys, text)
+
+    def tier_one(evs):
+        return {(e["line"], e["start"], e["end"], e["entity_type"])
+                for e in evs if e["tier"] == "tier1"}
+
+    assert tier_one(off_events) and tier_one(off_events) <= tier_one(on_events)
+    assert _name_part_events(on_events) and not _name_part_events(off_events)
+    assert "<<" not in out

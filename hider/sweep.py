@@ -149,13 +149,15 @@ class Sweeper:
     def known_values_in(self, text: str) -> list[str]:
         return [m.group(0) for m in self._free(text)]
 
-    def sweep(self, text: str, *, unit: str = "", line: int = 0) -> tuple[str, list[dict]]:
+    def sweep(self, text: str, *, unit: str = "", line: int = 0,
+              tier: str = "sweep") -> tuple[str, list[dict]]:
         """Replace any identifier the vault already knows with its pseudonym.
 
         A value pseudonymised somewhere and missed here gets the same label it
         had before, so correlation survives and the value never crosses. Every
-        replacement is a decision event with ``tier: "sweep"``; offsets are
-        into ``text`` as it stood when the sweep read it.
+        replacement is a decision event with ``tier: "sweep"`` (``tier`` names
+        another pass that reuses this matcher); offsets are into ``text`` as it
+        stood when the sweep read it.
         """
         out: list[str] = []
         events: list[dict] = []
@@ -170,13 +172,51 @@ class Sweeper:
             events.append({
                 "schema": "hider.redaction.v1", "unit": unit, "line": line,
                 "start": m.start(), "end": m.end(), "entity_type": etype,
-                "action": "pseudonymised", "tier": "sweep", "score": 1.0,
+                "action": "pseudonymised", "tier": tier, "score": 1.0,
                 "marker": label, "replacement": label,
             })
         if not events:
             return text, []
         out.append(text[last:])
         return "".join(out), events
+
+
+class NamePartReplacer:
+    """A part of a multi-word person name, hidden where it stands alone.
+
+    The vault holds "Anna Novak"; a later line says "Novak confirmed". The
+    sweep matches the whole value, so the surname stays readable. Each word of
+    four or more letters of a PERSON_NAME value of two or more words gets a
+    label of its own from the vault (type PERSON_NAME, never the full name's
+    label), unless it is on :data:`jsonscrub.ORDINARY_NAME_WORDS`. The words
+    are then replaced by the sweep's own matcher (:class:`Sweeper` limited to
+    those labels): case-sensitive against the stored, Title and UPPER forms,
+    whole words only, never inside a label.
+
+    It reads the finished text, after the sweep, so it can only add a
+    replacement: nothing tier 1 found is touched. Every replacement is a
+    decision event with ``tier: "name_part"``; no event carries the word.
+    Build it once the vault holds every name of the file.
+    """
+
+    def __init__(self, vault: pseudonym.EntityVault) -> None:
+        # Imported here: jsonscrub imports pipeline, and pipeline imports this
+        # module.
+        from .jsonscrub import ORDINARY_NAME_WORDS
+        words: dict[str, None] = {}
+        for e in list(vault.entries.values()):
+            if e["type"] != "PERSON_NAME" or len(e["value"].split()) < 2:
+                continue
+            for w in re.findall(r"[^\W\d_]+", e["value"]):
+                if len(w) >= 4 and w.casefold() not in ORDINARY_NAME_WORDS:
+                    words[w] = None
+        labels = {vault.pseudonym("PERSON_NAME", w) for w in words}
+        self._sweeper = Sweeper(vault, labels) if labels else None
+
+    def replace(self, text: str, *, unit: str = "", line: int = 0) -> tuple[str, list[dict]]:
+        if self._sweeper is None:
+            return text, []
+        return self._sweeper.sweep(text, unit=unit, line=line, tier="name_part")
 
 
 class TermReplacer:

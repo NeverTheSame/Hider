@@ -1101,6 +1101,13 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         for i, line in enumerate(out):
             out[i], named = last.replace(line, unit=unit, line=i)
             events.extend(named)
+    if args.name_parts == "on":
+        # Reads the finished text and only adds: one part of a person name the
+        # vault holds, standing alone, still readable after everything else.
+        parts = sweep.NamePartReplacer(vault)
+        for i, line in enumerate(out):
+            out[i], named = parts.replace(line, unit=unit, line=i)
+            events.extend(named)
     sys.stdout.write("\n".join(out) + "\n")
     if args.log:
         Path(args.log).write_text(
@@ -1487,6 +1494,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="after the per-line pass, replace every remaining occurrence of "
                         "a pseudonymised value across the whole file: all values "
                         "(default), only values tier 1 found, or none (measurement)")
+    r.add_argument("--name-parts", choices=["on", "off"], default="on",
+                   help="after the sweep, hide each word of four or more letters of a "
+                        "multi-word person name where it stands alone (default on)")
     r.set_defaults(fn=_cmd_redact)
 
     p = sub.add_parser("proxy", help="run the redacting OpenAI-compatible gateway")
