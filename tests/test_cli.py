@@ -527,3 +527,31 @@ def test_redact_name_parts_loses_nothing_tier_one_found(tmp_path, capsys):
     assert tier_one(off_events) and tier_one(off_events) <= tier_one(on_events)
     assert _name_part_events(on_events) and not _name_part_events(off_events)
     assert "<<" not in out
+
+
+def test_redact_leaves_a_part_the_file_also_writes_in_lowercase(tmp_path, capsys):
+    """A word the note itself writes in lowercase is an ordinary word there.
+    `--name-parts all` is the pass without that rule."""
+    text = ("Escalated by Anna Novak to the night desk\n"
+            "Novak confirmed the restore finished\n"
+            "see the novak share for the files\n")
+    on_dir, all_dir = tmp_path / "on", tmp_path / "all"
+    on_dir.mkdir()
+    all_dir.mkdir()
+    _, out, events, _ = _redact_file(on_dir, capsys, text)
+    assert out.splitlines()[1] == "Novak confirmed the restore finished"
+    assert _name_part_events(events) == []
+    _, out_all, events_all, _ = _redact_file(all_dir, capsys, text, ["--name-parts", "all"])
+    assert "Novak" not in out_all
+    assert [e["line"] for e in _name_part_events(events_all)] == [1]
+
+
+def test_redact_counts_no_lowercase_form_inside_a_hidden_address(tmp_path, capsys):
+    """The name in lowercase inside an address tier 1 hid is not prose: the
+    parts are still hidden where they stand alone."""
+    text = ("mail from anna.novak@contoso.com about the backup\n"
+            "Escalated by Anna Novak to the night desk\n"
+            "Novak confirmed the restore, Anna agreed\n")
+    _, out, events, _ = _redact_file(tmp_path, capsys, text)
+    assert "Novak" not in out and "Anna" not in out and "anna.novak" not in out
+    assert [e["line"] for e in _name_part_events(events)] == [2, 2]

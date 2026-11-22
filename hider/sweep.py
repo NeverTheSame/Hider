@@ -181,6 +181,31 @@ class Sweeper:
         return "".join(out), events
 
 
+def _lowercase_twins(words: Iterable[str], vault: pseudonym.EntityVault,
+                     lines: Iterable[str]) -> set[str]:
+    """The ``words`` whose all-lowercase form stands alone in ``lines``.
+
+    Case-sensitive, the sweep's boundary, and never inside a label: the
+    lowercase half of a hidden address is not prose. A word that is already
+    all lowercase has no twin and is never returned.
+    """
+    lower: dict[str, list[str]] = {}
+    for w in words:
+        if w.lower() != w:
+            lower.setdefault(w.lower(), []).append(w)
+    if not lower:
+        return set()
+    rx = re.compile(r"(?<![A-Za-z0-9])(?:" + "|".join(
+        map(re.escape, sorted(lower, key=len, reverse=True))) + r")(?![A-Za-z0-9])")
+    protected = _protected_rx(vault)
+    found: set[str] = set()
+    for line in lines:
+        found.update(m.group(0) for m in _outside_labels(rx, protected, line))
+        if len(found) == len(lower):
+            break
+    return {w for form in found for w in lower[form]}
+
+
 class NamePartReplacer:
     """A part of a multi-word person name, hidden where it stands alone.
 
@@ -197,9 +222,21 @@ class NamePartReplacer:
     replacement: nothing tier 1 found is touched. Every replacement is a
     decision event with ``tier: "name_part"``; no event carries the word.
     Build it once the vault holds every name of the file.
+
+    ``finished`` is that finished text, line by line. A word that also stands
+    there in lowercase, alone and outside every label, is left out: the file
+    itself uses it as an ordinary word. On six real case notes every false
+    part came from a two-word phrase tier 2 had taken for a person (a
+    heading, a status, a product), and most of those words stood in
+    lowercase elsewhere in the same note. A name the file lowercases once in
+    prose stays readable for the same reason; a lowercase form inside a
+    hidden address or login is inside a label and does not count. A word the
+    vault stored in lowercase has no lowercase twin to tell it apart and is
+    replaced as before. Without ``finished`` every part is replaced.
     """
 
-    def __init__(self, vault: pseudonym.EntityVault) -> None:
+    def __init__(self, vault: pseudonym.EntityVault,
+                 finished: Iterable[str] | None = None) -> None:
         # Imported here: jsonscrub imports pipeline, and pipeline imports this
         # module.
         from .jsonscrub import ORDINARY_NAME_WORDS
@@ -210,6 +247,10 @@ class NamePartReplacer:
             for w in re.findall(r"[^\W\d_]+", e["value"]):
                 if len(w) >= 4 and w.casefold() not in ORDINARY_NAME_WORDS:
                     words[w] = None
+        if finished is not None:
+            # Before a part gets a label: a word left out is never vaulted.
+            ordinary = _lowercase_twins(words, vault, finished)
+            words = {w: None for w in words if w not in ordinary}
         labels = {vault.pseudonym("PERSON_NAME", w) for w in words}
         self._sweeper = Sweeper(vault, labels) if labels else None
 

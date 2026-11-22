@@ -128,3 +128,57 @@ def test_a_part_gets_a_label_of_its_own_not_the_full_names():
         assert next(e for e in vault.entries.values() if e["label"] == label)["type"] == "PERSON_NAME"
     for e in events:
         assert "Novak" not in str(e) and "Anna" not in str(e)
+
+
+# ---------------------------------------------------------------------------
+# NamePartReplacer given the finished text: a word the file writes in lowercase
+# ---------------------------------------------------------------------------
+
+def _a_person_and_a_pair_tier_two_took_for_one() -> pseudonym.EntityVault:
+    vault = pseudonym.EntityVault()
+    vault.pseudonym("PERSON_NAME", "Anna Novak")
+    vault.pseudonym("PERSON_NAME", "Pending Rollout")
+    return vault
+
+
+def test_a_part_the_file_also_writes_in_lowercase_is_left_alone():
+    """Tier 2 took "Pending Rollout" for a person, and both words were then
+    hidden wherever they stood. The file writes them in lowercase too, so
+    here they are ordinary words; the real name beside them is still hidden,
+    and a word left out never gets a label."""
+    lines = ["Pending Rollout for ring two",
+             "the rollout is pending until Friday",
+             "Rollout notes: Novak confirmed, Pending on Anna"]
+    _, before = sweep.NamePartReplacer(
+        _a_person_and_a_pair_tier_two_took_for_one()).replace(lines[2])
+    assert len(before) == 4
+
+    vault = _a_person_and_a_pair_tier_two_took_for_one()
+    out, events = sweep.NamePartReplacer(vault, finished=lines).replace(lines[2])
+    assert len(events) == 2 and "Novak" not in out and "Anna" not in out
+    assert out.startswith("Rollout notes: <Person-") and ", Pending on <Person-" in out
+    assert not {"Pending", "Rollout"} & set(vault.by_label.values())
+
+
+def test_a_lowercase_form_inside_a_label_is_not_a_twin():
+    """The label of a profile path keeps the path's tail. A lowercase word in
+    it is not prose, so the surname is still hidden; the same word in a
+    sentence does count."""
+    vault, _ = _person("Anna Novak")
+    path = vault.pseudonym("WINDOWS_USER_PATH", "C:\\Users\\anna.novak\\novak\\plan.docx")
+    assert "novak" in path
+    lines = [f"file {path} was locked", "Novak confirmed"]
+    out, events = sweep.NamePartReplacer(vault, finished=lines).replace(lines[1])
+    assert "Novak" not in out and len(events) == 1
+
+    vault, _ = _person("Anna Novak")
+    lines = ["see the novak share for the files", "Novak confirmed"]
+    assert sweep.NamePartReplacer(vault, finished=lines).replace(lines[1]) == \
+           ("Novak confirmed", [])
+
+
+def test_a_part_the_vault_stored_in_lowercase_has_no_twin_and_is_still_hidden():
+    vault, _ = _person("anna novak")
+    lines = ["novak confirmed, Novak agreed"]
+    out, events = sweep.NamePartReplacer(vault, finished=lines).replace(lines[0])
+    assert "novak" not in out.casefold() and len(events) == 2

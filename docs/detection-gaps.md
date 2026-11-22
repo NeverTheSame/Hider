@@ -295,7 +295,7 @@ label), and replaces it where it stands, with the sweep's own matcher: case
 sensitive against the stored, Title and UPPER forms, whole words only, never
 inside a label. Each replacement is an event with `tier: "name_part"`, in the
 shape of the sweep's, and no event carries the word. `--name-parts off`
-switches it off (default on).
+switches it off (default on); `all` is described below.
 
 Why a pass of its own, last: it reads the finished output and can only add a
 replacement, so nothing tier 1 found is touched, which a replacement before
@@ -308,6 +308,33 @@ What it does not do: a part shorter than four letters is left, an ordinary word
 used as a name part is left (the same list and the same reason as everywhere
 else), a lowercased part ("novak") is left like any other lowercased name, and
 a name the vault never held as a multi-word `PERSON_NAME` has no parts to hide.
-A part that is also a common word that is not on the list is hidden wherever
-it stands alone, in prose too: the safe direction, and a reason to read the
-output before trusting it.
+
+### A part the file also writes in lowercase is left alone
+
+The first run on real case notes (six notes, 472 name-part replacements) found
+255 of them on words that were not names: ordinary and status words, a product,
+the vendor's name. Every one of the 62 replaced words came from a two-word
+value that only tier 2 had found, and 27 of the 28 wrong ones came from a
+phrase that is not a person at all (a heading, a status, a product): tier 2
+takes a capitalised pair for a name, and this pass then spread each word of it
+across the note. In the original notes 24 of the 28 wrong words also stood in
+lowercase, against 1 of the 34 right ones. Those are observations by a tester
+on real data, not figures a cassette can reproduce.
+
+So `NamePartReplacer` is given the finished text, and a word that also stands
+there in lowercase, alone and outside every label, is left out before it gets
+a label: the file itself uses it as an ordinary word. The lowercase half of a
+hidden address or login is inside a label and does not count, which is why the
+check reads the finished text and not the original. A word the vault stored in
+lowercase has no lowercase twin and is replaced as before.
+
+The trade, stated: a real name the note writes once in lowercase in prose keeps
+its capitalised form readable too, where the pass used to hide it. That is
+never worse than `--name-parts off`, and it is the same choice the sweep makes
+for a lowercased name. `--name-parts all` is the pass without this rule, for
+whoever prefers the over-redaction and for measuring one against the other.
+
+What is still wrong after it: a capitalised pair that is not a name and never
+appears in lowercase (a product tier, a meeting name) has its words hidden, and
+the pair itself is still labelled by tier 2 and swept. The cause is in tier 2,
+and this rule does not touch it.
