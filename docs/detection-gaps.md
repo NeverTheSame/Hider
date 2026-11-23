@@ -236,6 +236,35 @@ too. Every label the vault issued, anything shaped like one and every
 destroyed-secret marker is skipped by the sweep and by the gateway's
 leftover check alike. Pin: `tests/test_sweep.py`.
 
+## `redact --sweep-folders`: how a folder name is swept
+
+`sweep.known_values_rx` matches a person or organisation value as written and
+every other value in any casing. A vault entry of type PATH_SEGMENT is a
+folder name, and a folder name is often an ordinary word: the path
+`D:\Shares\Contoso\Finance\` hides the folder `Finance`, and the sweep then
+hid the word `finance` in the sentence about the finance report. On six real
+notes 15 folder names from tier 1 became 55 replacements, one word copied 22
+times.
+
+`--sweep-folders` takes four values. `all` (the default) is the old behaviour.
+`cased` matches a folder name the way a name is matched: as stored, Title and
+UPPER. `ordinary` is `cased`, and a one-word folder name is not swept at all
+when the text after the per-line pass also holds its lowercase form as a free
+word (`sweep._lowercase_twins`, the rule `--name-parts` uses). `off` sweeps no
+folder name. Each mode only removes sweep replacements: the folder is hidden
+inside its path in every mode because tier 1 does that, no other value type
+changes, and the gateway still sweeps folders in any casing.
+
+Measured on six real notes with a site profile, every other switch at its
+default (not sensitive = the replaced text matches no value on the note's
+list): the same 154 of 224 values hidden and the same 813 of 1,126
+occurrences in all four modes, and no value less hidden than with `all`. Not
+sensitive replacements: 237 with `all`, 226 with `cased`, 204 with `ordinary`,
+202 with `off`; the sweep's own, by the type of the swept value, were 35
+folder, 24 and 2 and 0 in the other modes. A one-word folder name written in
+lowercase as stored is still matched in lowercase by `cased` and `ordinary`
+(there is no capitalised form to tell it apart), the declared trade.
+
 ## `redact --term`: a name a person already knows
 
 The tiers find a customer's name only by its shape or its sentence, so a name

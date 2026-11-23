@@ -36,11 +36,33 @@ def _entries(vault: pseudonym.EntityVault, labels: Collection[str] | None):
             yield e
 
 
+#: How a folder name (a vault value of type PATH_SEGMENT) is swept. ``all``
+#: matches it in any casing, as every shaped value is; ``cased`` as a name is
+#: matched (as stored, Title, UPPER); ``ordinary`` is ``cased`` and a one-word
+#: folder the text also holds in lowercase as a free word is not swept at all;
+#: ``off`` sweeps no folder. Each mode only removes sweep replacements.
+FOLDER_MODES = ("all", "cased", "ordinary", "off")
+
+
+def _check_folders(folders: str, lines: Iterable[str] | None) -> None:
+    if folders not in FOLDER_MODES:
+        raise ValueError(f"folders is one of {', '.join(FOLDER_MODES)}, not {folders!r}")
+    if folders == "ordinary" and lines is None:
+        raise ValueError("folders='ordinary' reads the text it sweeps: pass lines")
+
+
 def known_values_rx(vault: pseudonym.EntityVault,
-                    labels: Collection[str] | None = None) -> re.Pattern | None:
+                    labels: Collection[str] | None = None,
+                    folders: str = "all",
+                    lines: Iterable[str] | None = None) -> re.Pattern | None:
     """One pattern for every value the vault holds, or None when it is empty.
 
     ``labels`` limits it to the entries carrying one of those labels.
+
+    ``folders`` (see :data:`FOLDER_MODES`) says how a PATH_SEGMENT value is
+    matched; ``lines``, the text after the per-line pass, is what ``ordinary``
+    reads. Tier 1's own findings inside a path and every other value type are
+    not affected.
 
     Every value, however short (a four-character floor used to let a short
     identifier the tiers missed cross to the provider, with the leftover check
@@ -61,16 +83,28 @@ def known_values_rx(vault: pseudonym.EntityVault,
     matches is either replaced or refused. Costs in both directions are
     measured in ``test_sweep_wordlike_values_are_case_sensitive_and_measured``.
     """
+    _check_folders(folders, lines)
     shaped: list[str] = []
     wordlike: set[str] = set()
+    folder_values: list[str] = []
     for e in _entries(vault, labels):
         v = e["value"]
         if not v:
             continue
         if e["type"] in ("PERSON_NAME", "ORG_NAME"):
             wordlike.update({v, v.title(), v.upper()})
+        elif e["type"] == "PATH_SEGMENT" and folders != "all":
+            folder_values.append(v)
         else:
             shaped.append(v)
+    if folders in ("cased", "ordinary"):
+        skipped: set[str] = set()
+        if folders == "ordinary":
+            one_word = [v for v in folder_values if len(v.split()) == 1]
+            skipped = _lowercase_twins(one_word, vault, list(lines))
+        for v in folder_values:
+            if v not in skipped:
+                wordlike.update({v, v.title(), v.upper()})
     parts = []
     if shaped:
         parts.append("(?i:" + "|".join(
@@ -132,11 +166,15 @@ class Sweeper:
     ``labels`` limits the values swept to the entries carrying one of those
     labels. What is protected is never limited: every label the vault issued,
     and anything shaped like a label or a destroyed-secret marker.
+
+    ``folders`` and ``lines`` are those of :func:`known_values_rx`; the
+    gateway uses neither and sweeps folders in any casing.
     """
 
     def __init__(self, vault: pseudonym.EntityVault,
-                 labels: Collection[str] | None = None) -> None:
-        self.rx = known_values_rx(vault, labels)
+                 labels: Collection[str] | None = None, folders: str = "all",
+                 lines: Iterable[str] | None = None) -> None:
+        self.rx = known_values_rx(vault, labels, folders, lines)
         self.by_value = {e["value"].casefold(): (e["label"], e["type"])
                          for e in _entries(vault, labels)
                          if not e["type"].startswith("_")}

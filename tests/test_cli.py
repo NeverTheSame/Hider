@@ -621,3 +621,85 @@ def test_redact_ordinary_words_changes_nothing_for_a_name_the_file_never_lowerca
     assert rc_on == rc_off == 0 and out_on == out_off and "Novak" not in out_on
     assert [(e["tier"], e["line"]) for e in events_on] == \
            [(e["tier"], e["line"]) for e in events_off]
+
+
+# ---------------------------------------------------------------------------
+# redact --sweep-folders all | cased | ordinary | off
+# ---------------------------------------------------------------------------
+
+_FOLDER_NOTE = ("Share D:\\Shares\\Contoso\\Finance\\Q3.xlsx was locked\n"
+                "Share D:\\Shares\\Contoso\\Payroll\\Q3.xlsx was locked\n"
+                "the finance report is late, Finance asked\n"
+                "Payroll called about the run\n")
+_FOLDER_MODES = ("all", "cased", "ordinary", "off")
+
+
+def _folder_run(tmp_path, capsys, mode):
+    d = tmp_path / mode
+    d.mkdir()
+    rc, out, events, _ = _redact_file(d, capsys, _FOLDER_NOTE,
+                                      ["--tier2", "none", "--sweep-folders", mode])
+    assert rc == 0
+    return out.splitlines(), [{k: v for k, v in e.items() if k != "unit"} for e in events]
+
+
+def test_sweep_folders_all_is_the_default_and_hides_the_lowercase_word(tmp_path, capsys):
+    lines, events = _folder_run(tmp_path, capsys, "all")
+    assert "finance" not in lines[2] and "Finance" not in lines[2]
+    d = tmp_path / "default"
+    d.mkdir()
+    _, out, ev, _ = _redact_file(d, capsys, _FOLDER_NOTE, ["--tier2", "none"])
+    assert out.splitlines() == lines
+    assert [{k: v for k, v in e.items() if k != "unit"} for e in ev] == events
+
+
+def test_sweep_folders_cased_leaves_the_lowercase_word_and_hides_the_capitalised_one(
+        tmp_path, capsys):
+    lines, _ = _folder_run(tmp_path, capsys, "cased")
+    assert lines[2].startswith("the finance report is late, <Folder-")
+    assert lines[3].startswith("<Folder-")
+
+
+def test_sweep_folders_ordinary_leaves_a_word_the_file_writes_in_lowercase(tmp_path, capsys):
+    lines, _ = _folder_run(tmp_path, capsys, "ordinary")
+    assert lines[2] == "the finance report is late, Finance asked"
+    assert lines[3].startswith("<Folder-")  # Payroll is never written in lowercase
+
+
+def test_sweep_folders_off_leaves_every_sentence_alone(tmp_path, capsys):
+    lines, events = _folder_run(tmp_path, capsys, "off")
+    assert lines[2:] == _FOLDER_NOTE.splitlines()[2:]
+    assert not [e for e in events if e["tier"] == "sweep"]
+
+
+def test_in_every_sweep_folders_mode_the_folder_is_hidden_in_its_path_and_tier_one_is_the_same(
+        tmp_path, capsys):
+    runs = {m: _folder_run(tmp_path, capsys, m) for m in _FOLDER_MODES}
+    for lines, _ in runs.values():
+        assert lines[0].startswith("Share D:\\Shares\\<Folder-")
+        assert "Finance" not in lines[0] and "Payroll" not in lines[1]
+    tier_one = {m: [e for e in ev if e["tier"] == "tier1"] for m, (_, ev) in runs.items()}
+    assert tier_one["all"] and all(t == tier_one["all"] for t in tier_one.values())
+    sweeps = {m: len([e for e in ev if e["tier"] == "sweep"]) for m, (_, ev) in runs.items()}
+    assert sweeps["all"] > sweeps["cased"] > sweeps["ordinary"] > sweeps["off"] == 0
+
+
+def test_sweep_folders_leaves_a_person_a_host_and_a_guid_alone(tmp_path, capsys):
+    text = ("ask Anna Novak about 203.0.113.7 and 6cafd2ac-dd19-d991-291a-8d565940996d\n"
+            "ANNA NOVAK again, 203.0.113.7 again, 6CAFD2AC-DD19-D991-291A-8D565940996D\n")
+    runs = {}
+    for m in _FOLDER_MODES:
+        d = tmp_path / m
+        d.mkdir()
+        rc, out, ev, _ = _redact_file(d, capsys, text, ["--sweep-folders", m, "--tier2", "none"])
+        runs[m] = (out, [(e["line"], e["start"], e["entity_type"], e["tier"]) for e in ev])
+    assert len({repr(r) for r in runs.values()}) == 1
+    assert "203.0.113.7" not in runs["off"][0] and "6CAFD2AC" not in runs["off"][0]
+
+
+def test_sweep_folders_refuses_an_unknown_mode(tmp_path, capsys):
+    src = tmp_path / "a.md"
+    src.write_text("hello\n", encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["redact", str(src), "--sweep-folders", "some"])
+    assert e.value.code == 2

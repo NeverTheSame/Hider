@@ -1095,7 +1095,9 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         labels = (None if args.sweep == "all" else
                   {e["replacement"] for e in events
                    if e["tier"] == "tier1" and e["action"] == "pseudonymised"})
-        sweeper = sweep.Sweeper(vault, labels)  # compiled once for the whole file
+        # Compiled once for the whole file. "ordinary" reads the text as the
+        # per-line pass left it.
+        sweeper = sweep.Sweeper(vault, labels, folders=args.sweep_folders, lines=out)
         for i, line in enumerate(out):
             out[i], swept = sweeper.sweep(line, unit=unit, line=i)
             events.extend(swept)
@@ -1501,6 +1503,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="after the per-line pass, replace every remaining occurrence of "
                         "a pseudonymised value across the whole file: all values "
                         "(default), only values tier 1 found, or none (measurement)")
+    r.add_argument("--sweep-folders", choices=list(sweep.FOLDER_MODES), default="all",
+                   help="how the sweep matches a folder name tier 1 found in a path: "
+                        "'all' in any casing (default), 'cased' as a name is matched (as "
+                        "written, Title, UPPER), 'ordinary' cased and not at all when the "
+                        "file also writes the one-word name in lowercase, 'off' never; the "
+                        "folder is hidden in its path in every mode")
     r.add_argument("--name-parts", choices=["on", "all", "off"], default="on",
                    help="after the sweep, hide each word of four or more letters of a "
                         "multi-word person name where it stands alone (default on); "

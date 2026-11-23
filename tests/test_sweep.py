@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from hider import pseudonym, sweep
 
 
@@ -182,3 +184,79 @@ def test_a_part_the_vault_stored_in_lowercase_has_no_twin_and_is_still_hidden():
     lines = ["novak confirmed, Novak agreed"]
     out, events = sweep.NamePartReplacer(vault, finished=lines).replace(lines[0])
     assert "novak" not in out.casefold() and len(events) == 2
+
+
+# ---------------------------------------------------------------------------
+# folders: how a PATH_SEGMENT value is swept
+# ---------------------------------------------------------------------------
+
+_MODES = ("all", "cased", "ordinary", "off")
+
+
+def _folders() -> pseudonym.EntityVault:
+    vault = pseudonym.EntityVault()
+    assert vault.pseudonym("PATH_SEGMENT", "Finance") == "<Folder-01>"
+    assert vault.pseudonym("PATH_SEGMENT", "Payroll") == "<Folder-02>"
+    return vault
+
+
+def _swept(vault, mode, line, lines=()):
+    return sweep.Sweeper(vault, folders=mode, lines=list(lines)).sweep(line)[0]
+
+
+def test_folders_all_hides_the_lowercase_word_in_a_sentence():
+    assert _swept(_folders(), "all", "the finance report is late") == \
+        "the <Folder-01> report is late"
+
+
+def test_folders_cased_leaves_the_lowercase_word_and_hides_the_capitalised_one():
+    vault = _folders()
+    assert _swept(vault, "cased", "the finance report is late") == "the finance report is late"
+    assert _swept(vault, "cased", "Finance asked, FINANCE too") == "<Folder-01> asked, <Folder-01> too"
+
+
+def test_folders_ordinary_leaves_a_word_the_file_writes_in_lowercase():
+    vault = _folders()
+    lines = ["Finance asked for the report", "the finance report is late", "Payroll called"]
+    for line in lines[:2]:
+        assert _swept(vault, "ordinary", line, lines) == line
+    assert _swept(vault, "ordinary", lines[2], lines) == "<Folder-02> called"
+    assert _swept(vault, "ordinary", "the payroll run", lines) == "the payroll run"
+
+
+def test_folders_ordinary_does_not_count_a_lowercase_form_inside_a_label_or_without_lines():
+    vault = _folders()
+    protected = vault.pseudonym("WINDOWS_USER_PATH", "D:\\Shares\\finance\\old\\plan.docx")
+    lines = [f"file {protected} was locked", "Finance asked"]
+    assert _swept(vault, "ordinary", lines[1], lines) == "<Folder-01> asked"
+    with pytest.raises(ValueError):
+        sweep.Sweeper(vault, folders="ordinary")
+
+
+def test_folders_off_leaves_every_sentence_alone():
+    vault = _folders()
+    for line in ("the finance report", "Finance asked", "PAYROLL called"):
+        assert _swept(vault, "off", line) == line
+    assert sweep.Sweeper(vault, folders="off").known_values_in("Finance and payroll") == []
+
+
+def test_a_person_a_host_and_a_guid_are_swept_the_same_in_all_four_modes():
+    vault = _folders()
+    vault.pseudonym("PERSON_NAME", "Lena Moreau")
+    vault.pseudonym("IPV4", "203.0.113.7")
+    vault.pseudonym("SESSION_GUID", "6cafd2ac-dd19-d991-291a-8d565940996d")
+    line = ("ask Lena Moreau, LENA MOREAU too, about 203.0.113.7 and "
+            "6CAFD2AC-DD19-D991-291A-8D565940996D")
+    results = {m: sweep.Sweeper(vault, folders=m, lines=[line]).sweep(line) for m in _MODES}
+    assert len({repr(r) for r in results.values()}) == 1
+    assert "Moreau" not in results["off"][0] and "203.0.113.7" not in results["off"][0]
+    assert len(results["off"][1]) == 4
+
+
+def test_the_default_is_all_and_a_bad_mode_is_refused():
+    vault = _folders()
+    line = "the finance report"
+    assert sweep.Sweeper(vault).sweep(line) == sweep.Sweeper(vault, folders="all").sweep(line)
+    assert sweep.sweep(vault, line) == sweep.Sweeper(vault, folders="all").sweep(line)
+    with pytest.raises(ValueError):
+        sweep.Sweeper(vault, folders="some")
