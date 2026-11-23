@@ -358,6 +358,52 @@ class ManagedNerTier:
         return sorted(found.values())
 
 
+class OrdinaryInFile:
+    """Tier 2 for one file: a claim the file itself writes as an ordinary word is dropped.
+
+    ``redact`` reads a whole file, so it can ask the file what a capitalised
+    word is. Tier 2 takes "Backlog", "Pending" or "Pending Rollout" at the
+    head of a table cell or a heading for a person or an organisation; the
+    same note writes "backlog", "pending", "pending rollout" in its prose. A
+    span whose whole text also stands in the file in lowercase, as a free
+    word, is not claimed. On five real case notes tier 2 made 231 of 336
+    replacements that hid nothing sensitive; 114 of those 231 were values the
+    note also wrote in lowercase, and none of tier 2's 72 right values was.
+
+    A free word has blank space, a bracket or a quote before it and blank
+    space or sentence punctuation after it. The lowercase half of an address
+    (``anna.novak@``), a login, a path segment or a hyphen-joined slug is not
+    a free word, so a real name is not dropped for standing in one of those.
+    The trade, stated: a name the file writes once in lowercase in a sentence
+    is not claimed by tier 2 anywhere in that file. Tier 1 and ``--term`` are
+    never touched, and a span is only ever removed, never widened.
+
+    It wraps the tier and keeps its name, so events and stats read as before.
+    """
+
+    def __init__(self, inner: Tier, file_text: str) -> None:
+        self.inner = inner
+        self.name = inner.name
+        self.cost_per_1k_chars = inner.cost_per_1k_chars
+        self._file = file_text
+        self._seen: dict[str, bool] = {}
+
+    def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
+        return [s for s in self.inner.detect(text, residue)
+                if not self.ordinary(text[s.start:s.end])]
+
+    def ordinary(self, value: str) -> bool:
+        """True when ``value`` has capitals and the file also holds it in lowercase."""
+        low = value.lower()
+        if low == value or not low.strip():
+            return False
+        if low not in self._seen:
+            rx = re.compile(r"(?:^|(?<=[\s(\[{\"']))" + re.escape(low)
+                            + r"(?=$|[\s,;:!?)\]}\"']|\.(?:\s|$))", re.MULTILINE)
+            self._seen[low] = rx.search(self._file) is not None
+        return self._seen[low]
+
+
 # ---------------------------------------------------------------------------
 # Tier 3: an LLM pass over what tier 2 could not resolve
 # ---------------------------------------------------------------------------

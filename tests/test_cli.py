@@ -555,3 +555,69 @@ def test_redact_counts_no_lowercase_form_inside_a_hidden_address(tmp_path, capsy
     _, out, events, _ = _redact_file(tmp_path, capsys, text)
     assert "Novak" not in out and "Anna" not in out and "anna.novak" not in out
     assert [e["line"] for e in _name_part_events(events)] == [2, 2]
+
+
+# ---------------------------------------------------------------------------
+# redact --ordinary-words: a tier 2 claim the file also writes in lowercase
+# ---------------------------------------------------------------------------
+
+class _ClaimsWords:
+    """A stand-in tier 2 that claims fixed words, so the rule is tested alone."""
+
+    name = "tier2"
+    cost_per_1k_chars = 0.0
+
+    def __init__(self, *words):
+        import re
+        self.rx = re.compile("|".join(map(re.escape, words)))
+
+    def detect(self, text, residue):
+        return [pipeline.Span(m.start(), m.end(), "PERSON_NAME", 0.9, self.name,
+                              detector="stand-in")
+                for m in self.rx.finditer(text)]
+
+
+_NOTE = ("| Pending | Anna Novak |\n"
+         "Pending Rollout\n"
+         "the change is pending until Friday, see pending rollout.\n"
+         "mail anna.novak@contoso.com, status waiting-on-anna, share \\\\fs\\anna\n"
+         "Anna called back\n")
+
+
+def test_a_tier_two_claim_the_file_writes_in_lowercase_is_dropped():
+    """Tier 2 took a table head and a heading for names; the note's own prose
+    says they are ordinary words. The person beside them is still claimed."""
+    tier = pipeline.OrdinaryInFile(
+        _ClaimsWords("Pending Rollout", "Pending", "Anna Novak", "Anna"), _NOTE)
+    assert tier.name == "tier2"
+    lines = _NOTE.splitlines()
+
+    def claimed(line):
+        return [line[s.start:s.end] for s in tier.detect(line, [(0, len(line))])]
+
+    assert claimed(lines[0]) == ["Anna Novak"]
+    assert claimed(lines[1]) == []
+    assert claimed(lines[4]) == ["Anna"]
+
+
+def test_a_lowercase_form_inside_an_address_a_slug_or_a_path_is_not_a_free_word():
+    tier = pipeline.OrdinaryInFile(_ClaimsWords("Anna"), _NOTE)
+    assert not tier.ordinary("Anna")
+    assert tier.ordinary("Pending") and tier.ordinary("Pending Rollout")
+    assert not tier.ordinary("pending")  # no capitals, nothing to compare
+    assert not tier.ordinary("Novak")
+
+
+def test_redact_ordinary_words_changes_nothing_for_a_name_the_file_never_lowercases(
+        tmp_path, capsys):
+    text = ("Escalated by Anna Novak to the night desk\n"
+            "Novak confirmed the restore finished\n")
+    on_dir, off_dir = tmp_path / "on", tmp_path / "off"
+    on_dir.mkdir()
+    off_dir.mkdir()
+    rc_on, out_on, events_on, _ = _redact_file(on_dir, capsys, text)
+    rc_off, out_off, events_off, _ = _redact_file(off_dir, capsys, text,
+                                                  ["--ordinary-words", "off"])
+    assert rc_on == rc_off == 0 and out_on == out_off and "Novak" not in out_on
+    assert [(e["tier"], e["line"]) for e in events_on] == \
+           [(e["tier"], e["line"]) for e in events_off]

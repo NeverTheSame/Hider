@@ -1062,6 +1062,12 @@ def _cmd_redact(args: argparse.Namespace) -> int:
     _announce_profile()
     vault = pseudonym.EntityVault()
     tiers = _build_tiers(args.tier2)
+    text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
+    if args.ordinary_words == "on":
+        # The file says what a capitalised word is: a tier 2 claim the file
+        # also writes in lowercase as a free word is dropped.
+        tiers = [pipeline.OrdinaryInFile(t, text) if t.name == "tier2" else t
+                 for t in tiers]
     if terms:
         # After tier 1, so a shape that holds the name (an address, a login, a
         # site URL) is still read and hidden whole; before tier 2, so it cannot
@@ -1074,7 +1080,6 @@ def _cmd_redact(args: argparse.Namespace) -> int:
     for t in terms:
         first_spelling.setdefault(t.casefold(), t)
     labelled = {t: vault.pseudonym("ORG_NAME", t) for t in first_spelling.values()}
-    text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
     unit = args.path or "<stdin>"
     events: list[dict] = []
     out = []
@@ -1501,6 +1506,9 @@ def main(argv: list[str] | None = None) -> int:
                         "multi-word person name where it stands alone (default on); "
                         "'on' leaves a word the file also writes in lowercase, "
                         "'all' hides those too")
+    r.add_argument("--ordinary-words", choices=["on", "off"], default="on",
+                   help="drop a tier 2 name the file also writes in lowercase as a free "
+                        "word (default on); off claims those too")
     r.set_defaults(fn=_cmd_redact)
 
     p = sub.add_parser("proxy", help="run the redacting OpenAI-compatible gateway")

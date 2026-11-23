@@ -347,3 +347,28 @@ What is still wrong after it: a capitalised pair that is not a name and never
 appears in lowercase (a product tier, a meeting name) has its words hidden, and
 the pair itself is still labelled by tier 2 and swept. The cause is in tier 2,
 and this rule does not touch it.
+
+## `redact --ordinary-words`: a tier 2 claim the file writes in lowercase
+
+With every switch on and a site profile, 336 of 1,086 replacements on five
+real case notes hid something that was not sensitive (a tester's judgement of
+every replaced value). Tier 2 made 231 of them: 42 ordinary single words and
+29 phrases (a status, a heading, a UI label) taken for a person or an
+organisation, each then swept across the note. Counted by machine against the
+tester's verdicts: of tier 2's own values, 24 of the 79 wrong ones (114 of 231
+replacements) also stood in the note in lowercase, whole; none of the 72 right
+ones did. "A word of it stands in lowercase" was the worse rule: it caught 40
+wrong values and 7 right ones.
+
+So `redact`, which has the whole file, wraps tier 2 in
+`pipeline.OrdinaryInFile`: a claim whose whole text the file also writes in
+lowercase, as a free word, is dropped. A free word has a blank, a bracket or a
+quote before it and a blank or sentence punctuation after it, so the lowercase
+half of an address, a login, a path segment or a hyphen-joined slug does not
+count; the measurement above did not make that distinction, so the figure for
+the rule as built is the one measured after it. `--ordinary-words off`
+claims those values as before.
+
+The trade, stated: a name the file writes once in lowercase in a sentence is
+not claimed by tier 2 anywhere in that file. Tier 1, `--term` and the gateway
+are untouched; the rule only removes a tier 2 span.
