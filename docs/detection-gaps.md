@@ -242,16 +242,16 @@ leftover check alike. Pin: `tests/test_sweep.py`.
 every other value in any casing. A vault entry of type PATH_SEGMENT is a
 folder name, and a folder name is often an ordinary word: the path
 `D:\Shares\Contoso\Finance\` hides the folder `Finance`, and the sweep then
-hid the word `finance` in the sentence about the finance report. On six real
+hid the word `finance` in the sentence about the finance report. On five real
 notes 15 folder names from tier 1 became 55 replacements, one word copied 22
 times.
 
-`--sweep-folders` takes four values. `all` (the default) is the old behaviour.
+`--sweep-folders` takes four values. `all` is the old behaviour.
 `cased` matches a folder name the way a name is matched: as stored, Title and
 UPPER. `ordinary` is `cased`, and a one-word folder name is not swept at all
 when the text after the per-line pass also holds its lowercase form as a free
-word (`sweep._lowercase_twins`, the rule `--name-parts` uses). `off` sweeps no
-folder name. Each mode only removes sweep replacements: the folder is hidden
+word (`sweep._lowercase_twins`, the rule `--name-parts` uses); it is the
+default. `off` sweeps no folder name. Each mode only removes sweep replacements: the folder is hidden
 inside its path in every mode because tier 1 does that, no other value type
 changes, and the gateway still sweeps folders in any casing.
 
@@ -264,6 +264,14 @@ sensitive replacements: 237 with `all`, 226 with `cased`, 204 with `ordinary`,
 folder, 24 and 2 and 0 in the other modes. A one-word folder name written in
 lowercase as stored is still matched in lowercase by `cased` and `ordinary`
 (there is no capitalised form to tell it apart), the declared trade.
+
+`ordinary` is the default because it removed 33 of the 35 wrong folder
+replacements and no listed value became less hidden, while `off` gives up the
+one thing the folder sweep is for: a customer's folder name written with its
+capital in a sentence, or in a path with no drive letter, stays hidden with
+`ordinary` and is readable with `off`. The declared cost of `ordinary`: a
+customer whose folder name the same file also writes in lowercase as a free
+word is hidden only inside the path; `--term` hides it everywhere.
 
 ## `redact --term`: a name a person already knows
 

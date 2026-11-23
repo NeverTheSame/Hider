@@ -643,9 +643,14 @@ def _folder_run(tmp_path, capsys, mode):
     return out.splitlines(), [{k: v for k, v in e.items() if k != "unit"} for e in events]
 
 
-def test_sweep_folders_all_is_the_default_and_hides_the_lowercase_word(tmp_path, capsys):
-    lines, events = _folder_run(tmp_path, capsys, "all")
+def test_sweep_folders_all_hides_the_lowercase_word(tmp_path, capsys):
+    lines, _ = _folder_run(tmp_path, capsys, "all")
     assert "finance" not in lines[2] and "Finance" not in lines[2]
+
+
+def test_sweep_folders_ordinary_is_the_default(tmp_path, capsys):
+    lines, events = _folder_run(tmp_path, capsys, "ordinary")
+    assert "the finance report" in lines[2]
     d = tmp_path / "default"
     d.mkdir()
     _, out, ev, _ = _redact_file(d, capsys, _FOLDER_NOTE, ["--tier2", "none"])

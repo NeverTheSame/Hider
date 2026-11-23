@@ -1503,12 +1503,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="after the per-line pass, replace every remaining occurrence of "
                         "a pseudonymised value across the whole file: all values "
                         "(default), only values tier 1 found, or none (measurement)")
-    r.add_argument("--sweep-folders", choices=list(sweep.FOLDER_MODES), default="all",
+    r.add_argument("--sweep-folders", choices=list(sweep.FOLDER_MODES), default="ordinary",
                    help="how the sweep matches a folder name tier 1 found in a path: "
-                        "'all' in any casing (default), 'cased' as a name is matched (as "
-                        "written, Title, UPPER), 'ordinary' cased and not at all when the "
-                        "file also writes the one-word name in lowercase, 'off' never; the "
-                        "folder is hidden in its path in every mode")
+                        "'ordinary' (default) as a name is matched (as written, Title, "
+                        "UPPER) and not at all when the file also writes the one-word name "
+                        "in lowercase, 'cased' as a name is matched, 'all' in any casing, "
+                        "'off' never; the folder is hidden in its path in every mode")
     r.add_argument("--name-parts", choices=["on", "all", "off"], default="on",
                    help="after the sweep, hide each word of four or more letters of a "
                         "multi-word person name where it stands alone (default on); "
