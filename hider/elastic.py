@@ -243,11 +243,23 @@ NO_VOCABULARY_TYPES: dict[str, str] = {
 #: for one surface must mean the same on the other. This name stays as
 #: the documented spelling; the contents are unchanged.
 ORDINARY_NAME_WORDS: frozenset[str] = jsonscrub.ORDINARY_NAME_WORDS
+#: A one-word name that is an HTTP method is not made vocabulary: a job
+#: called ``Delete`` would hide the method in every request line and the
+#: verb in every message ("failed to delete item"). The standard methods,
+#: a fixed list; a name kept out this way keeps its label in its own field.
+HTTP_METHOD_WORDS: frozenset[str] = frozenset(
+    ("GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"))
 #: Elasticsearch names a data stream's backing indices
 #: ``.ds-<stream>-<yyyy.MM.dd>-<generation>``, and a hit names the backing
 #: index, never the stream the query targeted. The suffix is fixed, so the
 #: stream name is recovered exactly; the greedy group is safe because the
 #: anchor is the end of the name.
+def _count(n: Any) -> str:
+    """A count for a refusal message: the number, or ``?`` for anything
+    that is not one, so a reply's own text never reaches the message."""
+    return str(n) if type(n) is int else "?"
+
+
 #: Appended to every ``incomplete`` refusal: the search was too wide to finish
 #: whole, and these are the levers the grammar has.
 INCOMPLETE_HINT = ("narrow the query: a shorter time window, a more specific phrase or an "
@@ -1451,6 +1463,8 @@ class EsScrubber(jsonscrub.JsonScrubber):
         if len(words) == 1:
             if len(v) < 4:
                 return "short"
+            if v.upper() in HTTP_METHOD_WORDS:
+                return "http_method"
             if v.casefold().strip(".,;:()") in ORDINARY_NAME_WORDS:
                 return "ordinary_word"
         return None
@@ -1606,8 +1620,13 @@ class EsScrubber(jsonscrub.JsonScrubber):
             if not isinstance(aggs, dict):
                 raise self._refuse("malformed", "response withheld: aggregations is not an object")
             self._harvest_aggs(aggs, plan.aggs)
-        elif plan.aggs:
-            raise self._refuse("malformed", "response withheld: planned aggregations missing")
+        elif plan.aggs and not self._no_index_reply(body, rows, plan):
+            # counts only, so a person can tell which reply this was
+            shards = body.get("_shards")
+            n = shards.get("total") if isinstance(shards, dict) else None
+            total = self._total(hits.get("total")) or {}
+            raise self._refuse("malformed", "response withheld: planned aggregations missing "
+                                            f"(shards {_count(n)}, hits {_count(total.get('value'))})")
 
         # Pass 2: rewrite.
         out: dict[str, Any] = {}
@@ -1742,6 +1761,25 @@ class EsScrubber(jsonscrub.JsonScrubber):
         agg["_strata"] = [(n_docs, [None if t is None else text_group_key(t) for t in texts])
                           for n_docs, texts in strata]
         return {"hits": {"total": total, "hits": []}, "aggregations": {g.name: agg}}
+
+    def _no_index_reply(self, body: dict, rows: list, plan: Any) -> bool:
+        """Whether a reply without its aggregations is Elasticsearch's answer
+        for a pattern that matched no index: zero shards, zero hits, no
+        rows, and then no ``aggregations`` block at all. That is an empty
+        result, not a broken one, and it is answered as a zero. Anything
+        else without the planned aggregations stays ``malformed``; so does
+        a group read, whose reply is built from its aggregations."""
+        if plan.groups is not None or rows:
+            return False
+        shards = body.get("_shards")
+        if not isinstance(shards, dict):
+            return False
+        if any(type(shards.get(k)) is not int or shards.get(k) != 0
+               for k in ("total", "successful", "failed")):
+            return False
+        total = self._total(body["hits"].get("total"))
+        return isinstance(total, dict) and type(total.get("value")) is int \
+            and total["value"] == 0 and total.get("relation") == "eq"
 
     @staticmethod
     def _total(total: Any) -> Any:

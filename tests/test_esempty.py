@@ -230,3 +230,69 @@ def test_an_explained_zero_moves_no_review_signal(world):
     # zero-hit phrase (the zero is explained, not excused: declared)
     assert n["queries"] == 2 and n["text_phrases_distinct"] == 1 and n["text_phrases_zero_hit"] == 1
     assert r["verdict"] == "nothing flagged"
+
+
+# -- a pattern with no index behind it -----------------------------------------------
+
+
+NO_INDEX = "traces-apm-*"
+
+
+@pytest.fixture
+def no_index(world):
+    _fx, engine, _vocab = world
+    engine.no_backing = {NO_INDEX}
+    yield
+    engine.no_backing = set()
+
+
+def test_an_aggregation_on_a_pattern_with_no_index_is_a_zero_for_the_model(world, no_index):
+    """Elasticsearch leaves the aggregations block out when a pattern matches
+    no index. The model was told ``malformed``; it gets a count of 0 and an
+    empty aggregations object."""
+    esbridge.clock = lambda: eseval.NOW.timestamp()
+    case = _mcp_case(world)
+    reply = esmcp.call_tool(CFG, case, "es_aggregate", {
+        "index": NO_INDEX, "time_range": DAY,
+        "aggs": {"t": {"type": "terms", "field": "labels.tenant_id", "size": 5}}})
+    assert not reply.get("isError")
+    payload = json.loads(reply["content"][0]["text"])
+    assert payload["hits_total"] == {"value": 0, "relation": "eq"}
+    assert payload["aggregations"] == {}
+    reply = esmcp.call_tool(CFG, case, "es_count", {"index": NO_INDEX, "time_range": DAY})
+    assert json.loads(reply["content"][0]["text"])["hits_total"]["value"] == 0
+
+
+def test_es_smoke_prints_a_pattern_with_no_index_as_a_zero(world, no_index, capsys):
+    _engine, case = _case(world)
+    q = {"index": NO_INDEX, "time_range": WEEK, "size": 0,
+         "aggs": {"t": {"type": "terms", "field": "labels.tenant_id", "size": 5},
+                  "d": {"type": "date_histogram", "field": "@timestamp", "interval": "1d"}}}
+    esbridge.clock = lambda: eseval.NOW.timestamp()
+    rc = esbridge.smoke(case.bridge, "stub", q)
+    out = capsys.readouterr().out
+    assert rc in (0, 3) and "hits_total=0" in out and "REFUSED" not in out
+
+
+def test_a_group_read_on_a_pattern_with_no_index_was_already_a_zero(world, no_index):
+    """A group read counts first, with no aggregation, so it never met the
+    missing block: no groups, and the zero explained as an empty window."""
+    _engine, case = _case(world)
+    out, refused, _dt, _c = case.call({
+        "index": NO_INDEX, "time_range": DAY, "size": 0,
+        "aggs": {"g": {"type": "text_groups", "field": "message", "size": 5}}})
+    assert refused is None
+    assert out["aggregations"]["g"]["buckets"] == [] and out["aggregations"]["g"]["total"] == 0
+    assert out["empty"]["window_documents"] == 0
+
+
+def test_a_count_and_a_terms_on_a_pattern_with_no_index_say_the_window_is_empty(world, no_index):
+    _engine, case = _case(world)
+    out, refused, _dt, _c = case.call({
+        "index": NO_INDEX, "time_range": DAY, "size": 0,
+        "aggs": {"t": {"type": "terms", "field": "labels.tenant_id", "size": 5}}})
+    assert refused is None and "aggregations" not in out
+    assert out["hits"]["total"] == {"value": 0, "relation": "eq"}
+    assert out["empty"]["window_documents"] == 0
+    rows = [json.loads(x) for x in (case.directory / "decisions.jsonl").read_text().splitlines()]
+    assert rows[-1]["hits_total"] == 0 and "refused" not in rows[-1]

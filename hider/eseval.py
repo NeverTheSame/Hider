@@ -2862,6 +2862,10 @@ class StubEngine:
         #: stays exact, as it does in Elasticsearch), and
         #: doc_count_error_upper_bound says so
         self.terms_error = terms_error
+        #: patterns the site map lists that match no index on this cluster.
+        #: Elasticsearch answers such a search with zero shards, zero hits
+        #: and no ``aggregations`` block at all, whatever was asked
+        self.no_backing: set[str] = set()
         self.requests: list[dict] = []
         self.lock = threading.Lock()
         self._flat: dict[str, list[tuple[int, dict]]] = {}
@@ -3159,6 +3163,11 @@ class StubEngine:
         with self.lock:
             self.requests.append({"index": index, "body": body})
         parts = index.split(",")
+        if self.no_backing and all(p in self.no_backing for p in parts):
+            return {"took": 0, "timed_out": False,
+                    "_shards": {"total": 0, "successful": 0, "skipped": 0, "failed": 0},
+                    "hits": {"total": {"value": 0, "relation": "eq"}, "max_score": 0.0,
+                             "hits": []}}
         if ignore_unavailable:
             parts = [p for p in parts if p in self.indices]
         elif any(p not in self.indices for p in parts):

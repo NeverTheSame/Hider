@@ -205,7 +205,7 @@ as with `adversarial.CASES`).
 - **Nothing is learnt from a partial, failed or timed-out read of a kept field; the saved vocabulary stays exactly as it was.** Pin: `tests/test_elastic.py`, `tests/test_esbridge.py`.
 - **One step per serve-loop iteration** (`submit`/`poll_once`/`release`) - the browser thread must keep answering. Gate: `vocabulary_slices_serve_early`.
 - **Logs and the VOCAB line hold counts, requests, seconds and field names, never a name; every surface says what was left out and why** (`omitted`, `over_cap`, `frozen`, `stuck`). Gate: `over_cap_field_left_out`, `field_added_backfilled`.
-- **Skip rules (`vocabulary_skip`) are a fixed list, not the system dictionary** - what is hidden must not depend on the machine.
+- **Skip rules (`vocabulary_skip`) are a fixed list, not the system dictionary; a one-word name that is an HTTP method is one of them (`HTTP_METHOD_WORDS`)** - what is hidden must not depend on the machine, and a job called `Delete` hid the verb in every message. Pin: `test_which_names_are_vocabulary`.
 - **Past `vocabulary_max_gap` the cover fails closed: every query of every case is refused `vocabulary_building` before any request; an open case re-applies a newer cover.** A constant, not a site setting - raising it chooses to leak. Gate: `gap_fails_closed`.
 - **The catch-up is read forward from the cover's end in one-day slices; the saved cover never claims a range with a hole (`put` replaces a non-touching slice).** Gate: `catch_up_sliced`.
 - **The cover is kept per field; a field is never claimed for days it was not read; a v1 file is untrusted and dropped.** Gate: `field_added_backfilled`; pin: `test_a_field_added_to_an_existing_cover_is_not_claimed_covered_for_days_it_was_not_read`, `test_two_fields_added_at_once_are_backfilled_together`.
@@ -238,6 +238,7 @@ as with `adversarial.CASES`).
 - **A label-only phrase counts toward `max_phrases`, spends no budget, resolves only a shown label, is logged as the label, and is not a typed guess for es-review.** Pin: `test_label_only_phrases_count_toward_the_per_query_cap_and_spend_no_budget`, `test_the_wider_scope_weakens_nothing_and_the_log_shows_the_label_not_the_name`.
 - **Every zero is explained inside the bridge with capped counts (`EMPTY_CHECK_CAP`), never a full scan; the explanation names fields, never a filter's value.** Pin: `tests/test_esempty.py`.
 - **An explained zero moves no review signal.** Pin: `test_an_explained_zero_moves_no_review_signal`.
+- **A reply with zero shards, zero hits and no aggregations block is a pattern that matched no index: answered as a zero with no aggregations, nothing invented; every other reply without its planned aggregations stays `malformed`, with shard and hit counts in the message and nothing else from the reply** - a terms query on a pattern one cluster does not have was refused while a count on it answered 0. Pin: `test_a_pattern_that_matched_no_index_is_an_empty_answer_not_a_broken_reply`, `test_every_other_reply_without_its_aggregations_stays_refused`, the no-index tests in `tests/test_esempty.py`.
 
 #### es-preflight and operator utility (docs/es/preflight-utility-gates.md)
 

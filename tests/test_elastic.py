@@ -604,6 +604,55 @@ def test_unplanned_aggregation_is_refused():
     assert e.value.code == "malformed"
 
 
+def _no_index(**shards):
+    env = _envelope([])
+    env["rawResponse"]["_shards"] = {"total": 0, "successful": 0, "skipped": 0, "failed": 0,
+                                     **shards}
+    return env
+
+
+_TERMS_PLAN = elastic.Plan("logs-app-*", {"x": elastic.AggPlan("terms", "labels.tenant_id")})
+
+
+def test_a_pattern_that_matched_no_index_is_an_empty_answer_not_a_broken_reply():
+    """Elasticsearch answers a pattern with no index behind it with zero
+    shards, zero hits and no aggregations block. That was refused
+    ``malformed``; it is a zero."""
+    out = _session().scrub_response(_no_index(), _TERMS_PLAN).output
+    assert out["hits"] == {"total": {"value": 0, "relation": "eq"}, "hits": []}
+    assert "aggregations" not in out
+
+
+@pytest.mark.parametrize("change", [
+    lambda env: env["rawResponse"]["_shards"].update(total=3, successful=3),
+    lambda env: env["rawResponse"]["_shards"].update(failed=1),
+    lambda env: env["rawResponse"]["_shards"].update(total="0"),
+    lambda env: env["rawResponse"]["_shards"].update(total=False),
+    lambda env: env["rawResponse"].pop("_shards"),
+    lambda env: env["rawResponse"]["hits"].update(total={"value": 4, "relation": "eq"}),
+    lambda env: env["rawResponse"]["hits"].update(total={"value": 0, "relation": "gte"}),
+])
+def test_every_other_reply_without_its_aggregations_stays_refused(change):
+    env = _no_index()
+    change(env)
+    with pytest.raises(elastic.Refused) as e:
+        _session().scrub_response(env, _TERMS_PLAN)
+    assert e.value.code == "malformed"
+    assert str(e.value).startswith("response withheld: planned aggregations missing (shards ")
+
+
+def test_the_refusal_for_missing_aggregations_carries_counts_and_nothing_from_the_reply():
+    env = _no_index(total="Tailspin")
+    env["rawResponse"]["hits"]["total"] = {"value": "Contoso", "relation": "eq"}
+    with pytest.raises(elastic.Refused) as e:
+        _session().scrub_response(env, _TERMS_PLAN)
+    assert str(e.value) == "response withheld: planned aggregations missing (shards ?, hits ?)"
+    env = _no_index(total=5, successful=5)
+    with pytest.raises(elastic.Refused) as e:
+        _session().scrub_response(env, _TERMS_PLAN)
+    assert str(e.value) == "response withheld: planned aggregations missing (shards 5, hits 0)"
+
+
 def test_bucket_and_hit_caps_are_enforced():
     s = _session()
     too_many = [_hit(APP_DOC, _id=f"d{i}") for i in range(CFG.max_hits + 1)]
@@ -1380,6 +1429,9 @@ def test_a_vocabulary_on_a_field_with_too_many_values_is_a_startup_error(field_p
     ("Archive", "ordinary_word"), ("Default", "stopword"), ("BACKUP", "ordinary_word"),
     ("Production", "ordinary_word"), ("Exports", "ordinary_word"),   # a structural path word
     ("HR", "short"), ("Ops", "short"), ("2026", "no_letters"), ("Error", "log_word"),
+    # an HTTP method: a job called Delete would hide the verb in every message
+    ("DELETE", "http_method"), ("Post", "http_method"), ("options", "http_method"),
+    ("GET", "short"), ("Post Office", None), ("Postmaster", None),
     ("default", "stopword"),
     ("Brackenvault", None), ("LegalHold2031", None), ("Kittiwake", None),
     ("Legal Hold", None), ("Daily Backup", None),   # more than one word: the phrase is specific

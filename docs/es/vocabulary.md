@@ -133,9 +133,15 @@ So, today:
   because the harnesses' fixtures sit at `eseval.NOW` rather than
   today, and nothing in the live path replaces it.
 - Values that are log words, stopwords, letterless, one word under four
-  characters, or one word on the shared `ORDINARY_NAME_WORDS` list are
-  skipped (`vocabulary_skip`) - a fixed list on purpose, not the system
-  dictionary: what is hidden must not depend on the machine.
+  characters, one word that is an HTTP method, or one word on the shared
+  `ORDINARY_NAME_WORDS` list are skipped (`vocabulary_skip`) - a fixed
+  list on purpose, not the system dictionary: what is hidden must not
+  depend on the machine. The HTTP methods (`elastic.HTTP_METHOD_WORDS`,
+  the nine standard ones, reason `http_method`) are there because a job
+  whose whole name is one of them hid the method in every request line
+  and the verb in every message; on one real page that was the method
+  slot of 25 of 50 documents. Such a name keeps its label in its own
+  field, as an ordinary word does.
 **Measured cost**, with the stub charging `PAGE_SECONDS` (8-35s a page
 over a slice) against `WIDE_PAGE_SECONDS` (31-297s over the whole
 range), so a build that stopped slicing fails its budget in the eval

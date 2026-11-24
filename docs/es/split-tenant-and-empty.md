@@ -159,3 +159,30 @@ shard still has to find the first hundred matching documents, which
 for a rare but present field is a scan until they are found - cheaper
 than counting all, not free; the measured 30-39 s was the full count.
 
+## A pattern with no index behind it
+
+A site map lists the index patterns of every cluster it serves, and one
+cluster may have nothing behind one of them. Elasticsearch answers a
+search on such a pattern with zero shards, zero hits and **no
+`aggregations` block at all**, whatever aggregations were asked. The
+scrubber took the missing block for a broken reply and refused the
+query `malformed` ("planned aggregations missing"), so on that pattern
+a count answered 0 and a terms query on the same scope was refused.
+
+Now `EsScrubber._no_index_reply` reads that one reply as what it is:
+`_shards.total`, `successful` and `failed` all the integer 0, the hit
+total exactly 0, no rows. The answer is a zero with no aggregations
+(`es_aggregate` returns `"aggregations": {}`), and the bridge explains
+it as every zero is explained: no document in this index and window.
+Nothing is invented: no bucket, no value. Every other reply without
+its planned aggregations is still refused `malformed`, and the message
+now carries two counts for the person reading the log, `(shards N,
+hits M)`, with `?` for anything that is not an integer, so nothing from
+the reply's own text reaches it. A group read never met the problem: it
+counts first, with no aggregation. The stub models the reply with
+`StubEngine.no_backing`. Pinned in `tests/test_elastic.py` (the reply
+and seven near misses) and `tests/test_esempty.py` (the MCP tools,
+es-smoke and the decision log). Not measured on a real cluster yet:
+that the real reply has this shape is inferred from one refusal on a
+pattern with 0 documents.
+
