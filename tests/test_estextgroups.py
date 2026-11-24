@@ -695,10 +695,17 @@ def test_a_strata_reply_wider_than_asked_is_withheld_before_a_document_is_read()
         with pytest.raises(elastic.Refused) as e:
             s.scrub_response(reply(bad), plan)
         assert e.value.code == "size_cap" and harvested == []
+    # a reply that lost its strata while it counts documents is malformed
     with pytest.raises(elastic.Refused) as e:
         s.scrub_response({"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
-            "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []}}}, plan)
-    assert e.value.code == "malformed"
+            "hits": {"total": {"value": 5, "relation": "eq"}, "hits": []}}}, plan)
+    assert e.value.code == "malformed" and harvested == []
+    # exactly zero hits and no aggregations is an index pattern with no
+    # document: an empty answer, no groups, nothing read
+    empty = s.scrub_response({"id": "x", "isPartial": False, "isRunning": False, "rawResponse": {
+        "hits": {"total": {"value": 0, "relation": "eq"}, "hits": []}}}, plan).output
+    assert empty["aggregations"]["g"]["buckets"] == [] and harvested == []
+    assert empty["aggregations"]["g"]["sampled"] == 0
     # what fits is read
     s._harvest_hit = elastic.EsScrubber._harvest_hit.__get__(s)
     g = s.scrub_response(reply([(20, 20)] * 50), plan).output["aggregations"]["g"]
