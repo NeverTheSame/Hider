@@ -1704,10 +1704,16 @@ def analyze(text: str, recognizers: list[LocalRecognizer]) -> list[RecognizerRes
 #: Words that, immediately before a dotted-quad, mean it is a version number
 #: rather than an address. Stock IP matching flags "Build 8.1.0.7", and an
 #: engineer who finds their build numbers redacted stops using the tool. That
-#: is the failure mode this list exists to prevent.
+#: is the failure mode this list exists to prevent. Notes write the same
+#: word with markdown marks, brackets, backticks or quotes before the number
+#: (``**Version:** 8.1.0.7``, ``release `8.1.0.7```), and name a release with
+#: ordinary words (``upcoming``, ``newest``, ``tag``). Only blanks and those
+#: marks may stand between, on the same line: a word on the line above, or
+#: any other word between, is no evidence, and neither is the size of a part.
 _VERSION_CONTEXT = re.compile(
     r"(?i)\b(?:build|version|ver|rev|assembly|release|schema|sdk|runtime|"
-    r"framework|agent|product)\b[\s:=v#]*$"
+    r"framework|agent|product|upcoming|newest|tag)\b"
+    r"[ \t:=v#*_`'\"\u2018\u2019\u201c\u201d()\[\]]*\Z"
 )
 
 #: Shared provider endpoints identify the SaaS vendor, not a customer, and

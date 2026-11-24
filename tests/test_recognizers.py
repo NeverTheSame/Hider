@@ -852,6 +852,29 @@ def test_real_address_survives_a_nearby_version_word():
     assert covered(line, "10.20.30.40")
 
 
+@pytest.mark.parametrize("line", [
+    "- **Version:** 12.1.0.213",
+    "Contoso upgraded overnight (build 12.1.0.213) and restarted",
+    "Release `7.0.0.123` is pinned",
+    'version "7.0.0.123" was rolled back',
+    "the upcoming 13.0.0.44 fixes the retry loop",
+    "newest 13.0.0.44 is staged",
+    "pinned at tag 13.0.0.44 for Fabrikam",
+])
+def test_version_numbers_keep_their_marks_and_stay_readable(line):
+    assert "IP_ADDRESS" not in types_in(line)
+
+
+@pytest.mark.parametrize("line, address", [
+    ("connect to 10.0.0.5", "10.0.0.5"),
+    ("Server 10.0.0.5 answered", "10.0.0.5"),
+    ("Anna Novak upgraded to version\n10.0.0.5 answered", "10.0.0.5"),
+    ("**Version:** 12.1.0.213 talking to (10.0.0.5)", "10.0.0.5"),
+])
+def test_an_address_without_a_version_word_right_before_it_is_still_hidden(line, address):
+    assert covered(line, address)
+
+
 # ---------------------------------------------------------------------------
 # Zero-padded IPv4. Was a documented tier 1 gap: Presidio's regex matched the
 # quad and its validator then rejected it, because Python's ipaddress refuses
