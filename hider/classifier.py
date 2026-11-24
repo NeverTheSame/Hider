@@ -227,6 +227,12 @@ _NOTE_FEATURE_WORDS = [
     "Connector", "Catalog", "Archive", "Mapping", "Rule", "Filter", "Queue",
     "Template", "Profile", "Workflow",
 ]
+#: Words that open a two-word label ("Next Steps"), so a label that opens
+#: with a word the model never saw is still read by the word after it.
+_NOTE_LEAD_WORDS = [
+    "Next", "Known", "Current", "Further", "Recent", "Remaining", "Main",
+    "Final", "Related", "Previous",
+]
 _NOTE_COLUMN_WORDS = [
     "Item", "Status", "Owner", "Date", "Count", "Result", "Priority",
     "Severity", "Ticket", "Component", "Version", "Comment", "Reference",
@@ -247,9 +253,10 @@ _NOTE_ORG_LABELS = [
 #: Cumulative shares of the ten kinds of note line, in the order
 #: ``_render_note_line`` tests them: heading, table header, bold label, list
 #: item with a feature phrase, sentence with a feature phrase, person in a
-#: cell, person after a label, person in a list item, organisation in a cell,
-#: organisation after a label; the rest is an organisation in a list item.
-_NOTE_MIX = (0.04, 0.07, 0.11, 0.15, 0.18, 0.45, 0.70, 0.84, 0.92, 0.97)
+#: cell, person after a label, person in a list item, person before a colon
+#: (a pasted chat or mail line), person who opens the line, organisation in a
+#: cell, organisation after a label; the rest is an organisation in a list item.
+_NOTE_MIX = (0.04, 0.07, 0.11, 0.15, 0.18, 0.33, 0.50, 0.64, 0.74, 0.84, 0.92, 0.97)
 
 #: Note-shaped lines with a person. ``{L}`` is a person label, ``{P}`` the
 #: person, ``{W}`` a lowercase word, ``{D}`` a number.
@@ -261,6 +268,25 @@ _NOTE_PERSON_LIST_TEMPLATES = [
     "- Waiting on {P} for the {W} review.",
     "- {P} reported the issue twice.",
     "2. Handover to {P} after the call.",
+]
+#: What follows a person and a colon in a pasted chat or mail line: lowercase.
+_NOTE_CHAT_TEXTS = [
+    "can you send the {W} logs again?",
+    "the export finished on my side.",
+    "i will look at it after lunch.",
+    "no change after the restart.",
+    "thanks, that worked.",
+    "still seeing the same error here.",
+    "the {W} items are back now.",
+]
+#: A person who opens the line with no marker, then a lowercase word.
+_NOTE_PERSON_OPEN_TEMPLATES = [
+    "{P} restarted the {W} job after the call.",
+    "{P} sent two screenshots of the error.",
+    "{P} is out until {D} and asked us to wait.",
+    "{P} from {O} joined the call at {D}.",
+    "{P} shared a new export with {W} items.",
+    "{P} agreed to try the workaround tonight.",
 ]
 _NOTE_ORG_LIST_TEMPLATES = [
     "- {O} reported the issue through the portal.",
@@ -330,26 +356,36 @@ def _structure(tokens: Sequence[Token], text: str) -> list[dict]:
     another after it on the line, a table cell. ``token.in_bold``: an odd
     number of bold marks (``**`` or ``__``) stand before it on the line.
     ``phrase.before_colon``: the run of words the token starts, four at most,
-    is followed by a colon, with bold marks allowed between: a label.
-    They read only the text of the line the token stands on.
+    is followed by a colon, with bold marks allowed between: a label. Its
+    value says what follows the colon on the line: ``"end"`` nothing (a
+    heading-like label), ``"short"`` one or two words (a label and its value),
+    ``"long"`` three or more (a speaker and what they wrote); ``False`` when
+    the run is not followed by a colon.
+    They read only the text of the line the token stands on; the run of words
+    ends with the line.
     """
     out: list[dict] = []
-    cache: dict[int, tuple[bool, list[int], list[int]]] = {}
+    cache: dict[int, tuple[bool, list[int], list[int], int]] = {}
     for i, tok in enumerate(tokens):
         ls = text.rfind("\n", 0, tok.start) + 1
         if ls not in cache:
             le = text.find("\n", ls)
-            line = text[ls:le if le >= 0 else len(text)]
+            le = le if le >= 0 else len(text)
+            line = text[ls:le]
             cache[ls] = (bool(_HEADING_RE.match(line)),
                          [m.start() + ls for m in re.finditer(r"\|", line)],
-                         [m.start() + ls for m in _BOLD_RE.finditer(line)])
-        heading, pipes, bolds = cache[ls]
+                         [m.start() + ls for m in _BOLD_RE.finditer(line)], le)
+        heading, pipes, bolds, le = cache[ls]
+        on_line = lambda t: ls <= t.start and t.end <= le
         j, run = i, 0
-        while j < len(tokens) and tokens[j].text.isalpha() and tokens[j].start >= ls:
+        while j < len(tokens) and tokens[j].text.isalpha() and on_line(tokens[j]):
             j, run = j + 1, run + 1
-        while j < len(tokens) and tokens[j].text == "*":
+        while j < len(tokens) and tokens[j].text == "*" and on_line(tokens[j]):
             j += 1
-        colon = 0 < run <= 4 and j < len(tokens) and tokens[j].text == ":"
+        colon: bool | str = False
+        if 0 < run <= 4 and j < len(tokens) and tokens[j].text == ":" and on_line(tokens[j]):
+            rest = sum(1 for t in tokens[j + 1:] if on_line(t) and t.text != "*")
+            colon = "end" if rest == 0 else "short" if rest <= 2 else "long"
         k = bisect.bisect_left(pipes, tok.start)
         out.append({
             "line.heading": heading,
@@ -500,8 +536,9 @@ def _render_note_line(rng: random.Random) -> tuple[str, list[tuple[int, int, str
     Without a name: a heading, a table header row, a bold label before a
     colon, a list item that opens with a capitalised phrase, a sentence with a
     feature phrase in it. With a name: a person in a table cell, a person
-    after a label, a person in a list item, an organisation in a table cell or
-    after a label.
+    after a label, a person in a list item, a person before a colon with
+    lowercase text after it, a person who opens the line, an organisation in
+    a table cell or after a label.
     """
     roll = rng.random()
     entities: list[tuple[str, str]] = []
@@ -514,6 +551,8 @@ def _render_note_line(rng: random.Random) -> tuple[str, list[tuple[int, int, str
             r, _NOTE_COLUMN_WORDS, 1, 2 if r.random() < 0.25 else 1)))
     elif roll < _NOTE_MIX[2]:
         label = _phrase(rng, _NOTE_PHRASE_WORDS + _NOTE_COLUMN_WORDS)
+        if rng.random() < 0.4:
+            label = rng.choice(_NOTE_LEAD_WORDS) + " " + rng.choice(_NOTE_PHRASE_WORDS)
         text = _bold_label(rng, label)
         if rng.random() < 0.5:
             text += " " + " ".join(rng.sample(_NOTE_STATUS_WORDS, 2))
@@ -540,12 +579,24 @@ def _render_note_line(rng: random.Random) -> tuple[str, list[tuple[int, int, str
             P=person, W=rng.choice(_NOTE_STATUS_WORDS))
         entities = [(person, "PERSON")]
     elif roll < _NOTE_MIX[8]:
+        person = _draw_person(rng)
+        head = rng.choice(["{P}:", "{P}:", "**{P}**:", "**{P}:**"]).format(P=person)
+        text = head + " " + rng.choice(_NOTE_CHAT_TEXTS).format(
+            W=rng.choice(_NOTE_STATUS_WORDS))
+        entities = [(person, "PERSON")]
+    elif roll < _NOTE_MIX[9]:
+        person, org = _draw_person(rng), _draw_org(rng)
+        template = rng.choice(_NOTE_PERSON_OPEN_TEMPLATES)
+        text = template.format(P=person, O=org, W=rng.choice(_NOTE_STATUS_WORDS),
+                               D=rng.randint(1, 99))
+        entities = [(person, "PERSON")] + ([(org, "ORGANIZATION")] if "{O}" in template else [])
+    elif roll < _NOTE_MIX[10]:
         org = _draw_org(rng)
         cells = _cells(rng, rng.randint(3, 5), _plain_cell)
         cells[rng.randrange(len(cells))] = org
         text = _row(cells)
         entities = [(org, "ORGANIZATION")]
-    elif roll < _NOTE_MIX[9]:
+    elif roll < _NOTE_MIX[11]:
         org = _draw_org(rng)
         text = _bold_label(rng, rng.choice(_NOTE_ORG_LABELS)) + " " + org
         entities = [(org, "ORGANIZATION")]

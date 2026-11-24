@@ -161,7 +161,8 @@ def test_fail_closed_when_the_classifier_errors(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _NOTES_LISTS = ("_NOTE_PHRASE_WORDS", "_NOTE_FEATURE_WORDS", "_NOTE_COLUMN_WORDS",
-                "_NOTE_STATUS_WORDS", "_NOTE_PERSON_LABELS", "_NOTE_ORG_LABELS")
+                "_NOTE_STATUS_WORDS", "_NOTE_PERSON_LABELS", "_NOTE_ORG_LABELS",
+                "_NOTE_LEAD_WORDS")
 _NOTES_FEATURES = {"line.heading", "token.in_pipes", "token.in_bold", "phrase.before_colon"}
 
 
@@ -252,6 +253,31 @@ def test_with_notes_an_organisation_after_a_label_or_in_a_cell_is_claimed(_notes
         _notes_clf, "**Customer:** Contoso Holdings")
     assert ("Fabrikam Group", "ORGANIZATION") in _claimed(
         _notes_clf, "| Fabrikam Group | open | 2 |")
+
+
+def test_the_colon_run_stops_at_the_end_of_the_line():
+    text = "Anna Novak\nNotes: open"
+    f = {t.text: x for t, x in zip(classifier.tokenize(text),
+                                   classifier.featurize(classifier.tokenize(text), text, notes=True))}
+    assert not f["Anna"]["phrase.before_colon"] and not f["Novak"]["phrase.before_colon"]
+    assert f["Notes"]["phrase.before_colon"]
+
+
+@pytest.mark.parametrize("line", [
+    "Marek Petrov: please check the job again.",
+    "**Marek Petrov**: please check the job again.",
+])
+def test_with_notes_a_person_before_a_colon_at_the_start_of_a_line_is_claimed(_notes_clf, line):
+    assert ("Marek Petrov", "PERSON") in _claimed(_notes_clf, line)
+
+
+def test_with_notes_a_person_who_opens_a_line_before_from_is_claimed_whole(_notes_clf):
+    claimed = _claimed(_notes_clf, "Lena Moreau from Contoso Holdings asked for the export again.")
+    assert ("Lena Moreau", "PERSON") in claimed
+
+
+def test_with_notes_open_questions_before_a_colon_is_still_not_claimed(_notes_clf):
+    assert _claimed(_notes_clf, "Open Questions:") == set()
 
 
 def test_notes_training_is_deterministic_and_the_default_model_is_not_the_notes_model():

@@ -422,8 +422,11 @@ features and the model are exactly what they were. With `True` the training
 set is the same log lines, then the same number of note-shaped lines, with four
 structure features on every token: `line.heading` (the line opens with hash
 signs), `token.in_pipes` (a table cell), `token.in_bold` (inside bold marks),
-`phrase.before_colon` (a run of up to four words followed by a colon). The
-note lines use their own invented word lists (`_NOTE_*`), disjoint from
+`phrase.before_colon` (a run of up to four words on one line followed by a
+colon; its value says whether nothing, one or two words, or three or more
+words follow the colon on that line, so a heading-like label, a label and its
+value, and a speaker in a pasted chat or mail line are told apart). The note
+lines use their own invented word lists (`_NOTE_*`), disjoint from
 `entities.py` and the name vocabulary, and the mix of line kinds is
 `_NOTE_MIX`. `redact --tier2-grammar logs|notes` picks it, default `logs`; eval,
 the gateway, jsonscrub and the Elasticsearch code do not take it.
@@ -433,40 +436,51 @@ and every other switch at its default; "hidden" means no occurrence readable:
 
 | | logs | notes |
 |---|---|---|
-| values hidden of 226 (whole / part readable) | 156 (63 / 7) | 151 (64 / 11) |
-| person names hidden of 53 | 45 | 42 |
-| organisation names hidden of 16 | 3 | 1 |
-| occurrences hidden of 1,160 | 839 | 828 |
-| replacements that hide nothing on the list | 211 | 152 |
-| of those, tier 2 | 124 | 57 |
-| tier 2 claims right / wrong | 236 / 124 | 203 / 57 |
+| values hidden of 226 (whole / part readable) | 156 (63 / 7) | 154 (62 / 10) |
+| person names hidden of 53 | 45 | 44 |
+| organisation names hidden of 16 | 3 | 2 |
+| occurrences hidden of 1,160 | 839 | 848 |
+| replacements that hide nothing on the list | 211 | 167 |
+| of those, tier 2 | 124 | 77 |
+| tier 2 claims right / wrong | 236 / 124 | 230 / 77 |
 
-Tier 2's wrong claims fall by more than half, in every place a claim can stand
-(table cell 25 to 13, list item 43 to 22, sentence 47 to 20, label before a
-colon 3 to 0). The right claims fall too, 236 to 203, and five listed values
-are less hidden than with `logs`: three two-word person names and one
-organisation name, each now readable in part, and one organisation name now
-readable whole. That is the trade, and it is why the default stays `logs`: the
-second grammar stops hiding things that are not names and hides fewer names.
-The note the profile and the note shapes were written from shows the same
-direction (tier 2 wrong claims 28 to 14, right 32 to 26, one value less hidden);
-the other five show it too (96 to 43 wrong, 204 to 177 right, four values less
+Tier 2's wrong claims fall by more than a third (table cell 25 to 18, list
+item 43 to 25, sentence 47 to 29, bold text 6 to 2, label before a colon 3 and
+3). The right claims fall a little, 236 to 230, and four listed values are less
+hidden than with `logs`: three two-word person names and one organisation
+name, each now readable in part. More occurrences are hidden than with `logs`
+(848 against 839). The default stays `logs`: four values are still less
+hidden, and a person readable in part is worse than a heading hidden. The note
+the profile and the note shapes were written from shows the same direction
+(tier 2 wrong claims 28 to 18, right 32 to 28, one value less hidden); the
+other five show it too (96 to 59 wrong, 204 to 202 right, three values less
 hidden). The note shapes were surveyed over all six notes, so there is no note
 here that the grammar was not designed against.
 
 On the generated corpus (4,000 lines, the one `hider eval` builds, without the
-adversarial unit) `notes` finds 295 of 315 free-text person names, 19 of them
+adversarial unit) `notes` finds 309 of 315 free-text person names, 6 of them
 only in part, against 315 with `logs`, and 247 of 247 organisations in both; it
-changes 0 of 1,000 clean lines, as `logs` does. Swapping one word of one note
-word list moved the person count from 305 to 295, so read that figure as
-carrying that much noise.
+changes 0 of 1,000 clean lines, as `logs` does. All six names found in part are
+two words that open the line, with the first word left readable. Swapping one word
+of one note word list once moved the person count by 10, so read that figure
+as carrying about that much noise.
 
-The grammar was changed once after a score. The first mix of note lines was
-half lines without a name, mostly capitalised pairs, and it taught the model
-that the second capitalised word after a capitalised word is not part of a
-name (on the earlier inputs: 17 of 53 person names hidden, 261 of 315 persons
-on the corpus). The mix now holds 18% lines without a name. Training on more
-note lines than `n_sentences` made it worse, not better (149 of 315 persons at
-twice the lines with the first mix). One probe-driven change came before any
-score: table header cells are mostly one word, so a two-word name in a cell is
-not read as a heading.
+The grammar was changed three times after a score. First, the mix of note
+lines: the first mix was half lines without a name, mostly capitalised pairs,
+and it taught the model that the second capitalised word after a capitalised
+word is not part of a name (on the earlier inputs: 17 of 53 person names
+hidden, 261 of 315 persons on the corpus); the mix holds 18% lines without a
+name. Second, one status word was replaced, which moved the corpus person
+count from 305 to 295. Third, after review: a person before a colon at the
+start of a line was not claimed at all, and every corpus person found in part was
+a two-word name opening the line. Note lines now hold a person, a colon and
+lowercase text (plain and in bold marks) and a person who opens the line, label
+lines sometimes open with a lead word (`_NOTE_LEAD_WORDS`, so a label that opens
+with an unseen word is read by the word after it), `phrase.before_colon` says
+what follows the colon, and its run of words stops at the end of the line. That
+third change was made after the corpus count and the review probes, not after a
+real-note score, and nothing changed after this round's real-note score.
+Training on more note lines than `n_sentences` made it worse, not better (149
+of 315 persons at twice the lines with the first mix). One probe-driven change
+came before any score: table header cells are mostly one word, so a two-word
+name in a cell is not read as a heading.
