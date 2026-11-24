@@ -1594,6 +1594,14 @@ class EsScrubber(jsonscrub.JsonScrubber):
         if len(rows) > cap:
             raise self._refuse("size_cap", "response withheld: more hits than the cap allows")
         aggs = body.get("aggregations", {})
+        if ("aggregations" not in body and plan.aggs and not rows
+                and _exactly_zero(hits.get("total"))):
+            # An index pattern that holds no index or no document answers
+            # with zero hits and no aggregations key at all. That is an empty
+            # answer, not a broken one: the planned aggregations are filled
+            # in empty and go through the same passes. Anything else without
+            # its planned aggregations is still refused below.
+            aggs = _empty_aggs(plan.aggs)
         if plan.groups is not None and plan.groups.phase == "strata":
             # before anything is harvested: the slices and the documents in
             # them are capped as a page is, per slice and in all
@@ -3530,6 +3538,38 @@ class _KeepStr(str):
 
 def _keep_mark(value: Any) -> Any:
     return _KeepStr(value) if isinstance(value, str) else value
+
+
+def _exactly_zero(total: Any) -> bool:
+    """A hit total that says exactly none: ``0`` or ``{"value": 0, "relation": "eq"}``."""
+    if isinstance(total, dict):
+        relation = total.get("relation", "eq")
+        total = total.get("value")
+        if relation != "eq":
+            return False
+    return isinstance(total, int) and not isinstance(total, bool) and total == 0
+
+
+def _empty_aggs(plans: dict[str, AggPlan]) -> dict:
+    """What Elasticsearch returns for ``plans`` over no document at all."""
+    return {name: _empty_agg(plan) for name, plan in plans.items()}
+
+
+def _empty_agg(plan: AggPlan) -> dict:
+    if plan.type in {"terms", "date_histogram", "histogram"}:
+        return {"buckets": []}
+    if plan.type == "filters":
+        return {"buckets": {name: {"doc_count": 0, **_empty_aggs(plan.subs)}
+                            for name in plan.names}}
+    if plan.type == "filter":
+        return {"doc_count": 0, **_empty_aggs(plan.subs)}
+    if plan.type == "top_hits":
+        return {"hits": {"total": {"value": 0, "relation": "eq"}, "hits": []}}
+    if plan.type == "percentiles":
+        return {"values": {}}
+    # single-value metrics: a count of nothing is 0, a min, max, avg or sum of
+    # nothing has no value
+    return {"value": 0 if plan.type in {"value_count", "cardinality"} else None}
 
 
 def _sub_aggs(bucket: dict) -> dict:

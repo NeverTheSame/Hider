@@ -599,9 +599,47 @@ def test_unplanned_aggregation_is_refused():
         s.scrub_response(_envelope([], {"surprise": {"buckets": [{"key": "Fabrikam", "doc_count": 1}]}}),
                          PLAN)
     assert e.value.code == "unplanned_agg"
-    with pytest.raises(elastic.Refused) as e:
-        s.scrub_response(_envelope([]), elastic.Plan("logs-app-*", {"x": elastic.AggPlan("cardinality", "labels.tenant_id")}))
-    assert e.value.code == "malformed"
+
+
+def _empty_plan() -> elastic.Plan:
+    return elastic.Plan("logs-app-*", {
+        "n": elastic.AggPlan("cardinality", "labels.tenant_id"),
+        "first": elastic.AggPlan("min", "@timestamp"),
+        "by": elastic.AggPlan("terms", "event.outcome"),
+        "days": elastic.AggPlan("date_histogram", "@timestamp"),
+        "split": elastic.AggPlan("filters", names=("a", "b"),
+                                 subs={"c": elastic.AggPlan("value_count", "@timestamp")}),
+    })
+
+
+def test_an_index_pattern_with_no_document_is_an_empty_answer_not_a_malformed_one():
+    """Elasticsearch answers a pattern that holds no document with zero hits
+    and no aggregations key. On a real cluster that was refused `malformed`,
+    so a count-by on an empty stream looked like a broken bridge. The planned
+    aggregations come back empty instead."""
+    out = _session().scrub_response(_envelope([]), _empty_plan()).output
+    assert out["hits"]["total"] == {"value": 0, "relation": "eq"} and out["hits"]["hits"] == []
+    aggs = out["aggregations"]
+    assert aggs["n"] == {"value": 0} and aggs["first"] == {"value": None}
+    assert aggs["by"] == {"buckets": []} and aggs["days"] == {"buckets": []}
+    assert aggs["split"] == {"buckets": {"a": {"doc_count": 0, "c": {"value": 0}},
+                                         "b": {"doc_count": 0, "c": {"value": 0}}}}
+
+
+def test_a_reply_that_lost_its_aggregations_any_other_way_is_still_refused():
+    """Only exactly zero hits explains a missing aggregations key. A reply
+    with a hit, a lower-bound total, a missing total or a non-zero total is
+    refused as before."""
+    one = elastic.AggPlan("cardinality", "labels.tenant_id")
+    plan = elastic.Plan("logs-app-*", {"x": one})
+    replies = [_envelope([_hit(APP_DOC)]), _envelope([]), _envelope([]), _envelope([])]
+    replies[1]["rawResponse"]["hits"]["total"] = {"value": 0, "relation": "gte"}
+    del replies[2]["rawResponse"]["hits"]["total"]
+    replies[3]["rawResponse"]["hits"]["total"] = {"value": 7, "relation": "eq"}
+    for reply in replies:
+        with pytest.raises(elastic.Refused) as e:
+            _session().scrub_response(reply, plan)
+        assert e.value.code == "malformed"
 
 
 def test_bucket_and_hit_caps_are_enforced():

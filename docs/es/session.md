@@ -131,3 +131,21 @@ denylist. The prompt is gated too (`esmcp.prompt_findings`), headless
 before launch and interactive as a `UserPromptSubmit` hook whose
 command ends in `|| exit 2`, so a broken check blocks.
 
+## An empty index pattern is an empty answer
+
+Every malformed reply is a refusal, and a reply without the aggregations
+the query planned used to count as one. On a real cluster an index pattern
+with no document in the window answered a plain count with 0 hits, and a
+terms aggregation on the same pattern with `malformed`: Elasticsearch
+leaves the `aggregations` key out when nothing matched an index, so
+"nothing there" read as "the bridge is broken", and the explanation every
+zero gets was never reached.
+
+So a reply with exactly zero hits (`total` 0 with relation `eq`, no hit
+rows) and no `aggregations` key gets its planned aggregations filled in
+empty by `elastic._empty_aggs`: an empty bucket list, a zero count, no
+value for a min, max, avg or sum. They then go through the same harvest,
+rewrite, sweep and leak check as any reply. Nothing else changed: a reply
+with a hit, a lower-bound total, no total or a non-zero total that lacks
+its planned aggregations is still refused `malformed`.
+
