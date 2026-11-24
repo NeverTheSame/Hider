@@ -81,8 +81,13 @@ def any_guid() -> PatternRecognizer:
         patterns=[
             Pattern(name="guid-braced", regex=r"\{" + _GUID_CORE + r"\}", score=0.9),
             Pattern(name="guid", regex=_GUID_CORE, score=0.85),
-            # No dashes: some components log GUIDs in "N" format.
-            Pattern(name="guid-n", regex=r"\b[0-9a-fA-F]{32}\b", score=0.5),
+            # No dashes: some components log GUIDs in "N" format. The edges
+            # are "no letter or digit", not \b: an underscore is a word
+            # character, so \b left the id readable in Svc_<id>.log and
+            # <id>_0001.log. A longer hex run (a 40-hex commit hash, a 64-hex
+            # digest) still has a hex digit at the edge and is not matched.
+            Pattern(name="guid-n",
+                    regex=r"(?<![0-9A-Za-z])[0-9a-fA-F]{32}(?![0-9A-Za-z])", score=0.5),
         ],
         context=["session", "tenant", "mailbox", "site", "job", "id", "guid"],
     )

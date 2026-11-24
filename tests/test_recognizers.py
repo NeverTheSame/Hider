@@ -37,6 +37,13 @@ CASES = [
      "a41f77c2-9be1-4c33-8f0e-1122aabbccdd"),
     ("SESSION_GUID", "session=a41f77c29be14c338f0e1122aabbccdd n-format",
      "a41f77c29be14c338f0e1122aabbccdd"),
+    # an underscore is a word character: the id is still an id beside one
+    ("GUID", r"wrote C:\Logs\Engine\Engine_a41f77c29be14c338f0e1122aabbccdd.log",
+     "a41f77c29be14c338f0e1122aabbccdd"),
+    ("GUID", "wrote /var/log/engine/a41f77c29be14c338f0e1122aabbccdd_0001.log",
+     "a41f77c29be14c338f0e1122aabbccdd"),
+    ("GUID", "wrote /var/log/engine/job_A41F77C29BE14C338F0E1122AABBCCDD_0001.log",
+     "A41F77C29BE14C338F0E1122AABBCCDD"),
     ("WORKER_POD_ID", "[Agent] Agent wkr-amer-prx117 heartbeat received", "wkr-amer-prx117"),
     ("WORKER_POD_ID", '{"pod":"wkr-emea-rg124","msg":"claim"}', "wkr-emea-rg124"),
     ("SERVICE_INSTANCE_ID", "Handled by service instance svc-prod-cus-001", "svc-prod-cus-001"),
@@ -1072,3 +1079,18 @@ def test_log_vocabulary_alone_is_never_a_tier2_span(tier2_pipe, w):
     for line in (f"{w}", f"level {w}", f"{w} {w}", f"[{w}] engine started"):
         r = tier2_pipe.redact(line)
         assert not [s for s in r.spans if s.tier == "tier2"], (line, r.text)
+
+
+@pytest.mark.parametrize("line", [
+    # a 40-hex commit hash and a 64-hex digest are not 32-hex ids, with or
+    # without an underscore beside them
+    "deployed rev_9fceb02d0ae598e95dc970b74767f19372d61af8_x to prod",
+    "digest sha_7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451_y stored",
+    "digest 7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451 stored",
+    # 32 hex digits that run on into a letter or a digit are part of a longer token
+    "wrote Engine_a41f77c29be14c338f0e1122aabbccddg.log",
+    "wrote Engine_a41f77c29be14c338f0e1122aabbccdd7x.log",
+])
+def test_a_dashless_guid_beside_an_underscore_does_not_widen_to_longer_hex_runs(line):
+    assert [r for r in R.analyze(line, [R.any_guid()])] == []
+

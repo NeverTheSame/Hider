@@ -540,3 +540,26 @@ real names, so a `--cassette` path inside the repository is refused with exit
 2 unless it is under the gitignored `out/`, and `redact` records with
 `store_prompts` off, so the cassette holds prompt hashes, not the file. The
 gateway, `eval`, jsonscrub and the Elasticsearch code are unchanged.
+
+## A dashless id beside an underscore
+
+The dashless GUID pattern (`guid-n`, 32 hex digits) ended on a word boundary.
+An underscore is a word character, so the id stayed readable wherever a file
+name joins it with one: `engine_<id>.log`, `<id>_0001.log`,
+`job_<id>_0001.log`. The edges are now "no letter or digit on either side". A
+longer hex run is still not matched, because its 33rd character is a hex
+digit: a 40-hex commit hash and a 64-hex digest stay readable, with or
+without an underscore beside them, as intent
+(`test_a_dashless_guid_beside_an_underscore_does_not_widen_to_longer_hex_runs`).
+
+The report that led here came from a real cluster through the Elasticsearch
+bridge: one page of 50 documents showed dashless 32-hex ids readable in log
+file names in a text field. The miss above was reproduced with invented names;
+which character stood beside the real ids has not been counted yet, so this is
+a cause that fits, not a confirmed fix of that page. A sweep cannot stand in
+for the shape: an id that is never found once is never a known value. The case
+is `guid-n-underscore` in `adversarial.CASES`; `eval` reports the same recall
+and false-redaction figures as before, with 89 placements and 0 surprises.
+
+Not changed: a 64-hex digest and a 40-hex hash stay readable by design. On
+that page they were a cookie digest and build commit hashes.

@@ -98,6 +98,13 @@ CASES: tuple[Case, ...] = (
         owner="",
     ),
     Case(
+        "guid-n-underscore",
+        "Dashless GUID inside a log file name, an underscore on each side: a word boundary does not see it",
+        "[21.08.2026 09:02:13.305] <2f> Info [Log] rolled /var/log/backup/engine_<<SESSION_GUID|b52e88d30cf25d449a1f2233bbccddee>>_0001.log",
+        expect_tier1=True,
+        owner="",
+    ),
+    Case(
         "json-escaped-quotes",
         "Value inside a JSON string that is itself embedded in a JSON string, so quotes are escaped twice",
         "{\"ts\":\"2026-08-21T09:02:14Z\",\"payload\":\"{\\\"upn\\\":\\\"<<UPN_EMAIL|hanna.okafor@litware22.com>>\\\",\\\"pod\\\":\\\"<<POD_ID|wkr-emea-rg124>>\\\"}\"}",

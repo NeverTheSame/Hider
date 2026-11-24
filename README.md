@@ -137,10 +137,10 @@ active — see below) on a 5,121 line, 711,858 character synthetic bundle with
 | Recall on free-text names and orgs (tier 2 classifier, floor 0.75) | 99.65% |
 | Recall across all types | 99.75% |
 | False-redaction rate on 1,000 known-clean lines | 0.0% |
-| Path lookalikes changed (27 fixed system, source, API and version path lines) | 0 by tier 1; 1 with tier 2 on |
+| Path lookalikes changed (32 fixed system, source, API and version path lines) | 0 by tier 1; 1 with tier 2 on |
 | Credential lookalikes changed (17 fixed lines holding a credential key name and no credential) | 0 |
 | Seeded values still findable verbatim in the output | 0 unexplained, 5 known gap |
-| Adversarial surprises across 88 hostile placements | 0 |
+| Adversarial surprises across 89 hostile placements | 0 |
 | Characters cleared before any paid or model tier is consulted | 39.5% |
 | Units degraded during the run | 0 |
 | Tier 1 throughput | ~1.2 milliseconds per line, single threaded, 33 recognizers |
@@ -153,7 +153,7 @@ did. All of the drop is their nine declared misses (`path-*` and
 alone the path rule changes no line: same recall, same spans, byte-identical
 output before and after the file-name change. That is also why the
 generated corpus cannot measure the rule; the 25 caught `path-*` cases and
-the 27 path lookalikes do. One lookalike still changes with tier 2 on: a prose
+the 32 path lookalikes do. One lookalike still changes with tier 2 on: a prose
 "Shared Documents" with no separator around it, which tier 2 calls a person.
 That is the declared boundary of `pipeline.in_structural_path_segment`
 (below): between separators, structural path segments are never part of a
@@ -633,7 +633,7 @@ readability is stated in Limitations.
 | `hider/proxy.py` | The gateway. Redacts chat completions in flight, sweeps for known identifiers, refuses degraded requests unforwarded, de-tokenises buffered and streamed replies, reports unknown labels, logs one row per request, counts on `/healthz`. Standard library only. |
 | `hider/pseudonym.py` | HMAC-keyed, shape-preserving pseudonyms, plus the vault that makes de-tokenisation possible for identifiers and impossible for secrets. |
 | `hider/generator.py` | Fills the placeholder templates and records exact ground truth for every value it plants. |
-| `hider/adversarial.py` | 88 hand-built hostile placements, 27 path lookalikes and 17 credential lookalikes that must stay readable (plus 2 credential lines destroyed on purpose, counted apart), 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
+| `hider/adversarial.py` | 89 hand-built hostile placements, 32 path lookalikes and 17 credential lookalikes that must stay readable (plus 2 credential lines destroyed on purpose, counted apart), 5 pure-text prompt-injection canaries, and 5 more that place the same payloads next to a real seeded name, for measuring tier 3's actual resistance rather than its absence. |
 | `hider/evaluate.py` | The harness. Recall per type per tier, precision as a false-redaction rate, the baseline delta, tier routing and cost, the tier 2 recall floor, and the injection bypass rate once tier 3 runs. |
 | `hider/utility.py` | The utility eval: ground-truth questions over an excerpt, asked on raw and on redacted text, scored after detokenisation. |
 | `hider/feedback.py` | The feedback channel: missed and wrong redactions reported from the web UI, appended locally. |

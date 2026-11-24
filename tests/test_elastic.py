@@ -1951,3 +1951,22 @@ def test_a_returning_field_ranks_after_the_top_ups_cases_wait_for():
     later = t + elastic.VOCABULARY_REFRESH_S + 1
     plan = index.next_slice("stub", cfg, later)
     assert plan.kind == "forward" and "job.name" in plan.fields
+
+
+def test_a_dashless_id_beside_an_underscore_in_a_file_name_is_labelled_in_text():
+    """Each id is on one document only, so the page sweep cannot stand in for
+    the shape: a word boundary did not see an id next to an underscore."""
+    ids = ["5feceb66ffc86f38d952786c6d696c79", "6b86b273ff34fce19d6b804eff5a3f57",
+           "d4735e3a265e16eee03f59718b9b5d03"]
+    lines = [f"rolled /var/log/backup/engine_{ids[0]}.log",
+             f"rolled /var/log/backup/{ids[1]}_0001.log",
+             f"rolled /var/log/backup/job_{ids[2]}_0001.log",
+             # a commit hash is 40 hex digits and stays what it was
+             "deployed rev_9fceb02d0ae598e95dc970b74767f19372d61af8_x"]
+    page = _session().scrub_response(_envelope([
+        _hit(_job_doc("Harbour Ridge Nightly", line), _id=f"h{i}")
+        for i, line in enumerate(lines)]), PLAN).output
+    text = [h["_source"]["message"] for h in page["hits"]["hits"]]
+    for i, value in enumerate(ids):
+        assert value not in text[i] and "<Guid-" in text[i]
+    assert "9fceb02d0ae598e95dc970b74767f19372d61af8" in text[3]
