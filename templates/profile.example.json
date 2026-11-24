@@ -7,7 +7,10 @@
     "topology, which is part of what the redaction layer exists to hide.",
     "A profile can only ADD patterns. It cannot weaken a built-in recognizer,",
     "and anything malformed here is a startup error rather than a silent skip.",
-    "Entries are a regex string, or an object with 'regex' and 'score'."
+    "Entries are a regex string, or an object with 'regex' and 'score'.",
+    "An object may add 'after', a regex for a cue: the value then counts only",
+    "right after the cue on the same line (blanks, ':', '#' or '=' between).",
+    "With 'list': true, values joined by ',', '/', ';' or 'and' count too."
   ],
   "patterns": {
     "WORKER_POD_ID": [
@@ -15,6 +18,9 @@
     ],
     "SERVICE_INSTANCE_ID": [
       { "regex": "\\bacme-svc-[a-z]{3,6}-[a-z]{2,8}-\\d{1,4}\\b", "score": 0.95 }
+    ],
+    "SUPPORT_CASE_NUMBER": [
+      { "regex": "\\b\\d{7}\\b", "after": "\\bacme-tracker(?: items?)?\\b", "list": true }
     ],
     "HOSTNAME_FQDN": [
       "\\b[a-z0-9-]{1,40}\\.acme-internal\\.example\\b"

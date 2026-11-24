@@ -77,11 +77,64 @@ def test_the_eval_baseline_ignores_any_local_profile(tmp_path, monkeypatch):
     ({"name": "x", "patterns": {"WORKER_POD_ID": []}}, "non-empty list"),
     ({"name": "x", "patterns": {"WORKER_POD_ID": [{"regex": "a", "score": 9}]}}, "outside"),
     ({"name": "x", "patterns": {"WORKER_POD_ID": [{"nope": "a"}]}}, "must be a regex"),
+    ({"name": "x", "patterns": {"SUPPORT_CASE_NUMBER": [{"regex": r"\d{7}", "list": True}]}},
+     "'list' needs 'after'"),
+    ({"name": "x", "patterns": {"SUPPORT_CASE_NUMBER": [{"regex": r"\d{7}", "after": "("}]}},
+     "'after' regex does not compile"),
 ])
 def test_a_broken_profile_raises_rather_than_loading_less_protection(tmp_path, bad, fragment):
     with pytest.raises(profiles.ProfileError) as e:
         profiles.load(write(tmp_path, bad))
     assert fragment in str(e.value)
+
+
+@pytest.fixture
+def cued(tmp_path, monkeypatch):
+    def build(**extra):
+        entry = {"regex": r"\b\d{7}\b", "after": r"\bRelated items\b", **extra}
+        path = write(tmp_path, {"name": "cue-site", "patterns": {"SUPPORT_CASE_NUMBER": [entry]}})
+        monkeypatch.setenv(profiles.ENV_PROFILE, str(path))
+        profiles.active.cache_clear()
+        return pipeline.Pipeline(vault=pseudonym.EntityVault(key=b"k"))
+    return build
+
+
+LISTED = "Related items: 4410021, 4410022 / 4410023"
+
+
+def test_a_cued_list_hides_every_number_and_keeps_the_cue_readable(cued):
+    out = cued(list=True).redact(LISTED).text
+    assert out.startswith("Related items: ")
+    for n in ("4410021", "4410022", "4410023"):
+        assert n not in out
+    assert ", " in out and " / " in out
+
+
+def test_a_cue_without_list_hides_only_the_first_number(cued):
+    out = cued().redact(LISTED).text
+    assert "4410021" not in out
+    assert "4410022" in out and "4410023" in out
+
+
+def test_a_list_follows_semicolons_and_the_word_and(cued):
+    out = cued(list=True).redact(
+        "Related items #4410021; 4410022 and 4410023, see notes").text
+    for n in ("4410021", "4410022", "4410023"):
+        assert n not in out
+
+
+@pytest.mark.parametrize("line", [
+    "Order 4410021 shipped",
+    "Related items:\n4410021",
+    "Related items for 4410021",
+    "Related items: 4410021 for 4410022",
+])
+def test_a_cued_value_needs_the_cue_on_the_same_line_with_nothing_between(cued, line):
+    out = cued(list=True).redact(line).text
+    if line == "Related items: 4410021 for 4410022":
+        assert "4410021" not in out and "4410022" in out
+    else:
+        assert "4410021" in out
 
 
 def test_missing_and_malformed_files_raise(tmp_path):
@@ -96,7 +149,8 @@ def test_the_shipped_example_profile_is_valid():
     from pathlib import Path
     example = Path(__file__).resolve().parent.parent / "templates" / "profile.example.json"
     prof = profiles.load(example)
-    assert prof.pattern_count >= 3
+    assert prof.pattern_count >= 4
+    assert prof.cued
 
 
 def test_the_example_profile_uses_only_the_invented_namespace():
@@ -113,3 +167,6 @@ def test_the_example_profile_uses_only_the_invented_namespace():
     for label, items in prof.patterns.items():
         for regex, _score in items:
             assert "acme" in regex, f"{label} pattern is outside the example namespace"
+    for label, entries in prof.cued.items():
+        for entry in entries:
+            assert "acme" in entry.after, f"{label} cue is outside the example namespace"

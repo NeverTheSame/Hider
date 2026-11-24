@@ -484,3 +484,19 @@ Training on more note lines than `n_sentences` made it worse, not better (149
 of 315 persons at twice the lines with the first mix). One probe-driven change
 came before any score: table header cells are mostly one word, so a two-word
 name in a cell is not read as a heading.
+
+## A profile pattern can name its cue and follow a list
+
+A profile entry is a regex and a score, and the whole match is the value. A
+value that is sensitive only after a cue word (a tracker number after
+`Related items:`) needed a look-behind, which has a fixed width and cannot
+follow a list: in `Related items: 4410021, 4410022 / 4410023` only the first
+number was hidden. An entry may now carry `after`, a regex for the cue, and
+`list`. The value counts only where it stands right after the cue on the same
+line, with nothing between but blanks, `:`, `#` or `=`; with `list` true each
+further value joined to the last by a comma, slash, semicolon or the word
+`and` counts too. Only values are reported, the cue stays readable
+(`recognizers.CuedProfileRecognizer`). `list` without `after`, or an `after`
+that does not compile, is a load error; an entry without `after` is matched as
+before. A bare number with no cue, on the next line, or with a word between
+stays readable by design: a cue is evidence, a digit run alone is not.

@@ -1592,6 +1592,49 @@ def custom() -> list[LocalRecognizer]:
     ]
 
 
+class CuedProfileRecognizer(LocalRecognizer):
+    """A site profile's cued entries for one label.
+
+    A look-behind has a fixed width and cannot follow a list, so the cue is
+    matched separately: the value counts only where it stands right after the
+    cue on the same line, and with ``follow_list`` each further value joined
+    by a comma, slash, semicolon or ``and`` counts too. Only values are
+    reported; the cue stays readable.
+    """
+
+    FLAGS = re.IGNORECASE | re.MULTILINE
+    GAP = re.compile(r"[ \t:#=]*")
+    JOIN = re.compile(r"[ \t]*(?:[,/;]|\band\b)[ \t]*", re.IGNORECASE)
+
+    def __init__(self, label: str, name: str, entries) -> None:
+        super().__init__(supported_entities=[label], name=name)
+        self.supported_entity = label
+        self.entries = [(re.compile(e.after, self.FLAGS), re.compile(e.regex, self.FLAGS),
+                         e.score, e.follow_list) for e in entries]
+
+    def load(self) -> None:
+        return None
+
+    def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+        if entities and self.supported_entity not in entities:
+            return []
+        found: dict[tuple[int, int], float] = {}
+        for cue, value, score, follow_list in self.entries:
+            for c in cue.finditer(text):
+                pos = self.GAP.match(text, c.end()).end()
+                while (v := value.match(text, pos)) and v.end() > v.start():
+                    found[v.span()] = max(score, found.get(v.span(), 0.0))
+                    if not follow_list:
+                        break
+                    pos = self.JOIN.match(text, v.end())
+                    if pos is None:
+                        break
+                    pos = pos.end()
+        return [RecognizerResult(entity_type=self.supported_entity, start=s, end=e,
+                                 score=sc, analysis_explanation=None)
+                for (s, e), sc in sorted(found.items())]
+
+
 def profile_recognizers(profile: profiles.SiteProfile | None) -> list[LocalRecognizer]:
     """Recognizers built from a site profile's patterns.
 
@@ -1613,6 +1656,8 @@ def profile_recognizers(profile: profiles.SiteProfile | None) -> list[LocalRecog
                 ],
             )
         )
+    for label, entries in sorted(profile.cued.items()):
+        out.append(CuedProfileRecognizer(label, f"Profile[{profile.name}]:{label}:cued", entries))
     return out
 
 

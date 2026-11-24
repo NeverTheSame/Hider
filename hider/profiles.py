@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -50,15 +50,34 @@ class ProfileError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class CuedPattern:
+    """A value that is sensitive only where it stands after a cue.
+
+    ``after`` matches the cue; the value must follow it on the same line with
+    nothing between but blanks, ``:``, ``#`` or ``=``. With ``follow_list``
+    each further value joined to the last by a comma, slash, semicolon or the
+    word ``and`` is reported too. Only values are reported, never the cue.
+    """
+
+    regex: str
+    score: float
+    after: str
+    follow_list: bool = False
+
+
+@dataclass(frozen=True)
 class SiteProfile:
     name: str
     #: detector label -> tuple of (regex source, score)
     patterns: dict[str, tuple[tuple[str, float], ...]]
     source: str = ""
+    #: detector label -> entries that carry an ``after`` cue
+    cued: dict[str, tuple[CuedPattern, ...]] = field(default_factory=dict)
 
     @property
     def pattern_count(self) -> int:
-        return sum(len(v) for v in self.patterns.values())
+        return (sum(len(v) for v in self.patterns.values())
+                + sum(len(v) for v in self.cued.values()))
 
 
 def parse(raw: dict, *, source: str = "") -> SiteProfile:
@@ -70,6 +89,7 @@ def parse(raw: dict, *, source: str = "") -> SiteProfile:
         raise ProfileError(f"{source or 'profile'}: 'patterns' must be a non-empty object")
 
     out: dict[str, tuple[tuple[str, float], ...]] = {}
+    cued: dict[str, tuple[CuedPattern, ...]] = {}
     for label, items in entries.items():
         if label not in ALLOWED_LABELS:
             raise ProfileError(
@@ -81,12 +101,29 @@ def parse(raw: dict, *, source: str = "") -> SiteProfile:
         if not isinstance(items, list) or not items:
             raise ProfileError(f"{source or 'profile'}: {label} must be a non-empty list")
         built: list[tuple[str, float]] = []
+        built_cued: list[CuedPattern] = []
         for item in items:
+            after, follow_list = None, False
             if isinstance(item, str):
                 regex, score = item, DEFAULT_SCORE
             elif isinstance(item, dict) and "regex" in item:
                 regex = item["regex"]
                 score = float(item.get("score", DEFAULT_SCORE))
+                after = item.get("after")
+                follow_list = item.get("list", False)
+                if not isinstance(follow_list, bool):
+                    raise ProfileError(f"{source or 'profile'}: {label} 'list' must be true or false")
+                if follow_list and after is None:
+                    raise ProfileError(f"{source or 'profile'}: {label} 'list' needs 'after'")
+                if after is not None:
+                    if not isinstance(after, str) or not after:
+                        raise ProfileError(f"{source or 'profile'}: {label} has an empty 'after'")
+                    try:
+                        re.compile(after)
+                    except re.error as e:
+                        raise ProfileError(
+                            f"{source or 'profile'}: {label} 'after' regex does not compile: {e}"
+                        ) from e
             else:
                 raise ProfileError(
                     f"{source or 'profile'}: {label} entries must be a regex string "
@@ -104,9 +141,15 @@ def parse(raw: dict, *, source: str = "") -> SiteProfile:
                 raise ProfileError(
                     f"{source or 'profile'}: {label} score {score} is outside (0, 1]"
                 )
-            built.append((regex, score))
-        out[label] = tuple(built)
-    return SiteProfile(name=name, patterns=out, source=source)
+            if after is None:
+                built.append((regex, score))
+            else:
+                built_cued.append(CuedPattern(regex, score, after, follow_list))
+        if built:
+            out[label] = tuple(built)
+        if built_cued:
+            cued[label] = tuple(built_cued)
+    return SiteProfile(name=name, patterns=out, source=source, cued=cued)
 
 
 def load(path: str | Path) -> SiteProfile:
