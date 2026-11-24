@@ -501,11 +501,11 @@ that does not compile, is a load error; an entry without `after` is matched as
 before. A bare number with no cue, on the next line, or with a word between
 stays readable by design: a cue is evidence, a digit run alone is not.
 
-## A version number keeps its marks and brackets
+## A version number keeps its marks
 
 `recognizers._VERSION_CONTEXT` keeps a dotted number readable when a version
 word stands right before it. Notes write that word with markdown marks,
-brackets, backticks or quotes in between (`**Version:** 12.1.0.213`,
+backticks or quotes in between (`**Version:** 12.1.0.213`,
 ``release `7.0.0.123` ``), and name a release with ordinary words
 (`upcoming`, `newest`, `tag`); each of these was hidden as an IP address. The
 gap between word and number may now hold blanks and those marks, on the same
@@ -513,6 +513,9 @@ line only: the window used to end in `$`, which also matches before a final
 newline, so a version word at the end of the line above kept an address on
 the next line readable. A word between, a word on another line, or the size
 of a part (`10.0.0.5` is an ordinary private address) is never evidence, and
-no rule reads the rest of the file. Still hidden as a declared miss: a number
+no rule reads the rest of the file. A bracket between the word and the number
+is not evidence either: `agent (10.0.0.5)` names a machine and its address, so
+it stays hidden, while `(build 12.1.0.213)`, with the bracket before the word,
+stays readable. Still hidden as a declared miss: a number
 after a product name (`Tailspin Console 7.0.0.123`), because a product name is
 not a word list.

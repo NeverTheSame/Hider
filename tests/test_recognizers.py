@@ -870,6 +870,9 @@ def test_version_numbers_keep_their_marks_and_stay_readable(line):
     ("Server 10.0.0.5 answered", "10.0.0.5"),
     ("Anna Novak upgraded to version\n10.0.0.5 answered", "10.0.0.5"),
     ("**Version:** 12.1.0.213 talking to (10.0.0.5)", "10.0.0.5"),
+    ("The agent (192.168.1.5) is unreachable", "192.168.1.5"),
+    ("product [10.0.0.5] did not respond", "10.0.0.5"),
+    ("moved to the new runtime (10.20.30.40)", "10.20.30.40"),
 ])
 def test_an_address_without_a_version_word_right_before_it_is_still_hidden(line, address):
     assert covered(line, address)

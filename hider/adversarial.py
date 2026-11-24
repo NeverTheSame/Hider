@@ -903,7 +903,7 @@ PATH_LOOKALIKES: tuple[str, ...] = (
     "[21.08.2026 09:03:02.600] <2f> Info [Agent] installed under /opt/agent/12.3.1/bin: version 12.3.1.1139 ready",
     "[21.08.2026 09:03:02.700] <2f> Info [Api] GET /v1.0/sites/root/drives/items returned 200, see trace.json",
     "[21.08.2026 09:03:02.800] <2f> Error [Worker]    at Run() in D:\\a\\1\\s\\src\\Proxy\\SessionWorker.cs:line 214, retrying",
-    # a version word with markdown marks, brackets, backticks or quotes
+    # a version word with markdown marks, backticks or quotes
     # before the number, and the ordinary words notes use for a release
     "[21.08.2026 09:03:02.900] <2f> Info [Note] **Version:** 12.1.0.213 rolled out",
     "[21.08.2026 09:03:03.000] <2f> Info [Note] service restarted (build 12.1.0.213) overnight",
