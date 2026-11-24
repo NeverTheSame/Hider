@@ -1061,7 +1061,7 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         return 2
     _announce_profile()
     vault = pseudonym.EntityVault()
-    tiers = _build_tiers(args.tier2)
+    tiers = _build_tiers(args.tier2, notes=args.tier2_grammar == "notes")
     text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
     if args.ordinary_words == "on":
         # The file says what a capitalised word is: a tier 2 claim the file
@@ -1133,7 +1133,7 @@ def _cmd_redact(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_tiers(which_tier2: str) -> list[pipeline.Tier]:
+def _build_tiers(which_tier2: str, notes: bool = False) -> list[pipeline.Tier]:
     """Tier 1, plus tier 2 unless it was explicitly turned off.
 
     Shared by every command that redacts real input, so the file path and the
@@ -1148,6 +1148,8 @@ def _build_tiers(which_tier2: str) -> list[pipeline.Tier]:
             print("WARNING: spaCy model not installed, tier 2 will not run; "
                   "free-text names will pass through. See requirements-ner.txt.",
                   file=sys.stderr)
+        elif notes and which_tier2 == "classifier":
+            tiers.append(pipeline.ManagedNerTier(notes=True))
         else:
             tiers.append(evaluate.build_tier2(which_tier2))
     else:
@@ -1499,6 +1501,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--tier2", choices=["classifier", "spacy", "none"], default="classifier",
                    help="tier 2 backend for free-text names: the trained "
                         "classifier (default), local spaCy NER, or none")
+    r.add_argument("--tier2-grammar", choices=["logs", "notes"], default="logs",
+                   help="what the trained classifier learns from: 'logs' (default) log "
+                        "lines and support sentences, 'notes' those plus markdown note "
+                        "lines (headings, table rows, labels, list items); applies to "
+                        "--tier2 classifier only")
     r.add_argument("--sweep", choices=["all", "tier1", "off"], default="all",
                    help="after the per-line pass, replace every remaining occurrence of "
                         "a pseudonymised value across the whole file: all values "

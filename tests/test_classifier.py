@@ -154,3 +154,111 @@ def test_fail_closed_when_the_classifier_errors(monkeypatch):
     assert p.stats.tiers["tier2"].errors == 1
     # Tier 1 coverage survives the tier 2 failure.
     assert "a41f77c2-9be1-4c33-8f0e-1122aabbccdd" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# The notes grammar: markdown lines (headings, table rows, labels, list items)
+# ---------------------------------------------------------------------------
+
+_NOTES_LISTS = ("_NOTE_PHRASE_WORDS", "_NOTE_FEATURE_WORDS", "_NOTE_COLUMN_WORDS",
+                "_NOTE_STATUS_WORDS", "_NOTE_PERSON_LABELS", "_NOTE_ORG_LABELS")
+_NOTES_FEATURES = {"line.heading", "token.in_pipes", "token.in_bold", "phrase.before_colon"}
+
+
+def _claimed(clf, text):
+    return {(text[s:e], t) for s, e, t, _ in classifier.predict_spans(clf, text)}
+
+
+def test_the_notes_vocabulary_is_disjoint_from_the_eval_and_the_name_vocabulary():
+    from hider import entities
+
+    names = {w.lower() for w in classifier._TRAIN_FIRST + classifier._TRAIN_LAST}
+    names |= {w.lower() for w in classifier._TRAIN_ORG_WORDS}
+    eval_words = {w.lower() for w in entities._FIRST + entities._LAST + entities._ORG_WORDS}
+    for lst in _NOTES_LISTS:
+        words = {w.lower() for w in getattr(classifier, lst)}
+        assert words, lst
+        assert words.isdisjoint(eval_words), lst
+        assert words.isdisjoint(names), lst
+
+
+def test_logs_training_examples_are_what_a_call_without_the_argument_makes():
+    plain = classifier.training_examples(7, 60)
+    assert classifier.training_examples(7, 60, notes=False) == plain
+    assert not any(_NOTES_FEATURES & set(f) for f in plain[0])
+
+
+def test_notes_training_is_the_same_log_lines_then_note_lines():
+    feats, labels = classifier.training_examples(7, 60)
+    nfeats, nlabels = classifier.training_examples(7, 60, notes=True)
+    assert nlabels[:len(labels)] == labels and len(nlabels) > len(labels)
+    assert [f["word.lower"] for f in nfeats[:len(feats)]] == [f["word.lower"] for f in feats]
+    assert all(_NOTES_FEATURES <= set(f) for f in nfeats)
+    drop = lambda f: {k: v for k, v in f.items() if k not in _NOTES_FEATURES}
+    assert [drop(f) for f in nfeats[:len(feats)]] == feats
+
+
+def test_the_structure_features_read_the_line():
+    toks = classifier.tokenize("## Capacity Planning")
+    f = classifier.featurize(toks, "## Capacity Planning", notes=True)
+    assert all(x["line.heading"] for x in f)
+    text = "| **Owner:** Anna | open |"
+    f = {t.text: x for t, x in zip(classifier.tokenize(text),
+                                   classifier.featurize(classifier.tokenize(text), text, notes=True))}
+    assert f["Owner"]["token.in_bold"] and f["Owner"]["phrase.before_colon"]
+    assert f["Owner"]["token.in_pipes"] and not f["Anna"]["token.in_bold"]
+    assert not f["Anna"]["phrase.before_colon"] and f["open"]["token.in_pipes"]
+    assert not any(x["line.heading"] for x in f.values())
+
+
+def test_the_default_features_are_unchanged():
+    toks = classifier.tokenize("Spoke to Mateo Berg at Meridian Systems.")
+    assert classifier.featurize(toks) == classifier.featurize(toks, notes=False)
+    assert not any(_NOTES_FEATURES & set(f) for f in classifier.featurize(toks))
+
+
+@pytest.fixture(scope="module")
+def _notes_clf():
+    return classifier.get_trained(notes=True)
+
+
+@pytest.mark.parametrize("line", [
+    "## Capacity Planning",
+    "### Retention Review",
+    "| Ticket | Region | Reviewer |",
+    "| Component | Severity | Reference | Comment |",
+    "**Open Questions:**",
+    "**Impact**:",
+])
+def test_with_notes_a_heading_a_table_header_and_a_bold_label_are_not_claimed(_notes_clf, line):
+    assert _claimed(_notes_clf, line) == set()
+
+
+@pytest.mark.parametrize("line, name", [
+    ("| Anna Novak | open | 3 | retry |", "Anna Novak"),
+    ("| 4 | Lena Moreau | closed | pending |", "Lena Moreau"),
+    ("Owner: Diego Ferreira", "Diego Ferreira"),
+    ("**Contact:** Priya Iyer", "Priya Iyer"),
+    ("- Marek Petrov confirmed the restore completed.", "Marek Petrov"),
+    ("Escalated the ticket to Sofia Tanaka this morning.", "Sofia Tanaka"),
+])
+def test_with_notes_a_person_in_a_cell_after_a_label_a_list_item_or_a_sentence_is_claimed(
+        _notes_clf, line, name):
+    assert (name, "PERSON") in _claimed(_notes_clf, line)
+
+
+def test_with_notes_an_organisation_after_a_label_or_in_a_cell_is_claimed(_notes_clf):
+    assert ("Contoso Holdings", "ORGANIZATION") in _claimed(
+        _notes_clf, "**Customer:** Contoso Holdings")
+    assert ("Fabrikam Group", "ORGANIZATION") in _claimed(
+        _notes_clf, "| Fabrikam Group | open | 2 |")
+
+
+def test_notes_training_is_deterministic_and_the_default_model_is_not_the_notes_model():
+    a = classifier.train(seed=1, n_sentences=50, notes=True)
+    b = classifier.train(seed=1, n_sentences=50, notes=True)
+    text = "| Anna Novak | open |"
+    assert classifier.predict_spans(a, text) == classifier.predict_spans(b, text)
+    assert a.notes and not classifier.get_trained().notes
+    assert classifier.get_trained(notes=True) is classifier.get_trained(notes=True)
+    assert classifier.get_trained(notes=True) is not classifier.get_trained()

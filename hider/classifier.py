@@ -39,6 +39,12 @@ SLA, VPN), so that "capitals after a name" is not by itself a signal. The
 eval corpus's own suffixes are still not in the training set; the lift has
 to come from shape.
 
+A second grammar, ``notes=True``, adds markdown lines to the training set
+(headings, table rows, bold labels before a colon, list items) and four
+features that describe a line's structure. A case note is made of those
+lines, and the log and support-sentence grammar never showed the model one.
+The default model is the logs-only one and is exactly what it was.
+
 Known limitation, stated the way the rest of this project states them: a
 linear per-token classifier trained on a generated grammar is a small model.
 It will not match a production NER system's recall, and its errors are
@@ -47,6 +53,7 @@ reported in ``hider eval`` rather than assumed away.
 
 from __future__ import annotations
 
+import bisect
 import random
 import re
 from dataclasses import dataclass, field
@@ -204,6 +211,80 @@ _NEGATIVE_TEMPLATES = [
     "{V} of the {N1} store completed with code {D}.",
 ]
 
+#: The notes grammar's own words: headings, column heads, labels and feature
+#: phrases of a case note, invented and generic. Disjoint from ``entities.py``
+#: and from the name vocabulary above (a test pins both), so a heading word is
+#: never also a name the model was shown.
+_NOTE_PHRASE_WORDS = [
+    "Summary", "Timeline", "Findings", "Overview", "Background", "Resolution",
+    "Impact", "Symptoms", "Workaround", "Details", "Scope", "Environment",
+    "Decision", "Evidence", "History", "Request", "Cause", "Update", "Review",
+    "Plan", "Questions", "Steps", "Actions", "Observations", "Outcome",
+]
+_NOTE_FEATURE_WORDS = [
+    "Retention", "Policy", "Wizard", "Window", "Schedule", "Repository",
+    "Proxy", "Console", "Dashboard", "Report", "Settings", "Gateway",
+    "Connector", "Catalog", "Archive", "Mapping", "Rule", "Filter", "Queue",
+    "Template", "Profile", "Workflow",
+]
+_NOTE_COLUMN_WORDS = [
+    "Item", "Status", "Owner", "Date", "Count", "Result", "Priority",
+    "Severity", "Ticket", "Component", "Version", "Comment", "Reference",
+    "Action", "Due", "Region", "Type", "Reviewer",
+]
+_NOTE_STATUS_WORDS = [
+    "open", "closed", "pending", "resolved", "waiting", "blocked", "done",
+    "new", "retry", "verified", "queued", "failed", "skipped", "stale",
+]
+_NOTE_PERSON_LABELS = [
+    "Owner", "Contact", "Engineer", "Reporter", "Assignee", "Requester",
+    "Manager", "Author", "Admin", "Approver",
+]
+_NOTE_ORG_LABELS = [
+    "Customer", "Account", "Tenant", "Client", "Vendor", "Partner", "Company",
+]
+
+#: Cumulative shares of the ten kinds of note line, in the order
+#: ``_render_note_line`` tests them: heading, table header, bold label, list
+#: item with a feature phrase, sentence with a feature phrase, person in a
+#: cell, person after a label, person in a list item, organisation in a cell,
+#: organisation after a label; the rest is an organisation in a list item.
+_NOTE_MIX = (0.04, 0.07, 0.11, 0.15, 0.18, 0.45, 0.70, 0.84, 0.92, 0.97)
+
+#: Note-shaped lines with a person. ``{L}`` is a person label, ``{P}`` the
+#: person, ``{W}`` a lowercase word, ``{D}`` a number.
+_NOTE_PERSON_LIST_TEMPLATES = [
+    "- {P} confirmed the restore completed.",
+    "- {P} will follow up on {W} items tomorrow.",
+    "* {P} asked for a status update.",
+    "1. {P} takes over the case.",
+    "- Waiting on {P} for the {W} review.",
+    "- {P} reported the issue twice.",
+    "2. Handover to {P} after the call.",
+]
+_NOTE_ORG_LIST_TEMPLATES = [
+    "- {O} reported the issue through the portal.",
+    "* Waiting on {O} for the change approval.",
+    "- The {O} tenant was re-indexed overnight.",
+]
+#: Note-shaped lines with no name: list items that open with a capitalised
+#: phrase, and sentences with a feature phrase in the middle.
+_NOTE_LIST_NEGATIVE_TEMPLATES = [
+    "- {F} was reviewed after the change.",
+    "* {F} fails on the {W} step.",
+    "1. {F} still shows {W} items.",
+    "- {F}: {W} since the last run.",
+    "- **{F}**: {W} after the retry.",
+]
+_NOTE_SENTENCE_NEGATIVE_TEMPLATES = [
+    "The {F} setting was changed before the {W} run.",
+    "Opened the {F} page and checked the {W} entries.",
+    "After the change the {F} showed {D} items.",
+    "Customer confirmed the {F} is {W} now.",
+    "Switched the {F} to {W} and retried.",
+    "The issue is in the {F} when a {W} item is added.",
+]
+
 _TOKEN_RE = re.compile(r"[A-Za-z]+|[0-9]+|[^\sA-Za-z0-9]")
 
 O_TAG = "O"
@@ -235,6 +316,48 @@ def _shape(word: str) -> str:
     if word.islower():
         return "lower"
     return "mixed"
+
+
+_HEADING_RE = re.compile(r"\s*#{1,6}\s")
+_BOLD_RE = re.compile(r"\*\*|__")
+
+
+def _structure(tokens: Sequence[Token], text: str) -> list[dict]:
+    """Four features per token that describe the line it stands on.
+
+    ``line.heading``: the line opens with one to six hash signs and a blank,
+    a markdown heading. ``token.in_pipes``: a pipe stands before the token and
+    another after it on the line, a table cell. ``token.in_bold``: an odd
+    number of bold marks (``**`` or ``__``) stand before it on the line.
+    ``phrase.before_colon``: the run of words the token starts, four at most,
+    is followed by a colon, with bold marks allowed between: a label.
+    They read only the text of the line the token stands on.
+    """
+    out: list[dict] = []
+    cache: dict[int, tuple[bool, list[int], list[int]]] = {}
+    for i, tok in enumerate(tokens):
+        ls = text.rfind("\n", 0, tok.start) + 1
+        if ls not in cache:
+            le = text.find("\n", ls)
+            line = text[ls:le if le >= 0 else len(text)]
+            cache[ls] = (bool(_HEADING_RE.match(line)),
+                         [m.start() + ls for m in re.finditer(r"\|", line)],
+                         [m.start() + ls for m in _BOLD_RE.finditer(line)])
+        heading, pipes, bolds = cache[ls]
+        j, run = i, 0
+        while j < len(tokens) and tokens[j].text.isalpha() and tokens[j].start >= ls:
+            j, run = j + 1, run + 1
+        while j < len(tokens) and tokens[j].text == "*":
+            j += 1
+        colon = 0 < run <= 4 and j < len(tokens) and tokens[j].text == ":"
+        k = bisect.bisect_left(pipes, tok.start)
+        out.append({
+            "line.heading": heading,
+            "token.in_pipes": 0 < k < len(pipes),
+            "token.in_bold": bisect.bisect_left(bolds, tok.start) % 2 == 1,
+            "phrase.before_colon": colon,
+        })
+    return out
 
 
 def _token_features(tokens: Sequence[Token], i: int) -> dict:
@@ -272,8 +395,17 @@ def _token_features(tokens: Sequence[Token], i: int) -> dict:
     }
 
 
-def featurize(tokens: Sequence[Token]) -> list[dict]:
-    return [_token_features(tokens, i) for i in range(len(tokens))]
+def featurize(tokens: Sequence[Token], text: str | None = None,
+              notes: bool = False) -> list[dict]:
+    """Features per token. With ``notes`` the four structure features are
+    added, read from ``text``; without it the dictionary is what it always was."""
+    feats = [_token_features(tokens, i) for i in range(len(tokens))]
+    if notes:
+        if text is None:
+            raise ValueError("notes features read the line: pass text")
+        for f, extra in zip(feats, _structure(tokens, text)):
+            f.update(extra)
+    return feats
 
 
 # ---------------------------------------------------------------------------
@@ -333,15 +465,120 @@ def _render_sentence(rng: random.Random) -> tuple[str, list[tuple[int, int, str]
     return text, spans
 
 
-def training_examples(seed: int, n_sentences: int) -> tuple[list[dict], list[str]]:
+def _phrase(rng: random.Random, pool: Sequence[str], lo: int = 1, hi: int = 3) -> str:
+    return " ".join(rng.sample(list(pool), rng.randint(lo, hi)))
+
+
+def _cells(rng: random.Random, n: int, filler) -> list[str]:
+    """``n`` table cells made of ``filler(rng)``; one in five is empty."""
+    return ["" if rng.random() < 0.2 else filler(rng) for _ in range(n)]
+
+
+def _plain_cell(rng: random.Random) -> str:
+    roll = rng.random()
+    if roll < 0.4:
+        return rng.choice(_NOTE_STATUS_WORDS)
+    if roll < 0.55:
+        return rng.choice(_NOTE_STATUS_WORDS).capitalize()
+    if roll < 0.8:
+        return str(rng.randint(0, 999))
+    return " ".join(rng.sample(_NOTE_STATUS_WORDS, rng.randint(2, 4)))
+
+
+def _row(cells: list[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _bold_label(rng: random.Random, label: str) -> str:
+    return rng.choice(["**{L}**:", "**{L}:**", "{L}:", "- **{L}**:",
+                       "- {L}:"]).format(L=label)
+
+
+def _render_note_line(rng: random.Random) -> tuple[str, list[tuple[int, int, str]]]:
+    """One markdown line as a case note writes it, with its entity spans.
+
+    Without a name: a heading, a table header row, a bold label before a
+    colon, a list item that opens with a capitalised phrase, a sentence with a
+    feature phrase in it. With a name: a person in a table cell, a person
+    after a label, a person in a list item, an organisation in a table cell or
+    after a label.
+    """
+    roll = rng.random()
+    entities: list[tuple[str, str]] = []
+    if roll < _NOTE_MIX[0]:
+        text = "#" * rng.randint(1, 3) + " " + _phrase(
+            rng, _NOTE_PHRASE_WORDS + _NOTE_FEATURE_WORDS)
+    elif roll < _NOTE_MIX[1]:
+        n = rng.randint(3, 5)
+        text = _row(_cells(rng, n, lambda r: _phrase(
+            r, _NOTE_COLUMN_WORDS, 1, 2 if r.random() < 0.25 else 1)))
+    elif roll < _NOTE_MIX[2]:
+        label = _phrase(rng, _NOTE_PHRASE_WORDS + _NOTE_COLUMN_WORDS)
+        text = _bold_label(rng, label)
+        if rng.random() < 0.5:
+            text += " " + " ".join(rng.sample(_NOTE_STATUS_WORDS, 2))
+    elif roll < _NOTE_MIX[3]:
+        text = rng.choice(_NOTE_LIST_NEGATIVE_TEMPLATES).format(
+            F=_phrase(rng, _NOTE_FEATURE_WORDS, 1, 3), W=rng.choice(_NOTE_STATUS_WORDS))
+    elif roll < _NOTE_MIX[4]:
+        text = rng.choice(_NOTE_SENTENCE_NEGATIVE_TEMPLATES).format(
+            F=_phrase(rng, _NOTE_FEATURE_WORDS, 2, 3), W=rng.choice(_NOTE_STATUS_WORDS),
+            D=rng.randint(1, 999))
+    elif roll < _NOTE_MIX[5]:
+        person = _draw_person(rng)
+        cells = _cells(rng, rng.randint(3, 5), _plain_cell)
+        cells[rng.randrange(len(cells))] = person
+        text = _row(cells)
+        entities = [(person, "PERSON")]
+    elif roll < _NOTE_MIX[6]:
+        person = _draw_person(rng)
+        text = _bold_label(rng, rng.choice(_NOTE_PERSON_LABELS)) + " " + person
+        entities = [(person, "PERSON")]
+    elif roll < _NOTE_MIX[7]:
+        person = _draw_person(rng)
+        text = rng.choice(_NOTE_PERSON_LIST_TEMPLATES).format(
+            P=person, W=rng.choice(_NOTE_STATUS_WORDS))
+        entities = [(person, "PERSON")]
+    elif roll < _NOTE_MIX[8]:
+        org = _draw_org(rng)
+        cells = _cells(rng, rng.randint(3, 5), _plain_cell)
+        cells[rng.randrange(len(cells))] = org
+        text = _row(cells)
+        entities = [(org, "ORGANIZATION")]
+    elif roll < _NOTE_MIX[9]:
+        org = _draw_org(rng)
+        text = _bold_label(rng, rng.choice(_NOTE_ORG_LABELS)) + " " + org
+        entities = [(org, "ORGANIZATION")]
+    else:
+        org = _draw_org(rng)
+        text = rng.choice(_NOTE_ORG_LIST_TEMPLATES).format(O=org)
+        entities = [(org, "ORGANIZATION")]
+    spans = []
+    for value, etype in entities:
+        start = text.index(value)
+        spans.append((start, start + len(value), etype))
+    return text, spans
+
+
+def training_examples(seed: int, n_sentences: int,
+                      notes: bool = False) -> tuple[list[dict], list[str]]:
+    """The training set. With ``notes`` it is the same ``n_sentences`` log
+    lines, drawn first and the same as without it, then ``n_sentences``
+    note-shaped lines, with the four structure features on every token."""
     rng = random.Random(seed)
     features: list[dict] = []
     labels: list[str] = []
     for _ in range(n_sentences):
         text, spans = _render_sentence(rng)
         tokens = tokenize(text)
-        features.extend(featurize(tokens))
+        features.extend(featurize(tokens, text, notes) if notes else featurize(tokens))
         labels.extend(_label_tokens(tokens, spans))
+    if notes:
+        for _ in range(n_sentences):
+            text, spans = _render_note_line(rng)
+            tokens = tokenize(text)
+            features.extend(featurize(tokens, text, True))
+            labels.extend(_label_tokens(tokens, spans))
     return features, labels
 
 
@@ -356,24 +593,28 @@ class TrainedNerClassifier:
     model: LogisticRegression
     seed: int
     n_sentences: int
+    notes: bool = False
 
 
-def train(seed: int = 20260821, n_sentences: int = 500) -> TrainedNerClassifier:
-    features, labels = training_examples(seed, n_sentences)
+def train(seed: int = 20260821, n_sentences: int = 500,
+          notes: bool = False) -> TrainedNerClassifier:
+    features, labels = training_examples(seed, n_sentences, notes)
     vec = DictVectorizer(sparse=True)
     x = vec.fit_transform(features)
     clf = LogisticRegression(max_iter=500, class_weight="balanced")
     clf.fit(x, labels)
-    return TrainedNerClassifier(vectorizer=vec, model=clf, seed=seed, n_sentences=n_sentences)
+    return TrainedNerClassifier(vectorizer=vec, model=clf, seed=seed,
+                                n_sentences=n_sentences, notes=notes)
 
 
 @lru_cache(maxsize=4)
-def get_trained(seed: int = 20260821, n_sentences: int = 500) -> TrainedNerClassifier:
+def get_trained(seed: int = 20260821, n_sentences: int = 500,
+                notes: bool = False) -> TrainedNerClassifier:
     """Process-wide cache: training takes well under a second, but eval and the
     pipeline both build tiers repeatedly, and retraining on every construction
     would make the identical model a fresh random draw of nothing - the fit is
     deterministic for a fixed seed, so there is nothing gained by repeating it."""
-    return train(seed=seed, n_sentences=n_sentences)
+    return train(seed=seed, n_sentences=n_sentences, notes=notes)
 
 
 def _decode_bio(tokens: Sequence[Token], labels: Sequence[str], scores: Sequence[float]
@@ -409,7 +650,7 @@ def predict_spans(clf: TrainedNerClassifier, text: str) -> list[tuple[int, int, 
     tokens = tokenize(text)
     if not tokens:
         return []
-    feats = featurize(tokens)
+    feats = featurize(tokens, text, clf.notes) if clf.notes else featurize(tokens)
     x = clf.vectorizer.transform(feats)
     labels = list(clf.model.predict(x))
     proba = clf.model.predict_proba(x)

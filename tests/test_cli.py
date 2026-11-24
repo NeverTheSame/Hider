@@ -708,3 +708,47 @@ def test_sweep_folders_refuses_an_unknown_mode(tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["redact", str(src), "--sweep-folders", "some"])
     assert e.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# redact --tier2-grammar logs | notes
+# ---------------------------------------------------------------------------
+
+_MARKDOWN_NOTE = ("## Capacity Planning\n"
+                  "| Ticket | Region | Reviewer |\n"
+                  "**Open Questions:**\n"
+                  "| Anna Novak | open | 3 | retry |\n"
+                  "Owner: Diego Ferreira\n"
+                  "Escalated the ticket to Sofia Tanaka this morning.\n")
+
+
+def test_tier2_grammar_defaults_to_logs_and_builds_the_logs_model():
+    from hider import classifier
+
+    seed = 20260821
+    plain = cli._build_tiers("classifier")[-1]
+    assert plain._clf is classifier.get_trained(seed=seed) and not plain._clf.notes
+    assert cli._build_tiers("classifier", notes=False)[-1]._clf is plain._clf
+    assert cli._build_tiers("classifier", notes=True)[-1]._clf is classifier.get_trained(
+        seed=seed, notes=True)
+    assert [t.name for t in cli._build_tiers("none", notes=True)] == ["tier1"]
+
+
+def test_redact_tier2_grammar_logs_is_what_redact_does_without_the_flag(tmp_path, capsys):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    rc_a, out_a, ev_a, _ = _redact_file(a, capsys, _MARKDOWN_NOTE)
+    rc_b, out_b, ev_b, _ = _redact_file(b, capsys, _MARKDOWN_NOTE, ["--tier2-grammar", "logs"])
+    assert rc_a == rc_b == 0 and out_a == out_b
+    drop = lambda evs: [{k: v for k, v in e.items() if k != "unit"} for e in evs]
+    assert drop(ev_a) == drop(ev_b)
+
+
+def test_redact_tier2_grammar_notes_leaves_the_structure_and_hides_the_names(tmp_path, capsys):
+    rc, out, _, _ = _redact_file(tmp_path, capsys, _MARKDOWN_NOTE, ["--tier2-grammar", "notes"])
+    lines = out.splitlines()
+    assert rc == 0
+    assert lines[:3] == _MARKDOWN_NOTE.splitlines()[:3]
+    for name in ("Anna", "Novak", "Diego", "Ferreira", "Sofia", "Tanaka"):
+        assert name not in out

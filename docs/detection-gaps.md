@@ -409,3 +409,64 @@ claims those values as before.
 The trade, stated: a name the file writes once in lowercase in a sentence is
 not claimed by tier 2 anywhere in that file. Tier 1, `--term` and the gateway
 are untouched; the rule only removes a tier 2 span.
+
+## `redact --tier2-grammar notes`: a second training grammar for markdown notes
+
+Tier 2 is trained on generated log lines and support sentences. A case note
+is markdown, and the model had never seen a heading, a table row, a bold
+label before a colon or a list item, so it claimed capitalised feature
+phrases (`Retention Policy`, `Capacity Planning`) as names. `classifier.train`,
+`get_trained`, `training_examples`, `pipeline.ManagedNerTier` and
+`cli._build_tiers` take `notes`, default `False`; with `False` the draws, the
+features and the model are exactly what they were. With `True` the training
+set is the same log lines, then the same number of note-shaped lines, with four
+structure features on every token: `line.heading` (the line opens with hash
+signs), `token.in_pipes` (a table cell), `token.in_bold` (inside bold marks),
+`phrase.before_colon` (a run of up to four words followed by a colon). The
+note lines use their own invented word lists (`_NOTE_*`), disjoint from
+`entities.py` and the name vocabulary, and the mix of line kinds is
+`_NOTE_MIX`. `redact --tier2-grammar logs|notes` picks it, default `logs`; eval,
+the gateway, jsonscrub and the Elasticsearch code do not take it.
+
+Measured on six real notes (copies, hashed before the run) with a site profile
+and every other switch at its default; "hidden" means no occurrence readable:
+
+| | logs | notes |
+|---|---|---|
+| values hidden of 226 (whole / part readable) | 156 (63 / 7) | 151 (64 / 11) |
+| person names hidden of 53 | 45 | 42 |
+| organisation names hidden of 16 | 3 | 1 |
+| occurrences hidden of 1,160 | 839 | 828 |
+| replacements that hide nothing on the list | 211 | 152 |
+| of those, tier 2 | 124 | 57 |
+| tier 2 claims right / wrong | 236 / 124 | 203 / 57 |
+
+Tier 2's wrong claims fall by more than half, in every place a claim can stand
+(table cell 25 to 13, list item 43 to 22, sentence 47 to 20, label before a
+colon 3 to 0). The right claims fall too, 236 to 203, and five listed values
+are less hidden than with `logs`: three two-word person names and one
+organisation name, each now readable in part, and one organisation name now
+readable whole. That is the trade, and it is why the default stays `logs`: the
+second grammar stops hiding things that are not names and hides fewer names.
+The note the profile and the note shapes were written from shows the same
+direction (tier 2 wrong claims 28 to 14, right 32 to 26, one value less hidden);
+the other five show it too (96 to 43 wrong, 204 to 177 right, four values less
+hidden). The note shapes were surveyed over all six notes, so there is no note
+here that the grammar was not designed against.
+
+On the generated corpus (4,000 lines, the one `hider eval` builds, without the
+adversarial unit) `notes` finds 295 of 315 free-text person names, 19 of them
+only in part, against 315 with `logs`, and 247 of 247 organisations in both; it
+changes 0 of 1,000 clean lines, as `logs` does. Swapping one word of one note
+word list moved the person count from 305 to 295, so read that figure as
+carrying that much noise.
+
+The grammar was changed once after a score. The first mix of note lines was
+half lines without a name, mostly capitalised pairs, and it taught the model
+that the second capitalised word after a capitalised word is not part of a
+name (on the earlier inputs: 17 of 53 person names hidden, 261 of 315 persons
+on the corpus). The mix now holds 18% lines without a name. Training on more
+note lines than `n_sentences` made it worse, not better (149 of 315 persons at
+twice the lines with the first mix). One probe-driven change came before any
+score: table header cells are mostly one word, so a two-word name in a cell is
+not read as a heading.

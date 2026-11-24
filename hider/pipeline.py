@@ -298,8 +298,9 @@ class ManagedNerTier:
     name = "tier2"
     cost_per_1k_chars = 0.0  # local model: no per-call bill, CPU time is in elapsed_s
 
-    def __init__(self, seed: int = 20260821) -> None:
-        self._clf = classifier.get_trained(seed=seed)
+    def __init__(self, seed: int = 20260821, notes: bool = False) -> None:
+        self._clf = (classifier.get_trained(seed=seed, notes=True) if notes
+                     else classifier.get_trained(seed=seed))
 
     def detect(self, text: str, residue: Sequence[tuple[int, int]]) -> list[Span]:
         spans: list[Span] = []
