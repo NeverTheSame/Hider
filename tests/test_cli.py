@@ -752,3 +752,159 @@ def test_redact_tier2_grammar_notes_leaves_the_structure_and_hides_the_names(tmp
     assert lines[:3] == _MARKDOWN_NOTE.splitlines()[:3]
     for name in ("Anna", "Novak", "Diego", "Ferreira", "Sofia", "Tanaka"):
         assert name not in out
+
+
+# ---------------------------------------------------------------------------
+# redact --tier3: the LLM pass as the last tier, with a scripted backend
+# ---------------------------------------------------------------------------
+
+_LONE_NAME = ("ask Ingrid about the restore window\n"
+              "| Ingrid | done |\n"
+              "case 08123456 is open\n")
+
+
+class _Scripted:
+    """Answers a finding for ``literal`` when ``cue`` is in the prompt."""
+    name = "scripted"
+    model = "scripted-1"
+
+    def __init__(self, literal, cue, etype="PERSON"):
+        self.literal, self.cue, self.etype = literal, cue, etype
+        self.prompts = []
+
+    def complete(self, prompt):
+        import json as _json
+
+        self.prompts.append(prompt)
+        found = ([{"text": self.literal, "type": self.etype}]
+                 if self.cue in prompt else [])
+        return _json.dumps({"findings": found})
+
+
+class _Raising:
+    name = "raising"
+    model = None
+
+    def complete(self, prompt):
+        raise RuntimeError("connection reset")
+
+
+def _tier3_run(tmp_path, capsys, monkeypatch, backend, text=_LONE_NAME, extra=None):
+    import json as _json
+
+    monkeypatch.setattr(cli, "_real_backend", lambda *a, **k: backend)
+    src = tmp_path / "bundle.md"
+    src.write_text(text, encoding="utf-8")
+    log = tmp_path / "decisions.jsonl"
+    cassette = tmp_path / "tier3.jsonl"
+    rc = cli.main(["redact", str(src), "--log", str(log), "--tier3", "openai",
+                   "--record", "--cassette", str(cassette)] + (extra or []))
+    cap = capsys.readouterr()
+    events = [_json.loads(r) for r in log.read_text().splitlines() if r.strip()]
+    return rc, cap.out, cap.err, events, cassette
+
+
+def test_redact_tier3_hides_a_lone_first_name_tier_two_left_and_the_sweep_takes_it_further(
+        tmp_path, capsys, monkeypatch):
+    rc, out, events, _ = _redact_file(tmp_path, capsys, _LONE_NAME)
+    assert rc == 0 and out.count("Ingrid") == 2
+    assert not [e for e in events if e["tier"] == "tier2"]
+
+    backend = _Scripted("Ingrid", "about the restore")
+    rc, out, _, events, _ = _tier3_run(tmp_path, capsys, monkeypatch, backend)
+    first, second, third = out.splitlines()
+    assert rc == 0 and "Ingrid" not in out
+    t3 = [e for e in events if e["tier"] == "tier3"]
+    assert [(e["line"], e["entity_type"], e["action"]) for e in t3] == [
+        (0, "PERSON", "pseudonymised")]
+    label = t3[0]["replacement"]
+    assert label.startswith("<Person-") and first == f"ask {label} about the restore window"
+    swept = [e for e in events if e["tier"] == "sweep"]
+    assert [(e["line"], e["replacement"]) for e in swept] == [(1, label)]
+    assert second == f"| {label} | done |"
+    assert "Ingrid" not in "\n".join(str(sorted(e.items())) for e in events)
+
+
+def test_redact_tier3_reads_only_what_tiers_one_and_two_left(tmp_path, capsys, monkeypatch):
+    backend = _Scripted("Ingrid", "about the restore")
+    _tier3_run(tmp_path, capsys, monkeypatch, backend)
+    assert backend.prompts and not any("08123456" in p for p in backend.prompts)
+
+
+def test_redact_tier3_drops_a_finding_that_is_not_a_verbatim_quote(tmp_path, capsys,
+                                                                    monkeypatch):
+    backend = _Scripted("Ingrid Novak", "about the restore")
+    rc, out, _, events, _ = _tier3_run(tmp_path, capsys, monkeypatch, backend,
+                                       extra=["--tier2", "none"])
+    assert rc == 0 and out.count("Ingrid") == 2
+    assert not [e for e in events if e["tier"] == "tier3"]
+
+
+def test_redact_tier3_backend_that_raises_is_refused_as_a_degraded_line(tmp_path, capsys,
+                                                                         monkeypatch):
+    rc, out, err, events, _ = _tier3_run(tmp_path, capsys, monkeypatch, _Raising())
+    assert rc == 1
+    assert "REFUSE: 3 line(s) degraded during redaction; do not forward this output" in err
+    assert "08123456" not in out
+    assert not [e for e in events if e["tier"] == "tier3"]
+
+
+def test_redact_tier3_records_hashes_and_never_the_prompt(tmp_path, capsys, monkeypatch):
+    import json as _json
+
+    backend = _Scripted("Ingrid", "about the restore")
+    _, _, _, _, cassette = _tier3_run(tmp_path, capsys, monkeypatch, backend)
+    rows = [_json.loads(r) for r in cassette.read_text().splitlines() if r.strip()]
+    entries = [r for r in rows if "prompt_sha256" in r]
+    assert entries and all("prompt" not in r for r in entries)
+    assert "about the restore window" not in cassette.read_text()
+
+
+@pytest.mark.parametrize("where", ["cassettes/tier3-note.jsonl", "tier3-note.jsonl",
+                                   "hider/../tests/tier3-note.jsonl"])
+def test_redact_refuses_a_cassette_inside_the_repository_outside_out(tmp_path, capsys,
+                                                                     where):
+    src = tmp_path / "bundle.md"
+    src.write_text(_LONE_NAME, encoding="utf-8")
+    path = cli.OUT.parent / where
+    rc = cli.main(["redact", str(src), "--tier3", "openai", "--cassette", str(path)])
+    cap = capsys.readouterr()
+    assert rc == 2 and cap.out == ""
+    assert "inside the repository" in cap.err and "out/" in cap.err
+    assert not path.exists()
+
+
+def test_redact_allows_a_cassette_under_out_or_outside_the_repository():
+    assert cli._cassette_allowed(str(cli.OUT / "tier3-note.jsonl"))
+    assert cli._cassette_allowed("/nonexistent-dir/tier3-note.jsonl")
+    assert not cli._cassette_allowed(str(cli.OUT.parent / "cassettes" / "x.jsonl"))
+
+
+def test_redact_without_tier3_builds_no_llm_tier_and_matches_tier3_none(tmp_path, capsys,
+                                                                        monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("the LLM pass was built")
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    rc_a, out_a, ev_a, _ = _redact_file(a, capsys, _LONE_NAME)
+    monkeypatch.setattr(pipeline, "LlmPassTier", boom)
+    monkeypatch.setattr(cli, "_real_backend", boom)
+    rc_b, out_b, ev_b, _ = _redact_file(b, capsys, _LONE_NAME, ["--tier3", "none"])
+    rc_c, out_c, ev_c, _ = _redact_file(tmp_path, capsys, _LONE_NAME)
+    drop = lambda evs: [{k: v for k, v in e.items() if k != "unit"} for e in evs]
+    assert rc_a == rc_b == rc_c == 0 and out_a == out_b == out_c
+    assert drop(ev_a) == drop(ev_b) == drop(ev_c)
+    assert {e["tier"] for e in ev_a} <= {"tier1", "tier2", "sweep", "name_part"}
+
+
+def test_redact_tier3_leaves_every_tier_one_event_as_it_was(tmp_path, capsys, monkeypatch):
+    a = tmp_path / "a"
+    a.mkdir()
+    _, _, ev_plain, _ = _redact_file(a, capsys, _LONE_NAME)
+    _, _, _, ev_t3, _ = _tier3_run(tmp_path, capsys, monkeypatch,
+                                   _Scripted("Ingrid", "about the restore"))
+    t1 = lambda evs: [{k: v for k, v in e.items() if k != "unit"}
+                      for e in evs if e["tier"] == "tier1"]
+    assert t1(ev_plain) and t1(ev_plain) == t1(ev_t3)

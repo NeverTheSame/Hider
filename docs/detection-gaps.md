@@ -519,3 +519,24 @@ it stays hidden, while `(build 12.1.0.213)`, with the bracket before the word,
 stays readable. Still hidden as a declared miss: a number
 after a product name (`Tailspin Console 7.0.0.123`), because a product name is
 not a word list.
+
+## `redact --tier3`: the LLM pass as the last tier
+
+Tier 3 was built only by `eval`, so `redact` could not run it, and on real
+notes a lone first name or a name tier 2 took in part stayed readable with no
+rule left to hide it. `redact` now takes the flags `eval` has (`--tier3`,
+`--model`, `--base-url`, `--fallback`, `--cassette`, `--record`, `--batch`,
+`--workers`), with `--tier3 none` the default; with `none` the tiers and the
+output are exactly what they were. With a backend, `pipeline.LlmPassTier` is
+the last tier, after tier 2 and `--term`, so it reads only what tiers 1 and 2
+left; `--ordinary-words` still wraps tier 2 only. A name it finds goes into
+the vault like any other, so the sweep and `--name-parts` work on it, and its
+event says `tier3` and carries the label, never the name. Every finding is
+still a verbatim quote checked against the line, or dropped. A backend that
+fails marks the line degraded and `redact` refuses its output with exit 1, as
+for any degraded line. Two guards keep real text out of the repository: a
+cassette recorded from a real file holds the model's answers, which quote
+real names, so a `--cassette` path inside the repository is refused with exit
+2 unless it is under the gitignored `out/`, and `redact` records with
+`store_prompts` off, so the cassette holds prompt hashes, not the file. The
+gateway, `eval`, jsonscrub and the Elasticsearch code are unchanged.

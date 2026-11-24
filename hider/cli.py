@@ -1059,9 +1059,18 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         print("redact: --term takes a name to hide; an empty --term is refused",
               file=sys.stderr)
         return 2
+    if args.cassette and not _cassette_allowed(args.cassette):
+        print(f"redact: --cassette {args.cassette} is inside the repository; a cassette "
+              f"recorded from a real file holds the model's answers, which quote real "
+              f"names, so it may only live outside the repository or under its "
+              f"gitignored out/",
+              file=sys.stderr)
+        return 2
     _announce_profile()
     vault = pseudonym.EntityVault()
     tiers = _build_tiers(args.tier2, notes=args.tier2_grammar == "notes")
+    # The prompts are the file itself; the cassette keeps only their hashes.
+    tier3_backend = _build_llm_backend(args, store_prompts=False)
     text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
     if args.ordinary_words == "on":
         # The file says what a capitalised word is: a tier 2 claim the file
@@ -1073,6 +1082,11 @@ def _cmd_redact(args: argparse.Namespace) -> int:
         # site URL) is still read and hidden whole; before tier 2, so it cannot
         # take half of the name first.
         tiers.insert(1, pipeline.TermTier(terms))
+    if tier3_backend is not None:
+        # Last, so it reads only what tiers 1 and 2 left. A backend that fails
+        # marks the line degraded and the refusal below applies.
+        tiers.append(pipeline.LlmPassTier(tier3_backend, batch_size=args.batch,
+                                          workers=args.workers))
     pipe = pipeline.Pipeline(tiers, vault=vault)
     # Each term gets its label before the first line is read, so every line
     # sees the same label whatever the other switches are.
@@ -1131,6 +1145,13 @@ def _cmd_redact(args: argparse.Namespace) -> int:
               f"this output", file=sys.stderr)
         return 1
     return 0
+
+
+def _cassette_allowed(path: str) -> bool:
+    """Outside the repository, or under its gitignored ``out/``."""
+    p = Path(path).resolve()
+    repo = OUT.parent.resolve()
+    return not p.is_relative_to(repo) or p.is_relative_to(OUT.resolve())
 
 
 def _build_tiers(which_tier2: str, notes: bool = False) -> list[pipeline.Tier]:
@@ -1524,6 +1545,12 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--ordinary-words", choices=["on", "off"], default="on",
                    help="drop a tier 2 name the file also writes in lowercase as a free "
                         "word (default on); off claims those too")
+    _add_llm_flags(r, dest="tier3")
+    r.add_argument("--batch", type=int, default=1,
+                   help="tier 3 residue segments per prompt (1 keeps the recorded "
+                        "single-segment prompt)")
+    r.add_argument("--workers", type=int, default=1,
+                   help="concurrent tier 3 batches per line")
     r.set_defaults(fn=_cmd_redact)
 
     p = sub.add_parser("proxy", help="run the redacting OpenAI-compatible gateway")
