@@ -144,7 +144,8 @@ So, today:
   field, as an ordinary word does.
 - A site may add names of its own to that rule: `vocabulary.readable` in
   the site map, a list of at most 200 names (`MAX_VOCABULARY_READABLE`).
-  A learnt or harvested name that is **whole** one of them (blanks and
+  A learnt or harvested name of a field a vocabulary may hold that is
+  **whole** one of them (blanks and
   casing normalised, never a part of a longer name) is skipped with the
   reason `site_word` (`EsScrubber.skip_reason`, the fixed rules first):
   labelled in its own field, readable everywhere else. It is for words of
@@ -156,6 +157,10 @@ So, today:
   list is a decision a person makes about named words, in the one file
   that already holds the site's decisions; it is not a dictionary and
   nothing is readable until it is written down. What it does not do: a
+  name harvested from a field no vocabulary may hold (`NO_VOCABULARY_TYPES`,
+  a `SERVER_NAME` field for one) is hidden whatever the list says, so a
+  service name that sits in a field typed as a server name is not made
+  readable by listing it - retype the field in the site map instead; a
   name the human seeds (`--term`, es-seed) is hidden whatever the list
   says; a malformed list is a load error that quotes no word; a case
   already open keeps treating a name the way it first met it, except

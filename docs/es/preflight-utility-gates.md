@@ -31,7 +31,11 @@ with `_index` called out as the stream itself being named after the
 customer. It was the occurrence count summed over paths ("58 to 200
 value(s)" on one real cluster for 2 distinct names, moving between
 runs because the newest 50 are a sample); the line now leads with the
-2 and says the document counts move between runs and the names do not.
+2 and says the document counts move between runs. It also said the
+names do not, and that was wrong: on a busy real cluster one pattern
+showed 9 distinct names over three runs and none of them in all three,
+because the names are read off the same newest 50 documents. The line
+now says the names can move too, so one run is not the full list.
 `KNOW` means a declared trade with its size: the **skip rules'** counts
 by reason (ordinary words, short - readable in text; seed per case),
 **readable words** harvested on the sample (labels and fields), and a

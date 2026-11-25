@@ -280,7 +280,8 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                     f"({', '.join(sorted(labels))}) inside longer keep values, in "
                     f"{', '.join(f'{p} on {c} doc(s)' for p, c in sorted(inside.items()))}"
                     f"{in_index}; {docs_with} of the newest {len(hits)} documents carry one "
-                    "- a sample, so the document counts move between runs; the names do not",
+                    "- a sample, so the document counts move between runs, and where the newest "
+                    "documents differ from run to run the names move too",
                     "map the field as identifier, keep the stream out of indices, seed the "
                     "name per case (--term), or list it under vocabulary.readable if it is a "
                     "word of the system and no customer's name", **finding)
