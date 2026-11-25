@@ -135,6 +135,10 @@ VOCABULARY_PAGE = 1_000
 #: tick retries it, and what is already saved stays saved.
 DEFAULT_VOCABULARY_BUDGET_S = 1200.0
 MAX_VOCABULARY_BUDGET_S = 7200.0
+#: ``vocabulary.readable``: names the site declares words of its own system
+#: (a dataset, a component, a product). At most this many, so the list
+#: stays something a person reads.
+MAX_VOCABULARY_READABLE = 200
 VOCABULARY_REFRESH_S = 600.0
 #: How far the end of the cover may fall behind now before a case is
 #: refused: past it, a name first logged in the gap has never been read and
@@ -435,6 +439,10 @@ class ElasticConfig:
     vocabulary_days: int = DEFAULT_VOCABULARY_DAYS
     vocabulary_max: int = DEFAULT_VOCABULARY_MAX
     vocabulary_budget_s: float = DEFAULT_VOCABULARY_BUDGET_S
+    #: names the site map lists as words of its own system, normalised
+    #: (:func:`jsonscrub._norm`): a learnt name that is one of them whole
+    #: keeps its label in its own field and stays readable everywhere else
+    vocabulary_readable: frozenset = frozenset()
 
     @property
     def learnable_rules(self) -> tuple["FieldRule", ...]:
@@ -624,15 +632,15 @@ def _parse_clusters(raw: Any, source: str) -> tuple[Cluster, ...]:
 
 
 def _parse_vocabulary(raw: Any, rules: tuple[FieldRule, ...], source: str) -> dict:
-    """``{"fields": [...], "days": 30, "max": 50000, "budget_s": 1200}``,
-    all optional.
+    """``{"fields": [...], "days": 30, "max": 50000, "budget_s": 1200,
+    "readable": [...]}``, all optional.
 
     Each field must be a listed, non-glob identifier without a shape, of a
     type a vocabulary may hold (:data:`NO_VOCABULARY_TYPES` says which may
     not, and why). Absent: every field that could be listed."""
     if raw is None:
         return {}
-    known = {"fields", "days", "max", "budget_s", "_comment"}
+    known = {"fields", "days", "max", "budget_s", "readable", "_comment"}
     if not isinstance(raw, dict) or set(raw) - known:
         raise ConfigError(f"{source}: vocabulary must be an object with "
                           f"{', '.join(sorted(known - {'_comment'}))}")
@@ -649,6 +657,24 @@ def _parse_vocabulary(raw: Any, rules: tuple[FieldRule, ...], source: str) -> di
         raise ConfigError(f"{source}: vocabulary.budget_s must be a number, "
                           f"1..{MAX_VOCABULARY_BUDGET_S:g}")
     out["vocabulary_budget_s"] = float(budget)
+    if "readable" in raw:
+        # The words are the site's own text, so no message quotes one: a
+        # refusal names the position.
+        words = raw["readable"]
+        if not isinstance(words, list) or len(words) > MAX_VOCABULARY_READABLE:
+            raise ConfigError(f"{source}: vocabulary.readable must be a list of at most "
+                              f"{MAX_VOCABULARY_READABLE} names")
+        normed = []
+        for i, w in enumerate(words):
+            if not isinstance(w, str) or not any(c.isalpha() for c in w) \
+                    or len(w) > 80 or "<" in w or ">" in w or "*" in w:
+                raise ConfigError(f"{source}: vocabulary.readable entry {i + 1} must be a "
+                                  "name with a letter, at most 80 characters, no label and "
+                                  "no wildcard")
+            normed.append(jsonscrub._norm(w))
+        if len(set(normed)) != len(normed):
+            raise ConfigError(f"{source}: vocabulary.readable lists a name twice")
+        out["vocabulary_readable"] = frozenset(normed)
     if "fields" in raw:
         fields = raw["fields"]
         if not isinstance(fields, list) or not all(isinstance(f, str) for f in fields) \
@@ -1214,6 +1240,9 @@ class EsScrubber(jsonscrub.JsonScrubber):
         self.vocabulary_counts: dict[str, int] = {}
         self.vocabulary_covers: dict[str, tuple[float, float]] = {}
         self.vocabulary_skipped: dict[str, int] = {}
+        #: field -> how many of its names the site map lists as readable
+        #: (``vocabulary.readable``): counts, for the report a person reads
+        self.vocabulary_site_words: dict[str, int] = {}
         #: fields the build counted and did not read, field -> distinct
         #: count. Their values stay readable in message text.
         self.vocabulary_over_cap: dict[str, int] = {}
@@ -1245,7 +1274,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
         """
         return (rule.pattern in self._learnable_patterns
                 and not self.ordinary_words_case_wide
-                and bool(self.vocabulary_skip(value)))
+                and bool(self.skip_reason(value)))
 
     def label_for(self, rule: FieldRule, value: str, *, parts: bool = True) -> str:
         """The stable label for a value seen under an identifier rule."""
@@ -1469,6 +1498,18 @@ class EsScrubber(jsonscrub.JsonScrubber):
                 return "ordinary_word"
         return None
 
+    def skip_reason(self, value: str) -> str | None:
+        """:meth:`vocabulary_skip`, then the site's own list: a name that is
+        whole one of ``vocabulary.readable`` is ``site_word``. The fixed
+        rules answer first, so their counts do not move when a site lists a
+        word they already cover. Whole value only, never a part of one, and
+        only for a name learnt or harvested: a value the human seeds is
+        hidden whatever the list says (:meth:`readable_in_text`)."""
+        why = self.vocabulary_skip(value)
+        if why is None and jsonscrub._norm(value) in self.config.vocabulary_readable:
+            return "site_word"
+        return why
+
     def _learn_vocabulary(self, cluster: str, values: dict[str, list[str]],
                           now: float | None = None,
                           covers: dict[str, tuple[float, float]] | None = None
@@ -1484,6 +1525,7 @@ class EsScrubber(jsonscrub.JsonScrubber):
         A field with no identifier rule left in the map is skipped."""
         counts: dict[str, int] = {}
         skipped: dict[str, int] = {}
+        site_words: dict[str, int] = {}
         learnt: list[tuple[FieldRule, str]] = []
         rules = list(self._vocab_rules)
         reading = {r.pattern for r in rules}
@@ -1496,9 +1538,11 @@ class EsScrubber(jsonscrub.JsonScrubber):
             got = values.get(rule.pattern, [])
             counts[rule.pattern] = len(got)
             for key in got:
-                why = self.vocabulary_skip(key) if isinstance(key, str) else "empty"
+                why = self.skip_reason(key) if isinstance(key, str) else "empty"
                 if why:
                     skipped[why] = skipped.get(why, 0) + 1
+                    if why == "site_word":
+                        site_words[rule.pattern] = site_words.get(rule.pattern, 0) + 1
                 else:
                     learnt.append((rule, key))
         for rule, key in learnt:
@@ -1506,11 +1550,12 @@ class EsScrubber(jsonscrub.JsonScrubber):
             # registered on its own and hide the word everywhere: the core is
             # held to the same readability rules as a name
             core = jsonscrub._LEGAL_SUFFIX.sub("", key.strip())
-            self.label_for(rule, key, parts=core == key.strip() or not self.vocabulary_skip(core))
+            self.label_for(rule, key, parts=core == key.strip() or not self.skip_reason(core))
         at = time.monotonic() if now is None else now
         self.vocabulary_covers = dict(covers or {})
         self._vocabulary_at[cluster] = (at, dict(self.vocabulary_covers))
         self.vocabulary_counts, self.vocabulary_skipped = counts, skipped
+        self.vocabulary_site_words = site_words
         return counts
 
     def vocabulary_report(self) -> dict:
@@ -2245,10 +2290,17 @@ class EsScrubber(jsonscrub.JsonScrubber):
         saved = raw.get("readable_words")
         labels = list(saved) if saved is not None else [
             lab for lab, value in s.mapping.items()
-            if s.types.get(lab) in s._learnable_types and cls.vocabulary_skip(value)]
+            if s.types.get(lab) in s._learnable_types and s.skip_reason(value)]
         for lab in labels:
             value = s.mapping.get(lab)
             if value is None:
+                continue
+            if s.skip_reason(value) is None:
+                # Saved readable, and no rule says so any more: a word taken
+                # off ``vocabulary.readable`` since. It stays indexed, so the
+                # case hides it again - the safe direction. The other way
+                # round (a word listed after the case first saw the name)
+                # changes nothing in an open case; a new case applies it.
                 continue
             s.readable_words[lab] = value
             s._unindex_value(jsonscrub._norm(value))

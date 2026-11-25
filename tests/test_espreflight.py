@@ -227,3 +227,42 @@ def test_the_broker_op_is_read_only_and_answers_with_and_without_probes(tmp_path
         assert not bad.get("ok") and bad.get("code") == "bad_cluster"
     finally:
         esbridge.clock = saved
+
+
+def test_a_stream_word_the_site_map_lists_as_readable_is_a_know_line_not_a_stop():
+    """The job-named stream again, with the name declared a system word:
+    the STOP goes, and a KNOW line says a name was let through, as a count
+    and a field; the word only under show_values."""
+    cfg = eseval.stream_name_map()
+    listed = dataclasses.replace(cfg, vocabulary_readable=frozenset({eseval.STREAM_JOB.casefold()}))
+    _e, index, search = _world(cfg, eseval.stream_name_docs(), (eseval.STREAM_INDEX,))
+    r = espreflight.gather(listed, "stub", index, search, now=NOW)
+    assert not _by_id(r, "name_in_keep") and r["stops"] == 0
+    (f,) = _by_id(r, "site_words")
+    assert f["severity"] == "know" and f["field"] == "job.name" and f["count"] == 1
+    assert "words" not in f
+    assert _by_id(r, "skip_rules")[0]["counts"].get("site_word") == 1
+    blob = (json.dumps(r) + "\n".join(espreflight.format_report({"stub": r}, listed))) \
+        .replace(eseval.STREAM_INDEX, "")
+    assert eseval.STREAM_JOB not in blob and "harborsync" not in blob
+    rv = espreflight.gather(listed, "stub", index, search, now=NOW, show_values=True)
+    assert _by_id(rv, "site_words")[0]["words"] == [eseval.STREAM_JOB]
+    # unlisted, the stop is where it was
+    assert _by_id(espreflight.gather(cfg, "stub", index, search, now=NOW), "name_in_keep")
+
+
+def test_a_readable_word_that_is_a_customers_whole_name_is_a_stop():
+    cfg = eseval.over_cap_map(listed=False)
+    kept = dataclasses.replace(cfg, vocabulary_fields=("labels.tenant_name", "job.name"))
+    fx = eseval.Fixture(eseval.over_cap_docs(), [], [])
+    engine = eseval.StubEngine(fx, (eseval.OVER_CAP_INDEX,))
+    index = elastic.VocabularyIndex(None)
+    vocab, _b = eseval.build_vocabulary(kept, engine)
+    index.put("stub", vocab)
+    tenant = next(v for v in vocab.fields["labels.tenant_name"]
+                  if elastic.EsScrubber.vocabulary_skip(v) is None)
+    listed = dataclasses.replace(kept, vocabulary_readable=frozenset({" ".join(tenant.split()).casefold()}))
+    r = espreflight.gather(listed, "stub", index, None, now=NOW)
+    (f,) = _by_id(r, "site_words")
+    assert f["severity"] == "stop" and f["field"] == "labels.tenant_name" and f["count"] == 1
+    assert "customer" in f["limit"] and tenant not in json.dumps(r)

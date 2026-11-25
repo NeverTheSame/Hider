@@ -2022,3 +2022,72 @@ def test_a_dashless_id_beside_an_underscore_in_a_file_name_is_labelled_in_text()
     for i, value in enumerate(ids):
         assert value not in text[i] and "<Guid-" in text[i]
     assert "9fceb02d0ae598e95dc970b74767f19372d61af8" in text[3]
+
+
+# -- vocabulary.readable: the site's own system words ----------------------
+
+def _readable_cfg(*words):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"]["readable"] = list(words)
+    return elastic.parse(raw, source="t")
+
+
+def test_a_name_the_site_map_lists_as_readable_keeps_its_field_label_and_stays_a_word():
+    """A job named after a dataset hid the dataset word in every message and
+    stood readable inside every longer keep value. Listed, it is labelled
+    in its own field only; a longer name that holds it is still hidden."""
+    s = elastic.EsScrubber(_readable_cfg("Harborsync", "tide  gauge"), tier2="none")
+    _learn(s, "c", *_for("job.name", "Harborsync", "Harborsync Nightly", "Tide Gauge",
+                         "Brackenvault"), now=0.0)
+    assert s.vocabulary_report()["skipped"] == {"site_word": 2}
+    assert s.vocabulary_site_words == {"job.name": 2}
+    out = s._scrub_text("harborsync wrote 4 rows; Tide Gauge idle; Harborsync Nightly and "
+                        "Brackenvault failed")
+    assert out.startswith("harborsync wrote 4 rows; Tide Gauge idle; <Job_Name-")
+    assert "Harborsync Nightly" not in out and "Brackenvault" not in out
+    # in its own field the name is a label, as an ordinary word's is
+    scrubbed = s.scrub_response(_envelope([_hit({"job": {"name": "Harborsync"},
+                                                 "message": "started"})]),
+                                elastic.Plan("logs-app-*", size=1))
+    assert scrubbed.output["hits"]["hits"][0]["_source"]["job"]["name"].startswith("<Job_Name-")
+    # without the list nothing changed: the word is vocabulary
+    plain = _session()
+    _learn(plain, "c", *_for("job.name", "Harborsync"), now=0.0)
+    assert "harborsync" not in plain._scrub_text("harborsync wrote 4 rows")
+
+
+def test_a_seeded_name_is_hidden_whatever_the_readable_list_says():
+    s = elastic.EsScrubber(_readable_cfg("Harborsync"), tier2="none")
+    _learn(s, "c", *_for("job.name", "Harborsync"), now=0.0)
+    assert "Harborsync" in s._scrub_text("Harborsync wrote 4 rows")
+    s.seed("Harborsync")
+    assert "Harborsync" not in s._scrub_text("Harborsync wrote 4 rows")
+    fresh = elastic.EsScrubber(_readable_cfg("Harborsync"), tier2="none", terms=["Harborsync"])
+    _learn(fresh, "c", *_for("job.name", "Harborsync"), now=0.0)
+    assert "Harborsync" not in fresh._scrub_text("Harborsync wrote 4 rows")
+
+
+def test_a_word_taken_off_the_readable_list_is_hidden_again_in_a_saved_case(tmp_path):
+    listed = _readable_cfg("Harborsync")
+    s = elastic.EsScrubber(listed, tier2="none")
+    _learn(s, "c", *_for("job.name", "Harborsync"), now=0.0)
+    s.scrub_response(_envelope([_hit({"job": {"name": "Harborsync"}, "message": "started"})]),
+                     elastic.Plan("logs-app-*", size=1))
+    assert "Harborsync" in s._scrub_text("Harborsync wrote 4 rows")
+    s.save_session(tmp_path)
+    same = elastic.EsScrubber.load_session(tmp_path, listed, tier2="none")
+    assert "Harborsync" in same._scrub_text("Harborsync wrote 4 rows")
+    off = elastic.EsScrubber.load_session(tmp_path, CFG, tier2="none")
+    assert "Harborsync" not in off._scrub_text("Harborsync wrote 4 rows")
+
+
+@pytest.mark.parametrize("words", [
+    "Harborsync", [7], ["2026"], ["<Job-01>"], ["Harbor*"], ["x" * 81],
+    ["Harborsync", " harborsync "], [f"Word{i}x" for i in range(201)],
+])
+def test_a_malformed_readable_list_is_a_startup_error_that_quotes_no_word(words):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["vocabulary"]["readable"] = words
+    with pytest.raises(elastic.ConfigError, match="vocabulary.readable") as e:
+        elastic.parse(raw, source="t")
+    assert "Harbor" not in str(e.value) and "Word1" not in str(e.value)

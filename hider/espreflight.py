@@ -163,10 +163,28 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                      for f, x in index.over_cap_fields(cluster, t).items()} if index else {}
             s0.apply_vocabulary(cluster, vocab, t, over_cap=over0)
             skipped = dict(s0.vocabulary_skipped)
+            site_words = dict(s0.vocabulary_site_words)
+            for f, n in sorted(site_words.items()):
+                rule = config.rule(f)
+                tenant = rule is not None and rule.type == "ORG_NAME"
+                finding = {"field": f, "count": n}
+                if show_values:
+                    finding["words"] = sorted(
+                        v for v in vocab.fields.get(f, [])
+                        if isinstance(v, str) and s0.skip_reason(v) == "site_word")
+                add("site_words", "stop" if tenant else "know",
+                    "a name the site map lists as a word of its own system "
+                    "(vocabulary.readable) keeps its label in its own field and is readable "
+                    "everywhere else" + (": here it is also the whole name of a customer"
+                                         if tenant else ""),
+                    f"{f}: {n} name(s)",
+                    "take the word off vocabulary.readable" if tenant else
+                    "take a word off vocabulary.readable if it is a customer's name", **finding)
         if skipped:
             add("skip_rules", "know",
-                "a one-word name that is an ordinary word, short, a stopword or letterless "
-                "is never made vocabulary; it stays readable in message text",
+                "a one-word name that is an ordinary word, short, a stopword or letterless, "
+                "or a name the site map lists as readable, is never made vocabulary; it "
+                "stays readable in message text",
                 ", ".join(f"{k}: {v}" for k, v in sorted(skipped.items())),
                 "seed any that is a real customer name per case (--term NAME)",
                 counts=skipped)
@@ -263,8 +281,9 @@ def gather(config: elastic.ElasticConfig, cluster: str,
                     f"{', '.join(f'{p} on {c} doc(s)' for p, c in sorted(inside.items()))}"
                     f"{in_index}; {docs_with} of the newest {len(hits)} documents carry one "
                     "- a sample, so the document counts move between runs; the names do not",
-                    "map the field as identifier, keep the stream out of indices, or seed "
-                    "the name per case (--term)", **finding)
+                    "map the field as identifier, keep the stream out of indices, seed the "
+                    "name per case (--term), or list it under vocabulary.readable if it is a "
+                    "word of the system and no customer's name", **finding)
             if s.readable_words:
                 fields = sorted({s.readable_fields.get(lab, "?") for lab in s.readable_words})
                 finding = {"index": pattern,

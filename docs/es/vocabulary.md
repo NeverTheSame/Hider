@@ -142,6 +142,28 @@ So, today:
   and the verb in every message; on one real page that was the method
   slot of 25 of 50 documents. Such a name keeps its label in its own
   field, as an ordinary word does.
+- A site may add names of its own to that rule: `vocabulary.readable` in
+  the site map, a list of at most 200 names (`MAX_VOCABULARY_READABLE`).
+  A learnt or harvested name that is **whole** one of them (blanks and
+  casing normalised, never a part of a longer name) is skipped with the
+  reason `site_word` (`EsScrubber.skip_reason`, the fixed rules first):
+  labelled in its own field, readable everywhere else. It is for words of
+  the system itself - a dataset, a component, a product - that some job
+  happens to be named after: on a real cluster two such job names stood
+  inside the index names and the dataset values of nearly every document,
+  so es-preflight reported three `name_in_keep` STOP lines that hid no
+  customer, and the same words were labels in ordinary message text. The
+  list is a decision a person makes about named words, in the one file
+  that already holds the site's decisions; it is not a dictionary and
+  nothing is readable until it is written down. What it does not do: a
+  name the human seeds (`--term`, es-seed) is hidden whatever the list
+  says; a malformed list is a load error that quotes no word; a case
+  already open keeps treating a name the way it first met it, except
+  that a word taken **off** the list is hidden again when the case is
+  loaded (the safe direction). es-preflight says what the list let
+  through: a `site_words` KNOW line per field with a count, the words
+  only under `--show-values`, and a STOP when the field is an
+  `ORG_NAME` one, because there the word is a customer's whole name.
 **Measured cost**, with the stub charging `PAGE_SECONDS` (8-35s a page
 over a slice) against `WIDE_PAGE_SECONDS` (31-297s over the whole
 range), so a build that stopped slicing fails its budget in the eval
