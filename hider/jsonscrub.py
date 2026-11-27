@@ -182,6 +182,12 @@ _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}|\d{2}:\d{2}")
 _PHONE = re.compile(r"(?<![\w+])\+?\d[\d\s().-]{7,}\d(?!\w)")
 _TOKEN = re.compile(r"[A-Za-z0-9]+")
 _WORD = re.compile(r"[A-Za-z0-9_]+")
+#: Blank characters a normalised value does not hold: two or more in a row,
+#: or any single one that is not a plain space (tab, line break, no-break
+#: space). Their presence is what sends the sweep to its slower, spacing-
+#: tolerant match; ``_WS_SLACK`` is how far around the index token it looks.
+_IRREGULAR_WS = re.compile(r"\s{2,}|[^\S ]")
+_WS_SLACK = 64
 #: A field name, not data: left untouched. Keys with an @, a dot-host or a long
 #: digit run still go through the scrubber.
 #: Every shape a label can take, so the sweep never rewrites inside one.
@@ -541,6 +547,33 @@ class JsonScrubber:
 
     # -- pass 2/3: rewrite -------------------------------------------------
 
+    def _spans_of(self, v: str, off: int, tok: re.Match, text: str):
+        """Where the known value ``v`` may stand around its index token.
+
+        First the span of the value's own length: the value is stored with
+        its blanks collapsed, so this is where it stands when the text spaces
+        it the same way. A text that writes a doubled blank, a tab or a line
+        break inside the name is longer than that span and was never matched,
+        so a learnt multi-word name stayed readable (8 of 7,918 job names on
+        one real cluster). Only near such irregular spacing, the value is
+        looked for again with any run of blank characters between its words.
+        """
+        a = tok.start() - off
+        yield a, a + len(v)
+        if " " not in v:
+            return
+        lo = max(0, a - _WS_SLACK)
+        hi = min(len(text), tok.end() + len(v) + _WS_SLACK)
+        if _IRREGULAR_WS.search(text, lo, hi) is None:
+            return
+        cache = self.__dict__.setdefault("_ws_rx", {})
+        rx = cache.get(v)
+        if rx is None:
+            rx = cache[v] = re.compile(r"\s+".join(map(re.escape, v.split(" "))), re.IGNORECASE)
+        for m in rx.finditer(text, lo, hi):
+            if m.start() <= tok.start() < m.end() and (m.start(), m.end()) != (a, a + len(v)):
+                yield m.start(), m.end()
+
     def _find_known(self, text: str) -> list[tuple[int, int, str]]:
         """Non-overlapping (start, end, value) hits of known values, longest first."""
         if not self._index and not self._prefixes:
@@ -559,18 +592,17 @@ class JsonScrubber:
             for v, off in self._index.get(tok.group(0).casefold(), ()):
                 if self._known_only is not None and self.known.get(v) not in self._known_only:
                     continue
-                a = tok.start() - off
-                b = a + len(v)
-                if a < 0 or b > len(text):
-                    continue
-                if a > 0 and text[a - 1].isascii() and text[a - 1].isalnum():
-                    continue
-                if b < len(text) and text[b].isascii() and text[b].isalnum():
-                    continue
-                if any(a < ge and gs < b for gs, ge in guard):
-                    continue  # inside a label we already placed
-                if " ".join(text[a:b].split()).casefold() == v:
-                    hits.append((a, b, v))
+                for a, b in self._spans_of(v, off, tok, text):
+                    if a < 0 or b > len(text):
+                        continue
+                    if a > 0 and text[a - 1].isascii() and text[a - 1].isalnum():
+                        continue
+                    if b < len(text) and text[b].isascii() and text[b].isalnum():
+                        continue
+                    if any(a < ge and gs < b for gs, ge in guard):
+                        continue  # inside a label we already placed
+                    if " ".join(text[a:b].split()).casefold() == v:
+                        hits.append((a, b, v))
         hits.sort(key=lambda h: (-(h[1] - h[0]), h[0]))
         kept: list[tuple[int, int, str]] = []
         for h in hits:

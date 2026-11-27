@@ -4,6 +4,8 @@ import json
 import random
 import re
 
+import pytest
+
 from hider import jsonscrub
 
 DOC = {
@@ -171,6 +173,33 @@ def test_leak_check_counts_a_short_value_it_still_holds():
     tampered = {**res.output, "notes": "Account 482 escalated"}
     assert s.leak_check(tampered) == [label]
     assert s.leak_check(res.output) == []
+
+
+@pytest.mark.parametrize("gap", ["  ", "\t", " \n  ", " ", "   "])
+def test_a_name_the_text_spaces_differently_is_still_swept(gap):
+    """The value is stored with its blanks collapsed, and the sweep took a
+    span of that length from the text. A text that writes the name with a
+    doubled blank, a tab, a line break or a no-break space is longer than
+    that span, so a learnt multi-word name stayed readable there (8 of 7,918
+    job names on a real cluster) and the leak check, which uses the same
+    matcher, called the output clean."""
+    doc = {"tenant": "Quillon Harbor Works",
+           "notes": f"the job for Quillon{gap}Harbor Works failed; Quillon Harbor{gap}Works again"}
+    res = jsonscrub.scrub(doc, tier2="none")
+    label = res.output["tenant"]
+    assert label.startswith("<")
+    assert res.output["notes"] == f"the job for {label} failed; {label} again"
+    assert res.stats["leaks"] == []
+
+
+def test_the_leak_check_sees_a_name_the_text_spaces_differently():
+    s = jsonscrub.JsonScrubber(tier2="none")
+    res = s.run({"tenant": "Quillon Harbor Works", "notes": "fine"})
+    label = res.output["tenant"]
+    tampered = {**res.output, "notes": "ask Quillon  Harbor\tWorks about it"}
+    assert s.leak_check(tampered) == [label]
+    # a longer word that only starts like the name is not the name
+    assert s.leak_check({**res.output, "notes": "Quillon  Harbor  Workshop"}) == []
 
 
 def test_short_values_are_swept_and_the_trade_is_measured():
