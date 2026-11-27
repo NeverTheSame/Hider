@@ -1123,6 +1123,75 @@ def test_es_login_then_many_es_smoke_runs_through_the_cli(served, site_map, caps
     assert rc == 2 and "REFUSED" in res.out and "code=session_expired" in res.out
 
 
+@pytest.fixture
+def site_profile(tmp_path, monkeypatch):
+    """A site profile for the process the in-test broker runs in."""
+    from hider import profiles
+
+    def use(text: str | None) -> str:
+        path = tmp_path / "harbor-ridge.profile.json"
+        if text is None:
+            monkeypatch.delenv(profiles.ENV_PROFILE, raising=False)
+        else:
+            path.write_text(text, encoding="utf-8")
+            monkeypatch.setenv(profiles.ENV_PROFILE, str(path))
+        profiles.active.cache_clear()
+        return str(path)
+
+    yield use
+    monkeypatch.delenv(profiles.ENV_PROFILE, raising=False)
+    profiles.active.cache_clear()
+
+
+_PROFILE = json.dumps({"name": "harbor-ridge-site", "patterns": {
+    "WORKER_POD_ID": ["\\bhrx-[a-z]{3}-\\d{2}\\b"],
+    "SUPPORT_CASE_NUMBER": [{"regex": "\\b\\d{7}\\b", "after": "\\bhrx-tracker\\b"}]}})
+
+
+def test_es_login_says_whether_the_bridge_holds_a_site_profile_as_a_count(
+        served, site_map, capsys, site_profile):
+    """Three real-cluster runs went by with no profile in the bridge and
+    nothing said so. The line is the broker's answer, a count, never the
+    profile's name or path."""
+    from hider import cli
+
+    path = site_profile(_PROFILE)
+    assert cli.main(["es-login", "--config", site_map, "--cluster", "stub", "--timeout", "5"]) == 0
+    out = capsys.readouterr()
+    assert "PROFILE  site profile loaded in the bridge: 2 patterns" in out.out
+    for stream in (out.out, out.err):
+        assert path not in stream and "harbor-ridge" not in stream and "hrx" not in stream
+
+
+def test_es_login_says_so_when_the_bridge_holds_no_site_profile(
+        served, site_map, capsys, site_profile):
+    from hider import cli
+
+    site_profile(None)
+    assert cli.main(["es-login", "--config", site_map, "--cluster", "stub", "--timeout", "5"]) == 0
+    out = capsys.readouterr().out
+    assert "PROFILE  no site profile in the bridge" in out and "this shell sets" not in out
+
+
+def test_the_profile_line_is_the_bridges_answer_not_the_shells(site_profile):
+    from hider import cli
+
+    # a bridge started without the variable, asked from a shell that sets it
+    site_profile(None)
+    state = esbridge.site_profile_state()
+    assert state == {"loaded": False, "patterns": 0, "broken": False}
+    line = cli._profile_line(state, True)
+    assert "no site profile in the bridge" in line and "es-logout, then es-login" in line
+    # a profile that does not load is said, not shown as "none"
+    path = site_profile("{not json")
+    state = esbridge.site_profile_state()
+    assert state == {"loaded": False, "patterns": 0, "broken": True}
+    line = cli._profile_line(state, True)
+    assert "did not load" in line and path not in line
+    # a bridge too old to say prints nothing rather than a guess
+    assert cli._profile_line(None, True) is None
+
+
 def test_es_smoke_through_the_bridge_checks_empty_fields_and_takes_typed_seeds(
         served, site_map, capsys, fixture):
     from hider import cli

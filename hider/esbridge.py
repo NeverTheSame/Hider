@@ -2041,6 +2041,26 @@ GROUP_SPAN_TTL_S = 3600.0
 _MAX_SEEDS = 40
 
 
+def site_profile_state() -> dict:
+    """Whether this process holds a site profile, as counts only.
+
+    The broker reads ``HIDER_PROFILE`` once, from the environment it was
+    started in; a shell that sets the variable later changes nothing, and a
+    bridge started without it hides site-specific names with the built-in
+    rules alone. So the answer comes from the broker, never from the client's
+    own environment. Never the profile's name or path: both describe the site.
+    """
+    from . import profiles
+
+    try:
+        profile = profiles.active()
+    except profiles.ProfileError:
+        return {"loaded": False, "patterns": 0, "broken": True}
+    if profile is None:
+        return {"loaded": False, "patterns": 0, "broken": False}
+    return {"loaded": True, "patterns": profile.pattern_count, "broken": False}
+
+
 def broker_socket(profile_dir: str | Path) -> Path:
     """Where the broker for a profile listens. Not created here."""
     if not str(profile_dir).strip():
@@ -2287,7 +2307,8 @@ class Broker:
                 if signed_in:
                     self.start_vocabulary(cluster)
                 return {"ok": True, "signed_in": signed_in,
-                        "vocabulary": self.vocabulary_progress(cluster.name)}
+                        "vocabulary": self.vocabulary_progress(cluster.name),
+                        "profile": site_profile_state()}
             if op == "vocabulary":
                 # ``build`` starts one if none is held and none is running:
                 # what es-login does after signing in, and what a transport

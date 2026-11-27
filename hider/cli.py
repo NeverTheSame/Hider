@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -468,6 +469,23 @@ def _broker_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
+def _profile_line(state: object, shell_sets_it: bool) -> str | None:
+    """es-login's PROFILE line: whether the bridge holds a site profile, as a
+    count. The bridge answers, not this shell: it read ``HIDER_PROFILE`` when
+    it started. None for a bridge too old to say."""
+    if not isinstance(state, dict):
+        return None
+    if state.get("broken"):
+        return ("PROFILE  the site profile named by HIDER_PROFILE did not load in the bridge; "
+                "queries fail until it is fixed (es-logout, fix the file, es-login)")
+    if state.get("loaded"):
+        return f"PROFILE  site profile loaded in the bridge: {int(state.get('patterns') or 0)} patterns"
+    return ("PROFILE  no site profile in the bridge (HIDER_PROFILE was not set when it started); "
+            "site-specific names and titles in message text are hidden by the built-in rules only"
+            + ("; this shell sets HIDER_PROFILE - run es-logout, then es-login, to load it"
+               if shell_sets_it else ""))
+
+
 def _cmd_es_login(args: argparse.Namespace) -> int:
     """Sign a cluster in, in the bridge's long-lived Chrome. Starts the
     bridge if it is not running. Prints cluster names, never Kibana URLs."""
@@ -496,6 +514,9 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
     if reply["signed_in"]:
         print(f"signed in: cluster {cluster.name}; the session lasts while the bridge runs "
               "(es-logout, closing its window, or 8 hours idle ends it)")
+        line = _profile_line(reply.get("profile"), bool(os.environ.get("HIDER_PROFILE")))
+        if line:
+            print(line)
         # The one vocabulary build for this bridge. It is slow - minutes on a
         # large estate - and a case opened before it finishes is refused, so
         # wait here, where someone is already waiting, and show the progress.
