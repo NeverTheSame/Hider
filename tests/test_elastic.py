@@ -153,6 +153,33 @@ def test_no_planted_value_survives_and_labels_are_consistent():
     assert all(v for v in s.mapping.values())
 
 
+@pytest.mark.parametrize("field_value, written", [
+    ("Harbor  Ridge Sync", "Harbor  Ridge Sync"),      # the field and the text both double the blank
+    ("Harbor  Ridge Sync", "Harbor Ridge Sync"),       # the text writes one blank
+    ("Harbor Ridge Sync", "Harbor   Ridge  Sync"),     # the text writes more blanks than the field
+    ("Harbor Ridge Sync", "Harbor\tRidge Sync"),       # one other blank character, as before
+    ("Sync Harbor  Ridge", "Sync Harbor  Ridge"),      # the doubled blank after the indexed word
+])
+def test_a_name_is_hidden_in_text_however_many_blanks_separate_its_words(field_value, written):
+    doc = copy.deepcopy(APP_DOC)
+    doc["job"]["name"] = field_value
+    doc["message"] = f"Job {written} failed, see {written}."
+    s = _session()
+    src = s.scrub_response(_envelope([_hit(doc)]), PLAN).output["hits"]["hits"][0]["_source"]
+    label = src["job"]["name"]
+    assert label.startswith("<")
+    assert src["message"] == f"Job {label} failed, see {label}."
+
+
+def test_a_name_is_not_matched_across_a_line_break_and_more_blanks():
+    doc = copy.deepcopy(APP_DOC)
+    doc["job"]["name"] = "Harbor Ridge"
+    doc["message"] = "moved to Harbor\n  Ridge road"
+    s = _session()
+    src = s.scrub_response(_envelope([_hit(doc)]), PLAN).output["hits"]["hits"][0]["_source"]
+    assert "Harbor" in src["message"] and "Ridge" in src["message"]
+
+
 def test_unlisted_fields_are_dropped_not_shown():
     s = _session()
     out = s.scrub_response(_envelope([_hit(APP_DOC)]), PLAN).output

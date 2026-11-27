@@ -235,6 +235,52 @@ def _norm(v: str) -> str:
     return " ".join(v.split()).casefold()
 
 
+#: The blank characters a text may repeat between two words of a known
+#: value. A line break is never one of a run.
+_RUN_BLANKS = " \t\u00a0"
+
+
+def _blank_span(text: str, at: int, v: str, off: int) -> tuple[int, int] | None:
+    """Where the normalised value ``v`` would stand in ``text`` if its
+    character ``off`` is the one at ``at``. Each single blank of ``v`` is
+    either a run of the same line's blanks (:data:`_RUN_BLANKS`) or exactly
+    one blank character of any other kind, as it always was. ``None`` when
+    the text ends first or has no blank where ``v`` has one. The caller
+    still compares the characters.
+
+    A value is stored with its blanks collapsed, so a span of ``len(v)``
+    characters came up short wherever the text wrote two blanks, and the
+    name stayed readable."""
+    i = at
+    for j in range(off - 1, -1, -1):
+        if i <= 0:
+            return None
+        if v[j] != " ":
+            i -= 1
+        elif text[i - 1] in _RUN_BLANKS:
+            while i > 0 and text[i - 1] in _RUN_BLANKS:
+                i -= 1
+        elif text[i - 1].isspace():
+            i -= 1
+        else:
+            return None
+    a = i
+    i = at
+    for j in range(off, len(v)):
+        if i >= len(text):
+            return None
+        if v[j] != " ":
+            i += 1
+        elif text[i] in _RUN_BLANKS:
+            while i < len(text) and text[i] in _RUN_BLANKS:
+                i += 1
+        elif text[i].isspace():
+            i += 1
+        else:
+            return None
+    return a, i
+
+
 _GREETING = re.compile(
     r"^(?:(?:hi|hello|hey|dear|thanks|thank\s+you|regards|kind\s+regards|best|cheers|"
     r"mr|mrs|ms|dr)\b[\s,.:]*)+",
@@ -559,10 +605,10 @@ class JsonScrubber:
             for v, off in self._index.get(tok.group(0).casefold(), ()):
                 if self._known_only is not None and self.known.get(v) not in self._known_only:
                     continue
-                a = tok.start() - off
-                b = a + len(v)
-                if a < 0 or b > len(text):
+                span = _blank_span(text, tok.start(), v, off)
+                if span is None:
                     continue
+                a, b = span
                 if a > 0 and text[a - 1].isascii() and text[a - 1].isalnum():
                     continue
                 if b < len(text) and text[b].isascii() and text[b].isalnum():
