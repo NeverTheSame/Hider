@@ -63,6 +63,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from . import elastic, esbridge, esquery
+from . import esalias
 
 SERVER_NAME = "hider-es"
 SERVER_VERSION = "1"
@@ -389,11 +390,17 @@ _AGGS = {
 def tool_list(config: elastic.ElasticConfig) -> list[dict]:
     """The four tools, their schemas filled in from the site map."""
     clusters = [c.name for c in config.clusters]
+    indices = list(config.indices)
+    names = esalias.Translator.of(config)
+    if names is not None:
+        # the schemas reach Claude before es_schema does
+        clusters = [names.cluster_out(c) for c in clusters]
+        indices = [names.index_out(i) for i in indices]
     common = {
         "cluster": {"type": "string", "enum": clusters,
                     "description": "configured cluster name"
                                    + ("; may be omitted, there is one" if len(clusters) == 1 else "")},
-        "index": {"type": "string", "enum": list(config.indices)},
+        "index": {"type": "string", "enum": indices},
         "time_range": _TIME_RANGE,
         "filters": _FILTERS,
     }
@@ -404,7 +411,7 @@ def tool_list(config: elastic.ElasticConfig) -> list[dict]:
                 "properties": {**common, **extra}, "required": required + list(need)}
 
     ro = {"readOnlyHint": True, "openWorldHint": False, "idempotentHint": True}
-    return [
+    return _tools(names, [
         {"name": "es_schema",
          "description": "The site map: clusters, index patterns, every queryable field and its "
                         "kind (keep, identifier, text), the caps, and the labels this case has "
@@ -430,7 +437,11 @@ def tool_list(config: elastic.ElasticConfig) -> list[dict]:
                         "histograms over time, metrics on keep fields.",
          "inputSchema": schema({"aggs": _AGGS}, ("aggs",)),
          "annotations": {"title": "Aggregate logs", **ro}},
-    ]
+    ])
+
+
+def _tools(names: "esalias.Translator | None", tools: list[dict]) -> list[dict]:
+    return tools if names is None else names.prose(tools)
 
 
 #: the grammar keys each tool may pass through; everything else is refused
@@ -464,6 +475,9 @@ def build_query(config: elastic.ElasticConfig, tool: str, args: dict) -> tuple[s
 
 def schema_payload(config: elastic.ElasticConfig, case: Case) -> dict:
     out = config.summary()
+    names = esalias.Translator.of(config)
+    if names is not None:
+        out = names.summary(out)
     labels = case.scrubber.types
     listed = sorted(labels)[:_MAX_LISTED_LABELS]
     case.pending_seeds.clear()   # listed here, with their types
@@ -537,24 +551,40 @@ def call_tool(config: elastic.ElasticConfig, case: Case, name: str, args: Any) -
         args = {}
     if not isinstance(args, dict):
         return _refusal("bad_request", "arguments must be an object")
+    # with ``aliases`` in the site map Claude types and reads aliases; the
+    # grammar, the bridge and the log behind this point keep the real names
+    names = esalias.Translator.of(config)
+
+    def refusal(e: elastic.Refused) -> dict:
+        return _refusal(e.code, e.message if names is None else names.refusal(e.message))
+
     try:
         if name == "es_schema":
             if args:
                 raise elastic.Refused("bad_request", "es_schema takes no arguments")
             return _text_result(schema_payload(config, case))
+        if names is not None:
+            args = names.inbound(args)
         cluster, query = build_query(config, name, args)
     except elastic.Refused as e:
-        return _refusal(e.code, e.message)
+        return refusal(e)
     try:
         try:
             outcome = case.bridge.run(cluster, query, tool=name)
         finally:
             case.save()
     except elastic.Refused as e:
-        return _refusal(e.code, e.message)
+        return refusal(e)
     except Exception:  # fail closed, and keep whatever it was out of the reply
         return _refusal("bridge_error", _BRIDGE_ERROR)
     payload = _payload(name, outcome)
+    if names is not None:
+        try:
+            payload = names.payload(payload)
+        except esalias.Unmapped:
+            # a name the alias map cannot place is a real name; nothing of
+            # the reply goes out
+            return _refusal("bridge_error", _BRIDGE_ERROR)
     if case.pending_seeds:
         # how Claude learns a name was added while it worked: the label
         # and its type, once, in the next result that reaches it

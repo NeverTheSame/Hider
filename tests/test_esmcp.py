@@ -948,3 +948,179 @@ def test_a_bad_index_refusal_reaches_the_model_as_code_and_message_only():
     assert text == ("refused (bad_index): response withheld: a hit came from an index "
                     "outside the allowlist")
     assert "index_shape" not in json.dumps(res) and "9.9.9" not in json.dumps(res)
+
+
+# -- aliases: the names Claude sees in place of the site's own ----------------
+
+
+def _aliases(raw: dict) -> dict:
+    """Every exact field, every index pattern and the cluster under an
+    alias; a glob rule shown as written, which is all a glob can be."""
+    fields = {}
+    for i, path in enumerate(raw["fields"]):
+        fields[path] = True if "*" in path else f"f{i:02d}"
+    return {"clusters": {"stub": "c1"},
+            "indices": {p: f"i{n}" for n, p in enumerate(raw["indices"], 1)},
+            "fields": fields}
+
+
+@pytest.fixture
+def aliased(stub, short_dir):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    b = _Bridge(_config(stub.url, short_dir / "profile", aliases=_aliases(raw)),
+                short_dir / "cases")
+    b.names = _aliases(raw)
+    yield b
+    b.stop()
+
+
+def _real_names(names: dict) -> re.Pattern:
+    """Every aliased real name that cannot be an ordinary word of a log
+    line or a tool description: a dotted field path, an index pattern."""
+    real = [k for kind in ("indices", "fields") for k, v in names[kind].items()
+            if v is not True and ("." in k or "*" in k)]
+    return re.compile("|".join(re.escape(k) for k in sorted(real, key=len, reverse=True)))
+
+
+def test_with_aliases_a_session_sees_and_types_aliases_only(aliased, fixture):
+    f, idx = aliased.names["fields"], aliased.names["indices"]["logs-app-*"]
+    tenant = fixture.tenants[0].name
+    opened = aliased.open(terms=[tenant])
+    (label, _), = opened["seeded"]
+    c = Mcp(opened["url"], opened["token"])
+    c.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "test", "version": "0"}})
+
+    tools = c.rpc("tools/list")["result"]["tools"]
+    props = tools[1]["inputSchema"]["properties"]
+    assert props["cluster"]["enum"] == ["c1"] and props["index"]["enum"] == ["i1", "i2", "i3"]
+
+    schema, err = c.tool("es_schema")
+    assert not err and schema["clusters"] == ["c1"] and schema["indices"] == ["i1", "i2", "i3"]
+    assert schema["fields"][f["labels.tenant_name"]] == "identifier"
+    assert schema["time_field"] == f["@timestamp"]
+    # a glob rule can only be shown as written, and is
+    assert schema["fields"]["event.*"] == "keep"
+    assert "labels.tenant_name" not in schema["fields"]
+
+    by_tenant = [{"field": f["labels.tenant_name"], "op": "eq", "value": label}]
+    want = _expected(fixture, "logs-app-*", lambda d: d.get("labels.tenant_name") == tenant)
+    count, err = c.tool("es_count", index=idx, filters=by_tenant)
+    assert not err and count["hits_total"]["value"] == want and count["cluster"] == "c1"
+
+    page, err = c.tool("es_search", index=idx, filters=by_tenant, size=5,
+                       sort=[{"field": f["@timestamp"], "order": "desc"}])
+    assert not err and page["hits_shown"] == 5
+    for h in page["hits"]:
+        assert h["_index"] == idx
+        src = h["_source"]
+        # one flat object: an alias per exact field, the path under a glob
+        assert src[f["labels.tenant_name"]] == label
+        assert all(not isinstance(v, dict) for v in src.values())
+        assert "event.outcome" in src and f["message"] in src
+
+    aggs, err = c.tool("es_aggregate", index=idx,
+                       aggs={"servers": {"type": "terms", "field": f["agent.name"], "size": 5}})
+    keys = [b["key"] for b in aggs["aggregations"]["servers"]["buckets"]]
+    assert not err and keys and all(re.fullmatch(r"ctr-[a-z]+-s\d+", k) for k in keys)
+    groups, err = c.tool("es_aggregate", index=idx,
+                         aggs={"kinds": {"type": "text_groups", "field": f["message"], "size": 3}})
+    assert not err and groups["aggregations"]["kinds"]["buckets"]
+
+    # a zero is explained by field, under the field's alias
+    none, err = c.tool("es_count", index=idx, filters=[
+        {"field": f["log.level"], "op": "eq", "value": "no-such-level"}])
+    assert not err and none["hits_total"]["value"] == 0
+    assert set(none["empty"]["fields"]) == {f["log.level"]}
+
+    seen = b"\n".join(c.bodies).decode("utf-8")
+    assert _real_names(aliased.names).findall(seen) == []
+    assert '"stub"' not in seen
+    assert _no_truth(c.bodies, fixture) == []
+
+
+def test_with_aliases_a_real_name_is_refused_like_an_invented_one(aliased, fixture):
+    f, idx = aliased.names["fields"], aliased.names["indices"]["logs-app-*"]
+    opened = aliased.open(terms=[fixture.tenants[0].name])
+    c = Mcp(opened["url"], opened["token"])
+
+    def refused(**args):
+        text, err = c.tool("es_count", **args)
+        assert err
+        return text
+
+    real = refused(index=idx, filters=[{"field": "labels.tenant_name", "op": "exists"}])
+    invented = refused(index=idx, filters=[{"field": "labels.no_such_name", "op": "exists"}])
+    assert real == invented and real.startswith("refused (unknown_field)")
+    assert refused(index="logs-app-*") == refused(index="logs-nothing-*")
+    assert refused(index=idx, cluster="stub") == refused(index=idx, cluster="elsewhere")
+    # a field under a glob shown as written is typed as written
+    ok, err = c.tool("es_count", index=idx, filters=[
+        {"field": "event.outcome", "op": "eq", "value": "failure"}])
+    assert not err
+    # a refusal that names a rule about a field names no real field
+    text, err = c.tool("es_search", index=idx, sort=[{"field": f["agent.name"]}])
+    assert err and "sort_identifier" in text and "agent.name" not in text
+    seen = b"\n".join(c.bodies).decode("utf-8")
+    assert _real_names(aliased.names).findall(seen) == []
+
+
+@pytest.mark.parametrize("patch, needle", [
+    (lambda a: a["fields"].pop("message"), "must list every name"),
+    (lambda a: a["fields"].update({"event.*": "ev"}), "glob rule"),
+    (lambda a: a["fields"].update({"message": a["fields"]["agent.name"]}), "used twice"),
+    (lambda a: a["fields"].update({"message": "@timestamp"}), "must be true or an alias"),
+    (lambda a: a["fields"].update({"no.such": "x1"}), "does not have"),
+    (lambda a: a["indices"].update({"logs-app-*": False}), "must be true or an alias"),
+    (lambda a: a.update({"hosts": {}}), "unknown keys"),
+])
+def test_an_aliases_section_that_leaves_a_name_out_is_a_load_error(patch, needle):
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": "http://127.0.0.1:1"}}
+    raw["aliases"] = _aliases(raw)
+    patch(raw["aliases"])
+    with pytest.raises(elastic.ConfigError, match=needle):
+        elastic.parse(raw, source="test")
+
+
+def test_without_aliases_nothing_is_translated_and_the_legend_is_for_the_engineer():
+    from hider import esalias
+    assert CFG0.aliases is None and esalias.Translator.of(CFG0) is None
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": "http://127.0.0.1:1"}}
+    raw["aliases"] = _aliases(raw)
+    names = esalias.Translator.of(elastic.parse(raw, source="test"))
+    alias = raw["aliases"]["fields"]["labels.tenant_name"]
+    legend = names.legend(f"Most errors on c1 in i1 carry `{alias}`; f999 is not a name.")
+    assert legend == [("cluster", "c1", "stub"), ("index", "i1", "logs-app-*"),
+                      ("field", alias, "labels.tenant_name")]
+
+
+def test_es_login_says_whether_aliases_are_on_as_counts_and_es_smoke_replays_an_aliased_call():
+    import argparse
+    from hider import cli, esalias
+    raw = json.loads(elastic.EXAMPLE.read_text())
+    raw["clusters"] = {"stub": {"kibana": "http://127.0.0.1:1"}}
+    assert cli._names_line(esalias.state(elastic.parse(raw, source="test"))).startswith(
+        "NAMES    no aliases")
+    assert cli._names_line(None) is None
+    raw["aliases"] = _aliases(raw)
+    cfg = elastic.parse(raw, source="test")
+    line = cli._names_line(esalias.state(cfg))
+    assert line == ("NAMES    aliases on in the bridge: fields 31 aliased, 3 as written; "
+                    "index patterns 3 aliased, 0 as written; clusters 1 aliased, 0 as written")
+    assert "logs-app" not in line and "stub" not in line
+    # a session's es_aggregate call, as it listed it, becomes the real query
+    f = raw["aliases"]["fields"]
+    call = {"cluster": "c1", "index": "i1",
+            "filters": [{"not": {"field": f["log.level"], "op": "eq", "value": "info"}}],
+            "aggs": {"k": {"type": "terms", "field": f["agent.name"], "size": 5}}}
+    args = argparse.Namespace(query=json.dumps(call), aliased=True, phrase=None, eq=None,
+                              count_by=None, interval=None, phrase_field=None, size=None,
+                              index=None)
+    assert cli._grammar_query(cfg, args) == {
+        "index": "logs-app-*", "size": 0,
+        "filters": [{"not": {"field": "log.level", "op": "eq", "value": "info"}}],
+        "aggs": {"k": {"type": "terms", "field": "agent.name", "size": 5}}}
+    assert "Names in this answer" in cli._alias_legend(cfg, "errors on c1")
+    assert cli._alias_legend(CFG0, "errors on c1") == ""

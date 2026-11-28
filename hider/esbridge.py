@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import elastic, esquery, jsonscrub
+from . import elastic, esalias, esquery, jsonscrub
 
 SEARCH_PATH = "/internal/search/ese"
 PROBE_PATH = "/internal/security/me"
@@ -2308,7 +2308,8 @@ class Broker:
                     self.start_vocabulary(cluster)
                 return {"ok": True, "signed_in": signed_in,
                         "vocabulary": self.vocabulary_progress(cluster.name),
-                        "profile": site_profile_state()}
+                        "profile": site_profile_state(),
+                        "names": esalias.state(self.config)}
             if op == "vocabulary":
                 # ``build`` starts one if none is held and none is running:
                 # what es-login does after signing in, and what a transport

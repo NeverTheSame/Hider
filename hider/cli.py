@@ -375,6 +375,17 @@ def _grammar_query(cfg, args: argparse.Namespace) -> dict:
             or args.size is not None:
         raise SystemExit("--query is the whole query; do not combine it with --phrase, --eq, "
                          "--phrase-field, --size, --count-by or --interval")
+    if getattr(args, "aliased", False):
+        # a session's own tool call, replayed by a person: the names are
+        # the aliases it was given, and es_aggregate asks for no hits
+        from . import esalias
+        names = esalias.Translator.of(cfg)
+        if names is None:
+            raise SystemExit("--aliased: this site map has no aliases section")
+        q = names.inbound(q)
+        q.pop("cluster", None)   # --cluster names the cluster, by its real key
+        if "aggs" in q:
+            q.setdefault("size", 0)
     if "index" not in q:
         q = {"index": args.index or cfg.indices[0], **q}
     return q
@@ -515,6 +526,9 @@ def _cmd_es_login(args: argparse.Namespace) -> int:
         print(f"signed in: cluster {cluster.name}; the session lasts while the bridge runs "
               "(es-logout, closing its window, or 8 hours idle ends it)")
         line = _profile_line(reply.get("profile"), bool(os.environ.get("HIDER_PROFILE")))
+        if line:
+            print(line)
+        line = _names_line(reply.get("names"))
         if line:
             print(line)
         # The one vocabulary build for this bridge. It is slow - minutes on a
@@ -813,6 +827,7 @@ def _es_research(args: argparse.Namespace, client, sessions_dir: Path, cfg) -> i
     dest = esmcp.research_dir(research.RESEARCH, args.case)
     (dest / "prompt.sent.txt").write_text(prompt, encoding="utf-8")
     (dest / "answer.masked.md").write_text(answer_masked, encoding="utf-8")
+    answer += _alias_legend(cfg, answer_masked)
     (dest / "answer.md").write_text(answer, encoding="utf-8")
     print(answer)
     denials = len(reply.get("permission_denials") or [])
@@ -822,6 +837,36 @@ def _es_research(args: argparse.Namespace, client, sessions_dir: Path, cfg) -> i
     if unknown:
         print(f"labels not in the case: {', '.join(unknown)}", file=sys.stderr)
     return 0
+
+
+def _names_line(state) -> str | None:
+    """es-login's NAMES line: whether a research session is given aliases
+    in place of the real cluster, index and field names, as counts. The
+    bridge answers from the site map it loaded."""
+    if not isinstance(state, dict):
+        return None   # an older bridge, which does not say
+    if not state.get("on"):
+        return ("NAMES    no aliases in the bridge's site map: a research session sees the "
+                "real cluster, index and field names")
+    parts = []
+    for kind, word in (("fields", "fields"), ("indices", "index patterns"),
+                       ("clusters", "clusters")):
+        aliased, written = (state.get(kind) or [0, 0])[:2]
+        parts.append(f"{word} {int(aliased)} aliased, {int(written)} as written")
+    return "NAMES    aliases on in the bridge: " + "; ".join(parts)
+
+
+def _alias_legend(cfg, answer_masked: str) -> str:
+    """The real names behind the aliases an answer uses, for the engineer's
+    copy only (``answer.md``). The session wrote in aliases and never sees
+    this."""
+    from . import esalias
+    names = esalias.Translator.of(cfg)
+    legend = names.legend(answer_masked) if names is not None else []
+    if not legend:
+        return ""
+    return ("\n\n---\nNames in this answer (aliases the session was given):\n"
+            + "".join(f"- {kind} `{alias}` = `{real}`\n" for kind, alias, real in legend))
 
 
 def _es_research_stub(args: argparse.Namespace) -> int:
@@ -1426,6 +1471,11 @@ def main(argv: list[str] | None = None) -> int:
                          "the first configured. Not combined with the query-building flags. "
                          "The summary stays counts, codes, timings and field names; group "
                          "texts and keys print with --show only")
+    sm.add_argument("--aliased", action="store_true",
+                    help="with --query: the query is a research session's own tool call, "
+                         "written in the site map's aliases (cluster, index, fields). It is "
+                         "put back into real names and sent; an aggregation asks for no hits, "
+                         "as es_aggregate does. For replaying what a session asked")
     sm.add_argument("--log", help="append a decision-log row to this JSONL file")
     sm.set_defaults(fn=_cmd_es_smoke)
 

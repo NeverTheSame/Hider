@@ -417,6 +417,31 @@ class Cluster:
         return self.kibana.split("//", 1)[1].split("/", 1)[0].lower()
 
 
+#: An alias is what Claude sees and types in place of a real name.
+_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+#: What a name Claude typed becomes when it is neither an alias nor a name
+#: shown as written: a name nothing in a site map may carry, so the grammar
+#: refuses it exactly as it refuses an invented one.
+ALIAS_UNKNOWN = "zz_not_in_the_site_map"
+
+
+@dataclass(frozen=True)
+class Aliases:
+    """``aliases`` in the site map: the names Claude sees in place of the
+    real cluster keys, index patterns and field paths.
+
+    Each is a tuple of ``(real, alias)`` pairs covering **every** name of
+    its kind; ``alias`` is ``None`` for a name the site chose to show as
+    written (``true`` in the file). Nothing is aliased by default and
+    nothing is shown by omission: a name missing from the section is a load
+    error (:func:`_parse_aliases`)."""
+
+    clusters: tuple[tuple[str, str | None], ...] = ()
+    indices: tuple[tuple[str, str | None], ...] = ()
+    fields: tuple[tuple[str, str | None], ...] = ()
+
+
 @dataclass(frozen=True)
 class ElasticConfig:
     indices: tuple[str, ...]
@@ -443,6 +468,9 @@ class ElasticConfig:
     #: (:func:`jsonscrub._norm`): a learnt name that is one of them whole
     #: keeps its label in its own field and stays readable everywhere else
     vocabulary_readable: frozenset = frozenset()
+    #: ``aliases``: the names Claude sees instead of the real ones, or None
+    #: (every name as written, the behaviour before aliases existed)
+    aliases: "Aliases | None" = None
 
     @property
     def learnable_rules(self) -> tuple["FieldRule", ...]:
@@ -701,7 +729,7 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
         raise ConfigError(f"{source}: top level must be an object")
     allowed = {"_comment", "indices", "fields", "time_field", "max_hits", "max_buckets",
                "max_text_chars", "clusters", "profile_dir", "poll_timeout_s",
-               "max_phrases", "phrase_budget", "vocabulary"}
+               "max_phrases", "phrase_budget", "vocabulary", "aliases"}
     unknown = set(raw) - allowed
     if unknown:
         raise ConfigError(f"{source}: unknown keys {sorted(unknown)}")
@@ -764,7 +792,69 @@ def parse(raw: Any, *, source: str = "elastic") -> ElasticConfig:
             raise ConfigError(f"{source}: identifier type {r.type!r} would label as "
                               f"<{prefix}-NN>, which {owner!r} already uses")
     # last: the fields it names are checked against everything above
-    return dataclasses.replace(cfg, **_parse_vocabulary(raw.get("vocabulary"), rules, source))
+    cfg = dataclasses.replace(cfg, **_parse_vocabulary(raw.get("vocabulary"), rules, source))
+    return dataclasses.replace(cfg, aliases=_parse_aliases(raw.get("aliases"), cfg, source))
+
+
+def _parse_aliases(raw: Any, cfg: ElasticConfig, source: str) -> Aliases | None:
+    """``{"clusters": {...}, "indices": {...}, "fields": {...}}``: per real
+    name an alias, or ``true`` to show that name as written.
+
+    Default-deny: with the section present every cluster key, index pattern
+    and field rule must be listed, so a field added to the map later cannot
+    reach Claude under its real name by being forgotten here. A glob field
+    rule has no single name to replace and can only be ``true``; the
+    concrete paths under it are then shown as written."""
+    if raw is None:
+        return None
+    where = f"{source}: aliases"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} must be an object")
+    unknown = set(raw) - {"clusters", "indices", "fields", "_comment"}
+    if unknown:
+        raise ConfigError(f"{where}: unknown keys {sorted(unknown)}")
+    out: dict[str, tuple[tuple[str, str | None], ...]] = {}
+    for kind, names in (("clusters", [c.name for c in cfg.clusters]),
+                        ("indices", list(cfg.indices)),
+                        ("fields", [r.pattern for r in cfg.fields])):
+        section = raw.get(kind, {})
+        if not isinstance(section, dict):
+            raise ConfigError(f"{where}.{kind} must be an object of name -> alias or true")
+        extra = sorted(set(section) - set(names))
+        if extra:
+            raise ConfigError(f"{where}.{kind} lists {len(extra)} name(s) the site map does "
+                              f"not have, the first: {extra[0]!r}")
+        missing = [n for n in names if n not in section]
+        if missing:
+            raise ConfigError(f"{where}.{kind} must list every name: {len(missing)} missing, "
+                              f"the first: {missing[0]!r} (an alias, or true to show it as "
+                              "written)")
+        pairs, seen = [], set()
+        for name in names:
+            alias = section[name]
+            if alias is True:
+                pairs.append((name, None))
+                continue
+            if not isinstance(alias, str) or not _ALIAS_RE.match(alias):
+                raise ConfigError(f"{where}.{kind}[{name!r}] must be true or an alias of "
+                                  "lowercase letters, digits and _ (at most 32, a letter first)")
+            if kind == "fields" and "*" in name:
+                raise ConfigError(f"{where}.fields[{name!r}]: a glob rule has no one name to "
+                                  "replace; set it to true or list its fields one by one")
+            if alias in seen:
+                raise ConfigError(f"{where}.{kind}: the alias {alias!r} is used twice")
+            if alias in names or alias == ALIAS_UNKNOWN:
+                raise ConfigError(f"{where}.{kind}: the alias {alias!r} is a real name of "
+                                  "this site map")
+            if kind == "fields" and cfg.rule(alias) is not None:
+                raise ConfigError(f"{where}.fields: the alias {alias!r} matches a field rule")
+            seen.add(alias)
+            pairs.append((name, alias))
+        out[kind] = tuple(pairs)
+    if cfg.rule(ALIAS_UNKNOWN) is not None or ALIAS_UNKNOWN in cfg.indices:
+        raise ConfigError(f"{where}: a rule of this site map matches the reserved name "
+                          f"{ALIAS_UNKNOWN!r}")
+    return Aliases(**out)
 
 
 def load(path: str | Path) -> ElasticConfig:

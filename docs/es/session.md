@@ -131,3 +131,50 @@ denylist. The prompt is gated too (`esmcp.prompt_findings`), headless
 before launch and interactive as a `UserPromptSubmit` hook whose
 command ends in `|| exit 2`, so a broken check blocks.
 
+## Aliases: the names a session sees
+
+A site map names the environment: cluster keys, index patterns and field
+paths carry product, region and project words. By default a research
+session is shown them as written (`es_schema` returns the site map's own
+summary). The first session on a real cluster was shown four cluster
+names, an index pattern and five field paths that way.
+
+`aliases` in the site map replaces them at the tool boundary:
+
+```json
+"aliases": {
+  "clusters": {"emea": "c1", "amer": "c2"},
+  "indices":  {"logs-app-*": "app_logs"},
+  "fields":   {"@timestamp": "time", "message": "text", "labels.tenant_name": "tenant",
+               "job.name": "job", "log.level": "level", "event.*": true}
+}
+```
+
+- Every cluster, index pattern and field rule must be listed. The value is
+  an alias (lowercase letters, digits, `_`, a letter first, at most 32) or
+  `true` to show that name as written. A name left out is a load error, so
+  a field added later cannot reach a session by being forgotten.
+- A glob rule has no one name to replace and can only be `true`; the
+  concrete paths under it then go out as written. List its fields one by
+  one to alias them.
+- Pick aliases that say what the field is for (`tenant`, `job`, `level`):
+  the alias is all a session has to choose a field by.
+- A session types aliases. A name that is neither an alias nor shown as
+  written is replaced by a name no site map can hold before the grammar
+  sees it, so a real name typed as a guess gets the refusal an invented
+  name gets.
+- Renamed: the tool schemas, `es_schema`, a reply's `cluster`, each hit's
+  `_index` (the alias of its pattern) and `_source` (one flat object keyed
+  by alias), the `empty` block, a refusal's message. Never renamed: data.
+  A message text, a group text, a bucket key and a keep value leave as the
+  scrubber made them, so a keep value that carries a product word is still
+  readable; retype such a field as an identifier, or hide the word with a
+  profile entry.
+- People keep real names: the decision log, es-smoke, es-review and
+  es-preflight are unchanged. `es-smoke --query ... --aliased` takes a
+  session's own tool call and puts the real names back, for replaying it.
+  `answer.md` ends with the real names behind the aliases the answer used;
+  `answer.masked.md` is what the session wrote.
+- es-login prints a `NAMES` line from the bridge: aliases on or off, and
+  how many names of each kind are aliased or shown as written.
+
