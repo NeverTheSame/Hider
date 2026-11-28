@@ -89,8 +89,6 @@ class Translator:
     def field_out(self, path: str) -> str:
         """The name a concrete field path goes out under: its rule's alias,
         or the path itself where the site shows that rule as written."""
-        if path.startswith("_"):
-            return path  # Elasticsearch's own meta fields (_id, _index)
         rule = self.config.rule(path)
         if rule is None:
             raise Unmapped("field")
@@ -126,8 +124,6 @@ class Translator:
             return name
         if name in self._field_in:
             return self._field_in[name]
-        if name.startswith("_"):
-            return name
         rule = self.config.rule(name) if elastic._FIELD_RE.match(name) and "*" not in name else None
         if rule is not None and self._fields[rule.pattern] is None:
             return name
@@ -147,7 +143,10 @@ class Translator:
 
     def _fields_in(self, node: Any) -> Any:
         if isinstance(node, dict):
-            return {k: (self._field_in_name(v) if k == "field" else self._fields_in(v))
+            # "field" holds a name; an aggregation a session called "field"
+            # holds an object, which is walked like any other
+            return {k: (self._field_in_name(v) if k == "field" and isinstance(v, str)
+                        else self._fields_in(v))
                     for k, v in node.items()}
         if isinstance(node, list):
             return [self._fields_in(v) for v in node]
@@ -192,11 +191,23 @@ class Translator:
         out = dict(payload)
         if isinstance(out.get("cluster"), str):
             out["cluster"] = self.cluster_out(out["cluster"])
-        if isinstance(out.get("hits"), list):
-            out["hits"] = [self._hit(h) for h in out["hits"]]
         if isinstance(out.get("empty"), dict):
             out["empty"] = self._names(out["empty"])
+        # hits stand at the top of a page and, under a top_hits, anywhere
+        # inside the aggregations: every one is renamed, wherever it is
+        for key in ("hits", "aggregations"):
+            if key in out:
+                out[key] = self._hits_in(out[key])
         return out
+
+    def _hits_in(self, node: Any) -> Any:
+        if isinstance(node, list):
+            return [self._hits_in(v) for v in node]
+        if not isinstance(node, dict):
+            return node
+        if "_source" in node or "_index" in node:
+            return self._hit(node)
+        return {k: self._hits_in(v) for k, v in node.items()}
 
     def _hit(self, hit: Any) -> Any:
         if not isinstance(hit, dict):

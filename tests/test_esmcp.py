@@ -1027,6 +1027,26 @@ def test_with_aliases_a_session_sees_and_types_aliases_only(aliased, fixture):
                          aggs={"kinds": {"type": "text_groups", "field": f["message"], "size": 3}})
     assert not err and groups["aggregations"]["kinds"]["buckets"]
 
+    # documents inside an aggregation are renamed like a page's
+    tops, err = c.tool("es_aggregate", index=idx, aggs={"by": {
+        "type": "terms", "field": f["log.level"], "size": 2,
+        "aggs": {"field": {"type": "top_hits", "size": 1}}}})
+    assert not err
+    inner = [h for b in tops["aggregations"]["by"]["buckets"] for h in b["field"]["hits"]["hits"]]
+    assert inner and all(h["_index"] == idx and f["message"] in h["_source"] for h in inner)
+
+    # Elasticsearch's own _index is not a field a session can bucket or filter by
+    text, err = c.tool("es_aggregate", index=idx,
+                       aggs={"i": {"type": "terms", "field": "_index", "size": 5}})
+    assert err and "unknown_field" in text
+
+    # the site map again, after a phrase was spent
+    _, err = c.tool("es_count", index=idx, filters=[
+        {"field": f["message"], "op": "phrase", "value": "failed"}])
+    assert not err
+    again, err = c.tool("es_schema")
+    assert not err and again["case"]["phrases_used"] == 1 and "message" not in again["fields"]
+
     # a zero is explained by field, under the field's alias
     none, err = c.tool("es_count", index=idx, filters=[
         {"field": f["log.level"], "op": "eq", "value": "no-such-level"}])
